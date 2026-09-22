@@ -7,7 +7,8 @@ operations and suggestion acceptance. Authors can explicitly unprotect; discussi
 and proposals remain available. This prevents accidental edits and is not password
 security. Snapshot diffs apply explicit unprotection before content and protection
 after content, including new worksheets. Older snapshots can clear the flag.
-No event format or migration changes.
+Idle event streams now acknowledge immediately instead of waiting for the first
+heartbeat; comments do not change replay cursors. No event format or migration changes.
 
 ## 0.1.0 — 2026-09-22
 
