@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+Worksheet protection now runs through the governance gate, including structural
+operations and suggestion acceptance. Authors can explicitly unprotect; discussion
+and proposals remain available. This prevents accidental edits and is not password
+security. No event format or migration changes.
+
 ## 0.1.0 — 2026-09-22
 
 Initial standalone source release from Dynodoc: four Rust crates, immutable
