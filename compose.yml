@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: dynodoc
+      POSTGRES_PASSWORD: local-development-only
+      POSTGRES_DB: dynodoc_engine
+    ports: ["127.0.0.1:5548:5432"]
+    volumes: ["engine_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dynodoc -d dynodoc_engine"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+volumes:
+  engine_data:

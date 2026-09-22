@@ -1,0 +1,11 @@
+Dynodoc Engine
+Copyright 2026 ArefinAlter and Dynodoc contributors.
+
+Extracted on 2026-09-22 from https://github.com/ArefinAlter/dynodoc
+at commit b1fc3b2df1fdbe54e8ce7e6800e23efb39043e34.
+The copyright owner explicitly authorized this extracted engine release under
+MIT on 2026-09-22. The source application's AGPL license is unchanged.
+Changes at extraction: standalone package metadata, fixture relocation,
+developer documentation, community policies, CI and local development setup.
+All database migration files and the event serialization contract are unchanged.
+Third-party dependencies retain their own licenses; see THIRD_PARTY_NOTICES.md.

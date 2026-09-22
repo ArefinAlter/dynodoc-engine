@@ -1,0 +1,49 @@
+[package]
+name = "engine-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "dynodoc HTTP API server (Axum + SSE + auth)."
+
+[lib]
+name = "engine_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "engine-api"
+path = "src/main.rs"
+
+[dependencies]
+engine-core = { workspace = true }
+engine-shared = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+# Auth (stage 17): Paseto v4 tokens, hashing/CSPRNG, time and id types.
+pasetors = { workspace = true }
+hex = { workspace = true }
+ring = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+# Stage 18: ULIDs for suggestion ids, opaque cursors, OpenAPI generation.
+ulid = { workspace = true }
+base64 = { workspace = true }
+utoipa = { workspace = true }
+
+[dev-dependencies]
+# `ServiceExt::oneshot` (tower `util`) drives the router in integration tests.
+tower = { workspace = true, features = ["util"] }

@@ -1,0 +1,30 @@
+[package]
+name = "engine-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "dynodoc engine core: event log, hash chain, materialization, merge."
+
+[dependencies]
+engine-shared = { workspace = true }
+sqlx = { workspace = true }
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ulid = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+similar = "=2.7.0"
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio-test = { workspace = true }
+insta = { workspace = true }

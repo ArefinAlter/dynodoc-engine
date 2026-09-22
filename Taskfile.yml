@@ -1,0 +1,20 @@
+version: "3"
+dotenv: [".env"]
+tasks:
+  up:
+    desc: Start local PostgreSQL on loopback port 5548
+    cmds: ["docker compose up -d --wait"]
+  run:
+    desc: Run API; applies pending migrations on startup
+    cmds: ["cargo run --locked -p engine-api"]
+  test:
+    desc: Run pure and isolated PostgreSQL integration tests
+    cmds: ["cargo test --locked --workspace"]
+  lint:
+    cmds:
+      - cargo fmt --all -- --check
+      - cargo clippy --locked --workspace --all-targets -- -D warnings
+  docs:
+    cmds: ["cargo doc --locked --workspace --no-deps"]
+  openapi:
+    cmds: ["cargo run --locked -p engine-cli -- openapi --out openapi.yaml"]
