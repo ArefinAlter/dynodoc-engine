@@ -9,7 +9,7 @@ tasks:
     cmds: ["cargo run --locked -p engine-api"]
   test:
     desc: Run pure and isolated PostgreSQL integration tests
-    cmds: ["cargo test --locked --workspace"]
+    cmds: ["cargo test --locked --workspace -- --test-threads=1"]
   lint:
     cmds:
       - cargo fmt --all -- --check

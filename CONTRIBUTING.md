@@ -16,3 +16,7 @@ Contributions are made under MIT. You must have the right to submit your changes
 retain third-party notices and identify borrowed code. No copyright assignment or
 separate contributor license agreement is required. Maintainers review and merge
 changes; there is no promised response time or security service-level agreement.
+
+Database integration tests run serially in Task and CI so concurrent database
+creation does not distort the existing 100 ms SSE delivery check. That check is
+a local acceptance test, not a production latency or concurrent-load guarantee.

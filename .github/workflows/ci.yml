@@ -30,6 +30,9 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://dynodoc:dynodoc@127.0.0.1:5432/dynodoc
+      # Tests create/drop databases. Keep this work from competing with the
+      # existing 100 ms SSE acceptance check; this is not a load benchmark.
+      RUST_TEST_THREADS: 1
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain (pinned via rust-toolchain.toml)
