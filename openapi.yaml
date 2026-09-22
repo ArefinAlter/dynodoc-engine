@@ -2,9 +2,11 @@ openapi: 3.1.0
 info:
   title: dynodoc engine API
   description: Document version control, collaborative review and authorized administration. Canonical content history is append-only except explicit audited whole-document erasure.
+  contact:
+    name: dynodoc contributors
   license:
-    name: AGPL-3.0-or-later
-    identifier: AGPL-3.0-or-later
+    name: MIT
+    identifier: MIT
   version: 0.1.0
 paths:
   /admin/actions:
