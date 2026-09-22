@@ -248,7 +248,11 @@ fn inclusion_path(leaves: &[[u8; 32]], target: usize) -> ([u8; 32], Vec<ProofSte
         if layer.len() % 2 == 1 {
             layer.push([0u8; 32]);
         }
-        let sibling_index = if index % 2 == 0 { index + 1 } else { index - 1 };
+        let sibling_index = if index.is_multiple_of(2) {
+            index + 1
+        } else {
+            index - 1
+        };
         path.push(ProofStep {
             sibling: hex(&layer[sibling_index]),
             sibling_is_left: sibling_index < index,
