@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Date-only application contract documentation - 2026-10-06
+
+Documented application 7cc58e3 date-only Excel/Sheets observations, native calendar
+round-trip/timezone checks, merged-cell preflight and retained retry/recovery IDs.
+Client code remains in the application. No Rust, migration, event or OpenAPI
+changes; engine source remains synchronized at d6666a2. Native-host acceptance,
+structural/formatting sync and marketplace distribution remain open.
+
 ### Historical checkpoints and recovery support - 2026-10-06
 
 Synchronized from application a286aee276dff03f01c529485566115cc7024658. Both checkpoint

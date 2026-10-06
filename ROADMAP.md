@@ -20,5 +20,9 @@ no Git transport, CRDT typing, complete offline convergence or Office editor is
 implemented by this standalone engine. Source publication is not deployment.
 
 All six development clients now share field-level capture, frozen retries and
-explicit sidecar recovery in the application. Spreadsheet cells/formulas and
+explicit sidecar recovery in the application. Spreadsheet cells, date-only values/formulas and
 slide shape text are initial supported projections, not full format coverage.
+
+The date-only client follow-up is application 7cc58e3. Its native calendar/timezone
+checks are application code; timestamps, formula/date formatting compatibility
+and installed-host acceptance remain open. Service source/migrations are unchanged.

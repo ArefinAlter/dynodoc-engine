@@ -79,3 +79,21 @@ CI for d6666a2 passed format, Clippy, build, all 200 tests, docs and OpenAPI con
 [run 37430229717](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/37430229717).
 Pre-existing Rustdoc link warnings remain. Native installation and VPS rollout
 are application evidence and are not implied by engine source publication.
+
+## Date-only application clients - 6 October 2026
+
+Application 7cc58e36b065410b52722f94906d45d5784e0ca9 adds date-only Excel/Sheets
+observations to the existing version-1 string-field contract. Excel uses checked
+native calendar functions; Sheets uses the spreadsheet timezone and checked local
+midnight. Both preflight values and preserve retry/recovery identity. The application
+now requires ExcelApi 1.13 for local merged-cell checks. Timestamps, date-format/type
+changes, formula-engine compatibility and real-host acceptance remain open.
+
+These adapters and generated Google artifacts live in the application, not this
+MIT engine repository. Service source remains the d6666a2 synchronization from
+application 348bef9; migration bytes, event variants and OpenAPI are unchanged.
+The engine already stores/retrieves these string observations and merges them
+through the existing permission-checked proposal path. The engine does not perform
+native calendar or Office/Google runtime conversion. See the
+[application release](https://github.com/ArefinAlter/dynodoc/blob/main/docs/SPREADSHEET-DATE-SYNC-RELEASE.md)
+and [native acceptance matrix](https://github.com/ArefinAlter/dynodoc/blob/main/docs/NATIVE-CONNECTOR-ACCEPTANCE.md).
