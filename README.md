@@ -15,6 +15,15 @@ credentials, user files or production database. It is an early 0.1 source releas
 not a claim of Git protocol compatibility, offline convergence or complete Office
 file support. No crates.io package has been published.
 
+## Current state (6 October 2026)
+
+The Rust service is synchronized from application `52c2447`: change requests,
+strict review of unrelated uploads, copy fingerprints/detection, the six-role
+ladder, review rules/approvals and in-app notification APIs are included. The
+GitHub-style Projects workspace remains unimplemented. Invitation email belongs
+to the application web gateway; this engine does not send those invitations.
+See [capabilities and limits](docs/CAPABILITIES.md).
+
 ## Components
 
 | Crate | Responsibility |
@@ -59,7 +68,8 @@ cargo run --locked -p engine-cli -- replay DOCUMENT_UUID
 cargo run --locked -p engine-cli -- snapshot DOCUMENT_UUID
 ```
 
-See [architecture](docs/ARCHITECTURE.md), [API and authentication](docs/API.md),
+See [current capabilities](docs/CAPABILITIES.md), [architecture](docs/ARCHITECTURE.md),
+[API and authentication](docs/API.md),
 [contributing](CONTRIBUTING.md), [security](SECURITY.md),
 [code of conduct](CODE_OF_CONDUCT.md) and [roadmap](ROADMAP.md).
 

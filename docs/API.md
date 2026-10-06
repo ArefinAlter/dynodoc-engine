@@ -18,3 +18,23 @@ checks before exposing the service to a network.
 `crates/engine-api/tests/api_test.rs` and `auth_test.rs` demonstrate local authenticated
 requests, version/draft operations, stale writes and membership isolation against
 fresh SQLx test databases. They do not contact real login or research providers.
+
+## Current document collaboration API
+
+The synchronized service includes `/documents/:id/change-requests` (create/list,
+detail, merge, decline, withdraw and reviews), draft submit/withdraw,
+`/documents/:id/history-points` and `/state?through_seq=`, `/people`, `/policy`,
+`/owner`, `/documents/:id/copies`, `/copies/:match_id`,
+`/notifications`, `/notifications/count` and `/notifications/read`.
+Use generated OpenAPI for exact verbs, payloads and response shapes.
+
+Per-document rules protect canonical edits and constrain approval/merge rights.
+Submitted requests are reviewable by permitted collaborators; private drafts stay
+private. Approvals must reflect current request content. Copy metadata and notices
+are filtered at read time; a notification does not grant document access.
+
+The API binary starts a background copy-index/detection worker. Fingerprints are
+derived data; notifications and review metadata are separate from content events.
+Projects and watch/digest APIs are absent. Invitation delivery at application
+`b70f048` is a web-gateway operation after an engine grant, not an engine endpoint.
+See [current capabilities](CAPABILITIES.md) for role-name compatibility and limits.

@@ -28,3 +28,16 @@ or access-control operation; the operational audit is a separate log.
 The `engine-api` adapter retains the original product schema so migrations and
 recorded histories remain compatible. Further extraction of product-specific
 adapters is a future change with explicit compatibility tests.
+
+## Current collaboration adapters
+
+`workspace_merge::merge_strict` adds explicit existing-block choices for unrelated
+content. `similarity` computes bounded deterministic word/block fingerprints and
+MinHash/LSH summaries; `engine-api::copies` indexes/detects relationships and checks
+access before displaying them. Similarity does not establish authenticated origin.
+
+`access`/`people` map the product role ladder onto the preserved core capabilities,
+with per-document rules. `reviews` handles submitted drafts, approvals/comments
+and permission-checked merges; `notifications` stores per-recipient operational
+notices. Migrations `0020`/`0021` extend these adapters without new content events.
+Project policy inheritance and multi-file branches/releases are future work.

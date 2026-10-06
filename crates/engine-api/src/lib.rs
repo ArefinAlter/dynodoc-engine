@@ -12,18 +12,23 @@
 //! [`error::ApiError`], opaque cursor [`pagination`], Postgres-backed [`idempotency`],
 //! and a generated [`ApiDoc`] OpenAPI document.
 
+pub mod access;
 pub mod admin;
 mod admin_controls;
 pub mod audit;
 pub mod auth;
 pub mod conflicts;
+pub mod copies;
 mod discussions;
 pub mod documents;
 pub mod error;
 pub mod idempotency;
+pub mod notifications;
 pub mod ops;
 pub mod pagination;
+pub mod people;
 pub mod product;
+pub mod reviews;
 pub mod stream;
 pub mod workspace;
 
@@ -46,6 +51,8 @@ pub struct AppState {
     /// Per-document SSE broadcast registry (live event fan-out).
     pub subscriptions: Subscriptions,
     pub admin_emails: String,
+    /// Wakes the background copy-detection indexer ([`copies::spawn`]).
+    pub copy_index: copies::CopyIndex,
 }
 
 impl AppState {
@@ -56,6 +63,7 @@ impl AppState {
             auth,
             subscriptions: Subscriptions::new(),
             admin_emails: std::env::var("ADMIN_EMAILS").unwrap_or_default(),
+            copy_index: copies::CopyIndex::default(),
         }
     }
 }
@@ -86,7 +94,11 @@ pub fn app(state: AppState) -> Router {
         .merge(stream::router())
         .merge(audit::router())
         .merge(workspace::router())
+        .merge(reviews::router())
         .merge(discussions::router())
+        .merge(notifications::router())
+        .merge(copies::router())
+        .merge(people::router())
         .with_state(state)
         .layer(cors)
         .layer(CompressionLayer::new())
@@ -157,10 +169,14 @@ struct WorkspaceDocs;
 impl utoipa::Modify for WorkspaceDocs {
     fn modify(&self, api: &mut utoipa::openapi::OpenApi) {
         api.merge(workspace::WorkspaceApi::openapi());
+        api.merge(reviews::ReviewApi::openapi());
         api.merge(product::ProductApi::openapi());
         api.merge(admin::AdminApi::openapi());
         api.merge(admin_controls::AdminControlsApi::openapi());
         api.merge(discussions::DiscussionApi::openapi());
+        api.merge(notifications::NotificationApi::openapi());
+        api.merge(copies::CopiesApi::openapi());
+        api.merge(people::PeopleApi::openapi());
         let components = api.components.get_or_insert_with(Default::default);
         components.add_security_scheme(
             "paseto",

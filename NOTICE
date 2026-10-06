@@ -9,3 +9,9 @@ Changes at extraction: standalone package metadata, fixture relocation,
 developer documentation, community policies, CI and local development setup.
 All database migration files and the event serialization contract are unchanged.
 Third-party dependencies retain their own licenses; see THIRD_PARTY_NOTICES.md.
+
+Synchronized on 2026-10-06 from the same source application at commit
+52c2447. Includes the September change-request and copies/roles service updates,
+new migrations 0020/0021 and existing tests; standalone packaging and the local
+golden fixture are retained. See docs/CAPABILITIES.md. Historical migrations and
+event serialization are unchanged; the authorized engine license remains MIT.
