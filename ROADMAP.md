@@ -23,6 +23,6 @@ All six development clients now share field-level capture, frozen retries and
 explicit sidecar recovery in the application. Spreadsheet cells, date-only values/formulas and
 slide shape text are initial supported projections, not full format coverage.
 
-The date-only client follow-up is application 7cc58e3. Its native calendar/timezone
+The date-only client follow-up is application 8c7461d. Its native calendar/timezone
 checks are application code; timestamps, formula/date formatting compatibility
 and installed-host acceptance remain open. Service source/migrations are unchanged.

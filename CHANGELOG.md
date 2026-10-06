@@ -4,7 +4,7 @@
 
 ### Date-only application contract documentation - 2026-10-06
 
-Documented application 7cc58e3 date-only Excel/Sheets observations, native calendar
+Documented application 8c7461d date-only Excel/Sheets observations, native calendar
 round-trip/timezone checks, merged-cell preflight and retained retry/recovery IDs.
 Client code remains in the application. No Rust, migration, event or OpenAPI
 changes; engine source remains synchronized at d6666a2. Native-host acceptance,

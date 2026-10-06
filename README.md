@@ -29,7 +29,7 @@ structural/background sync and marketplace publication remain open. This engine
 does not send invitation email. See [capabilities](docs/CAPABILITIES.md) and
 [provenance service contract](docs/PROVENANCE-SYNC.md).
 
-The application client follow-up 7cc58e3 adds checked date-only Excel/Sheets
+The application client follow-up 8c7461d adds checked date-only Excel/Sheets
 observations to that same contract. Native conversion/merged-cell checks stay in
 the application; service source and schema remain unchanged. See
 [current capabilities](docs/CAPABILITIES.md#date-only-application-clients---6-october-2026)

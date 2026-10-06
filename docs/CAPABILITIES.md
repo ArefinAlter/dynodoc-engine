@@ -82,10 +82,10 @@ are application evidence and are not implied by engine source publication.
 
 ## Date-only application clients - 6 October 2026
 
-Application 7cc58e36b065410b52722f94906d45d5784e0ca9 adds date-only Excel/Sheets
+Application 8c7461d137f0cefbbe265d58a12d4078acb07212 adds date-only Excel/Sheets
 observations to the existing version-1 string-field contract. Excel uses checked
 native calendar functions; Sheets uses the spreadsheet timezone and checked local
-midnight. Both preflight values and preserve retry/recovery identity. The application
+midnight. Both preflight native date-only masks/values and preserve retry/recovery identity. The application
 now requires ExcelApi 1.13 for local merged-cell checks. Timestamps, date-format/type
 changes, formula-engine compatibility and real-host acceptance remain open.
 

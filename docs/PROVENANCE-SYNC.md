@@ -168,7 +168,10 @@ The connector never guesses a 1900/1904 epoch or uses the machine timezone.
 Sheets converts native Date objects using the spreadsheet timezone, checks local
 midnight, then parses and verifies that same local midnight before writing. It
 rechecks timezone and native values after preflight. Invalid days, hidden times,
-type changes and unrepresentable local midnight stop sync. Dates must be real
+type changes and unrepresentable local midnight stop sync. Native date cells must
+retain a recognized date-only number format; General/text/time/ambiguous custom
+masks require file push. Formatting changes between supported date masks are not
+captured or synchronized. Dates must be real
 days from 1900 through 9999 and representable by the host's workbook/calendar.
 
 The version-1 string `FieldEdited` envelope, immutable receipts, schema and event
