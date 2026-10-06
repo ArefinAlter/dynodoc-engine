@@ -34,7 +34,7 @@ jobs:
       # existing 100 ms SSE acceptance check; this is not a load benchmark.
       RUST_TEST_THREADS: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain (pinned via rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
         with:
