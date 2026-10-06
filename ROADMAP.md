@@ -2,11 +2,11 @@
 
 Updated 6 October 2026. Projects and anchored retry-safe provenance bundles now
 have service implementations. See [capabilities](docs/CAPABILITIES.md) and the
-[portable contract](docs/PROVENANCE-SYNC.md). Application source: 2a289ce2fe5fc0071fc45596fdf39b66aca10af7.
+[portable contract](docs/PROVENANCE-SYNC.md). Application source: 348bef9da0be3a72e1f3eeca57225d60aef71420.
 
-1. Accept Word and Google Docs together in real hosts; extend structural block
+1. Accept Word/Docs, Excel/Sheets and PowerPoint/Slides in real hosts; extend structural block
    operations, formatting and cross-host conflict/retry recovery.
-2. Background/local capture and portable sidecars across copies/renames/devices;
+2. Background/local capture and automatic discovery across copies/renames/devices;
    secure pairing, signed installations and marketplace acceptance.
 3. Project activity/compare/search, then consistent multi-file releases.
 4. Replace duplicated application Rust sources with a pinned dependency/subtree;
@@ -18,3 +18,7 @@ Editor clients, file parsing and invitation email remain application components.
 Core history is serialized, centralized PostgreSQL with explicit overlap review;
 no Git transport, CRDT typing, complete offline convergence or Office editor is
 implemented by this standalone engine. Source publication is not deployment.
+
+All six development clients now share field-level capture, frozen retries and
+explicit sidecar recovery in the application. Spreadsheet cells/formulas and
+slide shape text are initial supported projections, not full format coverage.

@@ -34,7 +34,7 @@ responsible merger, while the original uploader/observations remain separate.
 
 1. Accept all three application editor pairs in real hosts: Word/Docs, Excel/Sheets and PowerPoint/Slides.
    Extend stable-ID structural sync, formatting adapters and conflict recovery.
-2. Durable background/local capture, sidecars across copies/renames/devices, secure
+2. Durable background/local capture, automatic copy/device discovery, secure
    pairing, signed installation and both marketplace reviews/publication.
 3. Project Compare/Activity/search and consistent multi-file releases.
 4. Remove duplicated Rust sources through a pinned dependency/subtree, extend
@@ -72,3 +72,10 @@ verifies Excel/Sheets and PowerPoint/Slides key isolation, string field operatio
 retry receipts, unchanged canonical heads and revocation. Client cell/formula/shape
 adapters live in the application. This does not establish structural/formatting
 sync, native-host acceptance, background capture or publication.
+
+Six-editor verification: task lint, all 200 tests via task test, task docs and
+OpenAPI generation passed locally. The generated API is unchanged. Independent
+CI for d6666a2 passed format, Clippy, build, all 200 tests, docs and OpenAPI consistency:
+[run 37430229717](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/37430229717).
+Pre-existing Rustdoc link warnings remain. Native installation and VPS rollout
+are application evidence and are not implied by engine source publication.
