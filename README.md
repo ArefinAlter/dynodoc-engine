@@ -23,7 +23,7 @@ bundles are anchored to exact document revisions, stored immutably and receive
 durable retry receipts. Seven-day revocable Word/Google Docs keys read/propose
 on one file only; they cannot merge or act as account-wide sessions.
 
-Synchronized from application 2a289ce2fe5fc0071fc45596fdf39b66aca10af7. Word/Google Docs development
+Synchronized from application a286aee276dff03f01c529485566115cc7024658. Word/Google Docs development
 clients and the Projects UI live in that application; real-host acceptance,
 structural/background sync and marketplace publication remain open. This engine
 does not send invitation email. See [capabilities](docs/CAPABILITIES.md) and

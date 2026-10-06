@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Historical checkpoints and recovery support - 2026-10-06
+
+Synchronized from application a286aee276dff03f01c529485566115cc7024658. Both checkpoint
+GET endpoints accept optional through_seq and return exact canonical historical
+state/hash under current membership/scoped-key checks. Reject invalid/future
+revisions; omitted selector retains current-head behavior. Native connectors use
+this to verify sidecar recovery before identity binding. They remain application
+code. No migration/event-format changes. Local lint, four integration tests and
+generated MIT OpenAPI pass; independent CI runs all 199 tests.
+
+
 ### Projects and portable provenance - 2026-10-06
 
 Synchronized from application 2a289ce2fe5fc0071fc45596fdf39b66aca10af7: invite-only Projects, aggregate

@@ -1,6 +1,6 @@
 # Current engine capabilities
 
-Updated 6 October 2026 from Dynodoc application 2a289ce2fe5fc0071fc45596fdf39b66aca10af7. This records
+Updated 6 October 2026 from Dynodoc application a286aee276dff03f01c529485566115cc7024658. This records
 executable service behaviour, not a production rollout or complete product.
 
 | Area | Implemented | Boundary |
@@ -10,7 +10,7 @@ executable service behaviour, not a production rollout or complete product.
 | Drafts/review | Private append-only drafts, selected sharing, historical/named versions, requests, approvals/comments, strict unrelated-content choices and permission-checked merge/decline/withdraw. | Other people's unsubmitted drafts remain private, including from project managers. |
 | Projects | Invite-only roots, folders, creation/listing, aggregate files/requests/own drafts, members, revision-checked settings and submission Watch. | Web navigation/import/download UI lives in Dynodoc; Compare/Activity and multi-file releases remain open. |
 | Roles/rules | Owner/Manager/Editor/Reviewer/Contributor/Viewer, direct/inherited access, file overrides, inherited project review defaults and protection/approval/merge restrictions. | Core still uses Author/Reviewer/Auditor; membership/rules are operational metadata. |
-| Provenance | Version-1 portable bundles, exact base-sequence/hash check, atomic content-only proposal, immutable normalized envelope/digest and durable same-actor retry receipt. Retrieval preserves private-draft permissions. | Uploader/reception are server facts; host/local-time/origin descriptions are client claims, not human/AI authorship proof or external timestamping. |
+| Provenance | Version-1 portable bundles, exact base-sequence/hash check, permission-checked historical checkpoints, atomic content-only proposal, immutable normalized envelope/digest and durable same-actor retry receipt. Retrieval preserves private-draft permissions. | Uploader/reception are server facts; host/local-time/origin descriptions are client claims, not human/AI authorship proof or external timestamping. |
 | Editor credentials | Hashed seven-day revocable file/host-scoped read/propose keys; current membership, account/session generation and expiry rechecked. | No merge/access-management permissions, no OAuth pairing or complete offline replica. Native clients remain development code in the application. |
 | Copies | Deterministic fingerprints, MinHash/LSH detection, containment/relatedness, owner actions and permission-filtered results. | Filename/content matching suggests relationships, not authenticated authorship. |
 | Notifications | Per-person inbox/count/read, copies/reviews/access notices and project submission watchers. | No engine email delivery, all-event Watch or daily summary. |
@@ -52,8 +52,16 @@ settings revisions, Watch, concurrent retries, bad-base/invalid-operation rollba
 scoped keys, revocation, expiry, forced sign-out/access removal and both document
 and private-account erasure. Existing replay/merge/privacy regressions remain.
 Run task lint, task test, task docs and task openapi against an isolated database.
-Local verification for this synchronization passed task lint, all 198 tests via
+Local verification for the earlier e73e4ba synchronization passed task lint, all 198 tests via
 task test (including the unchanged 100 ms SSE assertion), task docs and generated
 OpenAPI. Documentation retains existing Rustdoc link warnings. Earlier application
 runs hit the intermittent native SSE timeout; Linux CI retains the assertion.
 Source/test coverage does not establish production or live editor acceptance.
+
+Historical checkpoint follow-up: both GET endpoints accept optional through_seq.
+Current access/session/expiry checks apply to historical content; invalid/future
+revisions return 400. Application clients verify a recovered queue's exact base
+before binding. This increment passed task lint, all four Projects/provenance
+integration tests and OpenAPI generation locally. Independent CI runs all 199
+tests. No migrations/event variants changed. Native recovery UI remains application
+code and does not establish background capture or real editor-host acceptance.

@@ -43,3 +43,8 @@ See [current capabilities](CAPABILITIES.md) for role-name compatibility and limi
 Projects and editor-scoped provenance endpoints are implemented; see
 [the version-1 service contract](PROVENANCE-SYNC.md) and generated OpenAPI.
 Connector keys cannot use account-wide session endpoints or merge operations.
+
+Both provenance checkpoint GET endpoints accept optional through_seq for exact
+canonical historical state/hash. Current membership and credential checks apply;
+negative/future revisions return 400. Omitted selector returns the current head.
+Proposal statuses remain current, including in historical checkpoints.

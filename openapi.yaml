@@ -212,12 +212,21 @@ paths:
         schema:
           type: string
           format: uuid
+      - name: through_seq
+        in: query
+        description: Historical canonical revision; omitted means current head
+        required: false
+        schema:
+          type: integer
+          format: int64
       responses:
         '200':
           description: File-scoped credential checkpoint
           content:
             application/json:
               schema: {}
+        '400':
+          description: Revision outside history
       security:
       - connector_key: []
   /copies/{match_id}:
@@ -1591,12 +1600,21 @@ paths:
         schema:
           type: string
           format: uuid
+      - name: through_seq
+        in: query
+        description: Historical canonical revision; omitted means current head
+        required: false
+        schema:
+          type: integer
+          format: int64
       responses:
         '200':
           description: Consistent full checkpoint with stable block IDs
           content:
             application/json:
               schema: {}
+        '400':
+          description: Revision outside history
       security:
       - paseto: []
     post:
