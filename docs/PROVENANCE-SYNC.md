@@ -51,7 +51,7 @@ the workspace origin. Arbitrary cross-origin browser CORS is not enabled.
 }
 ```
 
-This is a shape example: a real push needs 1–20,000 changes. Each change has a
+This is a shape example: a real push needs 1â€“20,000 changes. Each change has a
 UUID `id`, RFC3339 `observed_at` and `operation`, using the existing content-only
 event vocabulary: NodeCreated, FieldEdited, RichTextPatched, NodeMoved,
 NodeDeleted, NodeRestored. Canonical node IDs remain ULIDs. The body limit is
@@ -133,3 +133,23 @@ exportable; reopen the pane and explicitly restore into the saved copy. It uses
 Existing filename/content copy detection remains useful for selecting a matching
 file when history markers are absent. Its ambiguity/permissions rules continue to
 apply; extension observation is distinct from a later imported-file comparison.
+
+## Additional editor hosts (6 October)
+
+Host values now include `excel`, `google-sheets`, `powerpoint`, `google-slides`
+alongside `word`, `google-docs` and authenticated portable imports. Connection
+creation checks document kind: Word/Docs document, Excel/Sheets spreadsheet,
+PowerPoint/Slides presentation. Existing file/actor/host restrictions apply.
+
+Shared clients project spreadsheet `cell_N` scalar/formula strings and slide
+shape `text` strings into `(node_id, field)` identities. `FieldEdited` uses the
+existing string value schema; paragraph content keeps its earlier JSON schema.
+Version-1 ledgers/sidecars permit an optional block `field` and all six hosts;
+paragraph exports remain compatible. Recovery validates fields against the exact
+server-verified original projection and never imports credentials. Cross-host
+exchange uses reviewed checkpoints; sidecars restore into their original host.
+
+The shared pull planner rejects remote format/structure changes for structured
+files. Native bindings check row ranges or shape/slide IDs, recheck preview values
+before writes, and confirm the applied projection before advancing the ledger.
+Formatting/structural capture, dates, media and native acceptance remain open.

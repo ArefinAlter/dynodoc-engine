@@ -1,6 +1,6 @@
 # Current engine capabilities
 
-Updated 6 October 2026 from Dynodoc application a286aee276dff03f01c529485566115cc7024658. This records
+Updated 6 October 2026 from Dynodoc application 348bef9da0be3a72e1f3eeca57225d60aef71420. This records
 executable service behaviour, not a production rollout or complete product.
 
 | Area | Implemented | Boundary |
@@ -11,7 +11,7 @@ executable service behaviour, not a production rollout or complete product.
 | Projects | Invite-only roots, folders, creation/listing, aggregate files/requests/own drafts, members, revision-checked settings and submission Watch. | Web navigation/import/download UI lives in Dynodoc; Compare/Activity and multi-file releases remain open. |
 | Roles/rules | Owner/Manager/Editor/Reviewer/Contributor/Viewer, direct/inherited access, file overrides, inherited project review defaults and protection/approval/merge restrictions. | Core still uses Author/Reviewer/Auditor; membership/rules are operational metadata. |
 | Provenance | Version-1 portable bundles, exact base-sequence/hash check, permission-checked historical checkpoints, atomic content-only proposal, immutable normalized envelope/digest and durable same-actor retry receipt. Retrieval preserves private-draft permissions. | Uploader/reception are server facts; host/local-time/origin descriptions are client claims, not human/AI authorship proof or external timestamping. |
-| Editor credentials | Hashed seven-day revocable file/host-scoped read/propose keys; current membership, account/session generation and expiry rechecked. | No merge/access-management permissions, no OAuth pairing or complete offline replica. Native clients remain development code in the application. |
+| Editor credentials | Hashed seven-day revocable file/host-scoped read/propose keys for Word/Docs, Excel/Sheets and PowerPoint/Slides; file-kind validation on creation; current membership, account/session generation and expiry rechecked. | No merge/access-management permissions, no OAuth pairing or complete offline replica. Native clients remain development code in the application. |
 | Copies | Deterministic fingerprints, MinHash/LSH detection, containment/relatedness, owner actions and permission-filtered results. | Filename/content matching suggests relationships, not authenticated authorship. |
 | Notifications | Per-person inbox/count/read, copies/reviews/access notices and project submission watchers. | No engine email delivery, all-event Watch or daily summary. |
 | Governance/API | Sheet protection, questionnaire validation, authenticated HTTP/SSE/audit, PASETO sessions, administrative controls and audited document/account erasure. Generated OpenAPI. | Hosted cookie/provider gateways and file parsing/editing are application responsibilities. |
@@ -19,7 +19,7 @@ executable service behaviour, not a production rollout or complete product.
 ## Compatibility and packaging
 
 New migrations 0022 and 0023 add Projects/settings/watchers and connector/bundle
-tables. Existing migrations through 0021, event variants and serialization are
+tables. Migration 0024 expands the six-host constraint; earlier migration bytes remain unchanged. Existing migrations through 0021, event variants and serialization are
 unchanged. MIT metadata, Rust 1.96 pin, independent CI and local rich-text replay
 fixture remain. No frontend, credentials, private files or production data are
 copied. Core/shared remain usable without the product HTTP adapters.
@@ -32,7 +32,7 @@ responsible merger, while the original uploader/observations remain separate.
 
 ## Remaining work, in order
 
-1. Accept the application Word and Google Docs prototypes in real hosts together.
+1. Accept all three application editor pairs in real hosts: Word/Docs, Excel/Sheets and PowerPoint/Slides.
    Extend stable-ID structural sync, formatting adapters and conflict recovery.
 2. Durable background/local capture, sidecars across copies/renames/devices, secure
    pairing, signed installation and both marketplace reviews/publication.
@@ -65,3 +65,10 @@ before binding. This increment passed task lint, all four Projects/provenance
 integration tests and OpenAPI generation locally. Independent CI runs all 199
 tests. No migrations/event variants changed. Native recovery UI remains application
 code and does not establish background capture or real editor-host acceptance.
+
+Six-editor follow-up: the same anchored bundle service accepts all six editor host
+claims, with scoped host/file keys and file-kind checks. New integration coverage
+verifies Excel/Sheets and PowerPoint/Slides key isolation, string field operations,
+retry receipts, unchanged canonical heads and revocation. Client cell/formula/shape
+adapters live in the application. This does not establish structural/formatting
+sync, native-host acceptance, background capture or publication.

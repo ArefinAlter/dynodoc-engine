@@ -50,3 +50,8 @@ is distinct from client observation claims and the responsible canonical merger.
 Scoped keys cannot merge or access another document. Audited resource erasure
 removes bundle children while ordinary history remains immutable. See
 [the sync contract](PROVENANCE-SYNC.md).
+
+Migration 0024 expands connector credentials to all six Microsoft/Google hosts.
+Creation validates document kind; existing host/file/account/session/review scope
+and append-only events remain unchanged. Native adapters remain application code.
+

@@ -20,10 +20,10 @@ file support. No crates.io package has been published.
 The Rust service now includes invite-only Projects, cross-file requests/private
 own drafts, inherited review rules and submission watchers. Portable change
 bundles are anchored to exact document revisions, stored immutably and receive
-durable retry receipts. Seven-day revocable Word/Google Docs keys read/propose
+durable retry receipts. Seven-day revocable Word/Docs, Excel/Sheets and PowerPoint/Slides keys read/propose
 on one file only; they cannot merge or act as account-wide sessions.
 
-Synchronized from application a286aee276dff03f01c529485566115cc7024658. Word/Google Docs development
+Synchronized from application 348bef9da0be3a72e1f3eeca57225d60aef71420. All six editor development
 clients and the Projects UI live in that application; real-host acceptance,
 structural/background sync and marketplace publication remain open. This engine
 does not send invitation email. See [capabilities](docs/CAPABILITIES.md) and

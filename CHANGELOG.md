@@ -62,3 +62,11 @@ migrations, generated API, tests and fixtures. MIT license authorized by the own
 Community policies, local PostgreSQL setup and independent CI added. Existing
 content-event and database migration formats are unchanged. No binary or crates.io
 release is implied by this entry.
+
+## Six-editor provenance (6 October 2026)
+
+- Sync service/tests from application 348bef9da0be3a72e1f3eeca57225d60aef71420.
+- Add immutable migration 0024 for Word/Docs, Excel/Sheets and PowerPoint/Slides keys.
+- Validate file kind on connection creation; retain scoped retries and revocation.
+- Native adapter source and acceptance remain application responsibilities.
+
