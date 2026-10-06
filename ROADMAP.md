@@ -1,27 +1,20 @@
 # Roadmap
 
-Updated 6 October 2026. See [current capabilities](docs/CAPABILITIES.md) for the
-implementation and boundaries synchronized from Dynodoc application `52c2447`.
+Updated 6 October 2026. Projects and anchored retry-safe provenance bundles now
+have service implementations. See [capabilities](docs/CAPABILITIES.md) and the
+[portable contract](docs/PROVENANCE-SYNC.md). Application source: 2a289ce2fe5fc0071fc45596fdf39b66aca10af7.
 
-Implemented: serialized append-only event chains, replay/snapshots, stable IDs,
-compact formatting-aware patches, three-way and strict unrelated-content merge,
-private drafts and named versions; change requests, role/rule checks, approvals,
-copy fingerprints/detection, in-app notification APIs and integration tests.
+1. Accept Word and Google Docs together in real hosts; extend structural block
+   operations, formatting and cross-host conflict/retry recovery.
+2. Background/local capture and portable sidecars across copies/renames/devices;
+   secure pairing, signed installations and marketplace acceptance.
+3. Project activity/compare/search, then consistent multi-file releases.
+4. Replace duplicated application Rust sources with a pinned dependency/subtree;
+   expand durable idempotency and metadata audit throughout workspace operations.
+5. Independently retained chain-head commitments, measured snapshot/storage costs
+   and a smaller generic service boundary with historical compatibility tests.
 
-| Priority | Work | Completion evidence |
-| --- | --- | --- |
-| 1 | Keep the hosted and standalone engine compatible; replace duplicate sources with a pinned dependency/subtree in a separate application build change. | Independent builds, identical historical migration blobs, golden replay and API consistency. |
-| 2 | Durable idempotency/retry behavior throughout workspace operations; strengthen metadata/access audit. | Retry/restart/concurrent-request regressions without duplicate mutations or lost access checks. |
-| 3 | Independently retained/signed chain-head commitments. | Detect privileged full-history replacement using an external commitment, not just self-consistent database hashes. |
-| 4 | Profile snapshot/storage/materialization and improve attribution. | Reproducible workloads, bounded memory/storage, deterministic replay and old-reader compatibility. |
-| 5 | Smaller generic service boundary, portable history exchange and external compatibility policy. | Keep questionnaire/hosted admin adapters explicit; test supported historical imports and version negotiation. |
-
-The next hosted product milestone is the approved GitHub-style Projects workspace;
-its project kind, aggregate APIs, policy inheritance and Watch are not yet built.
-Core per-document primitives already support the current file workflow. Browser
-editors, file conversion, invitation delivery and Projects navigation belong to the
-application; shared API/schema additions should be synchronized explicitly.
-
-Offline replication, CRDT typing, Git transport, AI agent provenance and Office
-editors are not implemented by this engine. Dates and delivery commitments are
-not assigned.
+Editor clients, file parsing and invitation email remain application components.
+Core history is serialized, centralized PostgreSQL with explicit overlap review;
+no Git transport, CRDT typing, complete offline convergence or Office editor is
+implemented by this standalone engine. Source publication is not deployment.

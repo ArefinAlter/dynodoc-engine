@@ -15,3 +15,8 @@ Synchronized on 2026-10-06 from the same source application at commit
 new migrations 0020/0021 and existing tests; standalone packaging and the local
 golden fixture are retained. See docs/CAPABILITIES.md. Historical migrations and
 event serialization are unchanged; the authorized engine license remains MIT.
+
+Projects/provenance adapters synchronized on 2026-10-06 from application
+2a289ce2fe5fc0071fc45596fdf39b66aca10af7. New migrations 0022/0023, immutable portable
+bundles/scoped editor keys and three integration tests; MIT packaging retained.
+Existing migration bytes and event serialization remain unchanged.

@@ -38,3 +38,8 @@ derived data; notifications and review metadata are separate from content events
 Projects and watch/digest APIs are absent. Invitation delivery at application
 `b70f048` is a web-gateway operation after an engine grant, not an engine endpoint.
 See [current capabilities](CAPABILITIES.md) for role-name compatibility and limits.
+
+
+Projects and editor-scoped provenance endpoints are implemented; see
+[the version-1 service contract](PROVENANCE-SYNC.md) and generated OpenAPI.
+Connector keys cannot use account-wide session endpoints or merge operations.

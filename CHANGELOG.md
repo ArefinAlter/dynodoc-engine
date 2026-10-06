@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Projects and portable provenance - 2026-10-06
+
+Synchronized from application 2a289ce2fe5fc0071fc45596fdf39b66aca10af7: invite-only Projects, aggregate
+files/requests/private own drafts, inherited review defaults and submission Watch.
+Added anchored immutable change bundles, atomic proposals/durable retry receipts,
+scoped revocable seven-day editor keys and current-access/session/expiry checks.
+New migrations 0022/0023 only; historical migrations and event formats unchanged.
+Three integration tests exercise privacy, policy, retries, scoping and audited
+document/private-account erasure. Regenerated API and current capability docs.
+Word/Google Docs clients remain application development prototypes; no production
+deployment, real-host acceptance or marketplace publication is implied.
+
+Local verification passed formatting/Clippy, all 198 tests (including SSE),
+documentation (existing Rustdoc warnings) and regenerated MIT OpenAPI.
+
 ### Application synchronization - 2026-10-06
 
 Synchronized the Rust service from application `52c2447`: change-request lifecycle,
@@ -12,7 +27,7 @@ regression tests. Historical migrations and event serialization are unchanged.
 Standalone MIT packaging, Rust 1.96 and the local golden replay fixture are retained.
 Regenerated OpenAPI; documented current capabilities and remaining work.
 
-The Projects workspace is not implemented; invitation emails still live in the
+At that earlier synchronization Projects was unimplemented; invitation emails live in the
 hosted web gateway. No production deployment, binary or crates.io release is
 implied. Local Windows verification: formatting/Clippy passed; 194 tests passed
 with the existing 100 ms SSE test filtered after it timed out both in the full

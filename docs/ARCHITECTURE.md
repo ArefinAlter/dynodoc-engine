@@ -40,4 +40,13 @@ access before displaying them. Similarity does not establish authenticated origi
 with per-document rules. `reviews` handles submitted drafts, approvals/comments
 and permission-checked merges; `notifications` stores per-recipient operational
 notices. Migrations `0020`/`0021` extend these adapters without new content events.
-Project policy inheritance and multi-file branches/releases are future work.
+Projects now inherit review defaults through their containing root; file overrides win. Multi-file branches/releases remain future work.
+
+
+Projects/provenance increment: project settings/member changes serialize with
+content writes. Bundles and their draft/receipt share one transaction, exact base
+hashes are checked, and retry lookup rechecks membership. Stored uploader identity
+is distinct from client observation claims and the responsible canonical merger.
+Scoped keys cannot merge or access another document. Audited resource erasure
+removes bundle children while ordinary history remains immutable. See
+[the sync contract](PROVENANCE-SYNC.md).

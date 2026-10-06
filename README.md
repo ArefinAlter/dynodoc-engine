@@ -17,12 +17,17 @@ file support. No crates.io package has been published.
 
 ## Current state (6 October 2026)
 
-The Rust service is synchronized from application `52c2447`: change requests,
-strict review of unrelated uploads, copy fingerprints/detection, the six-role
-ladder, review rules/approvals and in-app notification APIs are included. The
-GitHub-style Projects workspace remains unimplemented. Invitation email belongs
-to the application web gateway; this engine does not send those invitations.
-See [capabilities and limits](docs/CAPABILITIES.md).
+The Rust service now includes invite-only Projects, cross-file requests/private
+own drafts, inherited review rules and submission watchers. Portable change
+bundles are anchored to exact document revisions, stored immutably and receive
+durable retry receipts. Seven-day revocable Word/Google Docs keys read/propose
+on one file only; they cannot merge or act as account-wide sessions.
+
+Synchronized from application 2a289ce2fe5fc0071fc45596fdf39b66aca10af7. Word/Google Docs development
+clients and the Projects UI live in that application; real-host acceptance,
+structural/background sync and marketplace publication remain open. This engine
+does not send invitation email. See [capabilities](docs/CAPABILITIES.md) and
+[provenance service contract](docs/PROVENANCE-SYNC.md).
 
 ## Components
 
