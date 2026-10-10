@@ -1,5 +1,16 @@
 # Current engine capabilities
 
+## Historical recovery - 10 October 2026
+
+Current document members can export retained historical checkpoints. Recovery
+preview derives whole-block operations from a server-read earlier revision;
+contributors can create private drafts against a checked current head, with source
+sequence/hash and retry-safe UUIDs. Normal submission, approval and merge rules
+apply. Canonical history is preserved and newer overlaps require resolution.
+See [the contract](HISTORY-RECOVERY.md) and [verification handoff](ENGINE-EVOLUTION-HANDOFF.md).
+This adds no migration, portable commit model or native-file export capability.
+The history reader/diff/draft base still materialize full state.
+
 ## Evolution part 2d - 10 October 2026
 
 Core/API writers now use a document lock compatible with checkpoint erasure guards,

@@ -1,6 +1,6 @@
 # Engine and product evolution plan
 
-10 October 2026. Implements [decision 012](https://github.com/ArefinAlter/dynodoc/blob/c64a9ff39839a5070c1865a0d629ef8d3e0e6579/docs/decisions/012-local-first-document-version-control.md)
+10 October 2026. Implements [decision 012](https://github.com/ArefinAlter/dynodoc/blob/d83bf86782380860788a5edadf4bda342008031a/docs/decisions/012-local-first-document-version-control.md)
 and [the product specification](PRODUCT-SPEC.md). Status is in
 [ENGINE-EVOLUTION-HANDOFF](ENGINE-EVOLUTION-HANDOFF.md). Dependencies below replace
 the old questionnaire/civic stage order for this work.
@@ -21,6 +21,18 @@ acceptance, not permission to postpone memory discipline. Host experiments can p
 early; existing connectors must keep working while engine contracts evolve. Each
 part may require multiple reviewable increments. A finished part does not certify
 the entire product. Ship evidence with each claim.
+
+## Historical recovery clarification
+
+The owner's added journey requires permission-controlled retrieval of old/unnamed
+revisions and selected recovery without losing later work. The bounded
+[history-recovery increment](HISTORY-RECOVERY.md) reuses the existing centralized
+reader and review path, independently of the remaining storage work. Whole-block
+restoration is now distinct from future commit revert/cherry-pick. Parts 3 and 6
+must retain source/ancestry/actor links; part 8 must provide indexed discovery and
+native download/application across retained history. Current role and approval
+checks apply to all of these actions. This does not mark part 2 complete or defer
+bounded chunks, packing or shared draft/version references.
 
 ## Part 2a implementation boundary
 

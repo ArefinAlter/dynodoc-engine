@@ -15,7 +15,16 @@ credentials, user files or production database. It is an early 0.1 source releas
 not a claim of Git protocol compatibility, offline convergence or complete Office
 file support. No crates.io package has been published.
 
-## Current increment (10 October 2026)
+## Current increment: historical recovery (10 October 2026)
+
+The account-authenticated API previews selected content from any retained revision
+and creates a private recovery draft with a checked current base and source hash.
+Current membership, ordinary review/merge rules and idempotent retries apply.
+See [the recovery contract](docs/HISTORY-RECOVERY.md). The web controls live in the
+application repository. Commit revert/cherry-pick and native historical exports
+remain future work; bounded chunks and shared version/draft references stay next.
+
+## Previous increment: checkpoint concurrency (10 October 2026)
 
 Part 2d lets ordinary content transactions proceed during a checkpoint while
 preserving serialized writes, permission checks, pinned history and erasure guards.

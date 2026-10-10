@@ -128,3 +128,14 @@ Migration bytes are also a compatibility contract: SQLx hashes the complete file
 `.gitattributes` pins SQL checkouts to committed LF bytes on Windows and Unix.
 Application/engine migration checksums are tested against the same isolated DB;
 never edit applied migration content or recorded checksums to resolve a mismatch.
+
+## Historical recovery adapter
+
+The history API uses the same document/project locking, membership gate and mixed
+historical reader as existing writes. It derives selected whole-block differences
+against the current team head and validates them before creating a private draft.
+Draft UUID, original source revision/hash and starting sequence form an atomic
+retry receipt; changed source/actor/document combinations conflict. The ordinary
+review/merge path appends canonical recovery events. No event hashes or migrations
+change. Full-state materialization remains; commit revert/cherry-pick are later
+contracts. See [historical recovery](HISTORY-RECOVERY.md).
