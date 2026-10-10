@@ -1,8 +1,17 @@
 # Current engine capabilities
 
-Hosted application `536a448` now deploys these APIs on schema 25, with six editor
-test packages. Delivery/upgrade/rollback checks are recorded in the handoff.
-Installed-host acceptance and the algorithm/storage limits below remain unchanged.
+## Projects profiles and upload cap - 10 October 2026
+
+Source `8eef6dd` adds own/shared-Project-member profiles with revision-checked
+updates, private email omission and erasure cleanup. Original test uploads have a
+3,000,000-byte cap, including bounded base64 decoding and upload request bodies.
+Migration 0026 is required. All 233 Rust tests and source CI pass. This is an API
+increment; the Projects-first frontend lives in application source `6f1ac21`.
+See [the release contract](PROJECTS-WORKSPACE-RELEASE.md).
+
+The hosted application remains `536a448` on schema 25 until the next controlled
+rollout. Installed-host acceptance and the algorithm/storage limits below remain
+open. This increment does not change event encoding or algorithmic complexity.
 
 ## History ranges and connector pairing - 10 October 2026
 

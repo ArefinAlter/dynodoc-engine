@@ -35,7 +35,7 @@ are filtered at read time; a notification does not grant document access.
 
 The API binary starts a background copy-index/detection worker. Fingerprints are
 derived data; notifications and review metadata are separate from content events.
-Projects and watch/digest APIs are absent. Invitation delivery at application
+Watch/digest APIs are absent. Invitation delivery at application
 `b70f048` is a web-gateway operation after an engine grant, not an engine endpoint.
 See [current capabilities](CAPABILITIES.md) for role-name compatibility and limits.
 
@@ -48,3 +48,18 @@ Both provenance checkpoint GET endpoints accept optional through_seq for exact
 canonical historical state/hash. Current membership and credential checks apply;
 negative/future revisions return 400. Omitted selector returns the current head.
 Proposal statuses remain current, including in historical checkpoints.
+
+## Member profiles and test uploads (schema 26)
+
+`GET /profile` reads the signed-in account profile; `POST /profile` updates its
+name and bio with the expected revision. A stale revision returns 409. `GET
+/profiles/:id` returns only the caller or an enabled account currently sharing a
+Project with the caller; unavailable profiles return 404. Document-only sharing
+is insufficient. Responses omit email. Names are 1-80 Unicode scalar values and
+bios at most 280. Account erasure clears this metadata.
+
+Original-file upload accepts at most 3,000,000 decoded bytes and bounds base64
+length before decoding. Oversize originals return 400; the transport body limit
+can return 413. A rejected upload creates no original-file row. Derived provenance
+payloads and expanded-archive safety budgets remain separate. See generated
+OpenAPI and `profiles_upload_test.rs` for exact contracts and boundary checks.
