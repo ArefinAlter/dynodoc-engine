@@ -22,11 +22,18 @@ also passed for a document with a stored snapshot. Owned browser-test servers ar
 stopped and the labelled disposable database/volume is removed. This is source
 verification, not a production release.
 
-Application source `6ccd5f3` is pushed to main.
-[Rust CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38076177189) passes;
-[frontend CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38076177211) has
-passed build/unit/public-browser checks and is finishing signed-in workflows.
-Standalone source/CI references will follow publication of the verified mirror.
+Implementation is pushed to both main branches: application `6ccd5f3`, standalone
+engine `e8fe900`. All source CI passes:
+[application Rust](https://github.com/ArefinAlter/dynodoc/actions/runs/38076177189),
+[frontend and signed-in workflows](https://github.com/ArefinAlter/dynodoc/actions/runs/38076177211),
+[standalone engine](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38076557853).
+CI ran all 259 final Rust tests in each repo, plus frontend checks, 16 public browser
+tests and 68 signed-in workflows. These references track implementation; the later
+documentation-only commits record this evidence without changing runtime behavior.
+
+All 16 changed Rust/migration files are mirrored; the standalone's existing Merkle
+proof style, test fixture paths and MIT/API package metadata are preserved. Local
+logs are ignored under `target/snapshot-*`; CI provides the durable check record.
 No VPS workspace/API deployment has occurred; the last recorded VPS is still
 `ecbc643`, schema 26, with shared periodic writes off. Upgrade must include both
 schema-27 login revocation and schema-28 snapshot verification/backfill; an
