@@ -15,7 +15,17 @@ credentials, user files or production database. It is an early 0.1 source releas
 not a claim of Git protocol compatibility, offline convergence or complete Office
 file support. No crates.io package has been published.
 
-## Current state (6 October 2026)
+## Current increment (10 October 2026)
+
+Synchronized from application `667ecb6`. Part 1 adds checkpoint-aware streamed
+historical reads, streamed chain verification,
+lightweight cadence checks and constraint-dependency regressions. The product target
+is local/remote document repositories with shared content storage and offline
+history around existing editors. Those larger capabilities remain staged work.
+[Current status](docs/PROJECT-STATUS.md) ? [Explicit handoff](docs/ENGINE-EVOLUTION-HANDOFF.md)
+? [Product contract](docs/PRODUCT-SPEC.md) ? [Ordered plan](docs/ENGINE-EVOLUTION-PLAN.md).
+
+## Previous synchronization (6 October 2026)
 
 The Rust service now includes invite-only Projects, cross-file requests/private
 own drafts, inherited review rules and submission watchers. Portable change

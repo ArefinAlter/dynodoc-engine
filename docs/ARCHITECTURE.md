@@ -55,3 +55,24 @@ Migration 0024 expands connector credentials to all six Microsoft/Google hosts.
 Creation validates document kind; existing host/file/account/session/review scope
 and append-only events remain unchanged. Native adapters remain application code.
 
+
+## Evolution part 1
+
+`snapshot::read_state_at` is the common historical reader. It selects the greatest
+checkpoint sequence no greater than the requested revision, then streams only that
+suffix into the ordinary materializer. It rejects invalid revisions and suffix gaps
+and reports checkpoint/replay counts. Callers retain access checks and document
+write locks where needed. Snapshots are trusted derived data here; the path is not
+an independent verification of the snapshot's commitment. A missing checkpoint
+still requires genesis replay, and complete state remains resident in memory.
+
+`log::verify_chain` independently streams event rows, keeping current payload/hash
+working data instead of the entire history. It still needs a trusted externally
+retained head to detect replacement of the entire chain. Snapshot cadence queries
+only sequence metadata. Neither change supplies shared-object storage or hard tail
+bounds. See the evolution plan for typed objects, ancestry and offline convergence.
+
+Automatic operation independence includes reads, writes and validation constraints,
+not just target IDs. Unique-name and crossed-move regressions document concrete
+counterexamples. The engine does not yet infer a general cross-format dependency
+footprint or prove automatic convergence of arbitrary native editor operations.

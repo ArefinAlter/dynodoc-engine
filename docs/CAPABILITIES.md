@@ -1,5 +1,23 @@
 # Current engine capabilities
 
+## Evolution part 1 - 10 October 2026
+
+The authoritative direction is local/remote document repositories, not questionnaire
+authoring. See [PRODUCT-SPEC](PRODUCT-SPEC.md), [PROJECT-STATUS](PROJECT-STATUS.md)
+and [ENGINE-EVOLUTION-HANDOFF](ENGINE-EVOLUTION-HANDOFF.md).
+
+Historical materialization now selects the nearest preceding checkpoint and streams
+the suffix. Old-base batches/drafts share the review/provenance reader. Full chain
+verification streams rows, and checking snapshot cadence does not hydrate snapshot
+JSON. Core replay metadata makes selected checkpoint/replay counts testable. New
+regressions cover history boundaries, scope and cross-node constraint dependencies.
+Current snapshots/draft bases are still full state. Shared storage, a local commit
+DAG, complete offline convergence and independent audit anchors remain planned.
+Local part-1 checks passed: task lint, 204 tests, task docs (existing link warnings)
+and unchanged generated OpenAPI. Source: application `667ecb6`.
+The dated capability records below describe prior increments; current verification
+and counterpart source commits belong in the evolution handoff.
+
 Updated 6 October 2026 from Dynodoc application 348bef9da0be3a72e1f3eeca57225d60aef71420. This records
 executable service behaviour, not a production rollout or complete product.
 
@@ -30,7 +48,7 @@ Ordinary retry lookup still checks current permissions; different content/actor
 cannot reuse an existing receipt. Merging appends canonical events as the
 responsible merger, while the original uploader/observations remain separate.
 
-## Remaining work, in order
+## Previous backlog (6 October; superseded by the evolution plan)
 
 1. Accept all three application editor pairs in real hosts: Word/Docs, Excel/Sheets and PowerPoint/Slides.
    Extend stable-ID structural sync, formatting adapters and conflict recovery.
@@ -45,7 +63,7 @@ Invitation emails remain in the application web gateway. AI-origin/MCP/assessmen
 proposals are separate future work. Further web-editor Office parity is not the
 owner's product priority.
 
-## Verification
+## Earlier verification records
 
 Projects/provenance integration tests cover isolation/private drafts, inheritance,
 settings revisions, Watch, concurrent retries, bad-base/invalid-operation rollback,

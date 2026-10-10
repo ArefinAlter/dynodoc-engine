@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Repository foundations and bounded replay - 2026-10-10
+
+Synchronized from application `667ecb6`. Local lint, 204 tests, documentation and
+unchanged generated OpenAPI checks passed. Centralized historical reconstruction in a core nearest-checkpoint reader with a
+streamed suffix, revision/gap rejection and replay accounting. Historical batches
+and draft bases reuse it. Chain verification streams rows, and snapshot cadence
+reads sequence metadata only. Added checkpoint-boundary/replay-equivalence/scope
+and cross-node validation dependency regressions. No migrations, event format or
+HTTP schema changes. Shared content storage/offline commit exchange remain planned;
+new product/status/handoff documents establish their acceptance gates.
+
+
 ### Date-only application contract documentation - 2026-10-06
 
 Documented application 8c7461d date-only Excel/Sheets observations, native calendar
