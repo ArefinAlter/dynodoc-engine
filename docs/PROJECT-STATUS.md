@@ -17,15 +17,16 @@ not native large-file or concurrent-service acceptance. The shared writer remain
 off by default. [Measurements/limits](SHARED-CHECKPOINTS.md).
 
 Application fmt/Clippy, 224 Rust tests and unchanged OpenAPI pass. Standalone
-lint, all 224 tests, docs and unchanged OpenAPI pass. Source is synchronized;
-remote source/browser CI and final publication records are pending. [Verification/publication record](ENGINE-EVOLUTION-HANDOFF.md).
+lint, all 224 tests, docs and unchanged OpenAPI pass. Both source CI runs passed,
+including 62 signed-in workflows, 16 public browser tests and 274 frontend unit
+tests. Application source: `40a80be`; standalone: `c8ac6bc`. Both are pushed to main;
+the disposable database/volume has been removed. [Verification/publication record](ENGINE-EVOLUTION-HANDOFF.md).
 No new migration or deployment; schema 25 remains required for mixed readers.
 
 Next: incremental/staged publication with a short final lock, bounded text/asset
 chunks and compression/backend measurements, shared version/draft references,
 then durable local commits and resumable exchange. Offline convergence, independent
 provenance and native/scale acceptance remain open.
-
 
 ## Previous increment: part 2b (10 October 2026)
 
