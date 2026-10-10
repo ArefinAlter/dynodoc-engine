@@ -1,6 +1,6 @@
 # Engine and product evolution plan
 
-10 October 2026. Implements [decision 012](https://github.com/ArefinAlter/dynodoc/blob/d83bf86782380860788a5edadf4bda342008031a/docs/decisions/012-local-first-document-version-control.md)
+10 October 2026. Implements [decision 012](decisions/012-local-first-document-version-control.md)
 and [the product specification](PRODUCT-SPEC.md). Status is in
 [ENGINE-EVOLUTION-HANDOFF](ENGINE-EVOLUTION-HANDOFF.md). Dependencies below replace
 the old questionnaire/civic stage order for this work.
@@ -28,14 +28,20 @@ The owner's added journey requires permission-controlled retrieval of old/unname
 revisions and selected recovery without losing later work. The bounded
 [history-recovery increment](HISTORY-RECOVERY.md) reuses the existing centralized
 reader and review path, independently of the remaining storage work. Whole-block
-restoration is distinct from implemented revision-range revert/cherry-pick.
-Portable commit-addressed commands remain part 3. Application test-installation
-packages and browser pairing are early part-8 increments; real native acceptance
-and marketplace publication remain open. Parts 3 and 6
+restoration is distinct from the implemented net revision-range revert/cherry-pick.
+Portable commit-addressed commands remain part 3. Test-installation packages,
+Microsoft ribbon commands and browser pairing are now early part-8 increments;
+real host acceptance and marketplace publication remain open. Parts 3 and 6
 must retain source/ancestry/actor links; part 8 must provide indexed discovery and
 native download/application across retained history. Current role and approval
 checks apply to all of these actions. This does not mark part 2 complete or defer
 bounded chunks, packing or shared draft/version references.
+
+The owner also prioritized the Projects front page as an early part-8 increment:
+private member profiles, repository file browsing, per-file main/draft comparison,
+pull requests and history, with separate web editors and a 3 MB original-upload
+cap for testing. This reuses the current centralized contracts; it does not implement
+project-wide branches or atomic multi-file commits. See [decision 013](decisions/013-projects-first-test-workspace.md).
 
 ## Part 2a implementation boundary
 

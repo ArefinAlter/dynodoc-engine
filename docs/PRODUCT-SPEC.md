@@ -1,7 +1,7 @@
 # Dynodoc product specification
 
 Owner direction: 10 October 2026. This is the current product specification.
-Decision [012](https://github.com/ArefinAlter/dynodoc/blob/d83bf86782380860788a5edadf4bda342008031a/docs/decisions/012-local-first-document-version-control.md) supersedes
+Decision [012](decisions/012-local-first-document-version-control.md) supersedes
 the research-instrument product scope. Questionnaire support remains an adapter;
 public consultation, civic identity and AI assessment are separate proposals.
 
@@ -33,6 +33,15 @@ public consultation, civic identity and AI assessment are separate proposals.
 The web product provides repositories, branches, requests, comparisons, history,
 permissions and synchronization. Existing basic editors remain available.
 Native editor parity is not the product roadmap.
+
+The default signed-in destination is Projects, with minimal member profiles and
+multiple files in each Project. Repository navigation leads to files, pull requests,
+drafts, comparisons and retained history; a separate Web editor tab opens the basic
+editor. Names and bios are visible only to shared Project members, as explicitly
+chosen by the owner. Profile responses exclude email. During testing, original file
+uploads are capped at 3,000,000 bytes; large-file acceptance remains future work.
+See [decision 013](decisions/013-projects-first-test-workspace.md) for the distinction
+between current per-file drafts and planned project-wide portable branches.
 
 ## Historical access and recovery
 

@@ -15,7 +15,22 @@ credentials, user files or production database. It is an early 0.1 source releas
 not a claim of Git protocol compatibility, offline convergence or complete Office
 file support. No crates.io package has been published.
 
-## Current increment: history ranges and editor pairing (10 October 2026)
+## Current increment: member profiles and test-file boundaries (10 October 2026)
+
+Migration 0026 adds minimal account profiles with revision-checked saves. Profile
+reads require the same account or current shared Project membership and exclude
+email. Manually edited names survive subsequent provider sign-in. Original file
+uploads now accept at most 3,000,000 bytes, with a bounded base64 request and no
+stored upload on rejection. Existing events and history readers are unchanged.
+
+The hosted application's Projects-first interface, previews and separate editor
+navigation live in the application repository. Current drafts are per-file; this
+increment does not add project-wide branches or portable multi-file commits.
+Standalone verification: task lint, all 233 Rust tests, task docs (existing link
+warnings) and regenerated OpenAPI. Source/deployment status and remaining storage,
+offline, native-host and audit work are in [the handoff](docs/ENGINE-EVOLUTION-HANDOFF.md).
+
+## Previous increment: history ranges and editor pairing (10 October 2026)
 
 The API supports net revision-range revert/cherry-pick with explicit overlap
 choices, checked current heads and private recovery drafts. Normal review/merge

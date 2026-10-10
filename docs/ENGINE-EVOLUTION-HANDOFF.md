@@ -1,5 +1,35 @@
 # Engine evolution handoff
 
+## In progress: Projects front page and member profiles (10 October 2026)
+
+The current working tree implements the owner's Projects-first interface: minimal
+profiles visible only to shared Project members, repository file lists, read-only
+file previews, per-file main/private-draft selection, pull requests, history and
+recovery, with the existing editors under a separate Web editor tab. Migration
+0026 adds private profile metadata and revision checks. Original uploaded files
+are limited to 3,000,000 bytes in the browser, API and conversion/import services.
+Derived provenance envelopes and expanded archive safety budgets are separate.
+
+Verification in progress: standalone engine lint, all 233 Rust tests and API
+generation pass (rustdoc retains existing link warnings). All 282 frontend unit
+tests pass, with clean Svelte/ESLint checks. Profile tests cover absent/shared/
+removed membership, disabled accounts, email omission, stale saves and preserved
+names after sign-in. Upload tests cover exact 3 MB, excess bytes, request-body
+bounds and denied writers without extra stored uploads. Matching Rust/migrations
+and API schemas are mirrored into the standalone engine.
+
+The existing external-edit Project review/revoke browser journey passes. The new
+profile/file/draft/history browser journey is still being verified. A contrast issue
+was corrected; development-server dependency reloads interrupted intermediate
+browser attempts. Production builds are used for final acceptance. Application Rust
+attempts hit the existing 100 ms SSE timing assertion under local load; standalone
+serial tests pass. Do not change the timing assertion to hide the observation.
+Next: finish production-mode browser/visual checks, update final evidence, commit/
+push both repositories and inspect CI. No new source is deployed yet.
+Project-wide portable branches/commits remain part 3; current drafts belong to one
+file. Shared checkpoint writes remain disabled and part 2 storage work is pending.
+The schema-25 deployment described below is still the live release.
+
 ## Deployment handoff: history and editor installations (10 October 2026)
 
 The matching API/web/admin build is now live on the VPS: application `536a448`
