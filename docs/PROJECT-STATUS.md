@@ -15,9 +15,16 @@ event hashes, HTTP schema and MIT packaging remain compatible.
 
 Application checks passed 216 Rust tests, fmt/Clippy and unchanged OpenAPI;
 standalone task lint, 216 tests and task docs also passed (existing Rustdoc link
-warnings). Publication/CI is being finalized. The synthetic
+warnings). Both source CI runs passed; application CI also passed 62 signed-in and
+16 public browser tests. Engine source is `6ccdc22`. The checksum portability fix
+and final handoff follow that implementation commit. The synthetic
 8,000-block/21-checkpoint trace used 7.83 MB of unique object bytes versus 135.24 MB
 of full-state copies. Native files, database overhead and load are unmeasured.
+
+SQL migration checkouts are pinned to committed LF bytes; all 22 scripts match the
+application and validated against the same isolated database. No migration Git blob
+was edited. All 216 engine tests passed again after restoring canonical LF checkout
+bytes. Both disposable databases/volumes were removed.
 
 Next: normal-path shared checkpoint adoption and draft/version references; bounded
 large text/assets and durable backend measurements; then local commits/branches

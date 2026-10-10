@@ -11,7 +11,8 @@ schema are unchanged. Admin erasure previews/receipts count the new data and aud
 document erasure removes it. New codec/property/DB regressions and a synthetic
 storage-growth benchmark cover the first part-2 slice. Default-path adoption,
 large text/assets and portable commits remain open. See the evolution handoff for
-source synchronization, exact checks and CI.
+source synchronization, exact checks and CI. Pinned SQL checkouts to LF to prevent
+Windows line-ending conversion from changing SQLx migration checksums.
 
 
 ### Repository foundations and bounded replay - 2026-10-10

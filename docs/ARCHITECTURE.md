@@ -93,3 +93,8 @@ Objects are at most 1 MiB, radix leaves at most 32 entries, branches at most 16 
 paths at most 64 nibbles. Total byte/object budgets are checked. Complete state and
 map entries remain in memory; no whole native-file streaming guarantee follows.
 Audited erasure removes manifests then document-scoped objects. No GC is enabled.
+
+Migration bytes are also a compatibility contract: SQLx hashes the complete file.
+`.gitattributes` pins SQL checkouts to committed LF bytes on Windows and Unix.
+Application/engine migration checksums are tested against the same isolated DB;
+never edit applied migration content or recorded checksums to resolve a mismatch.

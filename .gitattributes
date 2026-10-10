@@ -1,0 +1,2 @@
+# SQLx hashes exact migration bytes. Keep committed LF bytes on every platform.
+migrations/*.sql text eol=lf
