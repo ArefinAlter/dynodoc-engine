@@ -5,9 +5,9 @@ access/refresh tokens. Browsers in the full application use a separate encrypted
 session gateway; that SvelteKit gateway is not included in this repository.
 
 `PASETO_LOCAL_KEY` is a 32-byte hex key. `WEB_SERVICE_KEY` authenticates trusted
-service-to-service provider identity exchange; do not expose it to browsers.
+service-to-service magic-link issuance and provider identity exchange; do not expose it to browsers.
 `ADMIN_EMAILS` is an explicit allowlist; an empty value denies admin access.
-Production requires a long service key. TLS termination, provider OAuth/email,
+Every environment requires a service key of at least 32 characters and a nonzero PASETO key. TLS termination, provider OAuth/email,
 secret management and a browser session gateway are deployment responsibilities.
 
 Run the binary with `DATABASE_URL`, `PASETO_LOCAL_KEY`, `WEB_SERVICE_KEY`, `API_HOST`,
@@ -63,3 +63,17 @@ length before decoding. Oversize originals return 400; the transport body limit
 can return 413. A rejected upload creates no original-file row. Derived provenance
 payloads and expanded-archive safety budgets remain separate. See generated
 OpenAPI and `profiles_upload_test.rs` for exact contracts and boundary checks.
+
+## Revocable web logins (schema 27)
+
+New access tokens and refresh successors share a login ID. POST /auth/logout
+accepts a refresh_token secret, including an unexpired rotated ancestor, and
+revokes that login. Protected requests and SSE data delivery check revocation.
+Logout is idempotent; an unknown secret discloses no account state. Independent
+logins remain active. A pre-schema-27 cookie lacks a login ID, so its logout
+invalidates the account generation instead, including existing connector grants.
+See [compatibility and deployment gates](SECURITY-HARDENING.md).
+
+Event pages are bounded in SQL (up to 1,000 rows plus lookahead). SSE catches up
+in 100-row pages before live delivery, supports Last-Event-ID and rejects negative
+or future positions. Byte/tenant/time limits and expensive search remain open.

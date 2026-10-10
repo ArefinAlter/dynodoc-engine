@@ -15,7 +15,22 @@ credentials, user files or production database. It is an early 0.1 source releas
 not a claim of Git protocol compatibility, offline convergence or complete Office
 file support. No crates.io package has been published.
 
-## Current increment: bounded checkpoint encoding (10 October 2026)
+## Current increment: authentication and bounded history (10 October 2026)
+
+Source hardening adds fail-closed service credentials, migration 0027 for revocable
+login lineages, bounded REST/SSE history reads, expression admission limits and
+iterative relevance-cycle detection. Existing event hashes remain unchanged.
+Legacy-cookie logout invalidates the account generation; new logout revokes only
+that login. An old API build must not be used as rollback without compatible
+revocation enforcement or deliberate credential invalidation.
+
+See [the security findings and open gates](docs/SECURITY-HARDENING.md) and
+[handoff](docs/ENGINE-EVOLUTION-HANDOFF.md). Legacy snapshot replay verification,
+runtime database privilege separation, project policy authority, independent audit
+commitments and the remaining repository/offline/storage work are not completed.
+Final validation references are recorded in the handoff. This is not a deployment.
+
+## Previous increment: bounded checkpoint encoding (10 October 2026)
 
 Shared checkpoint v1 now encodes borrowed values into a capped output buffer and
 checks canonical bytes through streaming comparison. Existing hashes, roots and
