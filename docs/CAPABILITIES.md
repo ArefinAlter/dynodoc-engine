@@ -230,3 +230,14 @@ through the existing permission-checked proposal path. The engine does not perfo
 native calendar or Office/Google runtime conversion. See the
 [application release](https://github.com/ArefinAlter/dynodoc/blob/main/docs/SPREADSHEET-DATE-SYNC-RELEASE.md)
 and [native acceptance matrix](https://github.com/ArefinAlter/dynodoc/blob/main/docs/NATIVE-CONNECTOR-ACCEPTANCE.md).
+
+
+## Verified legacy snapshots (11 October 2026)
+
+Schema 0028 guards legacy snapshots and adds immutable replay-verification receipts.
+Snapshot/public/history/deployed/restore reads use the checked reader; API/CLI audits
+compare every legacy snapshot against canonical replay. Existing rows require
+explicit verified backfill. Hashing uses a streaming canonical envelope, preserving
+old state/event bytes. This does not replace full JSONB snapshot storage, complete
+runtime privilege separation or provide externally anchored signatures. See
+[the contract](VERIFIED-SNAPSHOTS.md) and [verification handoff](ENGINE-EVOLUTION-HANDOFF.md).

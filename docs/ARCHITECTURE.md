@@ -145,3 +145,11 @@ History range operations merge a replayed historical content delta into current
 state, check explicit conflicts and create private drafts. Connector browser approval
 stores only the hash of a client-held secret in the existing grant table; completion
 rechecks current membership and grant/session validity. No event/storage codec change.
+
+
+Schema 0028 adds immutable legacy snapshots and replay-verification receipts.
+`snapshot_verification` centralizes checked reads/publication and independent
+full-history audits. Existing snapshots need explicit backfill before serving;
+ordinary reads validate their stored envelope and replay only a checked suffix.
+`Materializer::from_snapshot` is still a pure fold of trusted input. See
+[the trust, complexity and upgrade contract](VERIFIED-SNAPSHOTS.md).

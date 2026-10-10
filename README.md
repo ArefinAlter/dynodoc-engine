@@ -15,7 +15,20 @@ credentials, user files or production database. It is an early 0.1 source releas
 not a claim of Git protocol compatibility, offline convergence or complete Office
 file support. No crates.io package has been published.
 
-## Current increment: authentication and bounded history (10 October 2026)
+## Current increment: verified legacy snapshots (11 October 2026)
+
+Schema 0028 protects legacy snapshot rows and adds immutable verification receipts.
+Checked reads reject unverified/corrupt snapshots; API and CLI audits compare every
+legacy snapshot against the event history, including non-node state. New snapshots
+are reconstructed canonically. Existing databases require explicit verified backfill
+before reopening traffic. See [the snapshot contract](docs/VERIFIED-SNAPSHOTS.md)
+and [validation/remaining work](docs/ENGINE-EVOLUTION-HANDOFF.md).
+
+Runtime database privilege separation is next. Receipts are internal attestations,
+not signatures or external witnesses. Portable project histories, shared chunks,
+offline convergence and installed-editor acceptance remain open.
+
+## Previous increment: authentication and bounded history (10 October 2026)
 
 Source hardening adds fail-closed service credentials, migration 0027 for revocable
 login lineages, bounded REST/SSE history reads, expression admission limits and
@@ -25,7 +38,7 @@ that login. An old API build must not be used as rollback without compatible
 revocation enforcement or deliberate credential invalidation.
 
 See [the security findings and open gates](docs/SECURITY-HARDENING.md) and
-[handoff](docs/ENGINE-EVOLUTION-HANDOFF.md). Legacy snapshot replay verification,
+[handoff](docs/ENGINE-EVOLUTION-HANDOFF.md). Snapshot rollout/backfill acceptance,
 runtime database privilege separation, project policy authority, independent audit
 commitments and the remaining repository/offline/storage work are not completed.
 Final validation references are recorded in the handoff. This is not a deployment.

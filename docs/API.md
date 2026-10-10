@@ -77,3 +77,14 @@ See [compatibility and deployment gates](SECURITY-HARDENING.md).
 Event pages are bounded in SQL (up to 1,000 rows plus lookahead). SSE catches up
 in 100-row pages before live delivery, supports Last-Event-ID and rejects negative
 or future positions. Byte/tenant/time limits and expensive search remain open.
+
+
+## Legacy snapshot verification (schema 28)
+
+`GET /documents/:id/verify` independently checks the event chain and all legacy
+snapshots against replay. Snapshot/content/public-link/history/restore readers
+require immutable verification receipts. CLI `verify-snapshots DOCUMENT_UUID` or
+`verify-snapshots --all` performs verified backfill; CLI `verify` checks independently
+without writing receipts. An existing database must complete this backfill before
+traffic is restored. An old API that ignores receipts is not safe rollback. Read
+[the release gate and limitations](VERIFIED-SNAPSHOTS.md).
