@@ -80,7 +80,7 @@ not just target IDs. Unique-name and crossed-move regressions document concrete
 counterexamples. The engine does not yet infer a general cross-format dependency
 footprint or prove automatic convergence of arbitrary native editor operations.
 
-## Shared checkpoint boundary (part 2a)
+## Shared checkpoint boundary (parts 2a-2c)
 
 Core stores require document scope and caller authorization. Object hashes are
 content integrity addresses, not permissions or actor attestations. PostgreSQL
@@ -94,17 +94,26 @@ publication retains an independent legacy/event reference. Corrupt selected shar
 data fails, even when legacy data exists. Reader support is independent of the
 automatic writer flag; named/deployed snapshots and draft/merge bases stay legacy.
 
-A per-document try-advisory lock skips duplicate periodic builders. A savepoint
-rolls back partial shared objects on codec capacity errors before a legacy fallback
-at the same sequence; other errors propagate. Background writes opt in with API
-process env DYNODOC_PERIODIC_CHECKPOINT_STORAGE=shared-v1, otherwise legacy. Both
-formats count toward cadence. Database publication still scans all state and makes
-individual INSERT/reuse checks while holding a document KEY SHARE lock. Appends
-use FOR UPDATE on that row and wait. This measured cost gates production enablement.
-PgStore batches up to 16 value addresses; all returned bytes retain ordinary
-hash/type checks and budgets. The cache holds one document-scoped batch, at most
-16 MiB of encoded values. Whole state/map residency and prior allocations remain
-outside that cache bound.
+Explicit publishers take a document advisory lock before the row lock; periodic
+jobs use the same namespace with try-lock semantics to skip competing builders.
+This serializes overlapping historical publication before object batches, avoiding
+cross-batch lock-order deadlocks. A savepoint rolls back partial shared objects on
+capacity errors before a legacy fallback; other errors propagate. Background jobs
+opt in with API process env DYNODOC_PERIODIC_CHECKPOINT_STORAGE=shared-v1, otherwise
+legacy. Both formats count toward cadence.
+
+The writer scans all state, buffering at most 64 objects / 1 MiB of encoded bytes,
+plus the current object being encoded and driver/input state. PgStore validates
+input and checks exact stored bytes in bounded SQL joins returning booleans; one
+INSERT stores missing objects, and raced conflicts are checked again. Unchanged
+batches issue no INSERT. The document KEY SHARE lock still blocks FOR UPDATE
+appends through publication. Short staged publication remains separate work.
+
+Breadth-first index traversal and values use batches of at most 16 addresses with
+full hash/type/route/subtree validation and byte/object budgets. Traversal queues
+count against the remaining object budget. The cache retains the latest scoped
+batch, at most 16 MiB encoded bytes; traversal metadata, complete state/map entries,
+current decoded values and driver allocations are outside that cache bound.
 
 Objects are at most 1 MiB, radix leaves at most 32 entries, branches at most 16 and
 paths at most 64 nibbles. Total byte/object budgets are checked. Complete state and

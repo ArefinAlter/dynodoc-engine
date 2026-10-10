@@ -1,6 +1,33 @@
 # Engine project status
 
-## Current increment: part 2b (10 October 2026)
+## Latest increment: bounded checkpoint batches (10 October 2026)
+
+Part 2c batches PostgreSQL checkpoint writes (64 objects / 1 MiB encoded) and index
+reads (16 objects), retaining v1 hashes, exact-byte validation, document scope and
+atomic rollback/erasure. Publishers serialize overlapping historical graphs before
+object writes. Unchanged batches issue no INSERT. Complete state still resides in
+memory and publication still scans it while blocking document appends.
+
+Four controlled 8,000-block / three-checkpoint traces preserve identical paired
+roots and canonical bytes. Publication falls from 14.6-20.9 s to 2.1-2.9 s; the
+append-lock wait remains 2.1-2.9 s. Graph reads use 619 object SELECTs instead of
+9,817. Shared relations use about 10.9 MB; compressed legacy snapshots use 0.64 MB
+for repeated text and 20.78 MB for varied text. These are synthetic local traces,
+not native large-file or concurrent-service acceptance. The shared writer remains
+off by default. [Measurements/limits](SHARED-CHECKPOINTS.md).
+
+Application fmt/Clippy, 224 Rust tests and unchanged OpenAPI pass. Standalone
+lint, all 224 tests, docs and unchanged OpenAPI pass. Source is synchronized;
+remote source/browser CI and final publication records are pending. [Verification/publication record](ENGINE-EVOLUTION-HANDOFF.md).
+No new migration or deployment; schema 25 remains required for mixed readers.
+
+Next: incremental/staged publication with a short final lock, bounded text/asset
+chunks and compression/backend measurements, shared version/draft references,
+then durable local commits and resumable exchange. Offline convergence, independent
+provenance and native/scale acceptance remain open.
+
+
+## Previous increment: part 2b (10 October 2026)
 
 Normal current/history and API write readers select legacy/shared checkpoints and
 stream the suffix. Shared graphs are verified; corrupt selected data fails. The

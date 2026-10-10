@@ -1,5 +1,20 @@
 # Current engine capabilities
 
+## Evolution part 2c - 10 October 2026
+
+Shared checkpoint writes now buffer bounded batches (64 objects / 1 MiB); index
+and value reads fetch up to 16 objects together. Exact-byte reuse validation,
+concurrent INSERT-conflict validation, full reconstruction, document scope and
+rollback remain mandatory. Fixed-ID comparison fixtures preserve the same roots
+and canonical bytes across individual and batched SQL paths. Explicit/periodic
+publishers share an advisory lock to serialize overlapping historical graphs.
+
+Publication still scans full state and holds a document lock that blocks appends.
+The default writer stays legacy. This does not yet add large-value chunks, compact
+packing, short staged publication, shared draft references or offline commits.
+Current measurements and verification are in [the checkpoint contract](SHARED-CHECKPOINTS.md)
+and [handoff](ENGINE-EVOLUTION-HANDOFF.md). Earlier entries record historical slices.
+
 ## Evolution part 2b - 10 October 2026
 
 Normal history/current reads and authorized API writes now use the nearest shared
