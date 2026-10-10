@@ -68,6 +68,34 @@ correct before those guards were installed.
 
 ## Resume order
 
+### Next increment acceptance: snapshots and database roles
+
+- Inventory every legacy snapshot producer and reader, including core materialization,
+  named versions, public links, deployed pins, restore and audit exports. The core
+  insert already uses `ON CONFLICT DO NOTHING`; `workspace.rs` and `product.rs` still
+  use no-op updates to return an existing snapshot ID. Replace those before adding
+  immutable guards. Applied migrations remain unchanged.
+- Establish equivalence to canonical event replay for existing snapshots before
+  trusting them. A hash computed from a stored snapshot alone cannot establish
+  that equivalence. Validate all reconstructed state, not just the node Merkle
+  root, and reject mismatched document/revision/chain bindings. Design bounded
+  verification/backfill work so ordinary reads do not replay from event one.
+- Add corruption regressions for old snapshots and each serving path, as well as
+  concurrent creation at the same revision, historical restore and explicit
+  account/document erasure. Guard installation must not silently bless old corrupt
+  states or make approved erasure impossible. Shared checkpoint validation remains
+  a separate contract; it does not automatically verify legacy JSON snapshots.
+- Separate migration-owner and runtime connections. Exercise the actual runtime
+  role against UPDATE/DELETE/TRUNCATE, trigger disabling, schema mutation and role
+  escalation, then run normal append/read/review/auth/administration workflows with
+  that role. Do not grant ownership or broad privileges just to make a test pass.
+- Rehearse an existing-database upgrade and compatible rollback with synthetic
+  history and schema-27 sessions. Document the verification/backfill sequence and
+  failures before a VPS rollout. The database owner can still rewrite privileged
+  state; independent commitments remain a later, explicitly open audit boundary.
+
+### Subsequent order
+
 1. Snapshot replay verification/immutable guards and runtime database privilege split,
    with fixtures for corruption, old snapshots, erasure and rollback.
 2. Project policy floor/authority and audited metadata; CSP/HSTS compatible with all

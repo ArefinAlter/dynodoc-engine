@@ -13,9 +13,32 @@ of a separate login. Source packaging and generated connector checks also pass.
 Standalone `task lint`, `task test` (248 Rust tests), `task docs` and API generation
 also pass; rustdoc retains 16 existing link/HTML warnings. All 17 changed Rust and
 migration files match across repos; standalone fixture paths and package metadata
-are preserved. Application implementation `c9d4994` is pushed to main; its Rust CI
-passed. Frontend CI and standalone source/CI references are being finalized.
+are preserved. Implementations are pushed to main: application `c9d4994`, standalone
+engine `2e75859`. [Application Rust CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38070661483)
+and [standalone CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38071036482)
+passed. [Frontend CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38070661567)
+passed build/unit/public-browser checks, but its first authenticated run passed 67
+of 68 tests: the existing personal-draft typing test inserted its sentence before
+the second paragraph. The new copied-cookie logout test passed. The failed-job
+rerun (attempt 2) passed all authenticated workflows; the overall workflow is now
+green. Retain the initial failure as an unresolved intermittent editor/test issue.
 See [the full findings matrix and rollout contract](SECURITY-HARDENING.md).
+
+The retained browser trace shows cursor movement before the first autosave. Twenty
+local diagnostic repetitions passed, including CPU throttling and clicking at the
+paragraph start before Control+End. The exact cause is unconfirmed. No editor
+change, artificial wait, weakened assertion or retry policy was introduced to mask
+the failure. If it recurs, instrument DOM and ProseMirror selection around focus,
+Control+End and scheduled layout; do not assume an autosave regression from the
+test name alone. Ignored local evidence is under `target/security-ci-artifact/`
+and `target/security-cursor-*.json`; CI retains the original failure artifact for
+seven days. Preserve it before expiry if follow-up needs the browser trace.
+
+Local verification setup initially hit Windows' lock on the running Cargo output;
+running a separate copy of the API executable allowed the complete test rerun to
+pass. All subsequent tests used synthetic local identities/documents. Owned API/web
+processes and both disposable database instances/volumes used during verification
+are removed. Existing `dynodoc-postgres` and `margin-qdrant` containers are preserved.
 
 Highest-priority remaining security work: legacy snapshot verification/immutability,
 runtime database privilege separation, project policy floor and audited metadata,

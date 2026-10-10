@@ -13,8 +13,13 @@ of a separate login. Source packaging and generated connector checks also pass.
 Standalone `task lint`, `task test` (248 Rust tests), `task docs` and API generation
 also pass; rustdoc retains 16 existing link/HTML warnings. All 17 changed Rust and
 migration files match across repos; standalone fixture paths and package metadata
-are preserved. Application implementation `c9d4994` is pushed to main; its Rust CI
-passed. Frontend CI and standalone source/CI references are being finalized.
+are preserved. Implementations are pushed to main: application `c9d4994`, standalone
+engine `2e75859`. Both Rust CI runs passed. Frontend build/unit/public-browser CI
+passed; the first authenticated run passed 67 of 68, with an intermittent cursor
+failure in the existing personal-draft typing test. Twenty local diagnostic runs
+and the failed-job CI rerun passed. The exact cause is still unconfirmed; no editor
+or test behavior was changed to hide the failure. CI links and evidence are in
+[the handoff](ENGINE-EVOLUTION-HANDOFF.md).
 See [the full findings matrix and rollout contract](SECURITY-HARDENING.md).
 
 Highest-priority remaining security work: legacy snapshot verification/immutability,
