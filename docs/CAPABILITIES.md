@@ -1,5 +1,9 @@
 # Current engine capabilities
 
+Hosted application `536a448` now deploys these APIs on schema 25, with six editor
+test packages. Delivery/upgrade/rollback checks are recorded in the handoff.
+Installed-host acceptance and the algorithm/storage limits below remain unchanged.
+
 ## History ranges and connector pairing - 10 October 2026
 
 Range revert/cherry-pick computes and validates a selected net content delta,

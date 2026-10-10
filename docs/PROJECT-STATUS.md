@@ -1,5 +1,26 @@
 # Engine project status
 
+## Hosted deployment verified (10 October 2026)
+
+The application now runs source `536a448` (implementation `0478bf2`) on the VPS,
+schema 25, with matching history and six-editor pairing/install clients. This
+standalone repository's engine source remains `a44b8ad`; no new algorithm, Rust,
+event encoding or object codec change was needed for rollout.
+
+All 22 read-only delivery/auth checks and clean-browser installation/login navigation
+passed. Synthetic Workspace/Projects shells pass through public Nginx. Existing
+data fingerprints and unrelated services were preserved. Upgrade and compatible
+rollback API startup passed on an isolated empty database; temporary containers and
+network are removed. Shared checkpoint writes remain disabled. The documentation
+head `7bfd16c` also passed full engine CI before release.
+
+See [the deployment handoff](ENGINE-EVOLUTION-HANDOFF.md) and the application
+[release record](https://github.com/ArefinAlter/dynodoc/blob/main/docs/operations/2026-10-10-history-connector-release.md).
+Installed Microsoft/Google host acceptance, actual production sign-in and marketplace
+publication remain open. The next independent engine increment is bounded text/assets,
+compression/incremental publication and shared version/draft references in part 2,
+before portable commits/branches and resumable exchange.
+
 ## Latest increment: history ranges and editor pairing (10 October 2026)
 
 Synchronized the new API range operations, overlap resolution/private recovery,
@@ -15,7 +36,8 @@ in ArefinAlter/dynodoc. This repository contains their API contract, not the cli
 
 Next priorities: matching API/web test deployment and installed-host acceptance;
 bounded text/assets and shared version/draft references, then portable commits,
-parents/branches, resumable exchange and offline convergence. No new VPS deployment.
+parents/branches, resumable exchange and offline convergence. The later VPS rollout
+is recorded above.
 
 ## Previous increment: permission-controlled historical recovery (10 October 2026)
 
