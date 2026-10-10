@@ -9,9 +9,11 @@ Migration 0026 is required. All 233 Rust tests and source CI pass. This is an AP
 increment; the Projects-first frontend lives in application source `6f1ac21`.
 See [the release contract](PROJECTS-WORKSPACE-RELEASE.md).
 
-The hosted application remains `536a448` on schema 25 until the next controlled
-rollout. Installed-host acceptance and the algorithm/storage limits below remain
-open. This increment does not change event encoding or algorithmic complexity.
+The hosted application now runs `ecbc643` on schema 26 after a validated backup
+and successful upgrade/compatible-rollback rehearsal. Live workspace/proxy and
+connector delivery checks pass. Installed-host acceptance and the algorithm/storage
+limits below remain open. This increment does not change event encoding or
+algorithmic complexity. See [deployment evidence](operations/2026-10-10-projects-workspace-release.md).
 
 ## History ranges and connector pairing - 10 October 2026
 
