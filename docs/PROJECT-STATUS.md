@@ -19,8 +19,10 @@ See [measurements](SHARED-CHECKPOINTS.md) and [handoff](ENGINE-EVOLUTION-HANDOFF
 Application's 220 tests/fmt/Clippy/OpenAPI and Rust CI passed. Standalone task lint,
 all 220 tests, task docs and unchanged OpenAPI also passed. The first standalone
 run hit the existing 100 ms SSE deadline; the full rerun passed unchanged.
-Synchronized application source: 12be6a2. Publication and browser/engine CI records
-are pending. No VPS deployment.
+Published source: application `12be6a2`, standalone `970d78a`. Both source CI runs
+and application frontend/browser CI passed (62 signed-in, 16 public browser, 274
+frontend unit tests). The handoff links the runs. The disposable database/volume
+were removed; existing local services remain. No VPS deployment.
 
 Next: batch/incremental publication and short final locking, compression/backend
 measurement, bounded large text/assets, versioned draft references, then durable
