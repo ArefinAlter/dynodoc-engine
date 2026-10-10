@@ -15,7 +15,20 @@ credentials, user files or production database. It is an early 0.1 source releas
 not a claim of Git protocol compatibility, offline convergence or complete Office
 file support. No crates.io package has been published.
 
-## Current increment: historical recovery (10 October 2026)
+## Current increment: history ranges and editor pairing (10 October 2026)
+
+The API supports net revision-range revert/cherry-pick with explicit overlap
+choices, checked current heads and private recovery drafts. Normal review/merge
+policies preserve append-only canonical history. Browser approval can register a
+hash of the editor-held secret and complete through a scoped connection endpoint;
+all six hosts retain file/kind/role/session/revocation constraints. No migration.
+See [history operations](docs/HISTORY-RECOVERY.md) and [pairing](docs/CONNECTOR-PAIRING-AND-INSTALLATION.md).
+Native historical DOCX/XLSX/PPTX export controls, ribbon/menu UI and test-installation
+packages live in the application repository. They are not included in this Rust
+repository or a claim of full fidelity/native acceptance/marketplace publication.
+Verification and publication are tracked in [the handoff](docs/ENGINE-EVOLUTION-HANDOFF.md).
+
+## Previous increment: historical recovery (10 October 2026)
 
 The account-authenticated API previews selected content from any retained revision
 and creates a private recovery draft with a checked current base and source hash.

@@ -1,5 +1,19 @@
 # Engine project status
 
+## Latest increment: history ranges and editor pairing (10 October 2026)
+
+Synchronized the new API range operations, overlap resolution/private recovery,
+and hash-only browser approval/scoped connection completion from the application.
+No migrations or event/codec changes. Existing storage limitations remain unchanged.
+Standalone task lint, all 231 Rust tests, docs and OpenAPI pass.
+Application source 4df76ad is published; source CI/publication details are in the handoff.
+Application native export UI and all six test packages/auth clients are maintained
+in ArefinAlter/dynodoc. This repository contains their API contract, not the clients.
+
+Next priorities: matching API/web test deployment and installed-host acceptance;
+bounded text/assets and shared version/draft references, then portable commits,
+parents/branches, resumable exchange and offline convergence. No new VPS deployment.
+
 ## Latest increment: permission-controlled historical recovery (10 October 2026)
 
 The product now explicitly includes retrieving old or unnamed revisions and

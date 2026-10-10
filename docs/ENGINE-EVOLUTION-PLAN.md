@@ -28,7 +28,10 @@ The owner's added journey requires permission-controlled retrieval of old/unname
 revisions and selected recovery without losing later work. The bounded
 [history-recovery increment](HISTORY-RECOVERY.md) reuses the existing centralized
 reader and review path, independently of the remaining storage work. Whole-block
-restoration is now distinct from future commit revert/cherry-pick. Parts 3 and 6
+restoration is distinct from implemented revision-range revert/cherry-pick.
+Portable commit-addressed commands remain part 3. Application test-installation
+packages and browser pairing are early part-8 increments; real native acceptance
+and marketplace publication remain open. Parts 3 and 6
 must retain source/ancestry/actor links; part 8 must provide indexed discovery and
 native download/application across retained history. Current role and approval
 checks apply to all of these actions. This does not mark part 2 complete or defer

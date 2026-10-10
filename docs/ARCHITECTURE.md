@@ -139,3 +139,9 @@ retry receipt; changed source/actor/document combinations conflict. The ordinary
 review/merge path appends canonical recovery events. No event hashes or migrations
 change. Full-state materialization remains; commit revert/cherry-pick are later
 contracts. See [historical recovery](HISTORY-RECOVERY.md).
+
+
+History range operations merge a replayed historical content delta into current
+state, check explicit conflicts and create private drafts. Connector browser approval
+stores only the hash of a client-held secret in the existing grant table; completion
+rechecks current membership and grant/session validity. No event/storage codec change.

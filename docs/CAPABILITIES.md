@@ -1,5 +1,17 @@
 # Current engine capabilities
 
+## History ranges and connector pairing - 10 October 2026
+
+Range revert/cherry-pick computes and validates a selected net content delta,
+merges against current state and requires overlap choices before creating a private
+draft. Both range anchors and explicit choices are server-recorded; review rules,
+stale-head checks and retry identity remain enforced. Browser-approved connector
+keys can be registered by hash, completed using the editor secret, and revoked.
+Native file exporters and installation/ribbon/sidebar clients remain application
+features; this engine exposes pinned checkpoints, content operations and scoped auth.
+Portable commit/branch commands, bounded storage and native fidelity remain open.
+See HISTORY-RECOVERY.md and CONNECTOR-PAIRING-AND-INSTALLATION.md.
+
 ## Historical recovery - 10 October 2026
 
 Current document members can export retained historical checkpoints. Recovery

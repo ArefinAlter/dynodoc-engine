@@ -1,5 +1,46 @@
 # Engine evolution handoff
 
+## Current increment: history ranges and editor pairing
+
+10 October 2026. User explicitly requested revert/cherry-pick, native historical
+exports and installable six-host add-ins with auth. Implementation is present:
+revert/cherry_pick net revision deltas with checked overlap choices/private drafts;
+DOCX/XLSX/PPTX historical downloads; hash-only browser approval for all six clients;
+Microsoft ribbon commands/icons and reproducible test installation packages.
+No migration; minimum schema remains 25. No VPS deployment. Both repositories
+have the same four changed Rust files; all 22 SQL migrations still match. OpenAPI
+API schemas match, with the intended AGPL/MIT/contact packaging difference.
+Application source 4df76ad789038dc208cb0ea9a5dc2a4137b28133 is pushed to main.
+Standalone task lint, all 231 Rust tests, docs and OpenAPI pass. Source CI is pending.
+Application CI: Rust 38053822154; frontend/browser 38053822926.
+This engine source commit records the synchronized Rust API and capability docs.
+
+API targeted tests pass (range test corrected its merge request field names).
+All three Microsoft manifests pass the official validator after raising manifest
+version from 0.2.0.0 to its minimum 1.0.0.0; add-ins are still development clients.
+Application fmt/Clippy and all 231 Rust tests pass. Frontend lint/check/build and
+277 unit tests pass, followed by the final pairing suite including three new Google
+bridge tests. All four real signed-in browser checks pass: approval after login,
+DOCX recovery/download/range UI, XLSX and PPTX pinned history exports. Seven existing
+Office/Google connector bridge browser checks also pass. The DOCX browser assertion
+was corrected to read its existing custom origin properties; no exporter change
+was required. These archive checks verify old content and origin, not native fidelity.
+Standalone lint/docs/OpenAPI pass (existing 16 core / 4 API rustdoc warnings).
+Owned API/web processes 14912/9260 have been stopped after port/process verification.
+Disposable PostgreSQL cleanup is pending after the completed standalone test suite.
+Owned disposable PostgreSQL: dynodoc-connect-history-20261010, loopback 5553,
+label dynodoc.task=connect-history-20261010. Remove only this owned resource and
+owned browser-test API/web processes after validation (API PID 14912, web PID 9260;
+loopback 8087/4178, process record in temp). Logs: system temp prefix
+dynodoc-connect-history-, plus dynodoc-*-manifest.log. Existing databases untouched.
+Prior engine documentation CI 38051507307 has now been verified successful.
+
+Read HISTORY-RECOVERY.md and CONNECTOR-PAIRING-AND-INSTALLATION.md for exact scope.
+Native host acceptance/publication and full fidelity are not implied by source,
+browser mocks, OOXML archive checks or manifest validation. Portable commit IDs,
+branch ancestry, full local history/offline convergence and the remaining part 2
+storage work are still open.
+
 ## Historical recovery increment (10 October 2026)
 
 Complete and pushed to both main branches, with local and source CI checks passing.
@@ -45,6 +86,9 @@ follow-up records completed checks without changing the tested source.
 - [Application Rust](https://github.com/ArefinAlter/dynodoc/actions/runs/38050861763): passed, 229 tests.
 - [Application frontend/browser](https://github.com/ArefinAlter/dynodoc/actions/runs/38050861752): passed, 274 unit / 16 public / 63 signed-in tests.
 - [Standalone engine](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38051048267): passed, 229 tests plus lint/docs/OpenAPI.
+- Final engine handoff/status: `be355d1bde86740e4babe7d8245e53b2f498c76f`
+  ([checkout CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38051507307));
+  source is unchanged from the verified implementation commit.
 
 Next: resume part 2 bounded text/assets, compression/incremental construction and
 shared version/draft references, followed by local commit exchange. Preserve old
@@ -143,6 +187,9 @@ Publication:
 - [Application frontend/browser CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38048638534): passed, 274 unit tests, 16 public browser tests and 62 signed-in workflows.
 - Standalone source: `cc12b29e0197304cdfebb86ee1c16d5653b800e4`.
 - [Standalone engine CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38048849334): passed, 226 tests.
+- Final engine handoff/status: `b05796fb85003ee6f87278853d8d1d57a5bd5d2c`;
+  [final checkout CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38049284279)
+  passed. Source is unchanged from the verified implementation commit.
 
 ## Part 2c: bounded database batches (10 October 2026)
 
