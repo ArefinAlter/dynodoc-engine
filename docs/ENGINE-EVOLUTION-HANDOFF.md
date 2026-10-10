@@ -11,7 +11,12 @@ No migration; minimum schema remains 25. No VPS deployment. Both repositories
 have the same four changed Rust files; all 22 SQL migrations still match. OpenAPI
 API schemas match, with the intended AGPL/MIT/contact packaging difference.
 Application source 4df76ad789038dc208cb0ea9a5dc2a4137b28133 is pushed to main.
-Standalone task lint, all 231 Rust tests, docs and OpenAPI pass. Source CI is pending.
+Standalone task lint, all 231 Rust tests, docs and OpenAPI pass. Initial source CI passed: engine 38053895976 and application Rust 38053822154 /
+frontend 38053822926 (16 public and 66 signed-in browser scenarios).
+Final clock-skew follow-up: application 0478bf2fe3e9c4c6e171ec4fb38e61580c788a7a;
+this engine commit permits one minute of ahead-clock allowance on approval links.
+All 231 standalone tests, lint/docs and regenerated OpenAPI pass again, including
+ahead-clock success and expired/too-distant link rejection. Follow-up CI is pending.
 Application CI: Rust 38053822154; frontend/browser 38053822926.
 This engine source commit records the synchronized Rust API and capability docs.
 
