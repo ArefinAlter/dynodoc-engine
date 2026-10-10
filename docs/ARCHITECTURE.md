@@ -1,5 +1,13 @@
 # Architecture
 
+## Restricted database runtime - 11 October 2026
+
+Schema 0029 and `engine_core::database` provide separate migrate/provision CLI
+commands and read-only schema/privilege validation. The API requires a dedicated
+non-owner login and has no migration or DDL privileges. History is SELECT/INSERT;
+existing audited erasure remains possible through protected trigger entrypoints.
+Read [the contract](DATABASE-PRIVILEGES.md) and [checks/remaining gates](ENGINE-EVOLUTION-HANDOFF.md).
+
 Canonical content is an append-only `event` chain per document. Current node rows
 and snapshots are derived materializations. `log::append_in_tx` locks the document
 row with NO KEY UPDATE before allocating sequence numbers and hashes canonical, length-framed semantic

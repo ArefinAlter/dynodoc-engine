@@ -5,8 +5,19 @@ tasks:
     desc: Start local PostgreSQL on loopback port 5548
     cmds: ["docker compose up -d --wait"]
   run:
-    desc: Run API; applies pending migrations on startup
+    desc: Run the provisioned API; never applies migrations
     cmds: ["cargo run --locked -p engine-api"]
+  migrate:
+    desc: Apply migrations in a separate operator process
+    dotenv: [".env.migrate"]
+    cmds: ["cargo run --locked -p engine-cli -- migrate"]
+  db:grant-runtime:
+    desc: Grant the explicit allowlist to an existing dynodoc_runtime login
+    dotenv: [".env.migrate"]
+    cmds: ["cargo run --locked -p engine-cli -- grant-runtime dynodoc_runtime"]
+  db:check:
+    desc: Read-only schema/runtime privilege check
+    cmds: ["cargo run --locked -p engine-cli -- check-runtime"]
   test:
     desc: Run pure and isolated PostgreSQL integration tests
     cmds: ["cargo test --locked --workspace -- --test-threads=1"]

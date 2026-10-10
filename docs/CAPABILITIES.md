@@ -1,5 +1,13 @@
 # Current engine capabilities
 
+## Restricted database runtime - 11 October 2026
+
+Schema 0029 and `engine_core::database` provide separate migrate/provision CLI
+commands and read-only schema/privilege validation. The API requires a dedicated
+non-owner login and has no migration or DDL privileges. History is SELECT/INSERT;
+existing audited erasure remains possible through protected trigger entrypoints.
+Read [the contract](DATABASE-PRIVILEGES.md) and [checks/remaining gates](ENGINE-EVOLUTION-HANDOFF.md).
+
 ## Evolution part 2e - 10 October 2026
 
 Checkpoint encoding borrows values and checks output capacity before growth, capped
@@ -239,5 +247,5 @@ Snapshot/public/history/deployed/restore reads use the checked reader; API/CLI a
 compare every legacy snapshot against canonical replay. Existing rows require
 explicit verified backfill. Hashing uses a streaming canonical envelope, preserving
 old state/event bytes. This does not replace full JSONB snapshot storage, complete
-runtime privilege separation or provide externally anchored signatures. See
+externally anchored signatures. Runtime privilege separation is covered by schema 0029. See
 [the contract](VERIFIED-SNAPSHOTS.md) and [verification handoff](ENGINE-EVOLUTION-HANDOFF.md).

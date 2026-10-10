@@ -15,7 +15,15 @@ credentials, user files or production database. It is an early 0.1 source releas
 not a claim of Git protocol compatibility, offline convergence or complete Office
 file support. No crates.io package has been published.
 
-## Current increment: verified legacy snapshots (11 October 2026)
+## Current increment: restricted database runtime (11 October 2026)
+
+Schema 0029 separates operator migrations from API credentials. Startup checks the
+schema and a dedicated restricted login; it never applies migrations. Immutable
+history has SELECT/INSERT grants only, while approved erasure runs through guarded
+trigger entrypoints. Read [setup, trust and rollout requirements](docs/DATABASE-PRIVILEGES.md)
+and [verification/status](docs/ENGINE-EVOLUTION-HANDOFF.md). No VPS deployment is implied.
+
+## Previous increment: verified legacy snapshots (11 October 2026)
 
 Schema 0028 protects legacy snapshot rows and adds immutable verification receipts.
 Checked reads reject unverified/corrupt snapshots; API and CLI audits compare every
@@ -24,7 +32,8 @@ are reconstructed canonically. Existing databases require explicit verified back
 before reopening traffic. See [the snapshot contract](docs/VERIFIED-SNAPSHOTS.md)
 and [validation/remaining work](docs/ENGINE-EVOLUTION-HANDOFF.md).
 
-Runtime database privilege separation is next. Receipts are internal attestations,
+Runtime database privilege separation is implemented in current source; deployment
+acceptance remains open. Receipts are internal attestations,
 not signatures or external witnesses. Portable project histories, shared chunks,
 offline convergence and installed-editor acceptance remain open.
 
@@ -38,8 +47,8 @@ that login. An old API build must not be used as rollback without compatible
 revocation enforcement or deliberate credential invalidation.
 
 See [the security findings and open gates](docs/SECURITY-HARDENING.md) and
-[handoff](docs/ENGINE-EVOLUTION-HANDOFF.md). Snapshot rollout/backfill acceptance,
-runtime database privilege separation, project policy authority, independent audit
+[handoff](docs/ENGINE-EVOLUTION-HANDOFF.md). Snapshot/runtime-role rollout acceptance,
+project policy authority, independent audit
 commitments and the remaining repository/offline/storage work are not completed.
 Final validation references are recorded in the handoff. This is not a deployment.
 
@@ -150,17 +159,25 @@ Install Docker, Rust (the pinned `rust-toolchain.toml`) and
 
 ```sh
 cp .env.example .env
+cp migration.env.example .env.migrate
 # Fill PASETO_LOCAL_KEY with `openssl rand -hex 32` and WEB_SERVICE_KEY with
 # a separate random value. Task loads .env; the binaries do not read it themselves.
 task up
-task test
+# Create the restricted login and set its password as described in DATABASE-PRIVILEGES.
+task migrate
+task db:grant-runtime
+task db:check
 task run
 ```
 
-The development database listens only at `127.0.0.1:5548`. `task run` applies the
-bundled migrations and listens on loopback port 8080. `GET /healthz` is the health
-check. Use a database role with CREATE DATABASE for SQLx integration tests; each
-`#[sqlx::test]` creates an isolated database. Never run tests against hosted data.
+The development database listens only at `127.0.0.1:5548`. `task run` checks the
+schema/runtime role and listens on loopback port 8080; it never migrates. The operator
+URL belongs only in `.env.migrate`, loaded by the migrate/grant tasks. `GET /healthz`
+is the health check. Export separate isolated test-owner credentials as `DATABASE_URL`
+for `task test`; SQLx tests need CREATE DATABASE and CREATE ROLE. Never run tests
+against hosted data or start an API with the test-owner URL. See
+[the full setup contract](docs/DATABASE-PRIVILEGES.md); the application-specific
+`task setup`/`task dev` commands there are replaced by the copy/`task run` steps above.
 
 ```sh
 task lint
