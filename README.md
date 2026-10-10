@@ -17,13 +17,13 @@ file support. No crates.io package has been published.
 
 ## Current increment (10 October 2026)
 
-Synchronized from application `667ecb6`. Part 1 adds checkpoint-aware streamed
-historical reads, streamed chain verification,
-lightweight cadence checks and constraint-dependency regressions. The product target
-is local/remote document repositories with shared content storage and offline
-history around existing editors. Those larger capabilities remain staged work.
-[Current status](docs/PROJECT-STATUS.md) ? [Explicit handoff](docs/ENGINE-EVOLUTION-HANDOFF.md)
-? [Product contract](docs/PRODUCT-SPEC.md) ? [Ordered plan](docs/ENGINE-EVOLUTION-PLAN.md).
+Part 2a adds opt-in [shared checkpoints](docs/SHARED-CHECKPOINTS.md): immutable
+objects, stable-key indexes, document isolation and atomic verified publication.
+The default snapshot/draft paths still store full JSON. Large text/assets, complete
+local histories/branches and offline exchange remain staged work. Part 1's streamed
+historical reader and verification remain compatible. Source/check evidence is in
+[the handoff](docs/ENGINE-EVOLUTION-HANDOFF.md); see [current status](docs/PROJECT-STATUS.md),
+[product contract](docs/PRODUCT-SPEC.md) and [ordered plan](docs/ENGINE-EVOLUTION-PLAN.md).
 
 ## Previous synchronization (6 October 2026)
 

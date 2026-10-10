@@ -1,52 +1,181 @@
 # Engine evolution handoff
 
-Updated 10 October 2026. **Part 1 complete and published.** Scope: checkpoint-aware streamed historical reads, streaming
-verification, mathematical/product contract correction and replay regression coverage.
-Read PRODUCT-SPEC, ENGINE-EVOLUTION-PLAN and PROJECT-STATUS before continuing.
-Starting engine commit: `67060cf`; starting application commit: `f054ad1`.
+Updated 10 October 2026. **Part 2a implemented and locally verified; publication/CI pending.** Part 1 remains published. Read [PRODUCT-SPEC](PRODUCT-SPEC.md),
+[ENGINE-EVOLUTION-PLAN](ENGINE-EVOLUTION-PLAN.md) and
+[SHARED-CHECKPOINTS](SHARED-CHECKPOINTS.md) before continuing.
 
-## Implemented in this increment
+## Part 2a: shared checkpoint foundation
 
-- Core `read_state_at`: nearest checkpoint at/before the exact revision, streamed
-  event suffix, revision/gap checks and selected-checkpoint/replay-count evidence.
-- Review/provenance checkpoints, historical batches and historical draft bases share
-  the reader within their existing authorization/transaction boundary.
-- Chain verification streams events; cadence checks read indexed sequence metadata.
-- Historical replay equivalence/boundary/document-isolation tests and two
-  cross-node validation-dependency regressions. No changed event or migration bytes.
-- Product/storage/replication roadmap and current status. Native client changes,
-  bounded browser matching and corrected historical math live in the application.
+- Versioned/domain-separated canonical objects cover all `DocumentState` fields,
+  including tombstones, comment order, suggestions and removed choices. Logical IDs
+  remain separate from addresses. Fixed hash vectors pin the Rust byte codec.
+- Stable-key radix maps share unchanged objects across checkpoints and avoid fixed
+  array chunk boundaries shifting on insertion. A one-node edit rewrites its value,
+  map path and root; creation still scans/hashes the complete state.
+- Document-scoped memory and PostgreSQL stores; no cross-document reuse or public
+  hash lookup. Migration 0025 adds immutable bytes and checkpoint manifests without
+  changing applied migrations or event encodings.
+- Transactional opt-in publication derives an exact historical state, verifies full
+  graph reconstruction before publishing, rejects mismatches, rolls back failures
+  and supports same-revision concurrent retries. Reads reject missing/corrupt roots
+  and check their recorded chain position. They still trust the root/history
+  association; external attestations are not implemented.
+- Operator `shared-snapshot` CLI; audited erasure removes manifests/objects and the
+  admin preview/receipt records their counts and bytes. Ordinary snapshots and
+  draft/version bases still use full JSON. No production default is switched.
 
-## Verification and publication
+## Verification and measurement
 
-Synchronized from application `667ecb6ecef5b64debcca6817e73b6be807bde37`.
-All seven changed source/test files match the application exactly. No migration,
-event format or HTTP schema changes. MIT package metadata and the standalone
-rich-text fixture location remain intact.
+Seven codec/property tests and five isolated database tests cover round trips,
+canonical bytes, all state components, reuse/insertion, malformed references/routes,
+limits, legacy equivalence, rollback/retry, concurrency, scope and erasure. The
+existing admin API erasure test also checks new counts and cleanup.
 
-- `task lint`: formatting and Clippy with warnings denied passed.
-- `task test`: all 204 tests passed against isolated PostgreSQL, including the
-  unchanged 100 ms SSE assertion and new historical/constraint regressions.
-- `task docs`: passed with the pre-existing Rustdoc link warnings.
-- `task openapi`: passed; generated OpenAPI unchanged.
-- Application: 204 Rust tests, affected 13 tests rerun after final streaming changes,
-  274 frontend unit tests, Clippy, ESLint and complete Svelte/type check passed.
+The first full application run failed the existing 100 ms SSE timing assertion
+while a release build was running concurrently. That test was not weakened; the
+full suite then passed all **216 tests** without competing work. Application fmt,
+Clippy and unchanged generated OpenAPI passed. Standalone task lint and all 216
+tests also passed. Standalone task docs passed with existing Rustdoc link warnings
+in unchanged files. Standalone generated OpenAPI is also unchanged, including MIT
+metadata. Remote CI is pending the source push.
 
-The disposable test container and volumes have been removed. No VPS deployment,
-real native-host acceptance or marketplace publication is claimed. Implementation is pushed to main at `647249e7ed692534f7ab21a1ad522912c7d58385`;
-application source is `667ecb6ecef5b64debcca6817e73b6be807bde37`.
-[Independent CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38038142218)
-passed for implementation `647249e`: formatting, Clippy, build, all tests, docs
-and OpenAPI consistency. Subsequent documentation commits do not change those source files.
+Synthetic release benchmark: 8,000 blocks, 21 checkpoints (20 one-block edits),
+135,244,119 bytes as repeated full-state JSON versus 7,831,404 unique object bytes;
+4,727-7,284 additional bytes per edit. Initial write 163.55 ms, median full scan/write
+168.54 ms, final reconstruction 115.87 ms, observed process peak working set
+54.5 MiB. Read the codec document for method and limitations: no PostgreSQL/WAL,
+large native files, transfer, concurrency or production backend acceptance.
 
-## Next concrete task
+## Next concrete task: part 2b adoption and bounded content
 
-Part 2: specify typed/versioned canonical objects and commit manifests, then implement
-tenant-scoped shared checkpoints behind a compatibility boundary. Compare every new
-checkpoint with legacy replay, prove unchanged subtrees reuse objects, test interrupted
-publication and reachability/erasure. Keep draft bases/event hashes readable. See the
-plan's design gate before adding a migration or raising upload limits.
+1. Add a compatibility-preserving default reader/writer selection between legacy
+   and shared checkpoints. Compare legacy/shared-plus-tail reconstruction at every
+   revision. Migrate draft bases/named versions by explicit versioned references;
+   preserve historical readers, erasure and stale-base checks. Do not silently
+   delete full snapshots or switch production before rollout evidence.
+2. Introduce bounded typed text/format/asset chunks so a single large logical node
+   does not exceed the current 1 MiB object cap. Benchmark PostgreSQL/index/TOAST/WAL
+   and durable local/remote backends, streaming, cancellation and memory. The memory
+   store is a test backend; write/read budgets do not bound the prior materializer.
+3. Settle cross-language numeric canonicalization and a separate commit envelope
+   binding repository, parents, root, operations/capture capabilities and actor
+   evidence. Then implement durable local commits, resumable missing-object exchange
+   and atomic branch refs (part 3). Offline convergence/audit/native host acceptance
+   remain separate explicit gates, not consequences of checkpoint deduplication.
 
-Full JSON snapshots, native structure/format/background gaps and centralized canonical
-history remain. Independent heads/signatures, full replica convergence, background
-capture and hundreds-of-MB/load acceptance are open; do not report them as shipped.
+Current limits: whole-state residency/scans, up to 1 MiB per object, 512 MiB/one
+million object operations by default, Rust-specific numeric encoding, no chunked
+assets, no GC, no default-path storage savings yet. No complete product or capacity
+claim. The radix tree is an implementation choice; comparative prolly-tree results
+remain unmeasured. Backup retention still applies after live audited erasure.
+
+## Source, deployment and temporary resources
+
+Working from application `1907eea` and standalone `6e7fdf9`. Both copies must match
+for changed Rust sources/tests/examples and migration 0025, while preserving engine
+MIT metadata and its standalone rich-text fixture. Application implementation:
+`7a8e28ed1bfdf5828deb341fdf9b533fad9f5469` (pushed). Engine commit/CI pending.
+
+No VPS deployment; last recorded production remains `8c7461d`, schema 24, with the
+previous Nginx header fix. The owned disposable PostgreSQL container
+`dynodoc-evolution-part2a-20261010` and its volumes were removed after verification
+and ownership-label checks. No test API/web servers were started. Existing local
+services were left running. Temporary logs and synthetic benchmark JSON are under
+the system temp directory.
+
+## Earlier completed increment: part 1
+
+The following is retained as the dated Part 1 release record. Its "next task" and
+shared-storage limits predate Part 2a; use the continuation above for current work.
+
+## Part 1 completed
+
+- Made existing-editor document repositories the authoritative product. Replaced the
+  duplicated combined volume with a current guide and marked legacy questionnaire/
+  civic stages as historical. Corrected mathematical independence, complexity,
+  shared-storage and audit claims, including their repeated cross-references.
+- Defined stable logical identity separately from content addresses and formatting
+  runs; initial graphs contain content, while the target avoids redundant full-file
+  versions. Defined explicit offline/merge/trust/capacity acceptance boundaries.
+- Added core `read_state_at`: nearest checkpoint at/before the exact revision,
+  streamed suffix, revision/gap rejection and checkpoint/replay-count evidence.
+  Historical batches/draft creation use the same reader as review/provenance.
+- Streamed chain verification and made cadence checks query only sequence metadata.
+- Bounded browser Myers extra work to input key count plus 1,000,000 work steps and
+  trace to 1,000,000 integer cells (about 4 MB, excluding frontier/objects/input).
+  Removed repeated frontier copies and quadratic duplicate occurrence lists.
+  Exhaustion uses unique anchors/LIS; fewer matches can require additional review.
+- Added exact historical replay/checkpoint/scope tests, duplicate-heavy matching
+  regressions and uniqueness/crossed-move counterexamples to disjoint-ID independence.
+- Synchronized the seven changed engine source/test files byte-for-byte to the MIT
+  repo and preserved its packaging metadata. No event/schema/migration changes.
+
+## Verification
+
+| Check | Result |
+|---|---|
+| Application `cargo test --workspace`, isolated PostgreSQL | 204 passed. After final streaming/cadence changes, all 13 event/snapshot tests passed again. |
+| Application Rust formatting/Clippy | Passed, including all targets after final changes. |
+| Frontend full unit suite | 274 passed, including document/spreadsheet/presentation import regressions. |
+| Changed frontend files: Prettier/ESLint; complete Svelte/type check | Passed; zero Svelte errors/warnings. |
+| Standalone engine `task lint`, `task test` | Passed; all 204 tests, including the unchanged 100 ms SSE check. |
+| Standalone `task docs` | Passed with previously documented Rustdoc link warnings. |
+| Standalone `task openapi` and generated diff | Passed; HTTP schema unchanged. |
+| New documentation links, source equality and whitespace checks | Passed. |
+| Application remote CI | Rust passed; frontend lint/build, 274 unit tests, 62 signed-in browser tests, 16 public browser tests and proxy regression passed. |
+| Engine implementation and final documentation-head CI | Both passed. |
+
+The isolated container `dynodoc-evolution-part1-20261010` and its volumes were removed.
+No test servers started; unrelated local containers retained. No VPS deployment,
+real native-host acceptance or marketplace publication was performed. Last recorded
+production remains app `8c7461d`, schema 24, plus the Nginx repair. Local tests do not
+establish hundreds-of-MB or large-service capacity. Remote browser acceptance used an isolated CI stack; it does not certify native
+Microsoft/Google installations, marketplace publication or a new VPS deployment.
+
+## Measurements and complexity boundary
+
+Pre-change audit (10 October) release medians: synthetic 8,000-block/6,030,116-byte
+JSON parse 58.44 ms; classify 41.36 ms; format patch 0.256 ms; replay 0.099 ms; small
+paragraph merge 0.032 ms; 8,000-block fingerprint 8.19 ms. These exclude native
+conversion, network, database writes, rendering and concurrent load. They are a
+baseline, not a fresh end-to-end benchmark of this increment.
+
+Current reads still hydrate full state; checkpoints and draft bases still duplicate
+full JSON. Missing historical checkpoints still require genesis replay. The periodic
+threshold is best-effort, not a hard 500-event tail bound. Key matching budgets do
+not cover all shape/cell candidate matching or key-byte comparison costs. Signed
+heads, shared object storage and a complete local commit DAG remain unimplemented.
+
+## Next concrete task: part 2 shared checkpoints
+
+1. Specify typed/versioned canonical objects, logical identity versus hash address,
+   commit manifests, ordering, chunk/reference limits and all committed state.
+2. Implement a tenant-scoped object-store boundary and shared checkpoints alongside
+   legacy snapshots; no rewriting event hashes or applied migrations.
+3. Compare reconstruction with legacy replay at every fixture checkpoint. Verify
+   unchanged objects are reused after a one-node edit, publication is recoverable,
+   missing/corrupt objects fail explicitly and tenant/erasure boundaries are intact.
+4. Measure unique-byte growth and peak memory. Then migrate full draft bases/named
+   versions and develop local commits/object negotiation in part 3.
+
+Bounded parsing/object contracts start now; full-load acceptance is part 7. Real-host
+experiments may proceed alongside settled contracts. Do not resume Office web-editor
+parity or the questionnaire/civic roadmap. Update this handoff and both project
+status records at every increment and before context/token exhaustion.
+
+## Source and publication record
+
+Starting application `f054ad1`; starting standalone `67060cf` (service `d6666a2`).
+Implementation is pushed to both main branches:
+
+- Application: `667ecb6ecef5b64debcca6817e73b6be807bde37`.
+- Standalone engine implementation: `647249e7ed692534f7ab21a1ad522912c7d58385`;
+  finalized handoff/status at `6e7fdf91810677b3dc8778b7d9789882125d2bb1`.
+- [Application Rust CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38038078571): passed.
+- [Frontend/authenticated browser CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38038078512): passed (274 unit, 62 signed-in, 16 public browser tests; proxy regression).
+- [Independent engine CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38038142218): passed.
+- [Final engine documentation-head CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38038345736): passed.
+
+All listed runs passed. The documentation follow-up records results and synchronization
+without changing the verified implementation. There are no remaining part-1 test
+failures; the larger unfinished product capabilities are explicitly listed above.

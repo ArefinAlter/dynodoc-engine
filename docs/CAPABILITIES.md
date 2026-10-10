@@ -1,5 +1,21 @@
 # Current engine capabilities
 
+## Evolution part 2a - 10 October 2026
+
+Opt-in shared checkpoints now reuse unchanged document objects. The versioned
+canonical codec covers full materialized state, stable-key radix indexes bound
+reference fanout, and document-scoped memory/Pg stores preserve isolation. Schema
+25 publication is transactional, verifies reconstruction and supports retry;
+immutable guards and audited erasure cover the new tables. The operator CLI exposes
+`shared-snapshot DOCUMENT_UUID --through-seq N`. No public object API is added.
+
+Default snapshots and draft/version bases still use full JSON. Objects over 1 MiB
+are rejected, state is fully resident and writes still scan it. The synthetic storage
+benchmark is in [SHARED-CHECKPOINTS](SHARED-CHECKPOINTS.md); it is not a native-file,
+database-load or production capacity result. Full local commit/branch exchange,
+large text/assets, default-path migration and independent provenance remain open.
+Verification, counterpart commits and CI are in [the handoff](ENGINE-EVOLUTION-HANDOFF.md).
+
 ## Evolution part 1 - 10 October 2026
 
 The authoritative direction is local/remote document repositories, not questionnaire

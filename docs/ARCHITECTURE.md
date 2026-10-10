@@ -7,7 +7,9 @@ content and actor identity. Genesis uses a zero predecessor hash.
 
 `Materializer` folds operations into stable-ID state, including tombstones.
 `SnapshotEngine` stores replay checkpoints and an ordered node Merkle commitment.
-Snapshots currently contain full JSONB states, not shared content-addressed trees.
+Default snapshots contain full JSONB states. The opt-in `shared_checkpoint` module
+stores versioned object bytes and stable-key radix maps alongside them; see
+[its format and limits](SHARED-CHECKPOINTS.md). No legacy state/event is rewritten.
 Restoration appends operations; it never resets the chain.
 
 `richtext` in shared defines versioned patches; core generates and checks them.
@@ -76,3 +78,18 @@ Automatic operation independence includes reads, writes and validation constrain
 not just target IDs. Unique-name and crossed-move regressions document concrete
 counterexamples. The engine does not yet infer a general cross-format dependency
 footprint or prove automatic convergence of arbitrary native editor operations.
+
+## Shared checkpoint boundary (part 2a)
+
+Core stores require document scope and caller authorization. Object hashes are
+content integrity addresses, not permissions or actor attestations. PostgreSQL
+publication protects the document from erasure, derives an exact historical state,
+stores/validates its reachable object graph and compares reconstruction before
+inserting the immutable sequence/root/chain manifest in the same transaction.
+Same-revision publication is idempotent. Default historical replay remains legacy;
+a separate exact shared-checkpoint load validates graph and chain-position metadata.
+
+Objects are at most 1 MiB, radix leaves at most 32 entries, branches at most 16 and
+paths at most 64 nibbles. Total byte/object budgets are checked. Complete state and
+map entries remain in memory; no whole native-file streaming guarantee follows.
+Audited erasure removes manifests then document-scoped objects. No GC is enabled.

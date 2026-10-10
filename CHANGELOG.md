@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Opt-in shared checkpoints - 2026-10-10
+
+Added versioned full-state content objects, stable-key radix maps, document-scoped
+memory/PostgreSQL stores, verified atomic checkpoint publication/load and an
+operator CLI. Migration 0025 is additive; legacy snapshots/events and the HTTP
+schema are unchanged. Admin erasure previews/receipts count the new data and audited
+document erasure removes it. New codec/property/DB regressions and a synthetic
+storage-growth benchmark cover the first part-2 slice. Default-path adoption,
+large text/assets and portable commits remain open. See the evolution handoff for
+source synchronization, exact checks and CI.
+
+
 ### Repository foundations and bounded replay - 2026-10-10
 
 Synchronized from application `667ecb6`. Local lint, 204 tests, documentation and

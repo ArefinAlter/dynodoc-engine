@@ -1,20 +1,30 @@
 # Engine project status
 
-Updated 10 October 2026. See [the product contract](PRODUCT-SPEC.md),
-[ordered plan](ENGINE-EVOLUTION-PLAN.md) and [current handoff](ENGINE-EVOLUTION-HANDOFF.md).
-The engine serves document repositories around existing editors. Questionnaire
-validation remains a supported adapter; it is not the product scope.
+Updated 10 October 2026. The engine serves document repositories around existing
+editors; questionnaire validation is one supported adapter. Read [the product
+contract](PRODUCT-SPEC.md), [ordered plan](ENGINE-EVOLUTION-PLAN.md),
+[current handoff](ENGINE-EVOLUTION-HANDOFF.md) and
+[shared checkpoint contract/benchmark](SHARED-CHECKPOINTS.md).
 
-Part 1 implements nearest-checkpoint historical reads with streamed suffixes and
-replay accounting, streamed chain verification, and sequence-only snapshot cadence
-queries. Old-base batches and draft creation use the shared reader. Unique-name and
-crossed-move regressions demonstrate why different IDs alone do not imply independence.
-Events, applied migrations, HTTP responses and the MIT boundary are preserved.
+Part 2a is synchronized from application `7a8e28e`. It adds opt-in shared checkpoint objects covering full materialized state,
+stable-key radix indexes, document-scoped memory/PostgreSQL stores and immutable
+schema 25 manifests. Publication reconstructs/verifies all reachable data in the
+same transaction; rollback/retry and audited erasure preserve existing boundaries.
+An operator CLI opts in. Existing default JSON snapshots and draft/version bases,
+event hashes, HTTP schema and MIT packaging remain compatible.
 
-Shared content-addressed checkpoints, local commit DAG/branches, complete offline
-replica convergence, signed/witnessed provenance and large-file/service capacity
-are planned, not implemented. Native hosts/adapters and web review UI live in the
-application. See CAPABILITIES for existing API boundaries.
+Application checks passed 216 Rust tests, fmt/Clippy and unchanged OpenAPI;
+standalone task lint, 216 tests and task docs also passed (existing Rustdoc link
+warnings). Publication/CI is being finalized. The synthetic
+8,000-block/21-checkpoint trace used 7.83 MB of unique object bytes versus 135.24 MB
+of full-state copies. Native files, database overhead and load are unmeasured.
 
-Engine implementation `647249e` is pushed to main, synchronized from application `667ecb6`. Local task lint, all 204 tests, task docs
-and unchanged generated OpenAPI passed. Independent CI also passed for implementation `647249e`; the handoff links its evidence. No VPS deployment is part of this increment.
+Next: normal-path shared checkpoint adoption and draft/version references; bounded
+large text/assets and durable backend measurements; then local commits/branches
+and missing-object exchange. Complete offline convergence, signed/witnessed heads,
+full native-host capture and large-file/service capacity remain unfinished. No
+production deployment; the application VPS remains at its recorded schema 24.
+
+Part 1 previously added streamed historical replay and verification, checkpoint
+cadence metadata reads and dependency-counterexample tests (204 tests). The full
+prior source and CI record remains in the handoff.
