@@ -15,7 +15,22 @@ credentials, user files or production database. It is an early 0.1 source releas
 not a claim of Git protocol compatibility, offline convergence or complete Office
 file support. No crates.io package has been published.
 
-## Current increment: member profiles and test-file boundaries (10 October 2026)
+## Current increment: bounded checkpoint encoding (10 October 2026)
+
+Shared checkpoint v1 now encodes borrowed values into a capped output buffer and
+checks canonical bytes through streaming comparison. Existing hashes, roots and
+history remain compatible; no migration or public API change. Five new tests cover
+byte compatibility, generated nested values and allocation boundaries. The
+[allocation probe and limits](docs/BOUNDED-CHECKPOINT-ENCODING.md) document the
+oversized-rejection improvement without claiming bounded total document memory.
+
+Large-value/asset chunks, packing/incremental publication and shared draft/version
+references remain next, before portable project commits and offline exchange.
+Shared writes remain opt-in. This source increment is not deployed; current source
+checks, native-host gaps and publication requirements are in
+[the handoff](docs/ENGINE-EVOLUTION-HANDOFF.md).
+
+## Previous increment: member profiles and test-file boundaries (10 October 2026)
 
 Migration 0026 adds minimal account profiles with revision-checked saves. Profile
 reads require the same account or current shared Project membership and exclude

@@ -1,5 +1,23 @@
 # Current engine capabilities
 
+## Evolution part 2e - 10 October 2026
+
+Checkpoint encoding borrows values and checks output capacity before growth, capped
+at 1 MiB or the remaining byte budget. Canonical validation compares bytes as they
+are emitted without cloning the decoded object or creating another encoded buffer.
+All seven v1 kinds retain their byte/hash contract; no migration or API change.
+Five additional tests cover compatibility, generated nested values, limits and
+noncanonical input. See [evidence](BOUNDED-CHECKPOINT-ENCODING.md).
+
+The synthetic oversized-rejection probe reduced peak additional requested heap
+from 75,500,265 to 1,048,724 bytes. This excludes existing document state and does
+not establish total memory or latency bounds. Full-state scans, property-key
+metadata, legacy fallback, large chunks, packing and shared draft/version bases
+remain open. Current drafts are per-file; durable project commits, exchange and
+offline convergence are not implemented. Shared periodic writes remain off in
+production. Source checks and desktop/marketplace limits are in
+[the handoff](ENGINE-EVOLUTION-HANDOFF.md).
+
 ## Projects profiles and upload cap - 10 October 2026
 
 Source `8eef6dd` adds own/shared-Project-member profiles with revision-checked
