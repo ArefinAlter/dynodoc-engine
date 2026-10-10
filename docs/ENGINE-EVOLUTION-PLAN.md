@@ -1,6 +1,6 @@
 # Engine and product evolution plan
 
-10 October 2026. Implements [decision 012](https://github.com/ArefinAlter/dynodoc/blob/40a80be7e11ae8b10add920c787573fab822d0f9/docs/decisions/012-local-first-document-version-control.md)
+10 October 2026. Implements [decision 012](https://github.com/ArefinAlter/dynodoc/blob/c64a9ff39839a5070c1865a0d629ef8d3e0e6579/docs/decisions/012-local-first-document-version-control.md)
 and [the product specification](PRODUCT-SPEC.md). Status is in
 [ENGINE-EVOLUTION-HANDOFF](ENGINE-EVOLUTION-HANDOFF.md). Dependencies below replace
 the old questionnaire/civic stage order for this work.
@@ -52,6 +52,17 @@ Fixed-ID repetitive/varied fixtures compare individual and batched publication,
 with real FOR UPDATE wait probes. This optimization preserves the atomic
 transaction; full-state scans, resident state, compressed storage/backend choices
 and short staged publication remain open. The writer stays opt-in until acceptance.
+
+## Part 2d implementation boundary
+
+Core and API content transactions use NO KEY UPDATE, compatible with checkpoints'
+KEY SHARE erasure guard. They still serialize writers and permission/state checks.
+Existing stronger permission/lifecycle/erasure locks remain. Checkpoints retain an
+exact immutable sequence and atomic object/manifest publication. No staging or
+migration is required for this lock correction. See [the concurrency contract](CHECKPOINT-CONCURRENCY.md).
+Full-state materialization, bounded text/assets, compressed packing and shared
+version/draft references remain the next work before portable local commit exchange.
+Default shared writes stay off until concurrent API/resource acceptance.
 
 ## Part 2 design gate and first implementation slice
 

@@ -1,5 +1,17 @@
 # Current engine capabilities
 
+## Evolution part 2d - 10 October 2026
+
+Core/API writers now use a document lock compatible with checkpoint erasure guards,
+retaining writer/permission serialization and exact pinned-history reconstruction.
+Ten real core writers in the controlled trace committed in 38-212 ms during shared
+publication, versus 1.93-2.04 s with the previous entry lock. API tests separately
+check edits under a checkpoint guard and permission revocation after a real wait.
+This is not end-to-end API or native-host latency acceptance. Stronger management
+and erasure operations still wait. The default shared writer remains off; full-state
+work, large chunks, compressed packing and shared draft references remain open.
+See [concurrency evidence](CHECKPOINT-CONCURRENCY.md) and [handoff](ENGINE-EVOLUTION-HANDOFF.md).
+
 ## Evolution part 2c - 10 October 2026
 
 Shared checkpoint writes now buffer bounded batches (64 objects / 1 MiB); index

@@ -17,13 +17,13 @@ file support. No crates.io package has been published.
 
 ## Current increment (10 October 2026)
 
-Part 2c batches [shared checkpoint](docs/SHARED-CHECKPOINTS.md) publication and
-index reads while retaining exact v1 roots, document scope and atomic rollback.
-Writes buffer at most 64 objects / 1 MiB; reads fetch up to 16 objects per batch.
-Current/history and API reads support both formats. Automatic shared writes remain
-opt-in: publication still scans full state and blocks appends during its transaction.
-Named versions and draft bases still store full JSON. Large text/assets, incremental
-publication and full local history/exchange remain open.
+Part 2d lets ordinary content transactions proceed during a checkpoint while
+preserving serialized writes, permission checks, pinned history and erasure guards.
+[The concurrency contract](docs/CHECKPOINT-CONCURRENCY.md) records the lock audit,
+regressions and controlled ten-writer measurement. Shared checkpoint writes remain
+opt-in; full-state work, bounded large text/assets, compression, shared version/draft
+references and durable local commits/exchange remain open. Existing graph batching
+and v1 hashes are unchanged.
 Source/check evidence is in
 [the handoff](docs/ENGINE-EVOLUTION-HANDOFF.md); see [current status](docs/PROJECT-STATUS.md),
 [product contract](docs/PRODUCT-SPEC.md) and [ordered plan](docs/ENGINE-EVOLUTION-PLAN.md).

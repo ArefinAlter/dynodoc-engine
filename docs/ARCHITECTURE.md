@@ -2,7 +2,7 @@
 
 Canonical content is an append-only `event` chain per document. Current node rows
 and snapshots are derived materializations. `log::append_in_tx` locks the document
-row before allocating sequence numbers and hashes canonical, length-framed semantic
+row with NO KEY UPDATE before allocating sequence numbers and hashes canonical, length-framed semantic
 content and actor identity. Genesis uses a zero predecessor hash.
 
 `Materializer` folds operations into stable-ID state, including tombstones.
@@ -80,7 +80,7 @@ not just target IDs. Unique-name and crossed-move regressions document concrete
 counterexamples. The engine does not yet infer a general cross-format dependency
 footprint or prove automatic convergence of arbitrary native editor operations.
 
-## Shared checkpoint boundary (parts 2a-2c)
+## Shared checkpoint boundary (parts 2a-2d)
 
 Core stores require document scope and caller authorization. Object hashes are
 content integrity addresses, not permissions or actor attestations. PostgreSQL
@@ -106,8 +106,12 @@ The writer scans all state, buffering at most 64 objects / 1 MiB of encoded byte
 plus the current object being encoded and driver/input state. PgStore validates
 input and checks exact stored bytes in bounded SQL joins returning booleans; one
 INSERT stores missing objects, and raced conflicts are checked again. Unchanged
-batches issue no INSERT. The document KEY SHARE lock still blocks FOR UPDATE
-appends through publication. Short staged publication remains separate work.
+batches issue no INSERT. The document KEY SHARE erasure guard is compatible with
+core/API NO KEY UPDATE content transactions. Those writers still serialize and
+recheck access/state after locking; checkpoint reconstruction pins an immutable
+revision and ignores later appends. Stronger management/erasure locks remain, and
+queued strong operations can still delay writes. Publication remains fully atomic;
+no staged object protocol is introduced. See [the lock audit](CHECKPOINT-CONCURRENCY.md).
 
 Breadth-first index traversal and values use batches of at most 16 addresses with
 full hash/type/route/subtree validation and byte/object budgets. Traversal queues
