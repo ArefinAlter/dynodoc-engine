@@ -16,6 +16,5 @@ replica convergence, signed/witnessed provenance and large-file/service capacity
 are planned, not implemented. Native hosts/adapters and web review UI live in the
 application. See CAPABILITIES for existing API boundaries.
 
-Synchronized from application `667ecb6`. Local task lint, all 204 tests, task docs
-and unchanged generated OpenAPI passed. The handoff records publication/remote CI
-separately. No VPS deployment is part of this increment.
+Engine implementation `647249e` is pushed to main, synchronized from application `667ecb6`. Local task lint, all 204 tests, task docs
+and unchanged generated OpenAPI passed. Independent CI also passed for implementation `647249e`; the handoff links its evidence. No VPS deployment is part of this increment.

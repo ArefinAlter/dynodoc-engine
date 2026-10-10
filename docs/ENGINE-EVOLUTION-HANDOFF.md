@@ -1,6 +1,6 @@
 # Engine evolution handoff
 
-Updated 10 October 2026. Part 1: checkpoint-aware streamed historical reads, streaming
+Updated 10 October 2026. **Part 1 complete and published.** Scope: checkpoint-aware streamed historical reads, streaming
 verification, mathematical/product contract correction and replay regression coverage.
 Read PRODUCT-SPEC, ENGINE-EVOLUTION-PLAN and PROJECT-STATUS before continuing.
 Starting engine commit: `67060cf`; starting application commit: `f054ad1`.
@@ -33,8 +33,11 @@ rich-text fixture location remain intact.
   274 frontend unit tests, Clippy, ESLint and complete Svelte/type check passed.
 
 The disposable test container and volumes have been removed. No VPS deployment,
-real native-host acceptance or marketplace publication is claimed. Publication
-commit IDs and remote CI results will be recorded after pushing this increment.
+real native-host acceptance or marketplace publication is claimed. Implementation is pushed to main at `647249e7ed692534f7ab21a1ad522912c7d58385`;
+application source is `667ecb6ecef5b64debcca6817e73b6be807bde37`.
+[Independent CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38038142218)
+passed for implementation `647249e`: formatting, Clippy, build, all tests, docs
+and OpenAPI consistency. Subsequent documentation commits do not change those source files.
 
 ## Next concrete task
 
