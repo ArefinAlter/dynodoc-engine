@@ -1,5 +1,21 @@
 # Current engine capabilities
 
+## Evolution part 2b - 10 October 2026
+
+Normal history/current reads and authorized API writes now use the nearest shared
+or legacy checkpoint and a streamed tail. Shared wins ties and corrupt selected
+graphs fail explicitly. The periodic shared writer is gated off by default; codec
+capacity failures roll back partial objects and retain a legacy checkpoint at the
+same revision. Duplicate jobs skip work and both checkpoint formats count toward
+cadence. PostgreSQL value reads use bounded batches with full validation.
+
+Named versions, deployed pins, audit snapshot IDs and draft/merge bases remain full
+JSON. Shared publication scans all state, writes objects individually and blocks
+FOR UPDATE appends during its transaction. Rollout, large-value chunks, versioned
+draft references and local commit exchange are still open. See
+[the storage contract/measurements](SHARED-CHECKPOINTS.md) and
+[handoff](ENGINE-EVOLUTION-HANDOFF.md). Earlier entries below describe their slices.
+
 ## Evolution part 2a - 10 October 2026
 
 Opt-in shared checkpoints now reuse unchanged document objects. The versioned

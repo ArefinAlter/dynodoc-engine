@@ -1,6 +1,6 @@
 # Engine and product evolution plan
 
-10 October 2026. Implements [decision 012](https://github.com/ArefinAlter/dynodoc/blob/main/docs/decisions/012-local-first-document-version-control.md)
+10 October 2026. Implements [decision 012](decisions/012-local-first-document-version-control.md)
 and [the product specification](PRODUCT-SPEC.md). Status is in
 [ENGINE-EVOLUTION-HANDOFF](ENGINE-EVOLUTION-HANDOFF.md). Dependencies below replace
 the old questionnaire/civic stage order for this work.
@@ -30,6 +30,17 @@ transactional verified publication, legacy equivalence and audited erasure. The
 operator CLI opts in explicitly. Default snapshots and draft/version bases still
 use full JSON; portable commit manifests, large text/assets, durable local storage
 and backend/load acceptance remain open. Part 2 is therefore still in progress.
+
+## Part 2b implementation boundary
+
+Normal current/history and API write materialization now select mixed checkpoints.
+The periodic shared writer is explicit opt-in; default legacy remains reversible.
+Capacity fallback is transactional; corrupt shared data fails closed. PostgreSQL
+value reads are bounded batches. Named/deployed versions and draft bases stay
+legacy JSON. Database measurements must gate writer rollout: publication still
+scans full state, performs per-object writes and blocks document FOR UPDATE appends.
+Next reduce that publication cost/lock window, add large-value chunks, then migrate
+version/draft references before exposing local commits/exchange. Part 2 stays open.
 
 ## Part 2 design gate and first implementation slice
 

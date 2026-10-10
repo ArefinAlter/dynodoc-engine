@@ -7,8 +7,9 @@ content and actor identity. Genesis uses a zero predecessor hash.
 
 `Materializer` folds operations into stable-ID state, including tombstones.
 `SnapshotEngine` stores replay checkpoints and an ordered node Merkle commitment.
-Default snapshots contain full JSONB states. The opt-in `shared_checkpoint` module
-stores versioned object bytes and stable-key radix maps alongside them; see
+Periodic writes default to full JSONB, with an opt-in shared writer. Normal reads
+select the nearest legacy/shared checkpoint, preferring shared on ties. The
+`shared_checkpoint` module stores versioned objects and stable-key radix maps; see
 [its format and limits](SHARED-CHECKPOINTS.md). No legacy state/event is rewritten.
 Restoration appends operations; it never resets the chain.
 
@@ -86,8 +87,24 @@ content integrity addresses, not permissions or actor attestations. PostgreSQL
 publication protects the document from erasure, derives an exact historical state,
 stores/validates its reachable object graph and compares reconstruction before
 inserting the immutable sequence/root/chain manifest in the same transaction.
-Same-revision publication is idempotent. Default historical replay remains legacy;
-a separate exact shared-checkpoint load validates graph and chain-position metadata.
+Same-revision publication is idempotent. Part 2b normal current/history readers and
+API write materialization select mixed checkpoints, verify shared graphs/chain
+positions and stream only the suffix through the pinned revision. Explicit CLI
+publication retains an independent legacy/event reference. Corrupt selected shared
+data fails, even when legacy data exists. Reader support is independent of the
+automatic writer flag; named/deployed snapshots and draft/merge bases stay legacy.
+
+A per-document try-advisory lock skips duplicate periodic builders. A savepoint
+rolls back partial shared objects on codec capacity errors before a legacy fallback
+at the same sequence; other errors propagate. Background writes opt in with API
+process env DYNODOC_PERIODIC_CHECKPOINT_STORAGE=shared-v1, otherwise legacy. Both
+formats count toward cadence. Database publication still scans all state and makes
+individual INSERT/reuse checks while holding a document KEY SHARE lock. Appends
+use FOR UPDATE on that row and wait. This measured cost gates production enablement.
+PgStore batches up to 16 value addresses; all returned bytes retain ordinary
+hash/type checks and budgets. The cache holds one document-scoped batch, at most
+16 MiB of encoded values. Whole state/map residency and prior allocations remain
+outside that cache bound.
 
 Objects are at most 1 MiB, radix leaves at most 32 entries, branches at most 16 and
 paths at most 64 nibbles. Total byte/object budgets are checked. Complete state and

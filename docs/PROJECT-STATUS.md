@@ -1,5 +1,34 @@
 # Engine project status
 
+## Current increment: part 2b (10 October 2026)
+
+Normal current/history and API write readers select legacy/shared checkpoints and
+stream the suffix. Shared graphs are verified; corrupt selected data fails. The
+optional periodic shared writer reuses objects, with savepoint rollback and legacy
+fallback on capacity errors only. Duplicate builders skip work. PostgreSQL values
+use bounded batches. Named/deployed versions and draft/merge bases remain full JSON.
+Schema 25 is required; events, HTTP contracts and MIT packaging remain compatible.
+
+The writer defaults to legacy. The 8,000-block PostgreSQL spike lowered read SELECTs
+9,885 -> 2,385, but shared publication took 15.3-17.4 seconds per edit and blocks
+FOR UPDATE appends for much of the transaction. Compressed legacy snapshots used
+less disk in the repetitive six-checkpoint fixture (2.92 MB vs shared 11.26 MB).
+These figures gate rollout; canonical-byte savings alone do not justify it.
+See [measurements](SHARED-CHECKPOINTS.md) and [handoff](ENGINE-EVOLUTION-HANDOFF.md).
+
+Application's 220 tests/fmt/Clippy/OpenAPI and Rust CI passed. Standalone task lint,
+all 220 tests, task docs and unchanged OpenAPI also passed. The first standalone
+run hit the existing 100 ms SSE deadline; the full rerun passed unchanged.
+Synchronized application source: 12be6a2. Publication and browser/engine CI records
+are pending. No VPS deployment.
+
+Next: batch/incremental publication and short final locking, compression/backend
+measurement, bounded large text/assets, versioned draft references, then durable
+local commits/exchange. Offline convergence, independent provenance, complete
+native adapters and large-file/service acceptance remain separate staged work.
+
+## Previous completed increment
+
 Updated 10 October 2026. The engine serves document repositories around existing
 editors; questionnaire validation is one supported adapter. Read [the product
 contract](PRODUCT-SPEC.md), [ordered plan](ENGINE-EVOLUTION-PLAN.md),

@@ -17,11 +17,13 @@ file support. No crates.io package has been published.
 
 ## Current increment (10 October 2026)
 
-Part 2a adds opt-in [shared checkpoints](docs/SHARED-CHECKPOINTS.md): immutable
-objects, stable-key indexes, document isolation and atomic verified publication.
-The default snapshot/draft paths still store full JSON. Large text/assets, complete
-local histories/branches and offline exchange remain staged work. Part 1's streamed
-historical reader and verification remain compatible. Source/check evidence is in
+Part 2b adopts [shared checkpoints](docs/SHARED-CHECKPOINTS.md) in normal current,
+history and API write reads. Automatic shared writes are opt-in; legacy remains
+the default pending database publication/lock acceptance. Capacity failures roll
+back partial objects before a legacy fallback; corruption fails explicitly.
+PostgreSQL value reads use bounded batches. Named versions and draft bases still
+store full JSON. Large text/assets and full local history/exchange remain open.
+Source/check evidence is in
 [the handoff](docs/ENGINE-EVOLUTION-HANDOFF.md); see [current status](docs/PROJECT-STATUS.md),
 [product contract](docs/PRODUCT-SPEC.md) and [ordered plan](docs/ENGINE-EVOLUTION-PLAN.md).
 

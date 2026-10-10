@@ -1,5 +1,70 @@
 # Engine evolution handoff
 
+## Part 2b: mixed readers and gated automatic writer (10 October 2026)
+
+Implementation, database measurements and both full Rust suites are complete.
+Application source is published; standalone publication and final CI are pending. This is a slice of part 2, not product completion.
+
+- Current/history readers select the nearest legacy/shared checkpoint (shared wins
+  ties), validate shared graphs and stream only the suffix. Pinned current seq
+  remains the SSE resume boundary. API write materialization uses the same reader
+  inside existing access checks and locks. Selected corrupt shared data fails.
+- Automatic writes default to legacy. API background jobs opt in via
+  DYNODOC_PERIODIC_CHECKPOINT_STORAGE=shared-v1; core exposes PeriodicStorage.
+  Both formats count toward cadence; per-document advisory locking skips duplicate
+  builders. No-op jobs check cadence before locking, then due jobs recheck it.
+- Shared capacity errors roll back partial objects at a savepoint before legacy
+  fallback at the same seq. Other errors propagate. Named/deployed snapshots,
+  snapshot audit IDs and draft/merge bases still contain full JSON.
+- PgStore prefetches at most 16 values, scoped by document; ordinary validation and
+  budgets remain. Latest-batch cache has a 16 MiB encoded-byte maximum, not a whole
+  request memory bound. Index entries/state still reside in memory.
+- Explicit operator publication still derives from legacy/event reconstruction,
+  independent of shared roots. No new schema/event/HTTP format; schema 25 required.
+- Publication holds KEY SHARE on the document, which blocks the API's FOR UPDATE
+  appends, and still scans/writes individual objects. Keep writer default off until
+  measured publication latency and concurrent acceptance improve.
+
+Verification: all 220 application Rust tests, fmt/Clippy and unchanged OpenAPI
+passed. Targeted tests cover every revision, mixed nearest/tie/scope selection,
+resume seq, duplicate builders, cadence/rollback, oversized-value partial rollback,
+batched duplicates/budgets/scope and corruption. Existing API workflows now run from
+shared state for stale edits and version/draft/restore compatibility. Standalone
+task lint, all 220 tests and task docs passed (existing Rustdoc link warnings).
+Its first full run hit the existing 100 ms SSE deadline once; the full rerun passed
+without changing the test. That timing check is not a production latency guarantee.
+Standalone generated OpenAPI is unchanged, including MIT metadata. Both copies of
+all seven changed Rust files and all 22 immutable migrations match exactly.
+Final counterpart/CI publication records are pending.
+
+PostgreSQL spike: 8,000 blocks / six checkpoints, all reconstruction/chain checks
+passed. Batching lowers graph object SELECTs 9,885 -> 2,385 and median read
+6,425 -> 1,831 ms; direct legacy JSONB read is 117 ms. Shared edit publication
+15.3-17.4 seconds blocks appends for much of that transaction. Shared relations
+11.26 MB versus compressed legacy snapshots 2.92 MB on this repetitive fixture,
+despite fewer canonical bytes and edit WAL. Observed client peak 101.1 MiB.
+No production gate passes from these figures; see the raw artifact and limitations
+in SHARED-CHECKPOINTS.md. Prior in-memory ratios are not database disk ratios.
+
+Next: optimize/batch publication and shorten its append-blocking transaction;
+bounded text/asset chunks; versioned draft/named references; cross-language codec
+and parent/root/actor commit envelope; durable local history and resumable exchange.
+Offline convergence, independent signatures/witnesses and native/scale acceptance
+remain separate gates. The basic web editor is not the product priority.
+
+Temporary DB: owned dynodoc-evolution-part2b-20261010 on 127.0.0.1:5553, label
+dynodoc.evolution=part2b-20261010. Remove it and its disposable volume after checks.
+No API/web server or VPS deployment in this increment. Production remains last
+recorded 8c7461d, schema 24. Starting app 0718ee6; standalone a70647d.
+
+Publication:
+- Application source: `12be6a2d5444b7044b06749ca9d2b3fafea815ec`.
+- [Application Rust CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38043426193): passed.
+- [Application frontend/browser CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38043426145): running.
+- Standalone source/CI: pending.
+
+## Previous completed increment
+
 Updated 10 October 2026. **Part 2a complete, published and CI-verified. Part 2 remains in progress.** Part 1 remains published. Read [PRODUCT-SPEC](PRODUCT-SPEC.md),
 [ENGINE-EVOLUTION-PLAN](ENGINE-EVOLUTION-PLAN.md) and
 [SHARED-CHECKPOINTS](SHARED-CHECKPOINTS.md) before continuing.
@@ -77,9 +142,11 @@ for changed Rust sources/tests/examples and migration 0025, while preserving eng
 MIT metadata and its standalone rich-text fixture. Published implementation:
 
 - Application: `7a8e28ed1bfdf5828deb341fdf9b533fad9f5469`.
-- Standalone engine: `6ccdc2277b187491eabbfa089a416bcdbcdaddac`.
+- Standalone engine: `6ccdc2277b187491eabbfa089a416bcdbcdaddac`; final handoff and
+  LF-checkout guard: `a70647d553be610f41c005d87ce6de26aeb955dd`.
 - [Application Rust CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38040472956): passed.
 - [Independent engine CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38040495733): passed.
+- [Final engine checkout-guard/handoff CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38041109485): passed at `a70647d`.
 - [Frontend/authenticated browser CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38040472960): passed (62 signed-in and 16 public browser tests, frontend units and the production-proxy regression).
 
 A final portability check found old Windows engine migration checkouts had CRLF
