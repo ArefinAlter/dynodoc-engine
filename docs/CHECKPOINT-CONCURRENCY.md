@@ -64,7 +64,7 @@ hash/codec and snapshot compatibility suites remain required.
 
 Both repositories pass fmt/Clippy, all 226 Rust tests and unchanged OpenAPI.
 Standalone documentation passes with existing Rustdoc link warnings. Source/browser
-CI is pending; current publication results belong in
+CI passed; verified runs and source commits are recorded in
 [the handoff](ENGINE-EVOLUTION-HANDOFF.md).
 
 ## Measurement contract

@@ -16,8 +16,10 @@ full API validation/materialization and native-host processing. See
 [the lock audit, tests and measurements](CHECKPOINT-CONCURRENCY.md).
 
 Both repositories pass fmt/Clippy, all 226 Rust tests and unchanged OpenAPI;
-standalone docs pass with existing link warnings. Application source is c19dbda;
-standalone publication and source/browser CI are pending. Exact continuation steps
+standalone docs pass with existing link warnings. Application source c19dbda and
+engine source cc12b29 are pushed to main. Both source CI runs passed, including
+274 frontend unit tests, 16 public browser tests and 62 signed-in workflows. The
+disposable database/volume is removed. Exact continuation steps
 are in [the handoff](ENGINE-EVOLUTION-HANDOFF.md). No VPS deployment.
 
 Next: versioned bounded text/asset chunks, compressed packing and incremental
