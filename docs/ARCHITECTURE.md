@@ -1,5 +1,14 @@
 # Architecture
 
+## Project policy and metadata authority - 11 October 2026
+
+The API combines file rules with project minimums and reserves project review
+bypasses/settings/moves for project management. Metadata uses bounded supported
+settings patches and atomic before/after digest audit. Existing schema 29,
+events and hashes are unchanged. See [the contract](PROJECT-POLICY-AND-METADATA.md)
+and [verification/handoff](ENGINE-EVOLUTION-HANDOFF.md). Final verification is
+in progress; this source update is not a VPS release.
+
 ## Restricted database runtime - 11 October 2026
 
 Schema 0029 and `engine_core::database` provide separate migrate/provision CLI
@@ -51,7 +60,9 @@ access before displaying them. Similarity does not establish authenticated origi
 with per-document rules. `reviews` handles submitted drafts, approvals/comments
 and permission-checked merges; `notifications` stores per-recipient operational
 notices. Migrations `0020`/`0021` extend these adapters without new content events.
-Projects now inherit review defaults through their containing root; file overrides win. Multi-file branches/releases remain future work.
+Projects enforce minimum review rules through their containing root; file rules may
+only strengthen them. File ownership does not grant project review authority.
+Multi-file branches/releases remain future work.
 
 
 Projects/provenance increment: project settings/member changes serialize with

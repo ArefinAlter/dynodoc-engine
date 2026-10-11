@@ -1,5 +1,14 @@
 # Current engine capabilities
 
+## Project policy and metadata authority - 11 October 2026
+
+The API combines file rules with project minimums and reserves project review
+bypasses/settings/moves for project management. Metadata uses bounded supported
+settings patches and atomic before/after digest audit. Existing schema 29,
+events and hashes are unchanged. See [the contract](PROJECT-POLICY-AND-METADATA.md)
+and [verification/handoff](ENGINE-EVOLUTION-HANDOFF.md). Final verification is
+in progress; this source update is not a VPS release.
+
 ## Restricted database runtime - 11 October 2026
 
 Schema 0029 and `engine_core::database` provide separate migrate/provision CLI
@@ -150,7 +159,7 @@ executable service behaviour, not a production rollout or complete product.
 | Rich content | Checked compact wording/formatting patches, three-way merge and explicit overlaps. | No complete Office file runtime or automatic convergence. |
 | Drafts/review | Private append-only drafts, selected sharing, historical/named versions, requests, approvals/comments, strict unrelated-content choices and permission-checked merge/decline/withdraw. | Other people's unsubmitted drafts remain private, including from project managers. |
 | Projects | Invite-only roots, folders, creation/listing, aggregate files/requests/own drafts, members, revision-checked settings and submission Watch. | Web navigation/import/download UI lives in Dynodoc; Compare/Activity and multi-file releases remain open. |
-| Roles/rules | Owner/Manager/Editor/Reviewer/Contributor/Viewer, direct/inherited access, file overrides, inherited project review defaults and protection/approval/merge restrictions. | Core still uses Author/Reviewer/Auditor; membership/rules are operational metadata. |
+| Roles/rules | Owner/Manager/Editor/Reviewer/Contributor/Viewer, direct/inherited access, project minimum review rules, stronger file rules and project authority for review overrides, metadata and moves. | Core still uses Author/Reviewer/Auditor; membership/rules are operational metadata. |
 | Provenance | Version-1 portable bundles, exact base-sequence/hash check, permission-checked historical checkpoints, atomic content-only proposal, immutable normalized envelope/digest and durable same-actor retry receipt. Retrieval preserves private-draft permissions. | Uploader/reception are server facts; host/local-time/origin descriptions are client claims, not human/AI authorship proof or external timestamping. |
 | Editor credentials | Hashed seven-day revocable file/host-scoped read/propose keys for Word/Docs, Excel/Sheets and PowerPoint/Slides; file-kind validation on creation; current membership, account/session generation and expiry rechecked. | No merge/access-management permissions, no OAuth pairing or complete offline replica. Native clients remain development code in the application. |
 | Copies | Deterministic fingerprints, MinHash/LSH detection, containment/relatedness, owner actions and permission-filtered results. | Filename/content matching suggests relationships, not authenticated authorship. |

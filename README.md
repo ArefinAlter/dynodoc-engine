@@ -1,5 +1,14 @@
 # Dynodoc Engine
 
+## Project policy and metadata authority - 11 October 2026
+
+The API combines file rules with project minimums and reserves project review
+bypasses/settings/moves for project management. Metadata uses bounded supported
+settings patches and atomic before/after digest audit. Existing schema 29,
+events and hashes are unchanged. See [the contract](docs/PROJECT-POLICY-AND-METADATA.md)
+and [verification/handoff](docs/ENGINE-EVOLUTION-HANDOFF.md). Final verification is
+in progress; this source update is not a VPS release.
+
 [![CI](https://github.com/ArefinAlter/dynodoc-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/ArefinAlter/dynodoc-engine/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -15,7 +24,7 @@ credentials, user files or production database. It is an early 0.1 source releas
 not a claim of Git protocol compatibility, offline convergence or complete Office
 file support. No crates.io package has been published.
 
-## Current increment: restricted database runtime (11 October 2026)
+## Previous increment: restricted database runtime (11 October 2026)
 
 Schema 0029 separates operator migrations from API credentials. Startup checks the
 schema and a dedicated restricted login; it never applies migrations. Immutable
@@ -48,8 +57,8 @@ revocation enforcement or deliberate credential invalidation.
 
 See [the security findings and open gates](docs/SECURITY-HARDENING.md) and
 [handoff](docs/ENGINE-EVOLUTION-HANDOFF.md). Snapshot/runtime-role rollout acceptance,
-project policy authority, independent audit
-commitments and the remaining repository/offline/storage work are not completed.
+independent audit commitments and the remaining repository/offline/storage work
+are not completed. Project-policy source acceptance is tracked in the current handoff.
 Final validation references are recorded in the handoff. This is not a deployment.
 
 ## Previous increment: bounded checkpoint encoding (10 October 2026)
