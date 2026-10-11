@@ -1,5 +1,13 @@
 # Dynodoc Engine
 
+## In progress: bounded API workloads and hosted rollout (11 October 2026)
+
+Process-local response admission, identity/project expensive-read budgets and SQL
+statement deadlines are implemented and under verification. The hosted application
+adds scoped CSP/HSTS. Schema stays 29 and event formats are unchanged. A production
+copy is being upgraded in an isolated VPS rehearsal; live activation is still pending.
+See docs/ENGINE-EVOLUTION-HANDOFF.md and docs/BROWSER-AND-WORKLOAD-SECURITY.md.
+
 ## Project policy and metadata authority - 11 October 2026
 
 The API combines file rules with project minimums and reserves project review
