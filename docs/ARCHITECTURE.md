@@ -1,12 +1,17 @@
 # Architecture
 
-## In progress: bounded API workloads and hosted rollout (11 October 2026)
+## Verified: bounded API workloads and hosted release (11 October 2026)
 
-Process-local response admission, identity/project expensive-read budgets and SQL
-statement deadlines are implemented and under verification. The hosted application
-adds scoped CSP/HSTS. Schema stays 29 and event formats are unchanged. A production
-copy is being upgraded in an isolated VPS rehearsal; live activation is still pending.
-See docs/ENGINE-EVOLUTION-HANDOFF.md and docs/BROWSER-AND-WORKLOAD-SECURITY.md.
+Engine `80cd148` passes all 275 Rust tests and independent CI. Process-local
+response admission, identity/project expensive-read budgets and database deadlines
+are implemented. The hosted application `858801c` is live at schema 29 after an
+isolated backup/upgrade/compatible-rollback rehearsal. Its API uses a restricted
+database login; events and hashes are unchanged. See [release evidence](operations/2026-10-11-security-runtime-release.md)
+and [bounds/remaining work](ENGINE-EVOLUTION-HANDOFF.md).
+
+Next are bounded shared chunks and historical references, portable project-wide
+commits, durable offline convergence and independent audit commitments. Current
+workload limits do not bound full-state memory or establish large-service capacity.
 
 ## Project policy and metadata authority - 11 October 2026
 
@@ -15,9 +20,8 @@ bypasses/settings/moves for project management. Metadata uses bounded supported
 settings patches and atomic before/after digest audit. Existing schema 29,
 events and hashes are unchanged. See [the contract](PROJECT-POLICY-AND-METADATA.md)
 and [verification/handoff](ENGINE-EVOLUTION-HANDOFF.md).
-Engine lint, all 269 Rust tests, rustdoc, OpenAPI and implementation CI pass;
-full hosted-frontend evidence is tracked in the handoff. The VPS workspace/API
-are unchanged.
+Engine lint, all 269 Rust tests, rustdoc, OpenAPI and implementation CI passed.
+This records the previous source increment; the later hosted release is linked above.
 
 ## Restricted database runtime - 11 October 2026
 

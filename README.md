@@ -1,12 +1,17 @@
 # Dynodoc Engine
 
-## In progress: bounded API workloads and hosted rollout (11 October 2026)
+## Verified: bounded API workloads and hosted release (11 October 2026)
 
-Process-local response admission, identity/project expensive-read budgets and SQL
-statement deadlines are implemented and under verification. The hosted application
-adds scoped CSP/HSTS. Schema stays 29 and event formats are unchanged. A production
-copy is being upgraded in an isolated VPS rehearsal; live activation is still pending.
-See docs/ENGINE-EVOLUTION-HANDOFF.md and docs/BROWSER-AND-WORKLOAD-SECURITY.md.
+Engine `80cd148` passes all 275 Rust tests and independent CI. Process-local
+response admission, identity/project expensive-read budgets and database deadlines
+are implemented. The hosted application `858801c` is live at schema 29 after an
+isolated backup/upgrade/compatible-rollback rehearsal. Its API uses a restricted
+database login; events and hashes are unchanged. See [release evidence](docs/operations/2026-10-11-security-runtime-release.md)
+and [bounds/remaining work](docs/ENGINE-EVOLUTION-HANDOFF.md).
+
+Next are bounded shared chunks and historical references, portable project-wide
+commits, durable offline convergence and independent audit commitments. Current
+workload limits do not bound full-state memory or establish large-service capacity.
 
 ## Project policy and metadata authority - 11 October 2026
 
@@ -15,9 +20,8 @@ bypasses/settings/moves for project management. Metadata uses bounded supported
 settings patches and atomic before/after digest audit. Existing schema 29,
 events and hashes are unchanged. See [the contract](docs/PROJECT-POLICY-AND-METADATA.md)
 and [verification/handoff](docs/ENGINE-EVOLUTION-HANDOFF.md).
-Engine lint, all 269 Rust tests, rustdoc, OpenAPI and implementation CI pass;
-full hosted-frontend evidence is tracked in the handoff. The VPS workspace/API
-are unchanged.
+Engine lint, all 269 Rust tests, rustdoc, OpenAPI and implementation CI passed.
+This records the previous source increment; the later hosted release is linked above.
 
 [![CI](https://github.com/ArefinAlter/dynodoc-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/ArefinAlter/dynodoc-engine/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -51,8 +55,8 @@ are reconstructed canonically. Existing databases require explicit verified back
 before reopening traffic. See [the snapshot contract](docs/VERIFIED-SNAPSHOTS.md)
 and [validation/remaining work](docs/ENGINE-EVOLUTION-HANDOFF.md).
 
-Runtime database privilege separation is implemented in current source; deployment
-acceptance remains open. Receipts are internal attestations,
+Runtime database privilege separation and hosted deployment acceptance pass.
+Receipts remain internal attestations,
 not signatures or external witnesses. Portable project histories, shared chunks,
 offline convergence and installed-editor acceptance remain open.
 
@@ -66,10 +70,9 @@ that login. An old API build must not be used as rollback without compatible
 revocation enforcement or deliberate credential invalidation.
 
 See [the security findings and open gates](docs/SECURITY-HARDENING.md) and
-[handoff](docs/ENGINE-EVOLUTION-HANDOFF.md). Snapshot/runtime-role rollout acceptance,
-independent audit commitments and the remaining repository/offline/storage work
-are not completed. Project-policy source acceptance is tracked in the current handoff.
-Final validation references are recorded in the handoff. This is not a deployment.
+[handoff](docs/ENGINE-EVOLUTION-HANDOFF.md). Snapshot/runtime-role and project-policy
+rollout acceptance passed in the later release above. Independent audit commitments
+and the remaining repository/offline/storage work are incomplete.
 
 ## Previous increment: bounded checkpoint encoding (10 October 2026)
 
