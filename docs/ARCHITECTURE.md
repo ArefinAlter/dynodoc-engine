@@ -6,8 +6,10 @@ The API combines file rules with project minimums and reserves project review
 bypasses/settings/moves for project management. Metadata uses bounded supported
 settings patches and atomic before/after digest audit. Existing schema 29,
 events and hashes are unchanged. See [the contract](PROJECT-POLICY-AND-METADATA.md)
-and [verification/handoff](ENGINE-EVOLUTION-HANDOFF.md). Final verification is
-in progress; this source update is not a VPS release.
+and [verification/handoff](ENGINE-EVOLUTION-HANDOFF.md).
+Engine lint, all 269 Rust tests, rustdoc, OpenAPI and implementation CI pass;
+full hosted-frontend evidence is tracked in the handoff. The VPS workspace/API
+are unchanged.
 
 ## Restricted database runtime - 11 October 2026
 
