@@ -1,5 +1,21 @@
 # Dynodoc Engine
 
+## Source: streaming byte-content storage (12 October 2026)
+
+Engine `746d373` (application `3462520`) adds document-scoped 64 KiB content chunks,
+bounded reference trees and streaming I/O with explicit object/byte budgets. Fixed
+independent hash vectors, reuse/scope, rollback and erasure regressions accompany
+the binary format. Existing v1 state/event hashes and schema 29 are preserved.
+Read [the contract and measured limits](docs/CHUNKED-CONTENT.md) and
+[verification/next work](docs/ENGINE-EVOLUTION-HANDOFF.md).
+
+This is an internal byte-storage primitive. Typed checkpoint manifests, bounded
+semantic decoding, shared draft/version references and portable project branches
+remain open; ordinary snapshots do not yet use these content roots. Production
+remains the release below, with shared periodic writes off. The application also
+provides a [local native-host test worksheet](https://github.com/ArefinAlter/dynodoc/blob/main/extensions/ACCEPTANCE.md);
+real Office/Google host acceptance remains to be run by the owner.
+
 ## Verified: bounded API workloads and hosted release (11 October 2026)
 
 Engine `80cd148` passes all 275 Rust tests and independent CI. Process-local
