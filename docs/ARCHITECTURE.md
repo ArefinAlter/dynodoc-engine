@@ -1,5 +1,20 @@
 # Architecture
 
+## Source: typed storage and portable local project history (12 October 2026)
+
+Current source adds typed v2 checkpoints and opt-in shared draft bases (schema 31),
+plus a durable SQLite local repository with signed multi-file commits, parent
+history, branch CAS, missing-object transfer, project comparison and CLI commands.
+Read [storage/reference bounds](TYPED-CHECKPOINTS.md),
+[local history and trust limits](PORTABLE-PROJECT-HISTORY.md) and
+[the complete acceptance ledger](ROADMAP-ACCEPTANCE.md).
+
+This has not been deployed to the schema-29 VPS. Remote project authorization,
+connector/UI adoption, complete offline/native convergence and independent witness
+commitments remain open. Installed Office/Google testing is the owner's local
+worksheet. Exact checks and source revisions are in the
+[handoff](ENGINE-EVOLUTION-HANDOFF.md).
+
 ## Source: streaming byte-content storage (12 October 2026)
 
 Engine `746d373` (application `3462520`) adds document-scoped 64 KiB content chunks,
