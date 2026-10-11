@@ -1,5 +1,10 @@
 # Architecture
 
+Current source also includes [signed branch receipts and a separate durable client
+trust journal](REF-RECEIPTS.md), with independent signature fixtures, proof
+continuity, authority rotation and local revocation. These are core/CLI tools;
+production issuance, device/account binding and external witnesses remain open.
+
 ## Source: typed storage and portable local project history (12 October 2026)
 
 Current source adds typed v2 checkpoints and opt-in shared draft bases (schema 31),
