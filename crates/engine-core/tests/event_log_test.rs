@@ -8,7 +8,8 @@
 //! Requires a reachable Postgres (DATABASE_URL): the dev container or CI service.
 
 use engine_core::log::{
-    append, append_in_tx, read_range, read_since_snapshot, verify_chain, EventError, ZERO_HASH,
+    append, append_in_tx, read_range, read_since_snapshot, verify_chain, verify_from, EventError,
+    ZERO_HASH,
 };
 use engine_shared::{DocumentId, EventPayload, IdentityId, NodeId};
 use serde_json::json;
@@ -187,6 +188,48 @@ async fn verify_chain_detects_payload_tampering(pool: PgPool) -> anyhow::Result<
         Err(EventError::ChainBroken { seq, .. }) => assert_eq!(seq, 2),
         other => panic!("expected ChainBroken at seq 2, got {other:?}"),
     }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_from_checks_events_after_a_trusted_position(pool: PgPool) -> anyhow::Result<()> {
+    let (actor, doc, node) = seed(&pool).await?;
+    for i in 0..6 {
+        append(
+            &pool,
+            doc,
+            &field_edit(&node, "label", &format!("v{i}")),
+            actor,
+        )
+        .await?;
+    }
+    let trusted: Vec<u8> =
+        sqlx::query_scalar("select chain_hash from event where document_id = $1 and seq = 3")
+            .bind(doc.0)
+            .fetch_one(&pool)
+            .await?;
+    verify_from(&pool, doc, 0, &ZERO_HASH).await?;
+    verify_from(&pool, doc, 3, &trusted).await?;
+
+    let broken_at = |result: Result<(), EventError>| match result {
+        Err(EventError::ChainBroken { seq, .. }) => seq,
+        other => panic!("expected ChainBroken, got {other:?}"),
+    };
+    // A position that does not match, or does not exist, must not pass silently.
+    assert_eq!(broken_at(verify_from(&pool, doc, 3, &[7u8; 32]).await), 3);
+    assert_eq!(broken_at(verify_from(&pool, doc, 99, &trusted).await), 99);
+
+    sqlx::query("alter table event disable trigger event_no_update")
+        .execute(&pool)
+        .await?;
+    sqlx::query("update event set payload = jsonb_set(payload, '{value}', '\"FORGED\"') where document_id = $1 and seq = 5")
+        .bind(doc.0)
+        .execute(&pool)
+        .await?;
+    sqlx::query("alter table event enable trigger event_no_update")
+        .execute(&pool)
+        .await?;
+    assert_eq!(broken_at(verify_from(&pool, doc, 3, &trusted).await), 5);
     Ok(())
 }
 
