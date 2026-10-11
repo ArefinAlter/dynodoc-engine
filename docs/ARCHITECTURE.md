@@ -1,63 +1,26 @@
 # Architecture
 
-Current source also includes [signed branch receipts and a separate durable client
-trust journal](REF-RECEIPTS.md), with independent signature fixtures, proof
-continuity, authority rotation and local revocation. These are core/CLI tools;
-production issuance, device/account binding and external witnesses remain open.
+## Current source — 12 October 2026
 
-## Source: typed storage and portable local project history (12 October 2026)
+Schema 32 supports [typed chunked state](TYPED-CHECKPOINTS.md) and shared roots for
+[draft/rebase bases](SHARED-DRAFT-BASES.md) and [named/deployed/public snapshots](SHARED-NAMED-SNAPSHOTS.md).
+Publication verifies reconstruction and the exact event revision; mixed readers
+retain legacy compatibility. Writers remain opt-in. Full-state scans, resident
+materialization, physical packing and incremental publication remain limitations.
 
-Current source adds typed v2 checkpoints and opt-in shared draft bases (schema 31),
-plus a durable SQLite local repository with signed multi-file commits, parent
-history, branch CAS, missing-object transfer, project comparison and CLI commands.
-Read [storage/reference bounds](TYPED-CHECKPOINTS.md),
-[local history and trust limits](PORTABLE-PROJECT-HISTORY.md) and
-[the complete acceptance ledger](ROADMAP-ACCEPTANCE.md).
+[Portable local history](PORTABLE-PROJECT-HISTORY.md) adds a separate SQLite
+repository with signed multi-file commits/parents, generation-aware branch CAS,
+bounded object transfer and conservative project comparison. [Ref receipts](REF-RECEIPTS.md)
+provide an independently scoped client trust journal, contiguous proofs, dual-key
+authority rotation and durable local revocation. Signatures alone do not supply
+account permissions, production issuance or an external witness.
 
-This has not been deployed to the schema-29 VPS. Remote project authorization,
-connector/UI adoption, complete offline/native convergence and independent witness
-commitments remain open. Installed Office/Google testing is the owner's local
-worksheet. Exact checks and source revisions are in the
-[handoff](ENGINE-EVOLUTION-HANDOFF.md).
-
-## Source: streaming byte-content storage (12 October 2026)
-
-Engine `746d373` (application `3462520`) adds document-scoped 64 KiB content chunks,
-bounded reference trees and streaming I/O with explicit object/byte budgets. Fixed
-independent hash vectors, reuse/scope, rollback and erasure regressions accompany
-the binary format. Existing v1 state/event hashes and schema 29 are preserved.
-Read [the contract and measured limits](CHUNKED-CONTENT.md) and
-[verification/next work](ENGINE-EVOLUTION-HANDOFF.md).
-
-This is an internal byte-storage primitive. Typed checkpoint manifests, bounded
-semantic decoding, shared draft/version references and portable project branches
-remain open; ordinary snapshots do not yet use these content roots. Production
-remains the release below, with shared periodic writes off. The application also
-provides a [local native-host test worksheet](https://github.com/ArefinAlter/dynodoc/blob/main/extensions/ACCEPTANCE.md);
-real Office/Google host acceptance remains to be run by the owner.
-
-## Verified: bounded API workloads and hosted release (11 October 2026)
-
-Engine `80cd148` passes all 275 Rust tests and independent CI. Process-local
-response admission, identity/project expensive-read budgets and database deadlines
-are implemented. The hosted application `858801c` is live at schema 29 after an
-isolated backup/upgrade/compatible-rollback rehearsal. Its API uses a restricted
-database login; events and hashes are unchanged. See [release evidence](operations/2026-10-11-security-runtime-release.md)
-and [bounds/remaining work](ENGINE-EVOLUTION-HANDOFF.md).
-
-Next are bounded shared chunks and historical references, portable project-wide
-commits, durable offline convergence and independent audit commitments. Current
-workload limits do not bound full-state memory or establish large-service capacity.
-
-## Project policy and metadata authority - 11 October 2026
-
-The API combines file rules with project minimums and reserves project review
-bypasses/settings/moves for project management. Metadata uses bounded supported
-settings patches and atomic before/after digest audit. Existing schema 29,
-events and hashes are unchanged. See [the contract](PROJECT-POLICY-AND-METADATA.md)
-and [verification/handoff](ENGINE-EVOLUTION-HANDOFF.md).
-Engine lint, all 269 Rust tests, rustdoc, OpenAPI and implementation CI passed.
-This records the previous source increment; the later hosted release is linked above.
+Hosted project-wide transport/reviews, key/account binding, complete native/offline
+convergence and realistic large/concurrent workloads remain open. Production is
+application `858801c`, schema 29. The owner runs installed-editor acceptance using
+the prepared worksheet. Consult the [acceptance ledger](ROADMAP-ACCEPTANCE.md),
+[conformance limits](VERSIONING-CONFORMANCE.md) and [verified handoff](ENGINE-EVOLUTION-HANDOFF.md).
+The dated implementation notes below retain the history of earlier increments.
 
 ## Restricted database runtime - 11 October 2026
 
@@ -112,7 +75,7 @@ and permission-checked merges; `notifications` stores per-recipient operational
 notices. Migrations `0020`/`0021` extend these adapters without new content events.
 Projects enforce minimum review rules through their containing root; file rules may
 only strengthen them. File ownership does not grant project review authority.
-Multi-file branches/releases remain future work.
+Hosted multi-file branch/release integration remains future work; local branches exist in the repository library.
 
 
 Projects/provenance increment: project settings/member changes serialize with
