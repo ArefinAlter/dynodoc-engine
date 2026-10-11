@@ -1,5 +1,11 @@
 # Standalone engine synchronization
 
+Latest test synchronization: engine PR #7 (`e31f093`, merged `d6be03a`)
+is mirrored byte-for-byte in application `648aa27`. The v1 event fixture
+and regression test do not change runtime behavior or schema. See
+[verification and handoff](ENGINE-EVOLUTION-HANDOFF.md). The runtime
+synchronization and release below remain the deployed baseline.
+
 The engine is MIT-licensed source extracted from the AGPL Dynodoc application
 with the copyright owner?s authorization. It contains core/shared, HTTP API and
 operator CLI crates and compatible migrations. It has no dependency on the
