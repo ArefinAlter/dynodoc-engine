@@ -1,27 +1,36 @@
 # Architecture
 
-## Verified: bounded API workloads and hosted release (11 October 2026)
+## Current source — 12 October 2026
 
-Engine `80cd148` passes all 275 Rust tests and independent CI. Process-local
-response admission, identity/project expensive-read budgets and database deadlines
-are implemented. The hosted application `858801c` is live at schema 29 after an
-isolated backup/upgrade/compatible-rollback rehearsal. Its API uses a restricted
-database login; events and hashes are unchanged. See [release evidence](operations/2026-10-11-security-runtime-release.md)
-and [bounds/remaining work](ENGINE-EVOLUTION-HANDOFF.md).
+[Shared project history](SHARED-PROJECT-HISTORY.md) now adds explicit
+candidate publication, reachable downloads, protected main CAS/reviews and atomic
+server-signed receipts. A public authority is operator-installed, and the matching
+secret must be explicitly mounted into the API. These sources are not deployed.
+[Selected-history CLI sync](SELECTED-HISTORY-SYNC.md) now adds reviewed
+push, verified fetch, fast-forward pull and separate pinned remote tracking.
+Project-scoped sign-in, UI/native adoption, server rotation/witnesses and full
+native convergence/large-service acceptance remain open.
 
-Next are bounded shared chunks and historical references, portable project-wide
-commits, durable offline convergence and independent audit commitments. Current
-workload limits do not bound full-state memory or establish large-service capacity.
+Current schema 36 retains [typed chunked state](TYPED-CHECKPOINTS.md) and shared roots for
+[draft/rebase bases](SHARED-DRAFT-BASES.md) and [named/deployed/public snapshots](SHARED-NAMED-SNAPSHOTS.md).
+Publication verifies reconstruction and the exact event revision; mixed readers
+retain legacy compatibility. Writers remain opt-in. Full-state scans, resident
+materialization, physical packing and incremental publication remain limitations.
 
-## Project policy and metadata authority - 11 October 2026
+[Portable local history](PORTABLE-PROJECT-HISTORY.md) adds a separate SQLite
+repository with signed multi-file commits/parents, generation-aware branch CAS,
+bounded object transfer and conservative project comparison. [Ref receipts](REF-RECEIPTS.md)
+provide an independently scoped client trust journal, contiguous proofs, dual-key
+authority rotation and durable local revocation. Signatures alone do not supply
+account permissions, production issuance or an external witness.
 
-The API combines file rules with project minimums and reserves project review
-bypasses/settings/moves for project management. Metadata uses bounded supported
-settings patches and atomic before/after digest audit. Existing schema 29,
-events and hashes are unchanged. See [the contract](PROJECT-POLICY-AND-METADATA.md)
-and [verification/handoff](ENGINE-EVOLUTION-HANDOFF.md).
-Engine lint, all 269 Rust tests, rustdoc, OpenAPI and implementation CI passed.
-This records the previous source increment; the later hosted release is linked above.
+Account-bound signing keys and [private project transfers](PRIVATE-PROJECT-TRANSFERS.md)
+now support authenticated resumable staging with durable quotas and erasure.
+Complete native/offline convergence and realistic large/concurrent workloads remain open. Production is
+application `858801c`, schema 29. The owner runs installed-editor acceptance using
+the prepared worksheet. Consult the [acceptance ledger](ROADMAP-ACCEPTANCE.md),
+[conformance limits](VERSIONING-CONFORMANCE.md) and [verified handoff](ENGINE-EVOLUTION-HANDOFF.md).
+The dated implementation notes below retain the history of earlier increments.
 
 ## Restricted database runtime - 11 October 2026
 
@@ -76,7 +85,7 @@ and permission-checked merges; `notifications` stores per-recipient operational
 notices. Migrations `0020`/`0021` extend these adapters without new content events.
 Projects enforce minimum review rules through their containing root; file rules may
 only strengthen them. File ownership does not grant project review authority.
-Multi-file branches/releases remain future work.
+Hosted multi-file branch/release integration remains future work; local branches exist in the repository library.
 
 
 Projects/provenance increment: project settings/member changes serialize with

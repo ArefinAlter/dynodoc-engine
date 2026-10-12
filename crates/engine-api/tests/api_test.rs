@@ -86,7 +86,9 @@ async fn waiting_writer_rechecks_revoked_access(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn draft_sharing_remembers_exclusions_until_explicitly_included(pool: PgPool) {
-    let router = app(test_state(pool.clone()));
+    let mut shared_state = test_state(pool.clone());
+    shared_state.shared_draft_bases = true;
+    let router = app(shared_state);
     let owner = bearer(seed_identity(&pool, "selection@example.test").await);
     let doc = create_document(&router, &owner, "Selections").await;
     let root = ulid::Ulid::new().to_string();
@@ -163,6 +165,136 @@ async fn draft_sharing_remembers_exclusions_until_explicitly_included(pool: PgPo
     )
     .await;
     assert_eq!(verification["ok"], true);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn shared_draft_bases_reuse_content_preserve_responses_and_enforce_scope(pool: PgPool) {
+    let mut state = test_state(pool.clone());
+    state.shared_draft_bases = true;
+    let router = app(state);
+    let actor = seed_identity(&pool, "shared-drafts@example.test").await;
+    let owner = bearer(actor);
+    let document = create_document(&router, &owner, "Shared drafts").await;
+    let (_, created) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{document}/ops/node-create"),
+            &owner,
+            &json!({"node_type":"form","pos":"a0","fields":{"label":"Original"}}),
+        ),
+    )
+    .await;
+    let node = created["event"]["target_node_id"].as_str().unwrap();
+    let (_, first) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{document}/drafts"),
+            &owner,
+            &json!({"name":"First"}),
+        ),
+    )
+    .await;
+    let before: i64 =
+        sqlx::query_scalar("select count(*) from checkpoint_object where document_id=$1")
+            .bind(document)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (_, second) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{document}/drafts"),
+            &owner,
+            &json!({"name":"Second"}),
+        ),
+    )
+    .await;
+    let after: i64 =
+        sqlx::query_scalar("select count(*) from checkpoint_object where document_id=$1")
+            .bind(document)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after);
+    assert!(before > 0);
+    let bases: Vec<Value> =
+        sqlx::query_scalar("select base_state from workspace_draft where document_id=$1")
+            .bind(document)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(bases.len(), 2);
+    assert_eq!(bases[0], bases[1]);
+    assert_eq!(bases[0]["$dynodoc_state"], 2);
+    assert!(bases[0].to_string().len() < 120);
+    let uri = format!(
+        "/documents/{document}/drafts/{}",
+        first["id"].as_str().unwrap()
+    );
+    let (status, read) = send(&router, auth_post_get(&uri, &owner)).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(
+        read["draft"]["base_state"]["nodes"][node]["current_fields"]["label"],
+        "Original"
+    );
+    assert!(read["draft"]["base_state"].get("$dynodoc_state").is_none());
+    let (status,edited)=send(&router,auth_post(&uri,&owner,&json!({"revision":0,"ops":[{"type":"FieldEdited","node_id":node,"field":"label","value":"Draft"}]}))).await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    let sync = format!("{uri}/sync");
+    let (_, preview) = send(
+        &router,
+        auth_post(&sync, &owner, &json!({"action":"preview"})),
+    )
+    .await;
+    let (status, merged) = send(
+        &router,
+        auth_post(
+            &sync,
+            &owner,
+            &json!({"action":"share","team_seq":preview["team_seq"],"revision":1}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+    let merge_base: Value =
+        sqlx::query_scalar("select merge_base_state from workspace_draft where id=$1")
+            .bind(Uuid::parse_str(first["id"].as_str().unwrap()).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(merge_base["$dynodoc_state"], 2);
+    assert_ne!(merge_base, bases[0]);
+    let (status, read) = send(&router, auth_post_get(&uri, &owner)).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(
+        read["draft"]["merge_base_state"]["nodes"][node]["current_fields"]["label"],
+        "Draft"
+    );
+    // Initial bases cannot be changed by application-level UPDATE, in either codec.
+    assert!(
+        sqlx::query("update workspace_draft set base_state='{}' where document_id=$1")
+            .bind(document)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let other = create_document(&router, &owner, "Another document").await;
+    assert!(sqlx::query("insert into workspace_draft(document_id,name,base_seq,base_state,created_by) values($1,'Cross scope',0,$2,$3)")
+        .bind(other).bind(&bases[0]).bind(actor).execute(&pool).await.is_err());
+    let stranger = bearer(seed_identity(&pool, "stranger-shared@example.test").await);
+    assert_eq!(
+        send(&router, auth_post_get(&uri, &stranger)).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let second_uri = format!(
+        "/documents/{document}/drafts/{}",
+        second["id"].as_str().unwrap()
+    );
+    let (_, unchanged) = send(&router, auth_post_get(&second_uri, &owner)).await;
+    assert_eq!(
+        unchanged["state"]["nodes"][node]["current_fields"]["label"],
+        "Original"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -327,6 +459,8 @@ async fn admin_erasure_removes_whole_document_but_cannot_bypass_history_guards(p
     let owner_id = seed_identity(&pool, "erase-owner@example.test").await;
     let mut state = test_state(pool.clone());
     state.admin_emails = "erase-admin@example.test".into();
+    state.shared_draft_bases = true;
+    state.named_snapshot_storage = engine_core::snapshot::NamedStorage::SharedV2;
     let router = app(state);
     let admin = bearer(admin_id);
     let owner = bearer(owner_id);
@@ -546,6 +680,8 @@ async fn admin_account_erasure_preserves_shared_chain_and_clears_private_drafts(
     let receiver = seed_identity(&pool, "receiver@example.test").await;
     let mut state = test_state(pool.clone());
     state.admin_emails = "admin-erasure@example.test".into();
+    state.shared_draft_bases = true;
+    state.named_snapshot_storage = engine_core::snapshot::NamedStorage::SharedV2;
     let router = app(state);
     let admin = bearer(admin_id);
     let user = bearer(user_id);
@@ -1671,7 +1807,9 @@ async fn concurrent_acceptance_only_applies_once(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn batch_rolls_back_and_deploy_pins_its_exact_state(pool: PgPool) {
-    let router = app(test_state(pool.clone()));
+    let mut state = test_state(pool.clone());
+    state.named_snapshot_storage = engine_core::snapshot::NamedStorage::SharedV2;
+    let router = app(state);
     let owner = seed_identity(&pool, "owner@example.test").await;
     let token = bearer(owner);
     let doc = create_document(&router, &token, "Study").await;
@@ -1794,7 +1932,9 @@ async fn ten_researchers_merge_independent_cells_without_loss(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn personal_draft_conflicts_are_reviewed_and_old_versions_restore_stable_ids(pool: PgPool) {
-    let router = app(test_state(pool.clone()));
+    let mut state = test_state(pool.clone());
+    state.named_snapshot_storage = engine_core::snapshot::NamedStorage::SharedV2;
+    let router = app(state);
     let owner = seed_identity(&pool, "owner@draft.test").await;
     let token = bearer(owner);
     let doc = create_document(&router, &token, "Draft test").await;
@@ -2243,7 +2383,9 @@ async fn office_review_is_private_and_unresolved_changes_cannot_be_published(poo
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn product_public_copy_is_frozen_private_and_revocable(pool: PgPool) {
-    let router = app(test_state(pool.clone()));
+    let mut state = test_state(pool.clone());
+    state.named_snapshot_storage = engine_core::snapshot::NamedStorage::SharedV2;
+    let router = app(state);
     let owner = bearer(seed_identity(&pool, "publisher@example.org").await);
     let doc = create_document(&router, &owner, "Published protocol").await;
     let root = "01J00000000000000000000000";
@@ -2463,7 +2605,21 @@ async fn product_admin_removal_invalidates_existing_tokens_after_restoration(poo
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn corrupt_historical_snapshot_cannot_escape_through_public_restore_or_audit(pool: PgPool) {
-    let router = app(test_state(pool.clone()));
+    corrupt_snapshot_boundaries(pool, false).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn corrupt_shared_snapshot_cannot_escape_through_public_restore_or_audit(pool: PgPool) {
+    corrupt_snapshot_boundaries(pool, true).await;
+}
+
+async fn corrupt_snapshot_boundaries(pool: PgPool, shared: bool) {
+    let mut state = test_state(pool.clone());
+    if shared {
+        state.named_snapshot_storage = engine_core::snapshot::NamedStorage::SharedV2;
+    }
+    let storage = state.named_snapshot_storage;
+    let router = app(state);
     let owner = bearer(seed_identity(&pool, "snapshot-owner@example.test").await);
     let outsider = bearer(seed_identity(&pool, "snapshot-outsider@example.test").await);
     let doc = create_document(&router, &owner, "Verified history").await;
@@ -2512,6 +2668,7 @@ async fn corrupt_historical_snapshot_cannot_escape_through_public_restore_or_aud
         &json!({"base_seq":2,"ops":[{"type":"FieldEdited","node_id":node,"field":"label","value":"Current"}]}))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     engine_core::snapshot::SnapshotEngine::new(pool.clone())
+        .with_named_storage(storage)
         .take(
             DocumentId(doc),
             engine_core::snapshot::SnapshotReason::Periodic,
@@ -2522,8 +2679,19 @@ async fn corrupt_historical_snapshot_cannot_escape_through_public_restore_or_aud
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("update snapshot set state=jsonb_set(state,'{comments}','[{\"node_id\":null,\"body\":\"forged\"}]') where id=$1")
+    let raw: Value = sqlx::query_scalar("select state from snapshot where id=$1")
+        .bind(deployed)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(raw.get("$dynodoc_state").is_some(), shared);
+    if shared {
+        sqlx::query("update snapshot set state=(select state from snapshot where document_id=$2 and through_seq=3) where id=$1")
+            .bind(deployed).bind(doc).execute(&pool).await.unwrap();
+    } else {
+        sqlx::query("update snapshot set state=jsonb_set(state,'{comments}','[{\"node_id\":null,\"body\":\"forged\"}]') where id=$1")
         .bind(deployed).execute(&pool).await.unwrap();
+    }
     sqlx::query("alter table snapshot enable trigger snapshot_no_update")
         .execute(&pool)
         .await

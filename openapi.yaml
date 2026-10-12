@@ -293,6 +293,121 @@ paths:
           description: The owner or a manager of the original document
       security:
       - paseto: []
+  /devices:
+    get:
+      tags:
+      - devices
+      operationId: list
+      responses:
+        '200':
+          description: Own public signing keys, at most 128; never a directory of other members
+          content:
+            application/json:
+              schema: {}
+        '401':
+          description: Sign in required
+      security:
+      - paseto: []
+    post:
+      tags:
+      - devices
+      operationId: register
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Enrolled device or exact active retry
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid proof
+        '401':
+          description: Sign in required
+        '403':
+          description: Wrong account
+        '409':
+          description: Challenge expired, used, key revoked or limit reached
+      security:
+      - paseto: []
+  /devices/challenge:
+    post:
+      tags:
+      - devices
+      operationId: challenge
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Five-minute account and installation bound enrollment challenge
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid key
+        '401':
+          description: Sign in required
+        '409':
+          description: Key unavailable or device limit
+        '429':
+          description: Too many enrollment attempts
+      security:
+      - paseto: []
+  /devices/verify-commit:
+    post:
+      tags:
+      - devices
+      operationId: verify_commit
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Signature matches an active key of this account; does not publish, store or authorize project changes
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid signed commit
+        '401':
+          description: Sign in required
+        '403':
+          description: Key is not active for this account
+      security:
+      - paseto: []
+  /devices/{id}/revoke:
+    post:
+      tags:
+      - devices
+      operationId: revoke
+      parameters:
+      - name: id
+        in: path
+        description: Own device ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Permanently revoked, idempotent
+          content:
+            application/json:
+              schema: {}
+        '401':
+          description: Sign in required
+        '404':
+          description: No such own device
+      security:
+      - paseto: []
   /documents:
     get:
       tags:
@@ -2254,6 +2369,21 @@ paths:
           description: Profile changed; reload
       security:
       - paseto: []
+  /profile/storage:
+    get:
+      tags:
+      - profiles
+      operationId: storage
+      responses:
+        '200':
+          description: Own encoded shared-history usage and quotas; excludes uploads, events, legacy snapshots and database overhead
+          content:
+            application/json:
+              schema: {}
+        '401':
+          description: Sign in required
+      security:
+      - paseto: []
   /profiles/{id}:
     get:
       tags:
@@ -2398,6 +2528,378 @@ paths:
               schema: {}
       security:
       - paseto: []
+  /projects/{id}/history/authority:
+    get:
+      tags:
+      - project history
+      operationId: project_history_authority
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Installed public receipt authority; clients must verify this binding through an independently trusted channel
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+  /projects/{id}/history/commits:
+    post:
+      tags:
+      - project history
+      operationId: project_history_publish
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Explicit publication of own staged candidate and exactly its reachable objects; dependencies must already be published; no branch move
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Current contributor access and active own signing key required
+        '507':
+          description: Project metadata budget reached
+      security:
+      - paseto: []
+  /projects/{id}/history/commits/{address}:
+    get:
+      tags:
+      - project history
+      operationId: project_history_commit
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: address
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Published signed envelope; entire transitive file scope requires current access
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+  /projects/{id}/history/commits/{address}/acknowledge:
+    post:
+      tags:
+      - project history
+      operationId: project_history_acknowledge
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: address
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Privately acknowledge up to 256 objects reachable from an authorized published file state, without uploading their bytes again
+          content:
+            application/json:
+              schema: {}
+        '404':
+          description: An object is not reachable from this publication; nothing acknowledged
+        '507':
+          description: Private staging quota reached; nothing acknowledged
+      security:
+      - paseto: []
+  /projects/{id}/history/commits/{address}/objects/{document}:
+    get:
+      tags:
+      - project history
+      operationId: project_history_inventory
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: address
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: document
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: after
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: Reachable object keys in this published file state only; maximum 256
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+  /projects/{id}/history/commits/{address}/objects/{document}/{object}:
+    get:
+      tags:
+      - project history
+      operationId: project_history_object
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: address
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: document
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: object
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Hash-verified base64 object reachable from this published file state
+          content:
+            application/json:
+              schema: {}
+        '404':
+          description: Not reachable from this publication
+      security:
+      - paseto: []
+  /projects/{id}/history/receipts:
+    get:
+      tags:
+      - project history
+      operationId: project_history_receipts
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: branch
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: after_generation
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: At most 256 consecutive signed ref receipts, oldest first; current head scope must remain accessible
+          content:
+            application/json:
+              schema: {}
+        '409':
+          description: Erased branch head or receipt gap
+      security:
+      - paseto: []
+  /projects/{id}/history/refs:
+    get:
+      tags:
+      - project history
+      operationId: project_history_refs
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: branch
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: after
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: Current published branch heads, keyset page max 256; whole page fails closed when any head scope is unavailable
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+    post:
+      tags:
+      - project history
+      operationId: project_history_advance
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Atomic fast-forward branch CAS; main enforces current project/file merge roles and approvals; no centralized document edits
+          content:
+            application/json:
+              schema: {}
+        '409':
+          description: Stale head, unavailable ancestry, non-fast-forward or unmet reviews
+      security:
+      - paseto: []
+  /projects/{id}/history/reviews:
+    get:
+      tags:
+      - project history
+      operationId: project_history_reviews
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: candidate
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: after
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: Bounded review history for a published candidate; no emails
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+    post:
+      tags:
+      - project history
+      operationId: project_history_review
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Append approve/request_changes for exact branch base generation and candidate; independent current reviewer required
+          content:
+            application/json:
+              schema: {}
+        '409':
+          description: Base changed
+      security:
+      - paseto: []
+  /projects/{id}/history/storage:
+    get:
+      tags:
+      - project history
+      operationId: project_history_storage
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Project published metadata budget; physical object bytes have separate document/creator limits
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
   /projects/{id}/settings:
     post:
       tags: []
@@ -2422,6 +2924,212 @@ paths:
               schema: {}
         '409':
           description: Concurrent change
+      security:
+      - paseto: []
+  /projects/{id}/staging/commits:
+    post:
+      tags:
+      - project staging
+      operationId: stage
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Private signed commit accepted after all dependencies and typed file graphs verify; no branch published
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid signature, graph or recovery
+        '403':
+          description: Current account, key and contribution rights required
+        '404':
+          description: Missing private dependency
+        '507':
+          description: Durable quota reached
+      security:
+      - paseto: []
+  /projects/{id}/staging/commits/{address}:
+    get:
+      tags:
+      - project staging
+      operationId: commit
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: address
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Own signed commit; current access checked for its entire dependency scope, even after signing-key revocation
+          content:
+            application/json:
+              schema: {}
+        '404':
+          description: No such own staged commit
+      security:
+      - paseto: []
+  /projects/{id}/staging/objects:
+    post:
+      tags:
+      - project staging
+      operationId: upload
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Private upload acknowledged; base64 bytes, at most 64 objects and 1 MiB decoded; no ref published
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid batch
+        '403':
+          description: Current project/file contribution access required
+        '507':
+          description: Durable quota reached
+      security:
+      - paseto: []
+  /projects/{id}/staging/objects/missing:
+    post:
+      tags:
+      - project staging
+      operationId: missing
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Missing from this account's uploads only, at most 256 addresses; never searches other drafts
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+  /projects/{id}/staging/objects/{document}:
+    get:
+      tags:
+      - project staging
+      operationId: inventory
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: document
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: after
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: Own upload inventory; bounded keyset page, maximum 256
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+  /projects/{id}/staging/objects/{document}/{address}:
+    get:
+      tags:
+      - project staging
+      operationId: object
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: document
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: address
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Own acknowledged object, base64 encoded and hash verified
+          content:
+            application/json:
+              schema: {}
+        '404':
+          description: Not in own uploads
+      security:
+      - paseto: []
+  /projects/{id}/staging/storage:
+    get:
+      tags:
+      - project staging
+      operationId: storage
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Own durable private-transfer usage across all projects; shared physical bytes have separate document/creator budgets
+          content:
+            application/json:
+              schema: {}
       security:
       - paseto: []
   /projects/{id}/watch:

@@ -17,6 +17,12 @@ use sqlx::PgPool;
 use utoipa::OpenApi;
 use uuid::Uuid;
 
+mod device;
+mod receipt;
+mod repository;
+mod signing;
+mod sync;
+
 #[derive(Parser)]
 #[command(name = "engine-cli", version, about = "dynodoc admin tools")]
 struct Cli {
@@ -26,10 +32,35 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Selected-history transfer. Remote heads are pinned separately from local branches.
+    Sync(sync::Options),
+    /// Enroll a local signing key in an authenticated Dynodoc account.
+    Device {
+        #[command(subcommand)]
+        action: device::Action,
+    },
+    /// Signed ref receipts and a separate durable client trust journal (offline).
+    Receipt {
+        journal: std::path::PathBuf,
+        authority: Uuid,
+        project: Uuid,
+        branch: String,
+        #[command(subcommand)]
+        action: receipt::Action,
+    },
+    /// Durable local project history (no network or installed-editor session required).
+    Repository {
+        path: std::path::PathBuf,
+        project: Uuid,
+        #[command(subcommand)]
+        action: repository::Action,
+    },
     /// Apply migrations using MIGRATION_DATABASE_URL in a separate operator process.
     Migrate,
     /// Give an existing restricted login the explicit runtime allowlist (operator only).
     GrantRuntime { role: String },
+    /// Install the public receipt key using operator credentials; never replaces a key.
+    InstallRefAuthority { public_key: String },
     /// Check schema and runtime privileges using DATABASE_URL; makes no changes.
     CheckRuntime,
     /// Independently verify the event chain and all legacy snapshots.
@@ -60,6 +91,9 @@ enum Command {
         document_id: String,
         #[arg(long)]
         through_seq: i64,
+        /// Use typed chunked state objects (requires schema 30).
+        #[arg(long)]
+        typed: bool,
     },
     /// Emit the generated OpenAPI document. With `--out`, write it there; otherwise
     /// print to stdout. CI compares the committed `openapi.yaml` against `--out -` to
@@ -81,6 +115,31 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::Sync(options) => sync::run(options).await,
+        Command::Device { action } => device::run(action),
+        Command::Receipt {
+            journal,
+            authority,
+            project,
+            branch,
+            action,
+        } => {
+            receipt::run(
+                journal,
+                engine_core::repository::attestation::Scope {
+                    authority,
+                    project,
+                    branch,
+                },
+                action,
+            )
+            .await
+        }
+        Command::Repository {
+            path,
+            project,
+            action,
+        } => repository::run(path, project, action).await,
         Command::Migrate => {
             let pool = connect_migration().await?;
             engine_core::database::MIGRATOR.run(&pool).await?;
@@ -90,6 +149,15 @@ async fn main() -> anyhow::Result<()> {
         Command::GrantRuntime { role } => {
             engine_core::database::grant_runtime(&connect_migration().await?, &role).await?;
             println!("Runtime grants verified for {role}; connect directly using its separate credentials.");
+            Ok(())
+        }
+        Command::InstallRefAuthority { public_key } => {
+            let id = engine_core::repository::server_authority::install(
+                &connect_migration().await?,
+                &public_key,
+            )
+            .await?;
+            println!("Installed receipt authority {id}; distribute this identity and public key through a trusted channel.");
             Ok(())
         }
         Command::CheckRuntime => {
@@ -104,7 +172,8 @@ async fn main() -> anyhow::Result<()> {
         Command::SharedSnapshot {
             document_id,
             through_seq,
-        } => shared_snapshot(document_id, through_seq).await,
+            typed,
+        } => shared_snapshot(document_id, through_seq, typed).await,
         Command::Openapi { out } => openapi(out),
     }
 }
@@ -246,19 +315,22 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-async fn shared_snapshot(document_id: String, through_seq: i64) -> anyhow::Result<()> {
+async fn shared_snapshot(document_id: String, through_seq: i64, typed: bool) -> anyhow::Result<()> {
     let doc = parse_document_id(&document_id)?;
     let pool = connect().await?;
-    let result = engine_core::shared_checkpoint::postgres::take(
+    use engine_core::shared_checkpoint::postgres::Codec;
+    let codec = if typed { Codec::V2 } else { Codec::V1 };
+    let result = engine_core::shared_checkpoint::postgres::take_with_codec(
         &pool,
         doc,
         through_seq,
         engine_core::shared_checkpoint::Limits::default(),
+        codec,
     )
     .await
     .context("publishing shared checkpoint failed")?;
     println!(
-        "shared checkpoint v1 at revision {}: {}",
+        "shared checkpoint {codec:?} at revision {}: {}",
         result.through_seq,
         result.root.as_str()
     );
