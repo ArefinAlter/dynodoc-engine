@@ -1,13 +1,56 @@
 # Architecture
 
+## Current source — 12 October 2026
+
+[Shared project history](SHARED-PROJECT-HISTORY.md) now adds explicit
+candidate publication, reachable downloads, protected main CAS/reviews and atomic
+server-signed receipts. A public authority is operator-installed, and the matching
+secret must be explicitly mounted into the API. These sources are not deployed.
+[Selected-history CLI sync](SELECTED-HISTORY-SYNC.md) now adds reviewed
+push, verified fetch, fast-forward pull and separate pinned remote tracking.
+Project-scoped sign-in, UI/native adoption, server rotation/witnesses and full
+native convergence/large-service acceptance remain open.
+
+Current schema 36 retains [typed chunked state](TYPED-CHECKPOINTS.md) and shared roots for
+[draft/rebase bases](SHARED-DRAFT-BASES.md) and [named/deployed/public snapshots](SHARED-NAMED-SNAPSHOTS.md).
+Publication verifies reconstruction and the exact event revision; mixed readers
+retain legacy compatibility. Writers remain opt-in. Full-state scans, resident
+materialization, physical packing and incremental publication remain limitations.
+
+[Portable local history](PORTABLE-PROJECT-HISTORY.md) adds a separate SQLite
+repository with signed multi-file commits/parents, generation-aware branch CAS,
+bounded object transfer and conservative project comparison. [Ref receipts](REF-RECEIPTS.md)
+provide an independently scoped client trust journal, contiguous proofs, dual-key
+authority rotation and durable local revocation. Signatures alone do not supply
+account permissions, production issuance or an external witness.
+
+Account-bound signing keys and [private project transfers](PRIVATE-PROJECT-TRANSFERS.md)
+now support authenticated resumable staging with durable quotas and erasure.
+Complete native/offline convergence and realistic large/concurrent workloads remain open. Production is
+application `858801c`, schema 29. The owner runs installed-editor acceptance using
+the prepared worksheet. Consult the [acceptance ledger](ROADMAP-ACCEPTANCE.md),
+[conformance limits](VERSIONING-CONFORMANCE.md) and [verified handoff](ENGINE-EVOLUTION-HANDOFF.md).
+The dated implementation notes below retain the history of earlier increments.
+
+## Restricted database runtime - 11 October 2026
+
+Schema 0029 and `engine_core::database` provide separate migrate/provision CLI
+commands and read-only schema/privilege validation. The API requires a dedicated
+non-owner login and has no migration or DDL privileges. History is SELECT/INSERT;
+existing audited erasure remains possible through protected trigger entrypoints.
+Read [the contract](DATABASE-PRIVILEGES.md) and [checks/remaining gates](ENGINE-EVOLUTION-HANDOFF.md).
+
 Canonical content is an append-only `event` chain per document. Current node rows
 and snapshots are derived materializations. `log::append_in_tx` locks the document
-row before allocating sequence numbers and hashes canonical, length-framed semantic
+row with NO KEY UPDATE before allocating sequence numbers and hashes canonical, length-framed semantic
 content and actor identity. Genesis uses a zero predecessor hash.
 
 `Materializer` folds operations into stable-ID state, including tombstones.
 `SnapshotEngine` stores replay checkpoints and an ordered node Merkle commitment.
-Snapshots currently contain full JSONB states, not shared content-addressed trees.
+Periodic writes default to full JSONB, with an opt-in shared writer. Normal reads
+select the nearest legacy/shared checkpoint, preferring shared on ties. The
+`shared_checkpoint` module stores versioned objects and stable-key radix maps; see
+[its format and limits](SHARED-CHECKPOINTS.md). No legacy state/event is rewritten.
 Restoration appends operations; it never resets the chain.
 
 `richtext` in shared defines versioned patches; core generates and checks them.
@@ -28,3 +71,127 @@ or access-control operation; the operational audit is a separate log.
 The `engine-api` adapter retains the original product schema so migrations and
 recorded histories remain compatible. Further extraction of product-specific
 adapters is a future change with explicit compatibility tests.
+
+## Current collaboration adapters
+
+`workspace_merge::merge_strict` adds explicit existing-block choices for unrelated
+content. `similarity` computes bounded deterministic word/block fingerprints and
+MinHash/LSH summaries; `engine-api::copies` indexes/detects relationships and checks
+access before displaying them. Similarity does not establish authenticated origin.
+
+`access`/`people` map the product role ladder onto the preserved core capabilities,
+with per-document rules. `reviews` handles submitted drafts, approvals/comments
+and permission-checked merges; `notifications` stores per-recipient operational
+notices. Migrations `0020`/`0021` extend these adapters without new content events.
+Projects enforce minimum review rules through their containing root; file rules may
+only strengthen them. File ownership does not grant project review authority.
+Hosted multi-file branch/release integration remains future work; local branches exist in the repository library.
+
+
+Projects/provenance increment: project settings/member changes serialize with
+content writes. Bundles and their draft/receipt share one transaction, exact base
+hashes are checked, and retry lookup rechecks membership. Stored uploader identity
+is distinct from client observation claims and the responsible canonical merger.
+Scoped keys cannot merge or access another document. Audited resource erasure
+removes bundle children while ordinary history remains immutable. See
+[the sync contract](PROVENANCE-SYNC.md).
+
+Migration 0024 expands connector credentials to all six Microsoft/Google hosts.
+Creation validates document kind; existing host/file/account/session/review scope
+and append-only events remain unchanged. Native adapters remain application code.
+
+
+## Evolution part 1
+
+`snapshot::read_state_at` is the common historical reader. It selects the greatest
+checkpoint sequence no greater than the requested revision, then streams only that
+suffix into the ordinary materializer. It rejects invalid revisions and suffix gaps
+and reports checkpoint/replay counts. Callers retain access checks and document
+write locks where needed. Snapshots are trusted derived data here; the path is not
+an independent verification of the snapshot's commitment. A missing checkpoint
+still requires genesis replay, and complete state remains resident in memory.
+
+`log::verify_chain` independently streams event rows, keeping current payload/hash
+working data instead of the entire history. It still needs a trusted externally
+retained head to detect replacement of the entire chain. Snapshot cadence queries
+only sequence metadata. Neither change supplies shared-object storage or hard tail
+bounds. See the evolution plan for typed objects, ancestry and offline convergence.
+
+Automatic operation independence includes reads, writes and validation constraints,
+not just target IDs. Unique-name and crossed-move regressions document concrete
+counterexamples. The engine does not yet infer a general cross-format dependency
+footprint or prove automatic convergence of arbitrary native editor operations.
+
+## Shared checkpoint boundary (parts 2a-2d)
+
+Core stores require document scope and caller authorization. Object hashes are
+content integrity addresses, not permissions or actor attestations. PostgreSQL
+publication protects the document from erasure, derives an exact historical state,
+stores/validates its reachable object graph and compares reconstruction before
+inserting the immutable sequence/root/chain manifest in the same transaction.
+Same-revision publication is idempotent. Part 2b normal current/history readers and
+API write materialization select mixed checkpoints, verify shared graphs/chain
+positions and stream only the suffix through the pinned revision. Explicit CLI
+publication retains an independent legacy/event reference. Corrupt selected shared
+data fails, even when legacy data exists. Reader support is independent of the
+automatic writer flag; named/deployed snapshots and draft/merge bases stay legacy.
+
+Explicit publishers take a document advisory lock before the row lock; periodic
+jobs use the same namespace with try-lock semantics to skip competing builders.
+This serializes overlapping historical publication before object batches, avoiding
+cross-batch lock-order deadlocks. A savepoint rolls back partial shared objects on
+capacity errors before a legacy fallback; other errors propagate. Background jobs
+opt in with API process env DYNODOC_PERIODIC_CHECKPOINT_STORAGE=shared-v1, otherwise
+legacy. Both formats count toward cadence.
+
+The writer scans all state, buffering at most 64 objects / 1 MiB of encoded bytes,
+plus the current object being encoded and driver/input state. PgStore validates
+input and checks exact stored bytes in bounded SQL joins returning booleans; one
+INSERT stores missing objects, and raced conflicts are checked again. Unchanged
+batches issue no INSERT. The document KEY SHARE erasure guard is compatible with
+core/API NO KEY UPDATE content transactions. Those writers still serialize and
+recheck access/state after locking; checkpoint reconstruction pins an immutable
+revision and ignores later appends. Stronger management/erasure locks remain, and
+queued strong operations can still delay writes. Publication remains fully atomic;
+no staged object protocol is introduced. See [the lock audit](CHECKPOINT-CONCURRENCY.md).
+
+Breadth-first index traversal and values use batches of at most 16 addresses with
+full hash/type/route/subtree validation and byte/object budgets. Traversal queues
+count against the remaining object budget. The cache retains the latest scoped
+batch, at most 16 MiB encoded bytes; traversal metadata, complete state/map entries,
+current decoded values and driver allocations are outside that cache bound.
+
+Objects are at most 1 MiB, radix leaves at most 32 entries, branches at most 16 and
+paths at most 64 nibbles. Total byte/object budgets are checked. Complete state and
+map entries remain in memory; no whole native-file streaming guarantee follows.
+Audited erasure removes manifests then document-scoped objects. No GC is enabled.
+
+Migration bytes are also a compatibility contract: SQLx hashes the complete file.
+`.gitattributes` pins SQL checkouts to committed LF bytes on Windows and Unix.
+Application/engine migration checksums are tested against the same isolated DB;
+never edit applied migration content or recorded checksums to resolve a mismatch.
+
+## Historical recovery adapter
+
+The history API uses the same document/project locking, membership gate and mixed
+historical reader as existing writes. It derives selected whole-block differences
+against the current team head and validates them before creating a private draft.
+Draft UUID, original source revision/hash and starting sequence form an atomic
+retry receipt; changed source/actor/document combinations conflict. The ordinary
+review/merge path appends canonical recovery events. No event hashes or migrations
+change. Full-state materialization remains; commit revert/cherry-pick are later
+contracts. See [historical recovery](HISTORY-RECOVERY.md).
+
+
+History range operations merge a replayed historical content delta into current
+state, check explicit conflicts and create private drafts. Connector browser approval
+stores only the hash of a client-held secret in the existing grant table; completion
+rechecks current membership and grant/session validity. No event/storage codec change.
+
+
+Schema 0028 adds immutable legacy snapshots and replay-verification receipts.
+`snapshot_verification` centralizes checked reads/publication and independent
+full-history audits. Existing snapshots need explicit backfill before serving;
+ordinary reads validate their stored envelope and replay only a checked suffix.
+`Materializer::from_snapshot` is still a pure fold of trusted input. See
+[the trust, complexity and upgrade contract](VERIFIED-SNAPSHOTS.md).

@@ -1,7 +1,7 @@
 //! dynodoc API server (binary entry point).
 //!
-//! Reads configuration from the environment, connects to Postgres, applies pending
-//! migrations, and serves [`engine_api::app`]. The server exposes the full REST + SSE
+//! Reads configuration, verifies the schema and restricted Postgres login, and
+//! serves [`engine_api::app`]. The server exposes the full REST + SSE
 //! surface (stage 18) on top of the `/auth/*` identity routes (stage 17): documents,
 //! the governance-gated write path, the per-document event stream, and the public
 //! audit endpoints.
@@ -21,27 +21,54 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Fail before connecting: missing configuration is never a dev bypass.
+    let config = load_auth_config()?;
+    if std::env::var_os("MIGRATION_DATABASE_URL").is_some() {
+        anyhow::bail!("MIGRATION_DATABASE_URL must not be present in the API environment");
+    }
     let database_url =
         std::env::var("DATABASE_URL").context("DATABASE_URL is not set (see .env / SETUP.md)")?;
     let pool = PgPoolOptions::new()
         .max_connections(8)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .after_connect(|connection, _| {
+            Box::pin(async move {
+                for statement in [
+                    "set search_path = pg_catalog, public, pg_temp",
+                    "set statement_timeout = '15s'",
+                    "set lock_timeout = '5s'",
+                    "set idle_in_transaction_session_timeout = '30s'",
+                ] {
+                    sqlx::query(statement).execute(&mut *connection).await?;
+                }
+                Ok(())
+            })
+        })
         .connect(&database_url)
         .await
         .context("could not connect to Postgres")?;
 
-    // Apply any pending migrations on boot so a fresh database is usable immediately.
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
+    engine_core::database::check_runtime(&pool)
         .await
-        .context("running database migrations failed")?;
+        .context("runtime database boundary check failed")?;
 
-    let config = load_auth_config()?;
-    if std::env::var("APP_ENV").as_deref() == Ok("production")
-        && config.service_key.as_ref().is_none_or(|s| s.len() < 32)
-    {
-        anyhow::bail!("Production requires WEB_SERVICE_KEY of at least 32 characters");
+    let mut state = AppState::new(pool, config);
+    if let Some(path) = std::env::var_os("DYNODOC_REF_SIGNING_KEY_FILE") {
+        use engine_core::repository::server_authority;
+        use ring::signature::KeyPair;
+        let key = server_authority::load_key(std::path::Path::new(&path))?;
+        let mut authority_connection = state.pool.acquire().await?;
+        let (_, installed) = server_authority::binding(&mut authority_connection)
+            .await
+            .context("install the receipt public key with the separate operator command first")?;
+        anyhow::ensure!(
+            installed == hex::encode(key.public_key().as_ref()),
+            "receipt signing key does not match the installed authority"
+        );
+        state.ref_signer = Some(std::sync::Arc::new(key));
     }
-    let state = AppState::new(pool, config);
+    // Copy detection runs beside the edit path, never inside it.
+    engine_api::copies::spawn(state.clone());
 
     let host = std::env::var("API_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port: u16 = std::env::var("API_PORT")
@@ -65,8 +92,16 @@ fn load_auth_config() -> anyhow::Result<AuthConfig> {
         .as_slice()
         .try_into()
         .map_err(|_| anyhow::anyhow!("PASETO_LOCAL_KEY must be 32 bytes (64 hex chars)"))?;
-    if paseto_key == [0u8; 32] && std::env::var("APP_ENV").as_deref() == Ok("production") {
-        anyhow::bail!("Production requires a random PASETO_LOCAL_KEY");
+    if paseto_key == [0u8; 32] {
+        anyhow::bail!("A random PASETO_LOCAL_KEY is required in every environment");
+    }
+
+    let service_key = std::env::var("WEB_SERVICE_KEY").ok();
+    if service_key
+        .as_ref()
+        .is_none_or(|s| s.len() < 32 || s.trim().is_empty())
+    {
+        anyhow::bail!("WEB_SERVICE_KEY of at least 32 characters is required in every environment");
     }
 
     let token_ttl_seconds = std::env::var("TOKEN_TTL_SECONDS")
@@ -78,7 +113,7 @@ fn load_auth_config() -> anyhow::Result<AuthConfig> {
 
     Ok(AuthConfig {
         paseto_key,
-        service_key: std::env::var("WEB_SERVICE_KEY").ok(),
+        service_key,
         token_ttl_seconds,
         public_base_url,
     })

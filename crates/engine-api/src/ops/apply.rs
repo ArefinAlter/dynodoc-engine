@@ -19,9 +19,8 @@
 
 use engine_core::governance::{self, Role};
 use engine_core::log;
-use engine_core::materializer::{DocumentState, Materializer};
-use engine_core::snapshot::merkle_root;
-use engine_shared::{DocumentId, Event, EventPayload, IdentityId, NodeId, NodeType, Snapshot};
+use engine_core::materializer::DocumentState;
+use engine_shared::{DocumentId, Event, EventPayload, IdentityId, NodeId, NodeType};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -62,6 +61,9 @@ pub async fn apply_checked_op(
 ) -> Result<Event, ApiError> {
     let (mut tx, role, current) = begin_write(state, document_id, actor).await?;
     governance::authorize(role, &op, &current).map_err(ApiError::from)?;
+    if crate::access::changes_content(&op) {
+        crate::access::ensure_team_edit(&mut tx, document_id.0, actor.0).await?;
+    }
     if let (
         Some(base),
         EventPayload::FieldEdited {
@@ -96,7 +98,13 @@ pub async fn apply_checked_op(
         .await
         .map_err(ApiError::from)?;
     if matches!(op, EventPayload::Deployed { .. }) {
-        checkpoint_in_tx(&mut tx, document_id, &current, &inserted).await?;
+        checkpoint_in_tx(
+            &mut tx,
+            document_id,
+            &inserted,
+            state.named_snapshot_storage,
+        )
+        .await?;
     }
     tx.commit().await?;
 
@@ -123,6 +131,8 @@ pub async fn accept_proposal(
 
     // The wrapped op an accept must append, re-validated against current state.
     let wrapped = governance::plan_acceptance(role, &current, suggestion_id)?;
+    // Accepting a suggestion changes the team version, like merging.
+    crate::access::ensure_team_edit(&mut tx, document_id.0, actor.0).await?;
     let wrapped = engine_core::richtext::compact_event(&current, &wrapped);
     let accepted = EventPayload::SuggestionAccepted {
         suggestion_id: suggestion_id.to_string(),
@@ -349,6 +359,9 @@ fn object_or_empty(fields: &Value) -> Value {
 }
 
 /// Every write path takes this lock before reading state or validating a proposal.
+/// Match the core append lock without upgrading it: writers still exclude each
+/// other and SHARE/UPDATE permission locks, while checkpoints retain KEY SHARE
+/// protection against erasure without stopping content edits.
 pub(crate) async fn begin_write(
     state: &AppState,
     document_id: DocumentId,
@@ -356,13 +369,14 @@ pub(crate) async fn begin_write(
 ) -> Result<(Transaction<'_, Postgres>, Role, DocumentState), ApiError> {
     let mut tx = state.pool.begin().await?;
     let exists: Option<uuid::Uuid> =
-        sqlx::query_scalar("select id from document where id=$1 for update")
+        sqlx::query_scalar("select id from document where id=$1 for no key update")
             .bind(document_id.0)
             .fetch_optional(&mut *tx)
             .await?;
     if exists.is_none() {
         return Err(ApiError::NotFound);
     }
+    crate::projects::lock_document_project(&mut tx, document_id.0).await?;
     let role: Option<String> = sqlx::query_scalar("select effective_document_role($1,$2)")
         .bind(document_id.0)
         .bind(actor.0)
@@ -371,46 +385,25 @@ pub(crate) async fn begin_write(
     let role = role
         .and_then(|r| r.parse().ok())
         .ok_or(ApiError::Forbidden)?;
-    let snapshot = sqlx::query_as::<_, Snapshot>(
-        "select * from snapshot where document_id=$1 order by through_seq desc limit 1",
-    )
-    .bind(document_id.0)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let tail = sqlx::query_as::<_, Event>(
-        "select * from event where document_id=$1 and seq>$2 order by seq",
-    )
-    .bind(document_id.0)
-    .bind(snapshot.as_ref().map_or(0, |s| s.through_seq))
-    .fetch_all(&mut *tx)
-    .await?;
-    let current = match snapshot {
-        Some(s) => Materializer::from_snapshot(&s, &tail),
-        None => Materializer::fold(&tail),
-    }
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let (current, _) = engine_core::snapshot::read_current_state(&mut tx, document_id).await?;
     Ok((tx, role, current))
 }
 
 async fn checkpoint_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     document_id: DocumentId,
-    current: &DocumentState,
     event: &Event,
+    storage: engine_core::snapshot::NamedStorage,
 ) -> Result<(), ApiError> {
-    let root = merkle_root(current).map_err(|e| ApiError::Internal(e.to_string()))?;
-    let json = serde_json::to_value(current).map_err(|e| ApiError::Internal(e.to_string()))?;
-    let id: uuid::Uuid = sqlx::query_scalar(
-        "insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash)
-         values($1,$2,$3,$4,$5) returning id",
+    let id = engine_core::snapshot_verification::take_with_storage_in_connection(
+        tx,
+        document_id,
+        event.seq,
+        storage,
     )
-    .bind(document_id.0)
-    .bind(event.seq)
-    .bind(json)
-    .bind(root.as_slice())
-    .bind(&event.chain_hash)
-    .fetch_one(&mut **tx)
-    .await?;
+    .await?
+    .id
+    .0;
     sqlx::query("update document set status='deployed', deployed_snapshot_id=$2, updated_at=now() where id=$1")
         .bind(document_id.0).bind(id).execute(&mut **tx).await?;
     Ok(())

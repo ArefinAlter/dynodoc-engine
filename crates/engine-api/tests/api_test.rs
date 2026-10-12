@@ -18,11 +18,77 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod common;
+
 const KEY: [u8; 32] = [7u8; 32];
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn draft_sharing_remembers_exclusions_until_explicitly_included(pool: PgPool) {
+async fn waiting_writer_rechecks_revoked_access(pool: PgPool) {
     let router = app(test_state(pool.clone()));
+    let owner = bearer(seed_identity(&pool, "lock-owner@example.test").await);
+    let editor = seed_identity(&pool, "lock-editor@example.test").await;
+    let doc = create_document(&router, &owner, "Permission serialization").await;
+    sqlx::query("insert into document_access(document_id,identity_id,role) values($1,$2,'author')")
+        .bind(doc)
+        .bind(editor)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Hold the same lock taken by workspace membership changes, then revoke.
+    let mut permission = pool.begin().await.unwrap();
+    sqlx::query("select id from document where id=$1 for no key update")
+        .bind(doc)
+        .execute(&mut *permission)
+        .await
+        .unwrap();
+    let pid: i32 = sqlx::query_scalar("select pg_backend_pid()")
+        .fetch_one(&mut *permission)
+        .await
+        .unwrap();
+    sqlx::query("delete from document_access where document_id=$1 and identity_id=$2")
+        .bind(doc)
+        .bind(editor)
+        .execute(&mut *permission)
+        .await
+        .unwrap();
+    let writer = tokio::spawn(async move {
+        send(
+            &router,
+            auth_post(
+                &format!("/documents/{doc}/ops/node-create"),
+                &bearer(editor),
+                &json!({"node_type":"form","pos":"a0","fields":{}}),
+            ),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5),async {
+        loop {
+            let blocked:bool=sqlx::query_scalar("select exists(select 1 from pg_stat_activity where datname=current_database() and $1=any(pg_blocking_pids(pid)))")
+                .bind(pid).fetch_one(&pool).await.unwrap();
+            if blocked {break;}
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }).await.expect("writer never reached the permission lock");
+    permission.commit().await.unwrap();
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let events: i64 = sqlx::query_scalar("select count(*) from event where document_id=$1")
+        .bind(doc)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(events, 0);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn draft_sharing_remembers_exclusions_until_explicitly_included(pool: PgPool) {
+    let mut shared_state = test_state(pool.clone());
+    shared_state.shared_draft_bases = true;
+    let router = app(shared_state);
     let owner = bearer(seed_identity(&pool, "selection@example.test").await);
     let doc = create_document(&router, &owner, "Selections").await;
     let root = ulid::Ulid::new().to_string();
@@ -99,6 +165,136 @@ async fn draft_sharing_remembers_exclusions_until_explicitly_included(pool: PgPo
     )
     .await;
     assert_eq!(verification["ok"], true);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn shared_draft_bases_reuse_content_preserve_responses_and_enforce_scope(pool: PgPool) {
+    let mut state = test_state(pool.clone());
+    state.shared_draft_bases = true;
+    let router = app(state);
+    let actor = seed_identity(&pool, "shared-drafts@example.test").await;
+    let owner = bearer(actor);
+    let document = create_document(&router, &owner, "Shared drafts").await;
+    let (_, created) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{document}/ops/node-create"),
+            &owner,
+            &json!({"node_type":"form","pos":"a0","fields":{"label":"Original"}}),
+        ),
+    )
+    .await;
+    let node = created["event"]["target_node_id"].as_str().unwrap();
+    let (_, first) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{document}/drafts"),
+            &owner,
+            &json!({"name":"First"}),
+        ),
+    )
+    .await;
+    let before: i64 =
+        sqlx::query_scalar("select count(*) from checkpoint_object where document_id=$1")
+            .bind(document)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (_, second) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{document}/drafts"),
+            &owner,
+            &json!({"name":"Second"}),
+        ),
+    )
+    .await;
+    let after: i64 =
+        sqlx::query_scalar("select count(*) from checkpoint_object where document_id=$1")
+            .bind(document)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after);
+    assert!(before > 0);
+    let bases: Vec<Value> =
+        sqlx::query_scalar("select base_state from workspace_draft where document_id=$1")
+            .bind(document)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(bases.len(), 2);
+    assert_eq!(bases[0], bases[1]);
+    assert_eq!(bases[0]["$dynodoc_state"], 2);
+    assert!(bases[0].to_string().len() < 120);
+    let uri = format!(
+        "/documents/{document}/drafts/{}",
+        first["id"].as_str().unwrap()
+    );
+    let (status, read) = send(&router, auth_post_get(&uri, &owner)).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(
+        read["draft"]["base_state"]["nodes"][node]["current_fields"]["label"],
+        "Original"
+    );
+    assert!(read["draft"]["base_state"].get("$dynodoc_state").is_none());
+    let (status,edited)=send(&router,auth_post(&uri,&owner,&json!({"revision":0,"ops":[{"type":"FieldEdited","node_id":node,"field":"label","value":"Draft"}]}))).await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    let sync = format!("{uri}/sync");
+    let (_, preview) = send(
+        &router,
+        auth_post(&sync, &owner, &json!({"action":"preview"})),
+    )
+    .await;
+    let (status, merged) = send(
+        &router,
+        auth_post(
+            &sync,
+            &owner,
+            &json!({"action":"share","team_seq":preview["team_seq"],"revision":1}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+    let merge_base: Value =
+        sqlx::query_scalar("select merge_base_state from workspace_draft where id=$1")
+            .bind(Uuid::parse_str(first["id"].as_str().unwrap()).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(merge_base["$dynodoc_state"], 2);
+    assert_ne!(merge_base, bases[0]);
+    let (status, read) = send(&router, auth_post_get(&uri, &owner)).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(
+        read["draft"]["merge_base_state"]["nodes"][node]["current_fields"]["label"],
+        "Draft"
+    );
+    // Initial bases cannot be changed by application-level UPDATE, in either codec.
+    assert!(
+        sqlx::query("update workspace_draft set base_state='{}' where document_id=$1")
+            .bind(document)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let other = create_document(&router, &owner, "Another document").await;
+    assert!(sqlx::query("insert into workspace_draft(document_id,name,base_seq,base_state,created_by) values($1,'Cross scope',0,$2,$3)")
+        .bind(other).bind(&bases[0]).bind(actor).execute(&pool).await.is_err());
+    let stranger = bearer(seed_identity(&pool, "stranger-shared@example.test").await);
+    assert_eq!(
+        send(&router, auth_post_get(&uri, &stranger)).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let second_uri = format!(
+        "/documents/{document}/drafts/{}",
+        second["id"].as_str().unwrap()
+    );
+    let (_, unchanged) = send(&router, auth_post_get(&second_uri, &owner)).await;
+    assert_eq!(
+        unchanged["state"]["nodes"][node]["current_fields"]["label"],
+        "Original"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -257,10 +453,14 @@ async fn discussion_replies_resolution_permissions_and_replay(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn admin_erasure_removes_whole_document_but_cannot_bypass_history_guards(pool: PgPool) {
+    let runtime = common::RuntimeDatabase::new(pool).await;
+    let pool = runtime.pool.clone();
     let admin_id = seed_identity(&pool, "erase-admin@example.test").await;
     let owner_id = seed_identity(&pool, "erase-owner@example.test").await;
     let mut state = test_state(pool.clone());
     state.admin_emails = "erase-admin@example.test".into();
+    state.shared_draft_bases = true;
+    state.named_snapshot_storage = engine_core::snapshot::NamedStorage::SharedV2;
     let router = app(state);
     let admin = bearer(admin_id);
     let owner = bearer(owner_id);
@@ -311,6 +511,14 @@ async fn admin_erasure_removes_whole_document_but_cannot_bypass_history_guards(p
     .await;
     sqlx::query("insert into document_upload(document_id,filename,content_type,content,created_by) values($1,'private.txt','text/plain',$2,$3)").bind(doc).bind(b"private bytes".as_slice()).bind(owner_id).execute(&pool).await.unwrap();
     let preview_uri = format!("/admin/impact?kind=documents&id={doc}");
+    engine_core::shared_checkpoint::postgres::take(
+        &pool,
+        engine_shared::DocumentId(doc),
+        1,
+        engine_core::shared_checkpoint::Limits::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         send(&router, auth_post_get(&preview_uri, &owner)).await.0,
         StatusCode::FORBIDDEN
@@ -336,8 +544,11 @@ async fn admin_erasure_removes_whole_document_but_cannot_bypass_history_guards(p
         .execute(&pool)
         .await
         .is_err());
+    // An active document can be deleted directly: erasure moves it to Trash in the
+    // same transaction, so the preview reports that rather than a blocker.
     let (_, active_plan) = send(&router, auth_post_get(&preview_uri, &admin)).await;
-    assert!(!active_plan["blockers"].as_array().unwrap().is_empty());
+    assert!(active_plan["blockers"].as_array().unwrap().is_empty());
+    assert_eq!(active_plan["in_trash"], false);
     assert_eq!(
         send(
             &router,
@@ -353,6 +564,9 @@ async fn admin_erasure_removes_whole_document_but_cannot_bypass_history_guards(p
     );
     let (_, preview) = send(&router, auth_post_get(&preview_uri, &admin)).await;
     assert_eq!(preview["counts"]["events"], 1);
+    assert_eq!(preview["counts"]["shared_checkpoints"], 1);
+    assert!(preview["counts"]["checkpoint_objects"].as_i64().unwrap() > 0);
+    assert!(preview["counts"]["checkpoint_bytes"].as_i64().unwrap() > 0);
     let mut erase = json!({"kind":"documents","id":doc,"confirmation":"Remove me","revision":preview["revision"],"reason":"owner_request","acknowledge_backups":true});
     erase["confirmation"] = json!("wrong");
     assert_eq!(
@@ -388,6 +602,9 @@ async fn admin_erasure_removes_whole_document_but_cannot_bypass_history_guards(p
         "event",
         "node",
         "snapshot",
+        "snapshot_verification",
+        "shared_checkpoint",
+        "checkpoint_object",
         "document_upload",
         "document_version",
         "workspace_draft",
@@ -451,18 +668,36 @@ async fn admin_erasure_removes_whole_document_but_cannot_bypass_history_guards(p
         .execute(&pool)
         .await
         .is_err());
+    runtime.close().await;
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn admin_account_erasure_preserves_shared_chain_and_clears_private_drafts(pool: PgPool) {
+    let runtime = common::RuntimeDatabase::new(pool).await;
+    let pool = runtime.pool.clone();
     let admin_id = seed_identity(&pool, "admin-erasure@example.test").await;
     let user_id = seed_identity(&pool, "erased@example.test").await;
     let receiver = seed_identity(&pool, "receiver@example.test").await;
     let mut state = test_state(pool.clone());
     state.admin_emails = "admin-erasure@example.test".into();
+    state.shared_draft_bases = true;
+    state.named_snapshot_storage = engine_core::snapshot::NamedStorage::SharedV2;
     let router = app(state);
     let admin = bearer(admin_id);
     let user = bearer(user_id);
+    assert_eq!(
+        send(
+            &router,
+            auth_post(
+                "/profile",
+                &user,
+                &json!({"name":"Name to erase","bio":"Private profile to erase","revision":0})
+            )
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
     let doc = create_document(&router, &user, "Shared document").await;
     let (_, created) = send(
         &router,
@@ -504,6 +739,13 @@ async fn admin_account_erasure_preserves_shared_chain_and_clears_private_drafts(
         .await
         .unwrap();
     assert_eq!(name, "Deleted account");
+    let profile: (String, i64) =
+        sqlx::query_as("select bio,profile_revision from identity where id=$1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(profile, (String::new(), 2));
     assert_eq!(
         sqlx::query_scalar::<_, i64>("select count(*) from workspace_draft where created_by=$1")
             .bind(user_id)
@@ -547,6 +789,7 @@ async fn admin_account_erasure_preserves_shared_chain_and_clears_private_drafts(
         .0,
         StatusCode::FORBIDDEN
     );
+    runtime.close().await;
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -1239,6 +1482,110 @@ async fn events_endpoint_paginates_with_cursor(pool: PgPool) {
     let first_seq_p2 = page2["items"][0]["seq"].as_i64().unwrap();
     let last_seq_p1 = page1["items"][1]["seq"].as_i64().unwrap();
     assert!(first_seq_p2 > last_seq_p1, "cursor page must not overlap");
+    let (_, final_page) = send(
+        &router,
+        auth_post_get(
+            &format!("/documents/{doc_id}/events?limit=2&from_seq=4"),
+            &token,
+        ),
+    )
+    .await;
+    assert_eq!(final_page["items"].as_array().unwrap().len(), 2);
+    assert!(
+        final_page["next_cursor"].is_null(),
+        "an exactly full final page has no successor"
+    );
+    let cursor = engine_api::pagination::Cursor {
+        last_seq: i64::MAX,
+        last_id: String::new(),
+    }
+    .encode();
+    let (status, terminal) = send(
+        &router,
+        auth_post_get(
+            &format!("/documents/{doc_id}/events?cursor={cursor}"),
+            &token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(terminal["items"].as_array().unwrap().is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn sse_pages_backfill_then_live_events_without_gaps_and_honors_resume_header(pool: PgPool) {
+    let state = test_state(pool.clone());
+    let router = app(state.clone());
+    let author = seed_identity(&pool, "paged-stream@example.test").await;
+    let token = bearer(author);
+    let doc = create_document(&router, &token, "Paged stream").await;
+    let mut tx = pool.begin().await.unwrap();
+    let payload = engine_shared::EventPayload::CommentAdded {
+        node_id: None,
+        body: "comment".into(),
+    };
+    for _ in 0..205 {
+        engine_core::log::append_in_tx(
+            &mut tx,
+            DocumentId(doc),
+            &payload,
+            engine_shared::IdentityId(author),
+        )
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let page = engine_core::log::read_range_page(&pool, DocumentId(doc), 1, i64::MAX, 7)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 7);
+    for since in ["-1", "206", "9223372036854775807"] {
+        assert_eq!(
+            send(
+                &router,
+                auth_post_get(
+                    &format!("/documents/{doc}/stream?since_seq={since}"),
+                    &token
+                )
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let mut req = auth_post_get(&format!("/documents/{doc}/stream"), &token);
+    req.headers_mut()
+        .insert("last-event-id", "2".parse().unwrap());
+    let response = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    assert!(
+        String::from_utf8_lossy(&stream.next().await.unwrap().unwrap()).contains(": connected")
+    );
+    // Append after the pinned backfill head, before consuming its three pages.
+    let mut tx = pool.begin().await.unwrap();
+    let live = engine_core::log::append_in_tx(
+        &mut tx,
+        DocumentId(doc),
+        &payload,
+        engine_shared::IdentityId(author),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    state.subscriptions.publish(DocumentId(doc), live);
+    for seq in 3..=206 {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&frame);
+        assert!(
+            text.lines().any(|line| line == format!("id: {seq}")),
+            "{text}"
+        );
+    }
 }
 
 /// A GET with a bearer token (the events endpoint is `[auth]`).
@@ -1299,6 +1646,17 @@ async fn sse_delivers_a_new_event_within_100ms(pool: PgPool) {
         "no-cache, no-transform"
     );
     let mut body = resp.into_body().into_data_stream();
+
+    // An idle subscription must flush immediately without waiting for a write or
+    // the 30-second heartbeat. The acknowledgement carries no event/cursor.
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+        .await
+        .expect("idle SSE subscription must acknowledge immediately")
+        .expect("stream yielded an acknowledgement")
+        .expect("acknowledgement is not an error");
+    let ready = String::from_utf8_lossy(&ready);
+    assert!(ready.starts_with(": connected"));
+    assert!(!ready.contains("data:") && !ready.contains("id:"));
 
     // Append an event from "another connection".
     let writer = router.clone();
@@ -1366,6 +1724,21 @@ async fn stale_field_edits_are_refused_but_disjoint_edits_work(pool: PgPool) {
     )
     .await;
     let node = created["event"]["target_node_id"].as_str().unwrap();
+    // Exercise this full workflow from shared storage, including the API's
+    // authorized write transaction, stale checks and legacy version/draft bases.
+    engine_core::snapshot::SnapshotEngine::new(pool.clone())
+        .with_periodic_storage(engine_core::snapshot::PeriodicStorage::SharedV1)
+        .ensure_recent(engine_shared::DocumentId(doc), 0)
+        .await
+        .unwrap();
+    let shared: i64 =
+        sqlx::query_scalar("select count(*) from shared_checkpoint where document_id=$1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(shared, 1);
+
     let first = json!({"node_id":node,"field":"label","value":"First edit","base_seq":1});
     let second = json!({"node_id":node,"field":"label","value":"Stale edit","base_seq":1});
     let third = json!({"node_id":node,"field":"hint","value":"Independent","base_seq":1});
@@ -1434,7 +1807,9 @@ async fn concurrent_acceptance_only_applies_once(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn batch_rolls_back_and_deploy_pins_its_exact_state(pool: PgPool) {
-    let router = app(test_state(pool.clone()));
+    let mut state = test_state(pool.clone());
+    state.named_snapshot_storage = engine_core::snapshot::NamedStorage::SharedV2;
+    let router = app(state);
     let owner = seed_identity(&pool, "owner@example.test").await;
     let token = bearer(owner);
     let doc = create_document(&router, &token, "Study").await;
@@ -1521,8 +1896,22 @@ async fn ten_researchers_merge_independent_cells_without_loss(pool: PgPool) {
         assert_eq!(status, StatusCode::OK);
         tokens.push(bearer(person));
     }
+    // A checkpoint can retain its erasure guard while actual API writers proceed.
+    let mut checkpoint_guard = pool.begin().await.unwrap();
+    sqlx::query("select id from document where id=$1 for key share")
+        .bind(doc)
+        .execute(&mut *checkpoint_guard)
+        .await
+        .unwrap();
     let futures=tokens.iter().enumerate().map(|(i,token)| {let router=router.clone();let node=node.clone();async move {send(&router,auth_post(&format!("/documents/{doc}/batch"),token,&json!({"base_seq":1,"ops":[{"type":"FieldEdited","node_id":node,"field":format!("cell_{i}"),"value":format!("Researcher {i}")}]}))).await}});
-    for (status, body) in futures::future::join_all(futures).await {
+    let results = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        futures::future::join_all(futures),
+    )
+    .await
+    .expect("API writers blocked by checkpoint guard");
+    checkpoint_guard.rollback().await.unwrap();
+    for (status, body) in results {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
     let (_, read) = send(&router, auth_post_get(&format!("/documents/{doc}"), &token)).await;
@@ -1543,7 +1932,9 @@ async fn ten_researchers_merge_independent_cells_without_loss(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn personal_draft_conflicts_are_reviewed_and_old_versions_restore_stable_ids(pool: PgPool) {
-    let router = app(test_state(pool.clone()));
+    let mut state = test_state(pool.clone());
+    state.named_snapshot_storage = engine_core::snapshot::NamedStorage::SharedV2;
+    let router = app(state);
     let owner = seed_identity(&pool, "owner@draft.test").await;
     let token = bearer(owner);
     let doc = create_document(&router, &token, "Draft test").await;
@@ -1557,6 +1948,21 @@ async fn personal_draft_conflicts_are_reviewed_and_old_versions_restore_stable_i
     )
     .await;
     let node = created["event"]["target_node_id"].as_str().unwrap();
+    // Exercise this full workflow from shared storage, including the API's
+    // authorized write transaction, stale checks and legacy version/draft bases.
+    engine_core::snapshot::SnapshotEngine::new(pool.clone())
+        .with_periodic_storage(engine_core::snapshot::PeriodicStorage::SharedV1)
+        .ensure_recent(engine_shared::DocumentId(doc), 0)
+        .await
+        .unwrap();
+    let shared: i64 =
+        sqlx::query_scalar("select count(*) from shared_checkpoint where document_id=$1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(shared, 1);
+
     let (status, version) = send(
         &router,
         auth_post(
@@ -1977,7 +2383,9 @@ async fn office_review_is_private_and_unresolved_changes_cannot_be_published(poo
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn product_public_copy_is_frozen_private_and_revocable(pool: PgPool) {
-    let router = app(test_state(pool.clone()));
+    let mut state = test_state(pool.clone());
+    state.named_snapshot_storage = engine_core::snapshot::NamedStorage::SharedV2;
+    let router = app(state);
     let owner = bearer(seed_identity(&pool, "publisher@example.org").await);
     let doc = create_document(&router, &owner, "Published protocol").await;
     let root = "01J00000000000000000000000";
@@ -2193,4 +2601,219 @@ async fn product_admin_removal_invalidates_existing_tokens_after_restoration(poo
         .execute(&pool)
         .await;
     assert!(result.is_err(), "Operations audit must be append-only");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn corrupt_historical_snapshot_cannot_escape_through_public_restore_or_audit(pool: PgPool) {
+    corrupt_snapshot_boundaries(pool, false).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn corrupt_shared_snapshot_cannot_escape_through_public_restore_or_audit(pool: PgPool) {
+    corrupt_snapshot_boundaries(pool, true).await;
+}
+
+async fn corrupt_snapshot_boundaries(pool: PgPool, shared: bool) {
+    let mut state = test_state(pool.clone());
+    if shared {
+        state.named_snapshot_storage = engine_core::snapshot::NamedStorage::SharedV2;
+    }
+    let storage = state.named_snapshot_storage;
+    let router = app(state);
+    let owner = bearer(seed_identity(&pool, "snapshot-owner@example.test").await);
+    let outsider = bearer(seed_identity(&pool, "snapshot-outsider@example.test").await);
+    let doc = create_document(&router, &owner, "Verified history").await;
+    let node = ulid::Ulid::new().to_string();
+    let (status, body) = send(&router, auth_post(&format!("/documents/{doc}/batch"), &owner,
+        &json!({"base_seq":0,"ops":[{"type":"NodeCreated","node_id":node,"node_type":"form","pos":"a0","fields":{"label":"Original"}}]}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &router,
+        auth_post(&format!("/documents/{doc}/deploy"), &owner, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, version) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/versions"),
+            &owner,
+            &json!({"name":"Milestone","base_seq":2}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{version}");
+    let snapshot = version["snapshot_id"].as_str().unwrap();
+    let (status, link) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/public-links"),
+            &owner,
+            &json!({"base_seq":2}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{link}");
+    let public = format!("/public/documents/{}", link["token"].as_str().unwrap());
+    assert_eq!(send(&router, get(&public)).await.0, StatusCode::OK);
+    let deployed: Uuid =
+        sqlx::query_scalar("select deployed_snapshot_id from document where id=$1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(deployed.to_string(), snapshot);
+    // A newer healthy checkpoint must not mask a corrupt retained historical one.
+    let (status, body) = send(&router, auth_post(&format!("/documents/{doc}/batch"), &owner,
+        &json!({"base_seq":2,"ops":[{"type":"FieldEdited","node_id":node,"field":"label","value":"Current"}]}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    engine_core::snapshot::SnapshotEngine::new(pool.clone())
+        .with_named_storage(storage)
+        .take(
+            DocumentId(doc),
+            engine_core::snapshot::SnapshotReason::Periodic,
+        )
+        .await
+        .unwrap();
+    sqlx::query("alter table snapshot disable trigger snapshot_no_update")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let raw: Value = sqlx::query_scalar("select state from snapshot where id=$1")
+        .bind(deployed)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(raw.get("$dynodoc_state").is_some(), shared);
+    if shared {
+        sqlx::query("update snapshot set state=(select state from snapshot where document_id=$2 and through_seq=3) where id=$1")
+            .bind(deployed).bind(doc).execute(&pool).await.unwrap();
+    } else {
+        sqlx::query("update snapshot set state=jsonb_set(state,'{comments}','[{\"node_id\":null,\"body\":\"forged\"}]') where id=$1")
+        .bind(deployed).execute(&pool).await.unwrap();
+    }
+    sqlx::query("alter table snapshot enable trigger snapshot_no_update")
+        .execute(&pool)
+        .await
+        .unwrap();
+    engine_core::log::verify_chain(&pool, DocumentId(doc))
+        .await
+        .unwrap();
+    let (status, current) =
+        send(&router, auth_post_get(&format!("/documents/{doc}"), &owner)).await;
+    assert_eq!(status, StatusCode::OK, "{current}");
+    assert_eq!(
+        current["state"]["nodes"][&node]["current_fields"]["label"],
+        "Current"
+    );
+    let path = format!("/documents/{doc}/snapshot/{snapshot}");
+    assert_eq!(
+        send(&router, auth_post_get(&path, &owner)).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        send(&router, auth_post_get(&path, &outsider)).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(&router, get(&public)).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let (status, audit) = send(
+        &router,
+        auth_post_get(&format!("/documents/{doc}/verify"), &owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{audit}");
+    assert_eq!(audit["ok"], false);
+    assert_eq!(audit["broken_at_seq"], 2);
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!(
+                "/documents/{doc}/versions/{}/restore",
+                version["id"].as_str().unwrap()
+            ),
+            &owner,
+            &json!({"base_seq":3}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let seq: i64 = sqlx::query_scalar("select max(seq) from event where document_id=$1")
+        .bind(doc)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(seq, 3, "failed restore must append nothing");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_timeout_stops_blocked_scan_and_recovers(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let token = bearer(seed_identity(&pool, "bounded-search@example.test").await);
+    create_document(&router, &token, "Search fixture").await;
+    let mut lock = pool.begin().await.unwrap();
+    sqlx::query("lock table node in access exclusive mode")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        send(&router, auth_post_get("/search?q=fixture", &token)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(body["code"], "deadline_exceeded");
+    assert!(!body.to_string().contains("statement"));
+    lock.rollback().await.unwrap();
+    let (status, body) = send(&router, auth_post_get("/search?q=fixture", &token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+}
+#[sqlx::test(migrations = "../../migrations")]
+async fn expensive_reads_share_identity_budget_but_not_other_members(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let actor = seed_identity(&pool, "budget-actor@example.test").await;
+    let owner = bearer(actor);
+    let other = bearer(seed_identity(&pool, "budget-other@example.test").await);
+    let doc = create_document(&router, &owner, "Budget fixture").await;
+    // A denied caller cannot debit the owner's project or account budget.
+    for _ in 0..125 {
+        assert_eq!(
+            send(
+                &router,
+                auth_post_get(&format!("/documents/{doc}/verify"), &other)
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    for _ in 0..120 {
+        assert_eq!(
+            send(&router, auth_post_get("/search?q=fixture", &owner))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    let response = router
+        .clone()
+        .oneshot(auth_post_get(
+            &format!("/documents/{doc}/provenance"),
+            &bearer(actor),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["retry-after"], "60");
+    drop(response);
+    assert_eq!(
+        send(&router, auth_post_get("/search?q=fixture", &other))
+            .await
+            .0,
+        StatusCode::OK
+    );
 }

@@ -33,6 +33,9 @@ pub enum ApiError {
     /// Authenticated but lacking the capability/role for this action → 403.
     #[error("forbidden")]
     Forbidden,
+    /// Like [`ApiError::Forbidden`], with a reason the person can act on → 403.
+    #[error("forbidden: {reason}")]
+    Denied { reason: String },
     /// The request was structurally or semantically invalid → 400.
     #[error("bad request: {reason}")]
     BadRequest { reason: String },
@@ -43,6 +46,15 @@ pub enum ApiError {
     /// The caller exceeded a rate limit → 429, with a `Retry-After` hint (seconds).
     #[error("rate limited")]
     RateLimited { retry_after: u64 },
+    /// Read/database deadline reached; no query internals are returned.
+    #[error("operation deadline exceeded")]
+    Deadline,
+    /// Database pool admission unavailable.
+    #[error("service busy; retry later")]
+    Busy,
+    /// Encoded shared history reached its retained-storage budget.
+    #[error("Shared history storage limit reached. Your change was not saved. Ask the workspace operator to increase the storage budget.")]
+    StorageLimit,
     /// An unexpected server-side failure → 500. The detail is logged, never returned.
     #[error("internal error: {0}")]
     Internal(String),
@@ -54,11 +66,14 @@ impl ApiError {
         match self {
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
-            ApiError::Forbidden => StatusCode::FORBIDDEN,
+            ApiError::Forbidden | ApiError::Denied { .. } => StatusCode::FORBIDDEN,
             ApiError::BadRequest { .. } => StatusCode::BAD_REQUEST,
             ApiError::Conflict { .. } => StatusCode::CONFLICT,
             ApiError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::Deadline => StatusCode::GATEWAY_TIMEOUT,
+            ApiError::Busy => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::StorageLimit => StatusCode::INSUFFICIENT_STORAGE,
         }
     }
 
@@ -67,18 +82,23 @@ impl ApiError {
         match self {
             ApiError::NotFound => "not_found",
             ApiError::Unauthorized => "unauthorized",
-            ApiError::Forbidden => "forbidden",
+            ApiError::Forbidden | ApiError::Denied { .. } => "forbidden",
             ApiError::BadRequest { .. } => "bad_request",
             ApiError::Conflict { .. } => "conflict",
             ApiError::RateLimited { .. } => "rate_limited",
             ApiError::Internal(_) => "internal",
+            ApiError::Deadline => "deadline_exceeded",
+            ApiError::Busy => "busy",
+            ApiError::StorageLimit => "storage_limit",
         }
     }
 
     /// Structured detail returned to the client. Never includes internal text.
     fn details(&self) -> Value {
         match self {
-            ApiError::BadRequest { reason } | ApiError::Conflict { reason } => {
+            ApiError::BadRequest { reason }
+            | ApiError::Conflict { reason }
+            | ApiError::Denied { reason } => {
                 json!({ "reason": reason })
             }
             ApiError::RateLimited { retry_after } => json!({ "retry_after": retry_after }),
@@ -127,13 +147,33 @@ impl From<AuthError> for ApiError {
             }
             AuthError::Forbidden => ApiError::Forbidden,
             AuthError::InvalidKey | AuthError::TokenMint(_) => ApiError::Internal(err.to_string()),
-            AuthError::Db(e) => ApiError::Internal(e.to_string()),
+            AuthError::Db(e) => e.into(),
         }
     }
 }
 
 impl From<sqlx::Error> for ApiError {
     fn from(err: sqlx::Error) -> Self {
+        if matches!(err, sqlx::Error::PoolTimedOut) {
+            return ApiError::Busy;
+        }
+        if let sqlx::Error::Database(db) = &err {
+            if db.code().as_deref() == Some("23514")
+                && matches!(
+                    db.constraint(),
+                    Some(
+                        "checkpoint_storage_quota"
+                            | "project_staging_quota"
+                            | "project_history_quota"
+                    )
+                )
+            {
+                return ApiError::StorageLimit;
+            }
+            if matches!(db.code().as_deref(), Some("57014" | "55P03")) {
+                return ApiError::Deadline;
+            }
+        }
         ApiError::Internal(err.to_string())
     }
 }
@@ -161,9 +201,11 @@ impl From<GovernanceError> for ApiError {
             GovernanceError::Op(op) => ApiError::from(op),
             // A deploy refused on referential-integrity violations conflicts with the
             // current (broken) instrument state.
-            GovernanceError::Integrity(_) => ApiError::Conflict {
-                reason: err.to_string(),
-            },
+            GovernanceError::Integrity(_) | GovernanceError::SheetProtection(_) => {
+                ApiError::Conflict {
+                    reason: err.to_string(),
+                }
+            }
         }
     }
 }
@@ -172,6 +214,7 @@ impl From<EventError> for ApiError {
     fn from(err: EventError) -> Self {
         match err {
             EventError::DocumentNotFound(_) => ApiError::NotFound,
+            EventError::Db(e) => e.into(),
             other => ApiError::Internal(other.to_string()),
         }
     }
@@ -180,7 +223,19 @@ impl From<EventError> for ApiError {
 impl From<SnapshotError> for ApiError {
     fn from(err: SnapshotError) -> Self {
         match err {
-            SnapshotError::Event(EventError::DocumentNotFound(_)) => ApiError::NotFound,
+            SnapshotError::Event(e) => e.into(),
+            SnapshotError::Db(e) => e.into(),
+            SnapshotError::Shared(e) => (*e).into(),
+            other => ApiError::Internal(other.to_string()),
+        }
+    }
+}
+
+impl From<engine_core::shared_checkpoint::Error> for ApiError {
+    fn from(err: engine_core::shared_checkpoint::Error) -> Self {
+        match err {
+            engine_core::shared_checkpoint::Error::Db(e) => e.into(),
+            engine_core::shared_checkpoint::Error::History(e) => e.into(),
             other => ApiError::Internal(other.to_string()),
         }
     }

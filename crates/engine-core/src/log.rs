@@ -24,6 +24,7 @@
 //! the JSONB round-trip.
 
 use engine_shared::{DocumentId, Event, EventPayload, IdentityId};
+use futures::TryStreamExt;
 use ring::digest::{Context, SHA256};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -109,9 +110,12 @@ pub async fn append_in_tx(
     // Serialize all appends for this document. Locking the document row (rather than
     // the latest event row) is what actually makes appends linearizable: a lock on
     // the latest *existing* event does not stop a concurrent txn from selecting that
-    // same row and computing a duplicate next `seq`.
+    // same row and computing a duplicate next `seq`. NO KEY UPDATE conflicts with
+    // other writers and permission/lifecycle locks, but permits checkpoint KEY
+    // SHARE guards. Appends never change document.id; checkpoints pin immutable
+    // event sequences and must not require stopping later appends.
     let exists: Option<(Uuid,)> =
-        sqlx::query_as("select id from document where id = $1 for update")
+        sqlx::query_as("select id from document where id = $1 for no key update")
             .bind(document_id.0)
             .fetch_optional(&mut **tx)
             .await?;
@@ -176,60 +180,79 @@ pub async fn post_commit_snapshot(
 }
 
 /// Replay a document's log in `seq` order, recompute every hash, and confirm it
-/// matches what is stored. Linear in the number of events. Returns
+/// matches what is stored. Linear in history bytes; streams events without
+/// collecting the whole log in application memory. Returns
 /// [`EventError::ChainBroken`] naming the exact `seq` on the first inconsistency —
-/// this is the function the auditor CLI calls.
+/// Snapshot equivalence is checked separately by `snapshot_verification::verify_document`.
 pub async fn verify_chain(pool: &PgPool, document_id: DocumentId) -> Result<(), EventError> {
-    let events: Vec<Event> =
-        sqlx::query_as("select * from event where document_id = $1 order by seq asc")
+    let mut events =
+        sqlx::query_as::<_, Event>("select * from event where document_id = $1 order by seq asc")
             .bind(document_id.0)
-            .fetch_all(pool)
-            .await?;
+            .fetch(pool);
 
     let mut prev_chain_hash = ZERO_HASH.to_vec();
 
-    for (i, ev) in events.iter().enumerate() {
-        let expected_seq = i as i64 + 1;
-        if ev.seq != expected_seq {
-            return Err(EventError::ChainBroken {
-                seq: ev.seq,
-                detail: format!(
-                    "expected seq {expected_seq}, found {} (gap or reorder)",
-                    ev.seq
-                ),
-            });
-        }
-
-        let canonical = canonical_json(&ev.payload);
-        let recomputed_content = content_hash(
-            &ev.event_type,
-            ev.target_node_id.as_ref().map(|n| n.0.as_str()),
-            &canonical,
-            &ev.actor_id.0,
-        );
-        if recomputed_content[..] != ev.content_hash[..] {
-            return Err(EventError::ChainBroken {
-                seq: ev.seq,
-                detail: "content_hash mismatch (type, target, payload, or actor altered)".into(),
-            });
-        }
-
-        if ev.prev_chain_hash[..] != prev_chain_hash[..] {
-            return Err(EventError::ChainBroken {
-                seq: ev.seq,
-                detail: "prev_chain_hash does not match the prior event's chain_hash".into(),
-            });
-        }
-
-        let recomputed_chain = chain_hash(&recomputed_content, &prev_chain_hash);
-        if recomputed_chain[..] != ev.chain_hash[..] {
-            return Err(EventError::ChainBroken {
-                seq: ev.seq,
-                detail: "chain_hash mismatch".into(),
-            });
-        }
+    let mut expected_seq = 1;
+    while let Some(ev) = events.try_next().await? {
+        verify_event(&ev, document_id, expected_seq, &prev_chain_hash)?;
 
         prev_chain_hash = ev.chain_hash.clone();
+        expected_seq += 1;
+    }
+
+    Ok(())
+}
+
+/// Verify one row against its pinned document, expected sequence and predecessor.
+pub(crate) fn verify_event(
+    event: &Event,
+    document: DocumentId,
+    expected_seq: i64,
+    previous: &[u8],
+) -> Result<(), EventError> {
+    if event.document_id != document {
+        return Err(EventError::ChainBroken {
+            seq: event.seq,
+            detail: "document binding mismatch".into(),
+        });
+    }
+    if event.seq != expected_seq {
+        return Err(EventError::ChainBroken {
+            seq: event.seq,
+            detail: format!(
+                "expected seq {expected_seq}, found {} (gap or reorder)",
+                event.seq
+            ),
+        });
+    }
+
+    let canonical = canonical_json(&event.payload);
+    let recomputed_content = content_hash(
+        &event.event_type,
+        event.target_node_id.as_ref().map(|n| n.0.as_str()),
+        &canonical,
+        &event.actor_id.0,
+    );
+    if recomputed_content[..] != event.content_hash[..] {
+        return Err(EventError::ChainBroken {
+            seq: event.seq,
+            detail: "content_hash mismatch (type, target, payload, or actor altered)".into(),
+        });
+    }
+
+    if event.prev_chain_hash[..] != previous[..] {
+        return Err(EventError::ChainBroken {
+            seq: event.seq,
+            detail: "prev_chain_hash does not match the prior event's chain_hash".into(),
+        });
+    }
+
+    let recomputed_chain = chain_hash(&recomputed_content, previous);
+    if recomputed_chain[..] != event.chain_hash[..] {
+        return Err(EventError::ChainBroken {
+            seq: event.seq,
+            detail: "chain_hash mismatch".into(),
+        });
     }
 
     Ok(())
@@ -253,6 +276,20 @@ pub async fn read_range(
     .fetch_all(pool)
     .await?;
     Ok(events)
+}
+
+/// Bounded history page, including at most one lookahead row for a 1,000-row API
+/// page. SQL applies the limit before rows enter application memory.
+pub async fn read_range_page(
+    pool: &PgPool,
+    document_id: DocumentId,
+    from_seq: i64,
+    to_seq: i64,
+    limit: i64,
+) -> Result<Vec<Event>, EventError> {
+    Ok(sqlx::query_as("select * from event where document_id=$1 and seq between $2 and $3 order by seq asc limit $4")
+        .bind(document_id.0).bind(from_seq).bind(to_seq).bind(limit.clamp(1, 1001))
+        .fetch_all(pool).await?)
 }
 
 /// Read every event after a snapshot's `through_seq`, in `seq` order — the tail the
@@ -495,5 +532,62 @@ mod tests {
         // Deterministic: recomputing gives the same digest.
         assert_eq!(chain, chain_hash(&ch, &ZERO_HASH));
         assert_ne!(chain, ch);
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("fixture hex"))
+            .collect()
+    }
+
+    /// One valid log with every event type. The fixture's hashes come from an
+    /// independent implementation of the documented formula; replay must reproduce
+    /// the pinned state and node Merkle root.
+    #[test]
+    fn v1_golden_log_hashes_and_replay_are_stable() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/v1-log.json")).unwrap();
+        let document = DocumentId(fixture["document_id"].as_str().unwrap().parse().unwrap());
+        let actor = IdentityId(fixture["actor_id"].as_str().unwrap().parse().unwrap());
+
+        let mut events = Vec::new();
+        let mut types = std::collections::BTreeSet::new();
+        let mut previous = ZERO_HASH.to_vec();
+        for row in fixture["events"].as_array().unwrap() {
+            let payload: EventPayload = serde_json::from_value(row["payload"].clone()).unwrap();
+            let event = Event {
+                id: engine_shared::EventId(row["id"].as_str().unwrap().into()),
+                document_id: document,
+                seq: row["seq"].as_i64().unwrap(),
+                event_type: row["type"].as_str().unwrap().into(),
+                actor_id: actor,
+                target_node_id: row["target_node_id"]
+                    .as_str()
+                    .map(|id| engine_shared::NodeId(id.into())),
+                payload: row["payload"].clone(),
+                content_hash: hex(row["content_hash"].as_str().unwrap()),
+                prev_chain_hash: hex(row["prev_chain_hash"].as_str().unwrap()),
+                chain_hash: hex(row["chain_hash"].as_str().unwrap()),
+                created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            };
+            // The type and target columns are derived from the payload at append time.
+            assert_eq!(event.event_type, payload.event_type().as_str());
+            assert_eq!(event.target_node_id.as_ref(), payload.target_node_id());
+            verify_event(&event, document, event.seq, &previous).unwrap();
+            previous = event.chain_hash.clone();
+            types.insert(event.event_type.clone());
+            events.push(event);
+        }
+        assert_eq!(types.len(), 15, "the fixture covers every v1 event type");
+
+        let state = crate::materializer::Materializer::fold(&events).unwrap();
+        let pinned: crate::materializer::DocumentState =
+            serde_json::from_value(fixture["final_state"].clone()).unwrap();
+        assert_eq!(state, pinned);
+        assert_eq!(
+            snapshot::merkle_root(&state).unwrap().to_vec(),
+            hex(fixture["merkle_root"].as_str().unwrap())
+        );
     }
 }

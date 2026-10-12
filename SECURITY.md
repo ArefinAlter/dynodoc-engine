@@ -13,3 +13,9 @@ Particularly relevant areas are authorization across drafts/public views, event
 integrity and replay, parser/resource limits, authentication, administrative erasure
 and SQL concurrency. Run tests only against an isolated database. Never expose a
 development database or test authentication to the public internet.
+
+Known trust boundaries, current source fixes and remaining release gates are
+recorded in [security hardening](docs/SECURITY-HARDENING.md). In particular, legacy
+snapshot upgrade/backfill and runtime-role deployment acceptance remain release
+gates; checked snapshots and separate operator/runtime credentials are implemented;
+v1 chain consistency is not independent proof against a database owner.

@@ -11,11 +11,23 @@
 /// Append-only, hash-chained event log (the system of record). See docs/14.
 pub mod log;
 
+/// Separate migration/provisioning commands and read-only runtime startup gates.
+pub mod database;
+
 /// Snapshotted fold / state materialization. See docs/15.
 pub mod materializer;
 
 /// Snapshot storage, Merkle commitments, and snapshot-backed current-state reads.
 pub mod snapshot;
+
+/// Legacy snapshot replay verification, immutable receipts and checked reads.
+pub mod snapshot_verification;
+
+/// Opt-in content-addressed, document-scoped shared checkpoints.
+pub mod shared_checkpoint;
+
+/// Portable signed project commits and a durable local repository.
+pub mod repository;
 
 /// Semantic operation handlers: per-variant validation against current state. See docs/16.
 pub mod ops;
@@ -36,4 +48,8 @@ pub mod expr;
 pub mod merge;
 
 pub mod richtext;
+
+/// Content fingerprints (MinHash, locality-sensitive bands, block containment) for
+/// recognising renamed or edited copies of a document.
+pub mod similarity;
 pub mod workspace_merge;

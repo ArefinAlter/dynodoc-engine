@@ -5,9 +5,9 @@ access/refresh tokens. Browsers in the full application use a separate encrypted
 session gateway; that SvelteKit gateway is not included in this repository.
 
 `PASETO_LOCAL_KEY` is a 32-byte hex key. `WEB_SERVICE_KEY` authenticates trusted
-service-to-service provider identity exchange; do not expose it to browsers.
+service-to-service magic-link issuance and provider identity exchange; do not expose it to browsers.
 `ADMIN_EMAILS` is an explicit allowlist; an empty value denies admin access.
-Production requires a long service key. TLS termination, provider OAuth/email,
+Every environment requires a service key of at least 32 characters and a nonzero PASETO key. TLS termination, provider OAuth/email,
 secret management and a browser session gateway are deployment responsibilities.
 
 Run the binary with `DATABASE_URL`, `PASETO_LOCAL_KEY`, `WEB_SERVICE_KEY`, `API_HOST`,
@@ -18,3 +18,73 @@ checks before exposing the service to a network.
 `crates/engine-api/tests/api_test.rs` and `auth_test.rs` demonstrate local authenticated
 requests, version/draft operations, stale writes and membership isolation against
 fresh SQLx test databases. They do not contact real login or research providers.
+
+## Current document collaboration API
+
+The synchronized service includes `/documents/:id/change-requests` (create/list,
+detail, merge, decline, withdraw and reviews), draft submit/withdraw,
+`/documents/:id/history-points` and `/state?through_seq=`, `/people`, `/policy`,
+`/owner`, `/documents/:id/copies`, `/copies/:match_id`,
+`/notifications`, `/notifications/count` and `/notifications/read`.
+Use generated OpenAPI for exact verbs, payloads and response shapes.
+
+Per-document rules protect canonical edits and constrain approval/merge rights.
+Submitted requests are reviewable by permitted collaborators; private drafts stay
+private. Approvals must reflect current request content. Copy metadata and notices
+are filtered at read time; a notification does not grant document access.
+
+The API binary starts a background copy-index/detection worker. Fingerprints are
+derived data; notifications and review metadata are separate from content events.
+Watch/digest APIs are absent. Invitation delivery at application
+`b70f048` is a web-gateway operation after an engine grant, not an engine endpoint.
+See [current capabilities](CAPABILITIES.md) for role-name compatibility and limits.
+
+
+Projects and editor-scoped provenance endpoints are implemented; see
+[the version-1 service contract](PROVENANCE-SYNC.md) and generated OpenAPI.
+Connector keys cannot use account-wide session endpoints or merge operations.
+
+Both provenance checkpoint GET endpoints accept optional through_seq for exact
+canonical historical state/hash. Current membership and credential checks apply;
+negative/future revisions return 400. Omitted selector returns the current head.
+Proposal statuses remain current, including in historical checkpoints.
+
+## Member profiles and test uploads (schema 26)
+
+`GET /profile` reads the signed-in account profile; `POST /profile` updates its
+name and bio with the expected revision. A stale revision returns 409. `GET
+/profiles/:id` returns only the caller or an enabled account currently sharing a
+Project with the caller; unavailable profiles return 404. Document-only sharing
+is insufficient. Responses omit email. Names are 1-80 Unicode scalar values and
+bios at most 280. Account erasure clears this metadata.
+
+Original-file upload accepts at most 3,000,000 decoded bytes and bounds base64
+length before decoding. Oversize originals return 400; the transport body limit
+can return 413. A rejected upload creates no original-file row. Derived provenance
+payloads and expanded-archive safety budgets remain separate. See generated
+OpenAPI and `profiles_upload_test.rs` for exact contracts and boundary checks.
+
+## Revocable web logins (schema 27)
+
+New access tokens and refresh successors share a login ID. POST /auth/logout
+accepts a refresh_token secret, including an unexpired rotated ancestor, and
+revokes that login. Protected requests and SSE data delivery check revocation.
+Logout is idempotent; an unknown secret discloses no account state. Independent
+logins remain active. A pre-schema-27 cookie lacks a login ID, so its logout
+invalidates the account generation instead, including existing connector grants.
+See [compatibility and deployment gates](SECURITY-HARDENING.md).
+
+Event pages are bounded in SQL (up to 1,000 rows plus lookahead). SSE catches up
+in 100-row pages before live delivery, supports Last-Event-ID and rejects negative
+or future positions. Byte/tenant/time limits and expensive search remain open.
+
+
+## Legacy snapshot verification (schema 28)
+
+`GET /documents/:id/verify` independently checks the event chain and all legacy
+snapshots against replay. Snapshot/content/public-link/history/restore readers
+require immutable verification receipts. CLI `verify-snapshots DOCUMENT_UUID` or
+`verify-snapshots --all` performs verified backfill; CLI `verify` checks independently
+without writing receipts. An existing database must complete this backfill before
+traffic is restored. An old API that ignores receipts is not safe rollback. Read
+[the release gate and limitations](VERIFIED-SNAPSHOTS.md).

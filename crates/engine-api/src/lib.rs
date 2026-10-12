@@ -12,19 +12,33 @@
 //! [`error::ApiError`], opaque cursor [`pagination`], Postgres-backed [`idempotency`],
 //! and a generated [`ApiDoc`] OpenAPI document.
 
+pub mod access;
 pub mod admin;
 mod admin_controls;
 pub mod audit;
 pub mod auth;
 pub mod conflicts;
+pub mod copies;
+mod devices;
 mod discussions;
 pub mod documents;
+mod draft_storage;
 pub mod error;
+mod history;
 pub mod idempotency;
+pub mod notifications;
 pub mod ops;
 pub mod pagination;
+pub mod people;
 pub mod product;
+mod profiles;
+mod project_history;
+mod project_staging;
+pub mod projects;
+pub mod provenance;
+pub mod reviews;
 pub mod stream;
+pub mod workloads;
 pub mod workspace;
 
 use axum::{routing::get, Json, Router};
@@ -46,6 +60,15 @@ pub struct AppState {
     /// Per-document SSE broadcast registry (live event fan-out).
     pub subscriptions: Subscriptions,
     pub admin_emails: String,
+    /// Wakes the background copy-detection indexer ([`copies::spawn`]).
+    pub copy_index: copies::CopyIndex,
+    pub workloads: workloads::Workloads,
+    /// Explicitly loaded secret outside the database; required for shared ref writes.
+    pub ref_signer: Option<std::sync::Arc<ring::signature::Ed25519KeyPair>>,
+    /// Explicit opt-in; new draft/rebase bases use typed shared objects.
+    pub shared_draft_bases: bool,
+    /// Explicit opt-in; named versions, public pins and deploys share typed state.
+    pub named_snapshot_storage: engine_core::snapshot::NamedStorage,
 }
 
 impl AppState {
@@ -56,6 +79,18 @@ impl AppState {
             auth,
             subscriptions: Subscriptions::new(),
             admin_emails: std::env::var("ADMIN_EMAILS").unwrap_or_default(),
+            copy_index: copies::CopyIndex::default(),
+            workloads: workloads::Workloads::default(),
+            ref_signer: None,
+            shared_draft_bases: std::env::var("DYNODOC_SHARED_DRAFT_BASES").as_deref()
+                == Ok("shared-v2"),
+            named_snapshot_storage: if std::env::var("DYNODOC_NAMED_SNAPSHOT_STORAGE").as_deref()
+                == Ok("shared-v2")
+            {
+                engine_core::snapshot::NamedStorage::SharedV2
+            } else {
+                engine_core::snapshot::NamedStorage::Legacy
+            },
         }
     }
 }
@@ -64,8 +99,8 @@ impl AppState {
 ///
 /// Middleware (docs/18 §1): gzip compression, a CORS layer (permissive for the
 /// local-only PoC — tighten origins for a deployment), and an OpenTelemetry-compatible
-/// `TraceLayer`. Rate limiting is intentionally minimal in the PoC (see the module-level
-/// note in [`idempotency`]); idempotency is implemented fully.
+/// `TraceLayer`. Process-local admission/deadline controls are in [`workloads`];
+/// these do not replace tenant quotas at a multi-instance gateway.
 pub fn app(state: AppState) -> Router {
     // PoC: permissive CORS (local-only). A deployment restricts `allow_origin` to the
     // known frontend origins (docs/18 "restrict to known origins").
@@ -80,13 +115,31 @@ pub fn app(state: AppState) -> Router {
         .merge(auth::router())
         .merge(admin::router())
         .merge(product::router())
+        .merge(projects::router())
+        .merge(project_staging::router())
+        .merge(project_history::router())
+        .merge(profiles::router())
+        .merge(devices::router())
+        .merge(provenance::router())
         .merge(documents::router())
         .merge(ops::router())
         .merge(conflicts::router())
         .merge(stream::router())
         .merge(audit::router())
         .merge(workspace::router())
+        .merge(reviews::router())
+        .merge(history::router())
         .merge(discussions::router())
+        .merge(notifications::router())
+        .merge(copies::router())
+        .merge(people::router())
+        .layer(axum::middleware::from_fn_with_state(
+            state.workloads.clone(),
+            workloads::admission,
+        ))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            16 * 1024 * 1024,
+        ))
         .with_state(state)
         .layer(cors)
         .layer(CompressionLayer::new())
@@ -115,6 +168,11 @@ async fn openapi_json() -> Json<Value> {
     ),
     modifiers(&WorkspaceDocs),
     paths(
+        auth::routes::logout,
+        profiles::own,
+        profiles::read,
+        profiles::save,
+        profiles::storage,
         documents::routes::list_documents,
         documents::routes::get_document,
         documents::routes::get_node,
@@ -134,6 +192,7 @@ async fn openapi_json() -> Json<Value> {
         audit::merkle_proof,
     ),
     components(schemas(
+        auth::routes::RefreshRequest,
         documents::routes::CreateDocumentRequest,
         ops::routes::NodeCreateRequest,
         ops::routes::FieldEditRequest,
@@ -157,11 +216,30 @@ struct WorkspaceDocs;
 impl utoipa::Modify for WorkspaceDocs {
     fn modify(&self, api: &mut utoipa::openapi::OpenApi) {
         api.merge(workspace::WorkspaceApi::openapi());
+        api.merge(reviews::ReviewApi::openapi());
+        api.merge(history::HistoryApi::openapi());
         api.merge(product::ProductApi::openapi());
+        api.merge(projects::ProjectsApi::openapi());
+        api.merge(provenance::ProvenanceApi::openapi());
         api.merge(admin::AdminApi::openapi());
         api.merge(admin_controls::AdminControlsApi::openapi());
         api.merge(discussions::DiscussionApi::openapi());
+        api.merge(notifications::NotificationApi::openapi());
+        api.merge(copies::CopiesApi::openapi());
+        api.merge(people::PeopleApi::openapi());
+        api.merge(devices::DevicesApi::openapi());
+        api.merge(project_staging::ProjectStagingApi::openapi());
+        api.merge(project_history::ProjectHistoryApi::openapi());
         let components = api.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "connector_key",
+            utoipa::openapi::security::SecurityScheme::Http(
+                utoipa::openapi::security::HttpBuilder::new()
+                    .scheme(utoipa::openapi::security::HttpAuthScheme::Bearer)
+                    .bearer_format("64 hexadecimal characters; file-scoped editor key")
+                    .build(),
+            ),
+        );
         components.add_security_scheme(
             "paseto",
             utoipa::openapi::security::SecurityScheme::Http(

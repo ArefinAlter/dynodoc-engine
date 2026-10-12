@@ -8,7 +8,7 @@
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use engine_api::ApiDoc;
-use engine_core::log::{self, verify_chain, EventError};
+use engine_core::log;
 use engine_core::materializer::Materializer;
 use engine_core::snapshot::{SnapshotEngine, SnapshotReason};
 use engine_shared::DocumentId;
@@ -16,6 +16,12 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use utoipa::OpenApi;
 use uuid::Uuid;
+
+mod device;
+mod receipt;
+mod repository;
+mod signing;
+mod sync;
 
 #[derive(Parser)]
 #[command(name = "engine-cli", version, about = "dynodoc admin tools")]
@@ -26,10 +32,49 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Replay a document's event log and verify hash-chain integrity.
+    /// Selected-history transfer. Remote heads are pinned separately from local branches.
+    Sync(sync::Options),
+    /// Enroll a local signing key in an authenticated Dynodoc account.
+    Device {
+        #[command(subcommand)]
+        action: device::Action,
+    },
+    /// Signed ref receipts and a separate durable client trust journal (offline).
+    Receipt {
+        journal: std::path::PathBuf,
+        authority: Uuid,
+        project: Uuid,
+        branch: String,
+        #[command(subcommand)]
+        action: receipt::Action,
+    },
+    /// Durable local project history (no network or installed-editor session required).
+    Repository {
+        path: std::path::PathBuf,
+        project: Uuid,
+        #[command(subcommand)]
+        action: repository::Action,
+    },
+    /// Apply migrations using MIGRATION_DATABASE_URL in a separate operator process.
+    Migrate,
+    /// Give an existing restricted login the explicit runtime allowlist (operator only).
+    GrantRuntime { role: String },
+    /// Install the public receipt key using operator credentials; never replaces a key.
+    InstallRefAuthority { public_key: String },
+    /// Check schema and runtime privileges using DATABASE_URL; makes no changes.
+    CheckRuntime,
+    /// Independently verify the event chain and all legacy snapshots.
     Verify {
         /// Document id (UUID).
         document_id: String,
+    },
+    /// Backfill legacy snapshot receipts by verified replay (schema 28). Atomic per document.
+    VerifySnapshots {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        document_id: Option<String>,
+        /// Visit every document in keyset order; stop at the first integrity error.
+        #[arg(long)]
+        all: bool,
     },
     /// Replay a document's event log and print the materialized state.
     Replay {
@@ -40,6 +85,15 @@ enum Command {
     Snapshot {
         /// Document id (UUID).
         document_id: String,
+    },
+    /// Publish an opt-in shared checkpoint at an exact event revision (schema 25).
+    SharedSnapshot {
+        document_id: String,
+        #[arg(long)]
+        through_seq: i64,
+        /// Use typed chunked state objects (requires schema 30).
+        #[arg(long)]
+        typed: bool,
     },
     /// Emit the generated OpenAPI document. With `--out`, write it there; otherwise
     /// print to stdout. CI compares the committed `openapi.yaml` against `--out -` to
@@ -61,9 +115,65 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::Sync(options) => sync::run(options).await,
+        Command::Device { action } => device::run(action),
+        Command::Receipt {
+            journal,
+            authority,
+            project,
+            branch,
+            action,
+        } => {
+            receipt::run(
+                journal,
+                engine_core::repository::attestation::Scope {
+                    authority,
+                    project,
+                    branch,
+                },
+                action,
+            )
+            .await
+        }
+        Command::Repository {
+            path,
+            project,
+            action,
+        } => repository::run(path, project, action).await,
+        Command::Migrate => {
+            let pool = connect_migration().await?;
+            engine_core::database::MIGRATOR.run(&pool).await?;
+            println!("Database migrations complete; provision/check the runtime role before starting the API.");
+            Ok(())
+        }
+        Command::GrantRuntime { role } => {
+            engine_core::database::grant_runtime(&connect_migration().await?, &role).await?;
+            println!("Runtime grants verified for {role}; connect directly using its separate credentials.");
+            Ok(())
+        }
+        Command::InstallRefAuthority { public_key } => {
+            let id = engine_core::repository::server_authority::install(
+                &connect_migration().await?,
+                &public_key,
+            )
+            .await?;
+            println!("Installed receipt authority {id}; distribute this identity and public key through a trusted channel.");
+            Ok(())
+        }
+        Command::CheckRuntime => {
+            engine_core::database::check_runtime(&connect().await?).await?;
+            println!("Runtime schema and database privileges verified.");
+            Ok(())
+        }
         Command::Verify { document_id } => verify(document_id).await,
+        Command::VerifySnapshots { document_id, all } => verify_snapshots(document_id, all).await,
         Command::Replay { document_id } => replay(document_id).await,
         Command::Snapshot { document_id } => snapshot(document_id).await,
+        Command::SharedSnapshot {
+            document_id,
+            through_seq,
+            typed,
+        } => shared_snapshot(document_id, through_seq, typed).await,
         Command::Openapi { out } => openapi(out),
     }
 }
@@ -101,23 +211,63 @@ async fn connect() -> anyhow::Result<PgPool> {
         .context("could not connect to Postgres")
 }
 
+async fn connect_migration() -> anyhow::Result<PgPool> {
+    let url = std::env::var("MIGRATION_DATABASE_URL").context(
+        "MIGRATION_DATABASE_URL is required for this operator command; never pass it to the API",
+    )?;
+    PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .context("could not connect for database administration")
+}
+
 async fn verify(document_id: String) -> anyhow::Result<()> {
     let doc = parse_document_id(&document_id)?;
     let pool = connect().await?;
 
-    match verify_chain(&pool, doc).await {
-        Ok(()) => {
-            println!("OK: hash chain verified for document {document_id}");
-            Ok(())
+    let report = engine_core::snapshot_verification::verify_document(&pool, doc, false)
+        .await
+        .context("event/snapshot verification failed")?;
+    println!("OK: event chain and {} legacy snapshots verified through seq {} for document {document_id}", report.snapshots, report.through_seq);
+    Ok(())
+}
+
+async fn verify_snapshots(document_id: Option<String>, all: bool) -> anyhow::Result<()> {
+    let pool = connect().await?;
+    let mut cursor: Option<Uuid> = None;
+    loop {
+        let document = if all {
+            sqlx::query_scalar::<_, Uuid>(
+                "select id from document where ($1::uuid is null or id>$1) order by id limit 1",
+            )
+            .bind(cursor)
+            .fetch_optional(&pool)
+            .await?
+        } else {
+            Some(parse_document_id(document_id.as_deref().context("document id required")?)?.0)
+        };
+        let Some(id) = document else {
+            break;
+        };
+        let report =
+            engine_core::snapshot_verification::verify_document(&pool, DocumentId(id), true)
+                .await
+                .with_context(|| {
+                    format!(
+                        "snapshot backfill failed for document {id}; its receipts were rolled back"
+                    )
+                })?;
+        println!(
+            "OK: document {id}; {} snapshots; {} replayed events; through seq {}",
+            report.snapshots, report.replayed_events, report.through_seq
+        );
+        if !all {
+            break;
         }
-        Err(EventError::ChainBroken { seq, detail }) => {
-            // A failed audit is an operational signal, not a crash: report the exact
-            // event and exit non-zero so scripts/CI can gate on it.
-            eprintln!("CHAIN BROKEN at event seq {seq}: {detail}");
-            std::process::exit(1);
-        }
-        Err(other) => Err(other).context("verify failed"),
+        cursor = Some(id);
     }
+    Ok(())
 }
 
 async fn replay(document_id: String) -> anyhow::Result<()> {
@@ -163,4 +313,30 @@ fn to_hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+async fn shared_snapshot(document_id: String, through_seq: i64, typed: bool) -> anyhow::Result<()> {
+    let doc = parse_document_id(&document_id)?;
+    let pool = connect().await?;
+    use engine_core::shared_checkpoint::postgres::Codec;
+    let codec = if typed { Codec::V2 } else { Codec::V1 };
+    let result = engine_core::shared_checkpoint::postgres::take_with_codec(
+        &pool,
+        doc,
+        through_seq,
+        engine_core::shared_checkpoint::Limits::default(),
+        codec,
+    )
+    .await
+    .context("publishing shared checkpoint failed")?;
+    println!(
+        "shared checkpoint {codec:?} at revision {}: {}",
+        result.through_seq,
+        result.root.as_str()
+    );
+    println!(
+        "new objects: {}; new canonical bytes: {}",
+        result.stats.new_objects, result.stats.new_bytes
+    );
+    Ok(())
 }
