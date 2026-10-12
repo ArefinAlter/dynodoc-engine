@@ -204,12 +204,20 @@ pub async fn verify_from(
             detail: "invalid trusted position (genesis must use 32 zero bytes)".into(),
         });
     }
+    // Genesis audits every stored row, including malformed negative sequences;
+    // the schema does not enforce positive seq values. A trusted non-genesis
+    // position intentionally skips earlier rows.
+    let from_seq = if trusted_seq == 0 {
+        i64::MIN
+    } else {
+        trusted_seq
+    };
     // One statement, so the trusted row and the suffix come from one consistent view.
     let mut events = sqlx::query_as::<_, Event>(
         "select * from event where document_id = $1 and seq >= $2 order by seq asc",
     )
     .bind(document_id.0)
-    .bind(trusted_seq)
+    .bind(from_seq)
     .fetch(pool);
 
     if trusted_seq > 0 {

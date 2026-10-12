@@ -233,6 +233,40 @@ async fn verify_from_checks_events_after_a_trusted_position(pool: PgPool) -> any
     Ok(())
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn full_chain_verification_rejects_negative_sequence_rows(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, doc, node) = seed(&pool).await?;
+    append(&pool, doc, &field_edit(&node, "label", "valid"), actor).await?;
+
+    // The event table allows INSERTs with a negative sequence. Auditing from
+    // genesis must inspect this malformed row, even alongside a valid chain.
+    sqlx::query(
+        "insert into event
+         (id, document_id, seq, type, actor_id, payload, content_hash, prev_chain_hash, chain_hash)
+         values ($1, $2, -1, 'FieldEdited', $3, '{}'::jsonb, $4, $5, $6)",
+    )
+    .bind(ulid::Ulid::new().to_string())
+    .bind(doc.0)
+    .bind(actor.0)
+    .bind(ZERO_HASH.as_slice())
+    .bind(ZERO_HASH.as_slice())
+    .bind([7u8; 32].as_slice())
+    .execute(&pool)
+    .await?;
+
+    assert!(matches!(
+        verify_chain(&pool, doc).await,
+        Err(EventError::ChainBroken { seq: -1, .. })
+    ));
+    assert!(matches!(
+        verify_from(&pool, doc, 0, &ZERO_HASH).await,
+        Err(EventError::ChainBroken { seq: -1, .. })
+    ));
+    Ok(())
+}
+
 /// Two events appended on one transaction are atomic and stay gap-free: the second
 /// `append_in_tx` sees the first's row, so seq is 1,2 and the chain links. This is the
 /// primitive the stage-16 governance accept relies on (wrapped event + SuggestionAccepted
