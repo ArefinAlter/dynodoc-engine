@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::materializer::{CommentState, DocumentState, MaterializedNode, SuggestionState};
 
 pub(crate) mod canonical;
+pub mod content;
 pub mod postgres;
+pub mod typed;
 use canonical::ObjectRef;
 
 pub const MAX_OBJECT_BYTES: usize = 1024 * 1024;
@@ -69,6 +71,8 @@ pub enum Error {
     HashMismatch,
     #[error("checkpoint codec: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("checkpoint content I/O: {0}")]
+    Io(#[from] std::io::Error),
     #[error("checkpoint database: {0}")]
     Db(#[from] sqlx::Error),
     #[error("checkpoint history: {0}")]
@@ -92,7 +96,7 @@ impl Default for Limits {
 }
 
 impl Limits {
-    fn consume(&mut self, bytes: usize) -> Result<(), Error> {
+    pub(crate) fn consume(&mut self, bytes: usize) -> Result<(), Error> {
         self.max_objects = self
             .max_objects
             .checked_sub(1)
@@ -173,7 +177,7 @@ impl ObjectStore for MemoryStore {
         address: &Address,
         bytes: &[u8],
     ) -> Result<bool, Error> {
-        decode(address, bytes)?;
+        validate_stored(address, bytes)?;
         let key = (document.0, address.clone());
         if let Some(existing) = self.objects.get(&key) {
             if existing != bytes {
@@ -286,6 +290,20 @@ fn decode(expected: &Address, bytes: &[u8]) -> Result<Object, Error> {
     Ok(envelope.object)
 }
 
+// New content objects occupy the same document-scoped store, but have a separate
+// version/hash domain. V1 state readers still require only v1 checkpoint objects.
+/// Verify one encoded object and its address. This does not verify a complete
+/// reachable graph and never grants access to an object or its document.
+pub fn validate_stored(expected: &Address, bytes: &[u8]) -> Result<(), Error> {
+    if bytes.starts_with(content::MAGIC) {
+        content::validate(expected, bytes)
+    } else if bytes.starts_with(typed::MAGIC) {
+        typed::validate(expected, bytes)
+    } else {
+        decode(expected, bytes).map(|_| ())
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WriteStats {
     pub visited_objects: usize,
@@ -313,6 +331,10 @@ impl<S: ObjectStore + Send> Writer<'_, S> {
             return Err(Error::Limit("objects"));
         }
         let (address, bytes) = canonical::encode(object, self.budget.max_bytes)?;
+        self.encoded(address, bytes).await
+    }
+
+    async fn encoded(&mut self, address: Address, bytes: Vec<u8>) -> Result<Address, Error> {
         self.budget.consume(bytes.len())?;
         self.stats.visited_objects += 1;
         self.stats.encoded_bytes += bytes.len();
@@ -470,6 +492,15 @@ impl<S: ObjectStore + Send> Reader<'_, S> {
     }
 
     async fn entries(&mut self, root: &Address) -> Result<BTreeMap<String, Address>, Error> {
+        self.entries_limited(root, usize::MAX, usize::MAX).await
+    }
+
+    async fn entries_limited(
+        &mut self,
+        root: &Address,
+        max_entries: usize,
+        max_key_bytes: usize,
+    ) -> Result<BTreeMap<String, Address>, Error> {
         let mut entries = BTreeMap::new();
         // Breadth-first batches avoid retaining decoded ancestors or losing a
         // sibling prefetch when recursion replaces the cache. Only references
@@ -492,6 +523,9 @@ impl<S: ObjectStore + Send> Reader<'_, S> {
                     Object::MapLeaf(leaf) => {
                         counts.push((parent, leaf.len(), false));
                         for entry in leaf {
+                            if entries.len() == max_entries || entry.key.len() > max_key_bytes {
+                                return Err(Error::Limit("map entries or key bytes"));
+                            }
                             if !route(&entry.key).starts_with(&prefix)
                                 || entries.insert(entry.key, entry.address).is_some()
                             {
@@ -625,7 +659,7 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::json;
 
-    fn fixture(count: usize) -> DocumentState {
+    pub(super) fn fixture(count: usize) -> DocumentState {
         let mut state = DocumentState::default();
         for i in 0..count {
             let id = NodeId(format!("{i:026}"));

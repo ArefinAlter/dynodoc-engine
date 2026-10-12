@@ -19,8 +19,10 @@ pub mod audit;
 pub mod auth;
 pub mod conflicts;
 pub mod copies;
+mod devices;
 mod discussions;
 pub mod documents;
+mod draft_storage;
 pub mod error;
 mod history;
 pub mod idempotency;
@@ -30,6 +32,8 @@ pub mod pagination;
 pub mod people;
 pub mod product;
 mod profiles;
+mod project_history;
+mod project_staging;
 pub mod projects;
 pub mod provenance;
 pub mod reviews;
@@ -59,6 +63,12 @@ pub struct AppState {
     /// Wakes the background copy-detection indexer ([`copies::spawn`]).
     pub copy_index: copies::CopyIndex,
     pub workloads: workloads::Workloads,
+    /// Explicitly loaded secret outside the database; required for shared ref writes.
+    pub ref_signer: Option<std::sync::Arc<ring::signature::Ed25519KeyPair>>,
+    /// Explicit opt-in; new draft/rebase bases use typed shared objects.
+    pub shared_draft_bases: bool,
+    /// Explicit opt-in; named versions, public pins and deploys share typed state.
+    pub named_snapshot_storage: engine_core::snapshot::NamedStorage,
 }
 
 impl AppState {
@@ -71,6 +81,16 @@ impl AppState {
             admin_emails: std::env::var("ADMIN_EMAILS").unwrap_or_default(),
             copy_index: copies::CopyIndex::default(),
             workloads: workloads::Workloads::default(),
+            ref_signer: None,
+            shared_draft_bases: std::env::var("DYNODOC_SHARED_DRAFT_BASES").as_deref()
+                == Ok("shared-v2"),
+            named_snapshot_storage: if std::env::var("DYNODOC_NAMED_SNAPSHOT_STORAGE").as_deref()
+                == Ok("shared-v2")
+            {
+                engine_core::snapshot::NamedStorage::SharedV2
+            } else {
+                engine_core::snapshot::NamedStorage::Legacy
+            },
         }
     }
 }
@@ -96,7 +116,10 @@ pub fn app(state: AppState) -> Router {
         .merge(admin::router())
         .merge(product::router())
         .merge(projects::router())
+        .merge(project_staging::router())
+        .merge(project_history::router())
         .merge(profiles::router())
+        .merge(devices::router())
         .merge(provenance::router())
         .merge(documents::router())
         .merge(ops::router())
@@ -149,6 +172,7 @@ async fn openapi_json() -> Json<Value> {
         profiles::own,
         profiles::read,
         profiles::save,
+        profiles::storage,
         documents::routes::list_documents,
         documents::routes::get_document,
         documents::routes::get_node,
@@ -203,6 +227,9 @@ impl utoipa::Modify for WorkspaceDocs {
         api.merge(notifications::NotificationApi::openapi());
         api.merge(copies::CopiesApi::openapi());
         api.merge(people::PeopleApi::openapi());
+        api.merge(devices::DevicesApi::openapi());
+        api.merge(project_staging::ProjectStagingApi::openapi());
+        api.merge(project_history::ProjectHistoryApi::openapi());
         let components = api.components.get_or_insert_with(Default::default);
         components.add_security_scheme(
             "connector_key",

@@ -7,8 +7,32 @@ at application `858801c`, schema 29 (11 October 2026). See the
 The API uses restricted runtime credentials; snapshot verification, project rules,
 browser policy and bounded workload admission have passed CI and VPS acceptance.
 
-Resume part 2 below: bounded text/value/asset chunks and shared historical references,
-then portable local/project commits. Request admission is not a full-state memory
+Part 2g now adds [typed v2 checkpoints](TYPED-CHECKPOINTS.md) and the current pass
+adds opt-in shared draft bases and schema-32 [named/deployed/public snapshots](SHARED-NAMED-SNAPSHOTS.md).
+The settled typed-root contract also underlies the
+[portable local project repository](PORTABLE-PROJECT-HISTORY.md), an early part-3
+implementation with signed commits, parent history, branch CAS and transfer primitives.
+Part 6 now has [portable ref receipts and a separate client trust journal](REF-RECEIPTS.md),
+with independent signature vectors, contiguous proof checks, authority rotation
+and durable local revocation. Schema 33 adds [account/device binding and permanent
+revocation](DEVICE-SIGNING-KEYS.md). Schema 36 now provides atomic server issuance with protected project refs;
+authority distribution/rotation, witnesses and connector adoption remain open. Schema 34 adds [durable shared-object
+budgets](SHARED-STORAGE-BUDGETS.md). Local SQLite schema 2 now adds persistent
+[object/commit/branch capacity](LOCAL-STORAGE-BUDGETS.md). Physical storage packing,
+whole-device capacity and explicit local retention/GC remain separate work.
+Schema 35 adds [private project transfers](PRIVATE-PROJECT-TRANSFERS.md):
+account-scoped object negotiation, signed multi-file commit staging, current
+permission/key checks, logical staging quotas and transitive erasure. [Shared candidate publication](SHARED-PROJECT-HISTORY.md), verified reachable
+object reads, protected main refs/reviews and atomic receipts are implemented in
+schema 36. [Selected-history CLI sync](SELECTED-HISTORY-SYNC.md) now adds explicit
+publication plans, reachable-object transfer/reuse, verified fetch, separate pinned
+remote tracking and local CAS fast-forward pull. Project-scoped sign-in and
+UI/native adoption remain open.
+Part 3 also has local [commit-addressed recovery](PROJECT-COMMIT-RECOVERY.md):
+revert/cherry-pick with signed source references, explicit mainline selection and
+checked conflict resolutions. Hosted project UI integration remains open.
+Continue storage adoption/packing and authenticated transport/connector integration;
+these sources do not yet complete either part. Request admission is not a full-state memory
 bound; independent audit part 6, native-host acceptance and large-service limits
 remain open. Shared periodic checkpoint writes remain off.
 
@@ -41,7 +65,8 @@ revisions and selected recovery without losing later work. The bounded
 [history-recovery increment](HISTORY-RECOVERY.md) reuses the existing centralized
 reader and review path, independently of the remaining storage work. Whole-block
 restoration is distinct from the implemented net revision-range revert/cherry-pick.
-Portable commit-addressed commands remain part 3. Test-installation packages,
+Portable commit-addressed commands now exist in the local part-3 repository;
+hosted and native adoption remain open. Test-installation packages,
 Microsoft ribbon commands and browser pairing are now early part-8 increments;
 real host acceptance and marketplace publication remain open. Parts 3 and 6
 must retain source/ancestry/actor links; part 8 must provide indexed discovery and
@@ -114,6 +139,14 @@ The locally installed PowerPoint 2021 fails the current connector API prerequisi
 Word/Excel inventory alone is not runtime acceptance.
 
 ## Part 2 design gate and first implementation slice
+
+Part 2f adds an internal binary byte-content tree, 64 KiB chunks, bounded 128-way
+frontier/traversal and operation budgets, with memory and transactional PostgreSQL
+stores. It preserves v1 state roots and default publication. This is the byte
+foundation; typed node/value/asset references, bounded semantic reconstruction and
+versioned checkpoint publication remain before shared draft/version adoption.
+See [the format, limits and acceptance](CHUNKED-CONTENT.md). It does not mark part 2
+complete or authorize enabling periodic shared writes.
 
 Specify immutable typed objects for text/format runs, logical-node properties,
 ordered children, assets and commit manifests. Keep stable identity separate from

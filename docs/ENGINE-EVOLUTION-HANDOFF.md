@@ -1,5 +1,595 @@
 # Engine evolution handoff
 
+## Source: selected-history CLI synchronization (12 October 2026)
+
+The operator CLI now connects local project history to the schema-36 API through
+reviewed push plans, selected reachable-object transfer, authorized reuse of
+published bytes, verified fetch and separate receipt-journal remote tracking.
+Fast-forward pull advances only an explicitly selected local branch with exact
+address/generation CAS; divergent local work remains intact. No command writes an
+open/native file. Publication plans disclose private ancestry and recovery sources;
+execution cannot add an unreviewed dependency. Retries reuse accepted objects and
+commits; stale shared refs, corrupted objects and inconsistent receipt proofs fail
+closed. See [the contract and procedure](SELECTED-HISTORY-SYNC.md).
+
+This adds no migration/hash format change (PostgreSQL 36 / local SQLite 2). HTTP
+origins, credentials, response sizes, request deadlines and cumulative work are
+bounded. Initial authority trust comes from independently supplied configuration;
+accepted heads remain in the separate journal. First trust is a checkpoint, not
+proof of unseen older receipts. Multi-commit publication can partially succeed;
+complete file-state validation/scans remain, and local quotas include partial work.
+
+Code is pushed to main: application `47cb87f`, standalone engine `4ca7f16`.
+[Application Rust CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38248717652)
+and [standalone engine CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38248983325)
+passed on those exact revisions. Each Linux CI run passed all **356 tests** with
+no failures, ignored or filtered cases. Both Rust workflows cover formatting,
+Clippy, build/test and unchanged OpenAPI consistency; standalone also builds docs.
+Both frontend build/test and authenticated browser workflows passed in
+[frontend CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38248717732).
+
+The Windows standalone workspace run passed all **355 tests** before the final
+up-to-date race regression was added, including the unchanged 100 ms SSE check.
+After that final fix, task lint and all **seven CLI tests** passed. Six new sync
+scenarios cover restricted-runtime real HTTP with two authors, privacy and private
+ancestry disclosure, shared byte reuse, publish-only review, stale/lost-response
+retries, fast-forward/local-CAS/divergence behavior, resumable corruption failure,
+receipt rollback/fork/gap/key/revocation and a concurrent up-to-date response race.
+Task docs passed with existing rustdoc warnings; the actual sync command help
+smoke passed. No test threshold or coverage was relaxed. The dedicated PostgreSQL
+container was verified by its task label and auto-remove setting, then stopped
+and removed; existing development containers were untouched. Test HTTP listeners
+and temporary SQLite databases were closed/removed by the tests. Logs remain in
+ignored application target/sync-*.log. No real email or production data was used.
+
+Production is still recorded at application `858801c`, schema 29, shared writers
+off. No VPS rollout or installed Office/Google acceptance occurred in this increment.
+Schema-36 deployment still needs a production-copy rehearsal, compatible rollback
+images and operator receipt-key provisioning. Next priorities are project-scoped
+device sign-in/token renewal and native key storage, Projects/native branch/review
+adoption, incremental storage/GC, richer same-file convergence, independent audit
+witnesses/rotation and measured large-file/service acceptance. The owner runs the
+prepared installed-host worksheet. The full product roadmap is not complete.
+
+## Previous increment: shared publication, protected refs and receipts (12 October 2026)
+
+Schema 36 adds [shared project history](SHARED-PROJECT-HISTORY.md): explicit
+candidate publication, reachable-object downloads, published multi-author ancestry,
+fast-forward branch CAS and exact candidate/base reviews. Main applies current
+project/file policy floors and independent approvals; contributors can advance
+feature branches. Ref generation, signed receipt and audit entry commit atomically.
+Receipts bind an operator-installed public authority and use the existing client
+pin/journal contract. API signing keys must be explicitly mounted outside the DB;
+there is no unsigned fallback or silent replacement of the installed authority.
+
+Published metadata has per-project byte/row/branch quotas. Identical file roots
+reuse reachability indexes. Contributors can acknowledge up to 256 objects from
+an explicitly selected authorized publication without uploading their bytes again.
+Private hashes remain inaccessible; mixed invalid/quota-limited batches roll back
+and exact retries are free. Full graph scans, complete commit file manifests and
+changed-root index amplification remain. Document erasure removes affected
+published envelopes and descendants/reviews while retaining opaque receipt
+commitments and generations. Affected heads become unavailable and never fall
+back. Account erasure clears private work while retaining shared publications
+under current access checks. Reading an older commit does not rewind any branch.
+
+Final code is pushed to main: application `23ed7bf`, standalone engine `5f86db2`
+(initial publication/receipt implementation `0d501ca` / `15cc6c4`).
+[Application Rust CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38225348149),
+[standalone engine CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38225347973)
+and [frontend CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38225348138)
+all passed, including both frontend build/test and authenticated browser workflows.
+Linux ran all **350 tests**, including the unchanged 100 ms SSE deadline. Five new
+restricted-runtime scenarios plus the core authority-installation test cover
+publication/privacy, cross-author ancestry and content reuse, policy/base/role
+checks, concurrent CAS, quota rollback, key/account/document erasure, immutable
+boundaries, atomic receipts and independent client pin advancement/rollback.
+
+Local standalone task lint and task docs pass; existing documentation warnings
+remain. Contracts/types are regenerated with distinct shared-history operation
+names and preserved standalone MIT/contact metadata. Frontend lint/Svelte checks
+pass with zero diagnostics. The expanded object-reuse regression passes, including
+rejection of private hashes, all-or-nothing quota failure, free retries and the
+256-address boundary. Its initial 16 KiB request cap was too small for that boundary;
+it is now 20 KiB. There is no migration/hash/commit format change in that follow-up.
+
+The full Windows task test run again failed the existing 100 ms SSE assertion.
+A complete run explicitly excluding only that test passed all **349 remaining
+tests**, with no other ignored/filtered cases. No threshold or CI coverage was
+relaxed; this is not a Windows latency guarantee. The actual operator CLI migrated
+an isolated database to schema 36, installed a synthetic public authority and
+provisioned a restricted runtime login. A mismatched DER key prevented API startup;
+the matching key served health and the final API contract. That hidden test process
+was stopped, and the task-owned PostgreSQL container and synthetic key scratch
+directory were removed. Existing development containers were untouched. Ignored
+verification logs remain under application target/. No real email, production data
+or installed Office/Google host was used.
+
+Production remains recorded at application `858801c`, schema 29, shared writers off.
+No VPS upgrade was made in this pass. Schema 36 needs matching runtime grants,
+receipt-key provisioning, a production-copy rehearsal and schema-compatible
+rollback images before deployment. The owner runs installed-editor acceptance
+using the prepared worksheet; source/package tests do not certify those hosts.
+
+Next: automatic selected-root push/fetch and remote tracking, with explicit
+publication of dependencies; project-scoped device sessions; Projects/native
+branch/review adoption. Private/unreachable local inventory must stay private,
+and the server-reported authority key must not silently become a trusted pin.
+Server key rotation/distribution, witnesses, audited erased-branch reinitialization,
+reachability GC/packing, complete same-file offline convergence and realistic
+large-document/service acceptance remain open. These APIs do not advance centralized
+per-file events or replace web drafts. The full roadmap is not complete.
+
+## Source: private project history transfers (12 October 2026)
+
+Schema 35 adds account-private authenticated object/commit exchange, described in
+[Private project transfers](PRIVATE-PROJECT-TRANSFERS.md). Changed typed objects
+are shared physically per document; immutable per-account upload acknowledgements
+prevent guessed hashes from exposing other drafts. New signed multi-file commits
+verify active enrolled keys, dependencies, recovery semantics and complete typed
+graphs. Accepted ancestry remains readable after key revocation, subject to current
+project/file access. No project branch, team document or review is published.
+
+Persistent account staging budgets cover logical acknowledged bytes and signed
+commit/scope metadata: 4 GiB, 1,000,000 acknowledgements and 100,000 commits. Batches
+are atomic, retries free, quota failures return 507. Current API limits include
+256 historical files per transitive scope and 64 MiB/65,536 graph reads per commit.
+Audited document erasure removes affected envelopes and all descendant envelopes,
+even after they remove the file; account erasure removes its private staging.
+The CLI can inventory/export/import the same bounded base64 object packets.
+
+Final tested code is pushed to main: application `be538a6`, standalone engine
+`554afec` (initial implementation `2d5f613` / `1a4e6fb`).
+[Application Rust CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38212242810),
+[standalone CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38212247413)
+and [frontend CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38212242806)
+all passed, including both frontend build/test and authenticated browser workflows.
+The complete Linux engine suite passed all 344 tests, including the unchanged
+100 ms SSE assertion. Five new restricted-runtime tests cover transfer into a
+second SQLite repository, privacy, revoked-key history, recovery, current scopes,
+quota rollback/concurrent spending, permission changes during a lock wait and
+both erasure paths.
+
+Local verification: standalone task lint and task docs pass; documentation retains
+its existing warnings. Generated OpenAPI exactly matches the committed Git blob,
+including standalone MIT/contact metadata; the initial raw working-file hash check
+was sensitive to Windows line endings. Web API types are regenerated, and local
+frontend lint/Svelte checks pass with zero diagnostics. The actual CLI packet smoke
+reconstructs the same state in another database, inserts zero objects on retry,
+rolls back invalid packets and leaves the local branch unchanged.
+
+The full Windows task test run and an isolated recheck both failed the existing
+100 ms SSE deadline. A separate full run explicitly excluding only that assertion
+passed all 343 remaining tests. Its earlier attempt exposed a test-cleanup race:
+SQLite releases its final Windows handle shortly after Pool::close. The test now
+uses the existing bounded retry for sharing errors 32/33; other cleanup failures
+remain fatal, and the final run passed. This is not a clean local full-suite result
+or a certified Windows latency guarantee. No timing threshold or CI coverage was
+relaxed. Linux full-suite acceptance is recorded above.
+
+The first frontend CI attempt failed during package-manager setup: floating pnpm
+10 resolved to an unavailable tarball. Application `fdb7624` pins pnpm 10.34.6,
+whose npm archive was verified with HTTP 200; both subsequent frontend/browser CI
+runs passed. Task-owned PostgreSQL and synthetic SQLite scratch files are removed.
+No task test servers remain. Ignored logs are retained under application target/.
+No installed Office/Google host, real invitation or production data was exercised.
+
+Last recorded VPS release: application `858801c`/schema 29, shared writers off.
+No VPS deployment or production migration occurred in this pass. Source schema 35 needs compatible runtime grants
+and rollback binaries plus a production-copy rehearsal before rollout. Installed
+Office/Google acceptance remains the owner's local worksheet, not a completed test.
+
+Next: shared candidate publication with explicit reader reachability, protected
+project refs/reviews and atomic server receipts; selected-root push/fetch and remote
+tracking; then Projects/native adoption. Private acknowledgements must never become
+shared discovery. Whole-document erasure must cover future accepted history too.
+Complete same-file convergence, changed-node publication/packing, trusted witnesses,
+large native/service measurements and marketplace acceptance remain open. The full
+roadmap is not complete.
+
+## Source: persistent local repository capacity (12 October 2026)
+
+Implementation: application `962c9e1`, standalone engine `5822e57`, both pushed
+to main. [Application Rust CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38207702226)
+and [standalone CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38207706865)
+passed; the full Linux engine run passed all 339 tests including the unchanged
+SSE timing assertion. [Frontend CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38207702234)
+also passed, including both the build/test job and authenticated browser workflows.
+
+The [two reproducible storage experiments](LOCAL-STORAGE-BUDGETS.md#measured-small-history-growth)
+retained 33 revisions of 128/512-paragraph synthetic graphs. Encoded objects plus
+commits used 273,586/736,893 bytes versus 1,896,632/7,599,032 bytes for uncompressed
+full JSON states. Actual SQLite files used 589,824/1,695,744 bytes. Median debug CLI
+state writes were 280/1168 ms; unchanged retries stored zero bytes but took
+277/1523 ms. This exposes the remaining full-state scan cost; it does not certify
+large native files, peak memory, HTTP transfer or service throughput. Source
+revisions, binary digest and every timing are in the reports. Synthetic benchmark
+databases and keys were removed after recording the reports.
+
+SQLite schema 2 now enforces [persistent local capacity](LOCAL-STORAGE-BUDGETS.md)
+for retained objects, signed commits and branches: 4 GiB of encoded object/commit
+payloads, 1,000,000 objects, 100,000 commits and 4096 branches by default. Staged
+and unreachable objects count. Exact retries are free, failed batches roll back,
+and existing refs remain usable at capacity. Explicit CLI/library limit changes
+never prune history and cannot reduce capacity below current usage. Schema 1
+upgrades transactionally without changing roots/signatures/refs; above-default
+usage is retained. Older schema-1 clients reject schema 2. Physical disk/WAL,
+trust-journal budgets, packing and explicit retention/GC remain separate work.
+
+Validation: all 32 application repository tests pass, including five new migration,
+quota, rollback, concurrency and missing-accounting regressions. Both Rust Clippy
+checks and formatting pass. Rust documentation builds with the existing warnings.
+Two complete local Windows runs failed the existing 100 ms SSE assertion; its
+isolated run passed. A separate full run explicitly excluding that one timing test
+passed all 338 remaining tests. This is not a clean full-suite local result or a
+certified latency guarantee. The check includes the write request, database work
+and per-frame authorization, not just broadcast delivery. Its threshold and CI
+coverage were left unchanged. Full Linux CI passed, as recorded above.
+[Actual CLI acceptance](benchmarks/local-storage-cli-20261012.json)
+checks persisted capacity across processes, rejected-write rollback, explicit
+increase, zero-cost reuse at capacity and reading the retained root. Logs are
+under ignored target/. No native Office/Google host was exercised in this pass.
+
+The preceding device/shared-budget changes are application `a72333a` and engine
+`932f48a`: application Rust CI 38204054464, frontend CI 38204054384 (including
+authenticated workflows), and standalone CI 38204058559 all passed. Source hashes
+and CI for local capacity are recorded above. The prior frontend verification
+also passed 289 unit tests, lint, build and three local Projects browser tests.
+
+Application sources are mirrored to D:/dynodoc-engine; MIT metadata is preserved.
+Task-owned PostgreSQL and synthetic CLI scratch data are removed; API/web test
+servers remain stopped. Only ignored validation logs and the synthetic report remain.
+PostgreSQL source stays schema 34. Production remains `858801c`/schema 29, shared
+writers off; no deployment or production migration occurred. Before rollout,
+prepare a schema-34-compatible rollback image and rehearse with a production copy.
+Installed-editor acceptance remains the owner's prepared local worksheet.
+
+Next: authenticated project commit/object discovery and exchange with explicit
+private-stage/reachability/whole-document-erasure rules; protected project refs,
+review and atomic server receipts; then project-wide UI and native connector
+adoption. Local inventory must not become a public remote listing. Recheck current
+account/key/project/document rights in the publication transaction, distinguish
+already-accepted signed ancestry from new actions, and retain access checks after
+revocation/erasure. Complete same-file convergence, incremental native capture,
+packing/changed-node publication, trusted witnesses, large-document/service
+acceptance and marketplace publication remain open in [the ledger](ROADMAP-ACCEPTANCE.md).
+This checkpoint does not complete the product roadmap.
+
+## Source: device identity and retained shared storage (12 October 2026)
+
+Schema 33 adds [account-bound signing keys](DEVICE-SIGNING-KEYS.md): one-use
+five-minute account/installation challenges, Ed25519 possession proofs, immutable
+bindings, permanent revocation, current-key commit verification, offline CLI proof
+signing and own-profile enrollment/revocation. Account removal revokes keys;
+restoration cannot revive them. Transactional login rechecks cover the logout race.
+Historical signatures remain verifiable after revocation. Signature verification
+does not store/publish a commit or confer any project permission.
+
+Schema 34 adds [durable shared-object budgets](SHARED-STORAGE-BUDGETS.md):
+1 GiB/250,000 objects per document and 4 GiB/1,000,000 per creator by default.
+Transition-table accounting charges only inserted objects, preserves reuse at
+capacity, rolls back failed graphs and releases quota through audited erasure.
+Counters/limits are read-only to the runtime. Own-profile usage and HTTP 507 errors
+make capacity failures visible. This is encoded shared-history accounting, not a
+physical disk, event/legacy snapshot, upload or local SQLite quota. The pilot
+native-file cap remains 3,000,000 bytes. No shared writer was enabled in production.
+
+Validation: all 334 standalone Rust tests pass, including the schema-33→34
+backfill regression, restricted-runtime byte/count quota tests, concurrent account
+spending, key enrollment/retry/revocation and logout races. The final targeted
+quota run also tests byte and object limits independently. Both Rust Clippy checks
+pass. Frontend lint/Svelte checks, 289 unit tests, production build and all three
+authenticated Projects browser tests pass with shared draft/named writers enabled
+on an isolated schema-34 stack. The browser test caught and verified a fix for the
+Svelte-interpolated key-length pattern. The original full engine attempt missed
+the existing 100 ms SSE deadline under concurrent linking; its isolated and full
+reruns passed unchanged. No performance threshold was relaxed. The CLI smoke
+matches the independent Node/OpenSSL vector, rejects wrong scope and preserves
+existing output files. Synthetic private key files were removed. OpenAPI and web
+types are regenerated; standalone OpenAPI retains its MIT metadata and matches
+its generator. Rust documentation builds with 20 existing warnings. CI is pending
+the source push.
+
+Application source is mirrored into D:/dynodoc-engine with MIT metadata preserved.
+The task-owned API/web acceptance servers are stopped and the labeled disposable
+PostgreSQL test container has been removed. Logs live under ignored target/. Production remains 858801c/schema 29. No production migration or deployment
+occurred; a schema-34-compatible rollback build and production-copy rehearsal are
+still required before rollout. Never start a schema-29 image on schema 34.
+
+Next implementation order: authenticated remote commit/object discovery and
+exchange with explicit private-stage/reachability/whole-document-erasure rules;
+protected project refs/reviews and atomic server receipts; portable project UI and
+connector adoption. Do not expose the local inventory as an HTTP endpoint or treat
+a prior verify-commit response as a grant. Recheck the live account/key/permissions
+inside publication. Retained ancestry stays readable after signer revocation under
+the reader's current access. Physical packing/incremental publication, local-store
+retention, complete same-file convergence, background capture, RTF/native fidelity,
+large-document/service evidence and marketplace acceptance remain open in
+[the ledger](ROADMAP-ACCEPTANCE.md). Installed Office/Google acceptance is prepared
+for the owner to run locally. This is a source checkpoint, not roadmap completion.
+
+## Source: portable project revert and cherry-pick (12 October 2026)
+
+Application `7d889ac` and engine `bdde0f3` add core/CLI
+[commit-addressed project recovery](PROJECT-COMMIT-RECOVERY.md).
+Preview applies a source delta (or its inverse) to an exact current commit; new
+signed v2 commits retain source/mainline as provenance and current commit as their
+only ancestry parent. Existing v1 hashes/signatures remain unchanged. Root sources
+use an empty baseline; merge sources require a chosen parent. Same-file competition
+and shared identity/path constraints require explicit resolutions. Import verifies
+the sources, recomputes the plan and rejects unrelated settled-path changes.
+Publication remains a separate generation-aware branch CAS.
+
+All 25 repository regressions pass, including recovery fifty commits back,
+preservation of later independent work, restart/retry, missing/forged dependencies,
+mainline selection, conflict validation and independent Python/OpenSSL v2 vectors.
+Application Clippy passes. The [actual CLI smoke](benchmarks/project-recovery-cli-20261012.json)
+passes preview, revert, exact retry, historical reconstruction, later-file retention,
+branch publication, stale-CAS rejection and cherry-pick. Synthetic key files were
+removed. All 325 standalone Rust tests pass, along with task lint and task docs
+(the same 20 existing rustdoc warnings). Application focused tests, formatting and
+Clippy pass. The disposable PostgreSQL container and its volume were removed after
+validation; no local API/frontend server was started. Synthetic reports/databases
+and logs remain under ignored target. SQLite schema 1 and PostgreSQL schema 32 are
+unchanged. Production remains application 858801c/schema 29, with no new writer
+enabled. [Application Rust CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38171109983)
+and [standalone CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38171113730)
+pass all 325 tests plus their lint/build/OpenAPI checks. The application source
+packaging regression and standalone documentation check also pass.
+[Frontend CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38171109919)
+passes both jobs, including frontend checks, unit tests, the shared Google connector
+drift check, public browser tests, production-proxy regression and authenticated
+browser workflows. These CI browser sessions are not installed Office/Google
+acceptance. No deployment occurred.
+
+This completes local commit-addressed recovery, not hosted project branches or
+native recovery adoption. Next remains authenticated project transport and device
+identity, permission/private-stage/erasure rules, protected reviews and atomic
+server receipts. Packing/incremental publication, complete same-file convergence,
+native/background capture, representative scale and installed-host/marketplace
+acceptance remain open in the [ledger](ROADMAP-ACCEPTANCE.md). Installed-editor
+acceptance is prepared for the owner to run locally. Continue across this checkpoint.
+
+## Source: signed ref receipts and durable client trust (12 October 2026)
+
+Application `3218315` and standalone engine `20caed4` add [signed ref receipts](REF-RECEIPTS.md) and a separate SQLite client
+trust journal. Scope, generation, commit, predecessor, declared time and authority
+key are signed. Contiguous proofs reject rollback, conflicting heads, missing
+updates and scope/key substitution. Verified-prefix retries are idempotent.
+Authority rotation requires both keys at the exact pin; local revocation persists
+across restart and cannot be undone by retries or a replacement bootstrap.
+Journal publication is transactional and concurrent conflicting updates have one
+winner. The CLI exposes verification, first trust, advance, rotation and revocation.
+
+Validation: workspace check/Clippy passes; all 18 repository tests pass,
+including eight new receipt/journal regressions. Independent Python/OpenSSL vectors
+pin canonical hashes and receipt/rotation signatures. The local demonstration
+creates real synthetic project commits, exercises a separate client journal,
+reopens it and verifies fork/rollback/retry/rotation/revocation behavior. See
+[its record](benchmarks/receipt-journal-20261012.json). The built CLI successfully
+reads the reopened, revoked journal without PostgreSQL or network access.
+A follow-up fixes both signing commands to accept standard unencrypted DER
+PKCS#8 v1 keys as well as v2, retaining v2 public/private component checks.
+The new CLI regression passes against independent OpenSSL signatures; an actual
+CLI smoke signs/verifies a v1 key, trusts its receipt, signs/accepts a dual-key
+rotation, retries and revokes the journal. Synthetic key files were removed.
+Source follow-up: application `07db4bf`, standalone engine `8386adb`.
+All 318 Rust tests pass in the standalone local suite and in both
+[application CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38169393679)
+and [engine CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38169397678).
+Formatting/Clippy pass; documentation builds with the same 20 pre-existing warnings.
+[Frontend CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38169393675)
+passes, including 19 public browser tests and 72 authenticated workflows (the
+public job intentionally skips its 53 authenticated cases). The disposable test
+PostgreSQL container and its volume have been removed; unrelated containers were
+preserved. No local application servers were started. Source is schema 32;
+production remains schema 29/application `858801c`. No new production migration,
+shared-writer enablement, installed-editor or marketplace acceptance occurred.
+
+These are core/CLI integration primitives. Production does not yet issue signed
+ref receipts or distribute authority keys. Account/device registration and remote
+revocation, atomic protected-ref publication with receipts, proof endpoints,
+witnesses/gossip and connector adoption remain open. A declared time is not
+trusted timestamping. Initial trust cannot prove unseen history, and an attacker
+who can roll back the client's own trusted journal can destroy its pin.
+
+Next: authenticated remote project history with explicit staged-object visibility,
+current project/file permissions, protected refs/reviews, account/device key
+binding and audited erasure of multi-file history. Do not expose object inventory
+through private drafts or treat a local commit signature as an account grant.
+Physical packing/incremental publication, same-file offline convergence, native
+format/background capture, realistic large/concurrent workloads and installed
+Office/Google acceptance also remain in the [ledger](ROADMAP-ACCEPTANCE.md).
+The owner will run installed-editor acceptance locally. Continue across this
+checkpoint; the complete roadmap is not certified.
+
+## Source: shared named/deployed snapshots (12 October 2026)
+
+Application `f8f0adb` and standalone engine `107e45e` add [shared named snapshots](SHARED-NAMED-SNAPSHOTS.md),
+schema 32. Named versions, public-copy pins and deployed snapshots can refer to
+the same typed objects as drafts and periodic checkpoints. The API hydrates the
+existing response shape after verifying the stored receipt and referenced graph.
+New receipts use a separate v2 hash domain; the legacy vector and stored rows are
+unchanged. The new explicit setting is DYNODOC_NAMED_SNAPSHOT_STORAGE=shared-v2;
+the default remains legacy and production is still schema 29/application 858801c.
+
+Targeted checks pass: 19 snapshot integration tests and all 45 API integration
+tests, including mixed histories/concurrent writers, object reuse, failed-write
+rollback, root/object tampering, independent replay/backfill, historical restore,
+public-copy privacy and audited erasure using restricted runtime credentials.
+Formatting/Clippy and all 309 Rust tests pass in both repositories. Standalone
+task docs passes with the same 20 pre-existing warnings. [Application Rust CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38167894976)
+and [engine CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38167901880)
+pass. [Browser CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38167894975)
+passes both its build/unit/public job and all authenticated workflows.
+
+No production migration, optional-writer enablement or hosted package update has
+occurred. The task-owned disposable PostgreSQL container
+dynodoc-snapshots-test-20261012 and its volume were removed after the remaining
+suites completed. Logs and synthetic demo artifacts are under ignored target.
+Both repositories carry matching source; preserve standalone metadata/fixtures.
+
+Remaining storage work is physical packing, changed-node publication and realistic
+growth/resource acceptance. Remote project history must bind signing keys to
+accounts/devices, enforce current file/project membership, preserve private drafts,
+serialize protected refs and review, and make whole-document erasure explicit for
+multi-file ancestry. Local signed commits alone do not supply these boundaries.
+The complete [acceptance ledger](ROADMAP-ACCEPTANCE.md) remains open; installed
+Office/Google acceptance is assigned to the owner using the local worksheet.
+Continue the roadmap across this checkpoint without requiring another prompt.
+
+## Source: typed state, shared drafts and local project history (12 October 2026)
+
+This pass continues across storage, repository and algorithm boundaries. The
+[acceptance ledger](ROADMAP-ACCEPTANCE.md) tracks the whole roadmap without marking
+unfinished integration as complete. Application implementation: `8dd816b`;
+standalone engine implementation: `f1cdf8c`. Newer entries above record shared
+named/deployed snapshots and client audit tools; the evidence below covers these commits.
+
+Implemented:
+
+- [Typed v2 checkpoints](TYPED-CHECKPOINTS.md), chunked text/value/asset references,
+  global encoded-object and semantic reconstruction budgets, exact replay comparison,
+  mixed historical readers and explicit codec selection. Schema 30 adds capability;
+  existing v1 roots/events remain unchanged.
+- [Shared draft bases](SHARED-DRAFT-BASES.md) at schema 31: private drafts, pushed
+  requests, recovery and rebase bases can store typed roots instead of repeated
+  full JSON. Transactions, document-scoped FKs, immutable initial bases and verified
+  reconstruction preserve access/review/stale checks and existing API responses.
+  DYNODOC_SHARED_DRAFT_BASES=shared-v2 opts in; default remains legacy.
+- [Portable local project history](PORTABLE-PROJECT-HISTORY.md): SQLite WAL/FULL
+  durability, signed multi-file commits/parents, generation-aware branch CAS,
+  bounded/idempotent missing-object transfer, all best merge bases, conservative
+  file comparison, and explicit CLI commands. Different paths still conflict when
+  they share a document identity or namespace constraint. Signatures do not supply
+  account binding, device revocation or independent witnesses.
+- Cached iterative parent-depth preparation replaces repeated walks during diff
+  sorting. Its ordering step is O(N log N) with O(N) auxiliary metadata. Other
+  diff/state costs remain; the regression covers cyclic/missing-parent graphs and
+  a 20,000-level chain.
+
+Verification: formatting/Clippy and **303 Rust tests pass in each repository**
+against isolated PostgreSQL 16. Standalone task docs passes with the same 20
+pre-existing rustdoc warnings. Fixed content/commit hashes and previous v1 event
+vectors remain green. [Application Rust CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38166114708)
+and [engine CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38166122646)
+pass, including OpenAPI compatibility and source packaging where applicable.
+[Frontend CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38166114711)
+passes 289 units, 19 public browser checks (53 authenticated checks intentionally
+skipped in that public-only job), and all 72 authenticated-stack checks. The local
+repository CLI reads the demo's common head at generation 2. Standalone package
+metadata, licensing, toolchain and independent fixtures remain preserved.
+
+The synthetic two-replica example reopens both databases, exchanges only missing
+objects, publishes the same reviewed project merge and recovers the initial
+report. Repeating transfer sends zero objects. Initial transfer: 18 objects/2534
+encoded bytes; each changed side sends eight objects (~1.2 KiB). See the
+[record](benchmarks/local-repository-20261012.json). This is not native-editor,
+realistic large-file, HTTP, physical SQLite storage or service-load acceptance.
+
+Production remains application 858801c, schema 29. No live migration, writer
+enablement, hosted package/archive update or marketplace submission occurred.
+Schemas 30/31 require matching readers and a compatible rollback build; old
+schema-29 binaries must not be reused after migration. Shared periodic writes
+remain off. The task-owned disposable database dynodoc-roadmap-test-20261012
+and its anonymous volume were removed after both suites. Unrelated containers
+were preserved. Synthetic demo databases/logs remain under ignored target.
+The owner still runs installed
+Office/Google acceptance locally using the existing worksheet.
+
+Next integration priorities: shared named/deployed versions, physical packing and
+incremental publication; authenticated project transport/protected refs/device
+identity and connector/UI adoption of local history. Then complete same-file
+offline merge/constraint handling, native graph/fidelity/background capture,
+independent receipts/witnesses and realistic large/concurrent service acceptance.
+Current hosted drafts/branches remain per file. Do not call the total roadmap
+complete or treat the new local library as an installed Office/Google integration.
+
+## Source: streaming shared content and local acceptance kit (12 October 2026)
+
+Application implementation `3462520` adds evolution part 2f. Standalone engine
+implementation: `746d373`. Read [the binary contract, resource
+bounds and measurements](CHUNKED-CONTENT.md). A separate content hash domain stores
+64 KiB pieces under bounded 128-way trees; streaming I/O and object/byte budgets
+avoid a full input/output buffer. The document-scoped memory/Pg stores retain
+byte validation, reuse, transactional rollback, immutability and audited erasure.
+V1 state/event hashes and migrations are unchanged. No root is silently published
+as a checkpoint/commit, and no default writer or upload limit changes.
+
+Verification: application formatting, workspace Clippy and all 284 Rust tests pass
+against an isolated local PostgreSQL 16. Eight new tests cover independent fixed
+hashes, chunk/tree boundaries, fragmented I/O, reuse, scope, repeated-reference
+budgets, malformed graphs, I/O errors and Pg rollback/durability. Existing v1
+compatibility, history and erasure checks pass. Standalone task lint, all
+284 Rust tests and task docs also pass;
+rustdoc retains the same 20 pre-existing link warnings. The
+[application Rust CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38162089809)
+and [engine CI](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/38162187293)
+pass, including OpenAPI compatibility and source packaging where applicable.
+The [frontend CI](https://github.com/ArefinAlter/dynodoc/actions/runs/38162089764)
+passes lint/type/build/package checks, 289 frontend units, 19 public browser
+checks, and all 72 tests against the authenticated stack, including the
+production-proxy regression. Source inputs are the commits above; later
+documentation-only commits record evidence without changing those inputs.
+All changed engine sources/fixtures are mirrored; application/engine packaging
+and existing independent fixture/toolchain differences are preserved.
+
+The 100/250/500 MiB release probe streams generated repeated bytes to a sink. Peak
+working set was 5.95/5.54/5.53 MB and each trace retained five unique objects. This
+checks streaming behavior only; it is not native-file, realistic-entropy database,
+concurrent-service or user-capacity acceptance. Fixed boundaries can rewrite later
+chunks after insertions/deletions; equal-length edits reuse unaffected pieces.
+
+The owner chose to run installed-editor tests locally. The application now includes
+the [acceptance worksheet](https://github.com/ArefinAlter/dynodoc/blob/main/extensions/ACCEPTANCE.md)
+in each Google test ZIP and links it from Office installation instructions. It
+covers all six hosts, exact versions, synthetic inputs, pairing/capture/review/pull,
+conflicts, stale application, retries, restart, revocation and historical recovery.
+The stale schema-26 installation prerequisite is corrected to 29. Package rebuild,
+drift verification and script formatting pass. No native session was connected;
+real host results remain not run, and PowerPoint 2021 still fails its API baseline.
+No publisher registration, Marketplace submission or public listing is claimed.
+
+VPS remains application `858801c`, schema 29. This increment is source-only; hosted
+packages/archive still belong to that deployed release. Shared periodic writes
+remain off. The task-owned local PostgreSQL container and its anonymous data
+volume were auto-removed after both suites. Docker Desktop was left running
+because unrelated containers were active. No local app server was started;
+ignored target files retain only synthetic probe/review evidence.
+
+Next concrete dependency: part 2g typed node/value/asset manifests referencing
+content roots, with bounded semantic decode (not encoded bytes alone), exact
+state/replay equivalence, and explicit versioned publication/read selection. Keep
+v1 roots readable and add any schema change as a new migration. Ordinary v1 values
+over 1 MiB still reject/fall back; full DocumentState memory is not solved here.
+Then packing/incremental publication and shared draft/named-version references.
+Portable project-wide commits/parents/atomic refs, durable local history and
+resumable exchange follow those contracts; offline convergence, independent signed/
+witnessed commitments and native fidelity/large-service acceptance remain open.
+Current drafts/branches are per file. This does not complete parts 2-8.
+
+## Source: v1 event hash regression synchronized (11 October 2026)
+
+Engine PR [#7](https://github.com/ArefinAlter/dynodoc-engine/pull/7), source
+`e31f093`, merged as `d6be03a`. Application mirror `648aa27` copies the test and
+fixture byte-for-byte with contributor attribution. The 22 synthetic events cover
+all 15 v1 event types, fixed content/chain hashes, replay state and node Merkle root.
+No runtime, event encoding, migration or API behavior changed; no deployment is
+needed. The live application remains `858801c`, schema 29, as recorded below.
+
+Local application verification: all six log unit tests, workspace Clippy with
+warnings denied, formatting and diff checks pass. Prior independent review of
+`e31f093` verified hashes/root and the chain-input-order mutation; its engine CI
+passed all 276 Rust tests. Application mirror CI is tracked in
+[Rust](https://github.com/ArefinAlter/dynodoc/actions/runs/38160929510) and
+[frontend](https://github.com/ArefinAlter/dynodoc/actions/runs/38160929481).
+Both application mirror runs completed successfully.
+
+Optional follow-up: pin typed serialization round-trips and per-event validate_op
+inside the test; both passed in the separate review probe. This regression does
+not add independent audit commitments. Next product dependency remains bounded
+shared content and historical references, before portable project commits.
+
 ## Live: security and runtime safeguards (11 October 2026)
 
 VPS workspace/API/admin run application `858801c`, schema 29. Engine source is

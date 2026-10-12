@@ -68,14 +68,23 @@ pub enum CheckpointFormat {
     Genesis,
     Legacy,
     SharedV1,
+    SharedV2,
 }
 
 /// Automatic writes retain a reversible rollout boundary. Readers always support
-/// both formats. Named/deployed snapshots continue to use the legacy contract.
+/// both formats. Named/deployed snapshots have a separate opt-in writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeriodicStorage {
     Legacy,
     SharedV1,
+    SharedV2,
+}
+
+/// Storage for named/deployed/public snapshots; the response shape stays legacy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedStorage {
+    Legacy,
+    SharedV2,
 }
 
 /// A historical state and the work required to reconstruct it.
@@ -99,7 +108,8 @@ pub async fn read_state_at(
     read_state_at_with_formats(connection, document_id, through_seq, true).await
 }
 
-/// Independent legacy/event reference for explicit shared checkpoint publication.
+/// Independent verified-snapshot/event reference for explicit shared checkpoint
+/// publication. Excludes periodic shared manifests, includes attested named roots.
 pub(crate) async fn read_legacy_state_at(
     connection: &mut PgConnection,
     document_id: DocumentId,
@@ -118,14 +128,14 @@ async fn read_state_at_with_formats(
         return Err(SnapshotError::InvalidRevision(through_seq));
     }
     // Metadata only: never hydrate an older full JSON snapshot just to compare it.
-    let selected: Option<(i64, bool)> = sqlx::query_as(
-        "select through_seq,shared from (
-           (select through_seq,false as shared from snapshot
+    let selected: Option<(i64, i16)> = sqlx::query_as(
+        "select through_seq,codec from (
+           (select through_seq,0::smallint as codec from snapshot
             where document_id=$1 and through_seq<=$2 order by through_seq desc limit 1)
            union all
-           (select through_seq,true as shared from shared_checkpoint
+           (select through_seq,codec_version as codec from shared_checkpoint
             where document_id=$1 and through_seq<=$2 and $3 order by through_seq desc limit 1)
-         ) candidates order by through_seq desc,shared desc limit 1",
+         ) candidates order by through_seq desc,codec desc limit 1",
     )
     .bind(document_id.0)
     .bind(through_seq)
@@ -133,24 +143,36 @@ async fn read_state_at_with_formats(
     .fetch_optional(&mut *connection)
     .await?;
     let (snapshot_seq, checkpoint_format, mut state) = match selected {
-        Some((seq, true)) => (
+        Some((seq, version @ 1..=2)) => (
             seq,
-            CheckpointFormat::SharedV1,
+            if version == 1 {
+                CheckpointFormat::SharedV1
+            } else {
+                CheckpointFormat::SharedV2
+            },
             shared::load_in_connection(connection, document_id, seq, Limits::default()).await?,
         ),
-        Some((seq, false)) => {
+        Some((seq, 0)) => {
             let snapshot: Snapshot =
                 sqlx::query_as("select * from snapshot where document_id=$1 and through_seq=$2")
                     .bind(document_id.0)
                     .bind(seq)
                     .fetch_one(&mut *connection)
                     .await?;
-            crate::snapshot_verification::check_receipt(connection, &snapshot).await?;
+            let state =
+                crate::snapshot_verification::read_verified_state(connection, &snapshot).await?;
             (
                 seq,
-                CheckpointFormat::Legacy,
-                serde_json::from_value(snapshot.state)?,
+                if snapshot.state.get("$dynodoc_state").is_some() {
+                    CheckpointFormat::SharedV2
+                } else {
+                    CheckpointFormat::Legacy
+                },
+                state,
             )
+        }
+        Some(_) => {
+            return Err(shared_checkpoint::Error::Invalid("unsupported checkpoint version").into())
         }
         None => (0, CheckpointFormat::Genesis, DocumentState::default()),
     };
@@ -244,6 +266,7 @@ async fn checkpoint_due(
 pub struct SnapshotEngine {
     pool: PgPool,
     periodic_storage: PeriodicStorage,
+    named_storage: NamedStorage,
 }
 
 impl SnapshotEngine {
@@ -251,6 +274,7 @@ impl SnapshotEngine {
         Self {
             pool,
             periodic_storage: PeriodicStorage::Legacy,
+            named_storage: NamedStorage::Legacy,
         }
     }
 
@@ -261,7 +285,12 @@ impl SnapshotEngine {
         self
     }
 
-    /// Explicit legacy snapshot contract used by deploys and the existing CLI.
+    pub fn with_named_storage(mut self, storage: NamedStorage) -> Self {
+        self.named_storage = storage;
+        self
+    }
+
+    /// Snapshot contract used by deploys and the existing CLI; legacy by default.
     /// Uses the common mixed-format reader and pins an exact event sequence.
     pub async fn take(
         &self,
@@ -274,8 +303,13 @@ impl SnapshotEngine {
             .fetch_one(&mut *tx)
             .await?;
         let seq = latest_event_seq(&mut tx, document_id).await?;
-        let snapshot =
-            crate::snapshot_verification::take_in_connection(&mut tx, document_id, seq).await?;
+        let snapshot = crate::snapshot_verification::take_with_storage_in_connection(
+            &mut tx,
+            document_id,
+            seq,
+            self.named_storage,
+        )
+        .await?;
         tx.commit().await?;
         Ok(snapshot)
     }
@@ -312,7 +346,7 @@ impl SnapshotEngine {
         if exists.is_none() {
             return Ok(());
         }
-        if self.periodic_storage == PeriodicStorage::SharedV1 {
+        if self.periodic_storage != PeriodicStorage::Legacy {
             let state = read_state_at(&mut tx, document_id, seq).await?.state;
             let chain = shared::chain_at(&mut tx, document_id, seq).await?;
             sqlx::query("savepoint shared_periodic")
@@ -325,6 +359,11 @@ impl SnapshotEngine {
                 &state,
                 chain.clone(),
                 Limits::default(),
+                if self.periodic_storage == PeriodicStorage::SharedV2 {
+                    shared::Codec::V2
+                } else {
+                    shared::Codec::V1
+                },
             )
             .await
             {
@@ -424,12 +463,11 @@ fn finish(ctx: Context) -> [u8; 32] {
 /// Spawn a best-effort background `ensure_recent` task after a successful append.
 pub fn spawn_ensure_recent(pool: PgPool, document_id: DocumentId, max_events_in_tail: i64) {
     tokio::spawn(async move {
-        let storage =
-            if std::env::var("DYNODOC_PERIODIC_CHECKPOINT_STORAGE").as_deref() == Ok("shared-v1") {
-                PeriodicStorage::SharedV1
-            } else {
-                PeriodicStorage::Legacy
-            };
+        let storage = match std::env::var("DYNODOC_PERIODIC_CHECKPOINT_STORAGE").as_deref() {
+            Ok("shared-v1") => PeriodicStorage::SharedV1,
+            Ok("shared-v2") => PeriodicStorage::SharedV2,
+            _ => PeriodicStorage::Legacy,
+        };
         let engine = SnapshotEngine::new(pool).with_periodic_storage(storage);
         if let Err(err) = engine.ensure_recent(document_id, max_events_in_tail).await {
             warn!(

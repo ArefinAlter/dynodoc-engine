@@ -1,5 +1,19 @@
 # Database runtime boundary
 
+Schema 36 adds SELECT/INSERT on published commits, root reachability indexes,
+project history reviews and signed ref events. Published metadata counters and
+`project_ref_authority` are SELECT-only; only the operator installs its public key.
+Review sequence USAGE is explicitly granted. Immutable guards and audited document
+erasure preserve the boundary. Re-provision grants with the matching binary; see
+[Shared project history](SHARED-PROJECT-HISTORY.md).
+
+Schema 35 extends the explicit runtime inventory with SELECT/INSERT on
+`project_staged_object` and `project_staged_commit`, and SELECT-only on
+`project_staging_storage`. Immutable staging history has audited document/account
+erasure entrypoints; quota/erasure functions are not runtime-callable. See
+[Private project transfers](PRIVATE-PROJECT-TRANSFERS.md). Re-provision the matching
+runtime grants after migration with a schema-compatible operator binary.
+
 11 October 2026, schema 0029. This is a source and rollout contract; current checks
 and deployment state are in [the handoff](ENGINE-EVOLUTION-HANDOFF.md).
 
@@ -119,6 +133,17 @@ new runtime role, restored production-copy upgrade and compatible-image rollback
 are verified in the linked release. Repeat these gates for future schema changes.
 Do not downgrade by deleting migration records.
 
+The current source includes schema 30–34, while production remains 29. A schema-29
+binary fails the exact catalog check after this upgrade, even with all optional
+shared writers disabled. Before a future rollout, rehearse a compatible schema-34
+rollback build and the existing history/public-pin/session/erasure workflows.
+Migration 33 adds device key records/revocations and a read-only installation UUID;
+34 adds read-only storage accounting maintained by restricted trigger functions.
+Run `grant-runtime` again after migration to apply this expanded allowlist, then
+`check-runtime`. See [device enrollment](DEVICE-SIGNING-KEYS.md) and
+[storage budgets](SHARED-STORAGE-BUDGETS.md). This source pass has not performed
+production-copy rehearsal or VPS deployment.
+
 ## Trust and remaining work
 
 This constrains a compromised runtime credential's ability to rewrite existing
@@ -129,7 +154,9 @@ essential. Signed/witnessed heads and independent recovery remain separate work.
 Startup checks cannot stop an operator from changing privileges after startup;
 database administration and credential rotation remain trusted operations.
 
-No content algorithm, event hash, snapshot fingerprint or public API shape changes.
-The startup catalog checks are bounded by the schema inventory; they add no per-event
-queries. Full-state storage/memory, tenant budgets, project-wide portable branches,
+The schema-29 credential separation changed no content algorithm, event hash,
+snapshot fingerprint or document API shape. The startup catalog checks are bounded
+by the schema inventory; they add no per-event
+queries. Shared-object accounting now bounds encoded retained bytes/object counts;
+whole-service/local-store budgets, full-state memory, project-wide portable branches,
 offline convergence and installed native-host acceptance remain on the staged plan.
