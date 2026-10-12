@@ -6,8 +6,10 @@
 candidate publication, reachable downloads, protected main CAS/reviews and atomic
 server-signed receipts. A public authority is operator-installed, and the matching
 secret must be explicitly mounted into the API. These sources are not deployed.
-Automatic push/fetch, UI/native adoption, server rotation/witnesses and full native
-convergence/large-service acceptance remain open.
+[Selected-history CLI sync](SELECTED-HISTORY-SYNC.md) now adds reviewed
+push, verified fetch, fast-forward pull and separate pinned remote tracking.
+Project-scoped sign-in, UI/native adoption, server rotation/witnesses and full
+native convergence/large-service acceptance remain open.
 
 Current schema 36 retains [typed chunked state](TYPED-CHECKPOINTS.md) and shared roots for
 [draft/rebase bases](SHARED-DRAFT-BASES.md) and [named/deployed/public snapshots](SHARED-NAMED-SNAPSHOTS.md).

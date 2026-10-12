@@ -16,8 +16,10 @@ Projects frontend and Word/Docs, Excel/Sheets and PowerPoint/Slides connectors.
 candidate publication, reachable downloads, protected main CAS/reviews and atomic
 server-signed receipts. A public authority is operator-installed, and the matching
 secret must be explicitly mounted into the API. These sources are not deployed.
-Automatic push/fetch, UI/native adoption, server rotation/witnesses and full native
-convergence/large-service acceptance remain open.
+[Selected-history CLI sync](docs/SELECTED-HISTORY-SYNC.md) now adds reviewed
+push, verified fetch, fast-forward pull and separate pinned remote tracking.
+Project-scoped sign-in, UI/native adoption, server rotation/witnesses and full
+native convergence/large-service acceptance remain open.
 
 Source supports PostgreSQL schema 36. The hosted application remains at schema 29
 and release `858801c`; these new storage and audit capabilities are not deployed.
@@ -27,7 +29,7 @@ Read [verified source revisions and tests](docs/ENGINE-EVOLUTION-HANDOFF.md) and
 | Capability | Current boundary |
 |---|---|
 | [Shared state](docs/TYPED-CHECKPOINTS.md) | Typed chunked objects, immutable document-scoped storage, verified mixed readers and opt-in shared periodic/draft/named/deployed/public references. Durable per-document/account encoded-object budgets are enforced. Full-state scans, resident reconstruction and physical packing remain. |
-| [Local project history](docs/PORTABLE-PROJECT-HISTORY.md) | Durable signed multi-file commits, parents, branch CAS, missing-object exchange, merge bases and conservative comparison. SQLite schema 2 adds persistent local object/commit/branch capacity with an explicit CLI. Authenticated private staging, explicit shared publication, protected main CAS/review and atomic ref receipts are implemented. Automatic push/fetch and editor adoption remain open. |
+| [Local project history](docs/PORTABLE-PROJECT-HISTORY.md) | Durable signed multi-file commits, parents, branch CAS, missing-object exchange, merge bases and conservative comparison. SQLite schema 2 adds persistent local object/commit/branch capacity with an explicit CLI. Authenticated private staging, explicit shared publication, protected main CAS/review and atomic ref receipts are implemented. Selected-history CLI push/fetch, fast-forward pull and separate pinned remote tracking are available; project-scoped sign-in and editor adoption remain open. |
 | [Client audit](docs/REF-RECEIPTS.md) | Signed ref receipts, independent signature fixtures, separate durable pins, authority rotation and local revocation. Account-bound device enrollment/revocation is available; atomic server issuance is implemented; authority distribution/server rotation and external witnesses remain open. |
 | [Historical recovery](docs/HISTORY-RECOVERY.md) | Authorized per-file history, selected recovery and revision-range revert/cherry-pick under existing review rules. [Local project commit recovery](docs/PROJECT-COMMIT-RECOVERY.md) now adds signed revert/cherry-pick; hosted/native integration remains open. |
 | [Correctness and resources](docs/VERSIONING-CONFORMANCE.md) | Fixed compatibility vectors, replay equivalence, explicit budgets and constraint-aware validation. Complete offline/native convergence and large-service capacity are not certified. |
