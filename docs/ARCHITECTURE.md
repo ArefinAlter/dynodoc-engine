@@ -2,7 +2,14 @@
 
 ## Current source — 12 October 2026
 
-Current schema 35 retains [typed chunked state](TYPED-CHECKPOINTS.md) and shared roots for
+[Shared project history](SHARED-PROJECT-HISTORY.md) now adds explicit
+candidate publication, reachable downloads, protected main CAS/reviews and atomic
+server-signed receipts. A public authority is operator-installed, and the matching
+secret must be explicitly mounted into the API. These sources are not deployed.
+Automatic push/fetch, UI/native adoption, server rotation/witnesses and full native
+convergence/large-service acceptance remain open.
+
+Current schema 36 retains [typed chunked state](TYPED-CHECKPOINTS.md) and shared roots for
 [draft/rebase bases](SHARED-DRAFT-BASES.md) and [named/deployed/public snapshots](SHARED-NAMED-SNAPSHOTS.md).
 Publication verifies reconstruction and the exact event revision; mixed readers
 retain legacy compatibility. Writers remain opt-in. Full-state scans, resident
@@ -17,8 +24,7 @@ account permissions, production issuance or an external witness.
 
 Account-bound signing keys and [private project transfers](PRIVATE-PROJECT-TRANSFERS.md)
 now support authenticated resumable staging with durable quotas and erasure.
-Shared publication/protected refs/reviews, atomic server receipts, complete native/
-offline convergence and realistic large/concurrent workloads remain open. Production is
+Complete native/offline convergence and realistic large/concurrent workloads remain open. Production is
 application `858801c`, schema 29. The owner runs installed-editor acceptance using
 the prepared worksheet. Consult the [acceptance ledger](ROADMAP-ACCEPTANCE.md),
 [conformance limits](VERSIONING-CONFORMANCE.md) and [verified handoff](ENGINE-EVOLUTION-HANDOFF.md).
