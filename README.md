@@ -12,16 +12,16 @@ Projects frontend and Word/Docs, Excel/Sheets and PowerPoint/Slides connectors.
 
 ## Current state — 12 October 2026
 
-Source supports PostgreSQL schema 32. The hosted application remains at schema 29
+Source supports PostgreSQL schema 34. The hosted application remains at schema 29
 and release `858801c`; these new storage and audit capabilities are not deployed.
 Read [verified source revisions and tests](docs/ENGINE-EVOLUTION-HANDOFF.md) and the
 [complete acceptance ledger](docs/ROADMAP-ACCEPTANCE.md).
 
 | Capability | Current boundary |
 |---|---|
-| [Shared state](docs/TYPED-CHECKPOINTS.md) | Typed chunked objects, immutable document-scoped storage, verified mixed readers and opt-in shared periodic/draft/named/deployed/public references. Full-state scans and resident reconstruction remain. |
+| [Shared state](docs/TYPED-CHECKPOINTS.md) | Typed chunked objects, immutable document-scoped storage, verified mixed readers and opt-in shared periodic/draft/named/deployed/public references. Durable per-document/account encoded-object budgets are enforced. Full-state scans, resident reconstruction and physical packing remain. |
 | [Local project history](docs/PORTABLE-PROJECT-HISTORY.md) | Durable signed multi-file commits, parents, branch CAS, missing-object exchange, merge bases and conservative comparison. Hosted project transport/review and editor adoption remain open. |
-| [Client audit](docs/REF-RECEIPTS.md) | Signed ref receipts, independent signature fixtures, separate durable pins, authority rotation and local revocation. Account binding, atomic server issuance and external witnesses remain open. |
+| [Client audit](docs/REF-RECEIPTS.md) | Signed ref receipts, independent signature fixtures, separate durable pins, authority rotation and local revocation. Account-bound device enrollment/revocation is available; atomic server issuance and external witnesses remain open. |
 | [Historical recovery](docs/HISTORY-RECOVERY.md) | Authorized per-file history, selected recovery and revision-range revert/cherry-pick under existing review rules. [Local project commit recovery](docs/PROJECT-COMMIT-RECOVERY.md) now adds signed revert/cherry-pick; hosted/native integration remains open. |
 | [Correctness and resources](docs/VERSIONING-CONFORMANCE.md) | Fixed compatibility vectors, replay equivalence, explicit budgets and constraint-aware validation. Complete offline/native convergence and large-service capacity are not certified. |
 
