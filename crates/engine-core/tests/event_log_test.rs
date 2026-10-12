@@ -267,6 +267,38 @@ async fn full_chain_verification_rejects_negative_sequence_rows(
     Ok(())
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_from_handles_sequence_boundaries_without_overflow(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, doc, node) = seed(&pool).await?;
+    let event = append(&pool, doc, &field_edit(&node, "label", "anchor"), actor).await?;
+    assert!(matches!(
+        verify_from(&pool, doc, -1, &event.chain_hash).await,
+        Err(EventError::ChainBroken { seq: -1, .. })
+    ));
+    assert!(matches!(
+        verify_from(&pool, doc, 0, &event.chain_hash).await,
+        Err(EventError::ChainBroken { seq: 0, .. })
+    ));
+
+    // A trusted final row can have an empty suffix. Verifying that suffix must
+    // not compute MAX + 1; earlier rows are intentionally outside this audit.
+    sqlx::query("alter table event disable trigger event_no_update")
+        .execute(&pool)
+        .await?;
+    sqlx::query("update event set seq=$1 where document_id=$2")
+        .bind(i64::MAX)
+        .bind(doc.0)
+        .execute(&pool)
+        .await?;
+    sqlx::query("alter table event enable trigger event_no_update")
+        .execute(&pool)
+        .await?;
+    verify_from(&pool, doc, i64::MAX, &event.chain_hash).await?;
+    Ok(())
+}
+
 /// Two events appended on one transaction are atomic and stay gap-free: the second
 /// `append_in_tx` sees the first's row, so seq is 1,2 and the chain links. This is the
 /// primitive the stage-16 governance accept relies on (wrapped event + SuggestionAccepted

@@ -239,12 +239,17 @@ pub async fn verify_from(
     }
 
     let mut prev_chain_hash = trusted_chain_hash.to_vec();
-    let mut expected_seq = trusted_seq + 1;
+    let mut expected_seq = trusted_seq;
     while let Some(ev) = events.try_next().await? {
+        expected_seq = expected_seq
+            .checked_add(1)
+            .ok_or_else(|| EventError::ChainBroken {
+                seq: ev.seq,
+                detail: "event sequence exceeds the supported range".into(),
+            })?;
         verify_event(&ev, document_id, expected_seq, &prev_chain_hash)?;
 
         prev_chain_hash = ev.chain_hash.clone();
-        expected_seq += 1;
     }
 
     Ok(())
