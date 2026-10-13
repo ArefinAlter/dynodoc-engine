@@ -8,7 +8,7 @@ Harassment, discriminatory language, threats, sexual attention, doxxing, deliber
 intimidation and sustained disruption are unacceptable. These standards apply in
 project repositories, issues, pull requests and other official project spaces.
 
-Report concerns privately to the maintainer at arefinalter@gmail.com. Include links
+Report concerns privately to the maintainer at info@vernesystems.com. Include links
 or other context when safe to do so. Do not post sensitive reports in public issues.
 Maintainers will handle reports discreetly and avoid unnecessary disclosure. A
 maintainer involved in a complaint should not decide its outcome alone.
