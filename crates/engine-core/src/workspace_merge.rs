@@ -593,6 +593,33 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
     let from = canonical(from);
     let to = canonical(to);
     let mut result = Vec::new();
+    // A block that takes a name another block holds gets it after the deletions and
+    // renames that free it: (block, holder, the edit that gives the name).
+    let held: BTreeMap<&str, &NodeId> = from
+        .nodes
+        .values()
+        .filter(|n| !n.deleted)
+        .filter_map(|n| Some((n.var_name.as_deref().filter(|v| !v.is_empty())?, &n.id)))
+        .collect();
+    let mut later: Vec<(NodeId, NodeId, EventPayload)> = Vec::new();
+    let mut name_later = |n: &MaterializedNode| {
+        let Some(holder) = n.var_name.as_deref().and_then(|v| held.get(v)) else {
+            return false;
+        };
+        if *holder == &n.id {
+            return false;
+        }
+        later.push((
+            n.id.clone(),
+            (*holder).clone(),
+            EventPayload::FieldEdited {
+                node_id: n.id.clone(),
+                field: "var_name".into(),
+                value: json!(n.var_name),
+            },
+        ));
+        true
+    };
     let to_depths = depths(&to);
     let mut nodes: Vec<_> = to.nodes.values().collect();
     nodes.sort_by_cached_key(|n| (to_depths[&n.id], &n.id));
@@ -600,13 +627,20 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
         let prior = from.nodes.get(&n.id);
         if prior.is_none() {
             if let Ok(node_type) = n.node_type.parse() {
+                let mut fields = n.current_fields.clone();
+                let var_name = if name_later(n) {
+                    fields.as_object_mut().map(|f| f.remove("var_name"));
+                    None
+                } else {
+                    n.var_name.clone()
+                };
                 result.push(EventPayload::NodeCreated {
                     node_id: n.id.clone(),
                     node_type,
                     parent_id: n.parent_id.clone(),
                     pos: n.pos.clone(),
-                    fields: n.current_fields.clone(),
-                    var_name: n.var_name.clone(),
+                    fields,
+                    var_name,
                 });
             }
             continue;
@@ -662,7 +696,7 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
                 result.push(compact);
             }
         }
-        if p.var_name != n.var_name {
+        if p.var_name != n.var_name && !name_later(n) {
             result.push(EventPayload::FieldEdited {
                 node_id: n.id.clone(),
                 field: "var_name".into(),
@@ -683,6 +717,15 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
         result.push(EventPayload::NodeDeleted {
             node_id: n.id.clone(),
         });
+    }
+    // A name is free once its holder is deleted or renamed, so renames that wait on
+    // each other go in that order; only a cycle (two names swapped) still fails.
+    while !later.is_empty() {
+        let ready = later
+            .iter()
+            .position(|(_, holder, _)| later.iter().all(|(id, _, _)| id != holder))
+            .unwrap_or(0);
+        result.push(later.remove(ready).2);
     }
     // A snapshot can enable protection together with content changes. Apply that
     // flag last; explicit unprotection of an existing live sheet must happen first.
@@ -1486,5 +1529,65 @@ mod tests {
         let (keys, _, applied) = check(&b, &t, &d, &[("b:var_name", "team"), ("c:var_name", "z")]);
         assert!(keys.is_empty());
         assert_eq!(var(&applied, "c").as_deref(), Some("z"));
+    }
+
+    #[test]
+    fn a_name_freed_in_the_same_change_can_be_taken() {
+        let id = |s: &str| NodeId(s.into());
+        let add = |s: &mut DocumentState, n: &str, var: &str| {
+            let mut node = s.nodes[&id("root")].clone();
+            node.id = id(n);
+            node.node_type = "item".into();
+            node.parent_id = Some(id("root"));
+            node.current_fields = json!({"var_name": var});
+            node.var_name = Some(var.into());
+            s.nodes.insert(node.id.clone(), node);
+        };
+        let rename = |s: &mut DocumentState, n: &str, var: &str| {
+            let node = s.nodes.get_mut(&id(n)).unwrap();
+            node.current_fields["var_name"] = json!(var);
+            node.var_name = Some(var.into());
+        };
+        let apply = |from: &DocumentState, to: &DocumentState| {
+            let mut state = from.clone();
+            for op in diff(from, to) {
+                crate::ops::validate_op(&state, &op).unwrap();
+                crate::materializer::apply_payload(&mut state, &op).unwrap();
+            }
+            let var = |n: &str| {
+                state
+                    .nodes
+                    .get(&id(n))
+                    .filter(|n| !n.deleted)
+                    .and_then(|n| n.var_name.clone())
+            };
+            (var("a"), var("y"), var("z"))
+        };
+        // The block taking the name sorts first ("a"), so it used to claim it too early.
+        let mut from = state();
+        add(&mut from, "z", "q");
+        let mut to = from.clone();
+        to.nodes.get_mut(&id("z")).unwrap().deleted = true;
+        add(&mut to, "a", "q");
+        assert_eq!(apply(&from, &to), (Some("q".into()), None, None));
+        let mut from = state();
+        add(&mut from, "a", "r");
+        add(&mut from, "z", "q");
+        let mut to = from.clone();
+        to.nodes.get_mut(&id("z")).unwrap().deleted = true;
+        rename(&mut to, "a", "q");
+        assert_eq!(apply(&from, &to), (Some("q".into()), None, None));
+        // Names shift: y q -> r, z r -> s, and a new block takes q.
+        let mut from = state();
+        add(&mut from, "y", "q");
+        add(&mut from, "z", "r");
+        let mut to = from.clone();
+        rename(&mut to, "y", "r");
+        rename(&mut to, "z", "s");
+        add(&mut to, "a", "q");
+        assert_eq!(
+            apply(&from, &to),
+            (Some("q".into()), Some("r".into()), Some("s".into()))
+        );
     }
 }
