@@ -347,10 +347,10 @@ fn validate_merged_tree(
                 }
                 for other_id in &cycle {
                     if other_id != &d_id {
-                        if let Some(b_node) = base.nodes.get(other_id) {
+                        if let Some(d_node) = draft.nodes.get(other_id) {
                             if let Some(out_node) = out.nodes.get_mut(other_id) {
-                                out_node.parent_id = b_node.parent_id.clone();
-                                out_node.pos = b_node.pos.clone();
+                                out_node.parent_id = d_node.parent_id.clone();
+                                out_node.pos = d_node.pos.clone();
                             }
                         }
                     }
@@ -1063,7 +1063,7 @@ mod tests {
             crate::materializer::apply_payload(&mut team_applied, op).unwrap();
         }
 
-        // Choosing draft moves c under a and reverts opposing team move on b to base (root)
+        // Choosing draft moves c under a, undoes the team's move of b and keeps a under b
         let take_draft = merge(
             &b,
             &t,
@@ -1079,6 +1079,10 @@ mod tests {
         assert_eq!(
             take_draft.state.nodes[&NodeId("b".into())].parent_id,
             Some(NodeId("root".into()))
+        );
+        assert_eq!(
+            take_draft.state.nodes[&NodeId("a".into())].parent_id,
+            Some(NodeId("b".into()))
         );
         let mut draft_applied = t.clone();
         for op in &take_draft.ops {
