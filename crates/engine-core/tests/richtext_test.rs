@@ -249,3 +249,44 @@ fn image_attributes_merge_key_by_key() {
     narrow["attrs"]["width"] = json!(50);
     assert!(richtext::merge(&img, &width, &narrow).is_none());
 }
+
+#[test]
+fn edits_around_an_inline_atom_merge() {
+    let para = |c: Value| json!({"type":"paragraph","content":c});
+    let t = |s: &str| json!({"type":"text","text":s});
+    for atom in [
+        json!({"type":"hardBreak"}),
+        json!({"type":"inlineMath","attrs":{"latex":"x^2"}}),
+        json!({"type":"footnoteReference","attrs":{"id":"1"}}),
+    ] {
+        let base = para(json!([t("first line"), atom.clone(), t("second line")]));
+        let team = para(json!([t("FIRST line"), atom.clone(), t("second line")]));
+        let draft = para(json!([t("first line"), atom.clone(), t("second LINE")]));
+        assert_eq!(
+            richtext::merge(&base, &team, &draft),
+            Some(para(json!([
+                t("FIRST line"),
+                atom.clone(),
+                t("second LINE")
+            ]))),
+            "{atom}"
+        );
+    }
+}
+
+#[test]
+fn same_atom_edited_differently_conflicts() {
+    let para = |c: Value| json!({"type":"paragraph","content":c});
+    let t = |s: &str| json!({"type":"text","text":s});
+    let math = |latex: &str| json!({"type":"inlineMath","attrs":{"latex":latex}});
+    let base = para(json!([t("alpha "), math("x^2"), t(" omega")]));
+    let squared = para(json!([t("alpha "), math("x^3"), t(" omega")]));
+    let cubed = para(json!([t("alpha "), math("x^4"), t(" omega")]));
+    assert!(richtext::merge(&base, &squared, &cubed).is_none());
+    // One side's change to the atom still combines with the other side's wording.
+    let reworded = para(json!([t("alpha "), math("x^2"), t(" OMEGA")]));
+    assert_eq!(
+        richtext::merge(&base, &squared, &reworded),
+        Some(para(json!([t("alpha "), math("x^3"), t(" OMEGA")])))
+    );
+}
