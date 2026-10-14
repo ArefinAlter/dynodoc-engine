@@ -3,7 +3,7 @@
 //! The PoC has no CRDT branch source (stage 20 was skipped per
 //! `docs/decisions/000-initial.md`). Conflicts are instead **concurrent pending
 //! suggestions on the same field**: when two or more *pending* suggestions
-//! ([`SuggestionState`] with `!accepted && rejected_reason.is_none()`) each wrap a
+//! ([`SuggestionState`](engine_core::materializer::SuggestionState) with `!accepted && rejected_reason.is_none()`) each wrap a
 //! `FieldEdited` targeting the same `(node_id, field)` but propose *distinct* values,
 //! that is a four-card conflict for the author to resolve.
 //!
