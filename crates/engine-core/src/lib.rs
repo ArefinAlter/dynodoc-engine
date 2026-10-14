@@ -43,10 +43,6 @@ pub mod integrity;
 /// Used by the integrity pass for shape-aware reference extraction. See docs/21 item 1.
 pub mod expr;
 
-/// Pure three-way semantic merge: per-field change classification, four-card conflict
-/// surfacing, and a post-merge integrity gate. See docs/21 item 3.
-pub mod merge;
-
 pub mod richtext;
 
 /// Content fingerprints (MinHash, locality-sensitive bands, block containment) for
