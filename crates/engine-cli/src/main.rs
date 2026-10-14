@@ -121,6 +121,15 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Compare the node table with a verified replay (read-only); exits non-zero on an
+    /// unexplained difference.
+    VerifyProjection {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        document_id: Option<String>,
+        /// Visit every document in keyset order and report every failing one.
+        #[arg(long)]
+        all: bool,
+    },
     /// Replay a document's event log and print the materialized state.
     Replay {
         /// Document id (UUID).
@@ -241,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Verify { document_id } => verify(document_id).await,
         Command::VerifySnapshots { document_id, all } => verify_snapshots(document_id, all).await,
+        Command::VerifyProjection { document_id, all } => verify_projection(document_id, all).await,
         Command::Replay { document_id } => replay(document_id).await,
         Command::Snapshot { document_id } => snapshot(document_id).await,
         Command::SharedSnapshot {
@@ -340,6 +350,60 @@ async fn verify_snapshots(document_id: Option<String>, all: bool) -> anyhow::Res
             break;
         }
         cursor = Some(id);
+    }
+    Ok(())
+}
+
+async fn verify_projection(document_id: Option<String>, all: bool) -> anyhow::Result<()> {
+    let pool = connect().await?;
+    let mut cursor: Option<Uuid> = None;
+    let mut failed = 0usize;
+    loop {
+        let document = if all {
+            sqlx::query_scalar::<_, Uuid>(
+                "select id from document where ($1::uuid is null or id>$1) order by id limit 1",
+            )
+            .bind(cursor)
+            .fetch_optional(&pool)
+            .await?
+        } else {
+            Some(parse_document_id(document_id.as_deref().context("document id required")?)?.0)
+        };
+        let Some(id) = document else {
+            break;
+        };
+        match engine_core::projection::verify_projection(&pool, DocumentId(id)).await {
+            Err(err) => {
+                failed += 1;
+                println!("FAIL: document {id}: {err}");
+            }
+            Ok(report) => {
+                for d in &report.differences {
+                    let status = d
+                        .known
+                        .map_or("DIFF".to_string(), |why| format!("KNOWN ({why})"));
+                    println!(
+                        "{status}: document {id} node {} {}: replay={} table={}",
+                        d.node_id.0, d.field, d.replayed, d.stored
+                    );
+                }
+                let unexplained = report.unexplained().count();
+                let known = report.differences.len() - unexplained;
+                let verdict = if unexplained > 0 { "FAIL" } else { "OK" };
+                failed += usize::from(unexplained > 0);
+                println!(
+                    "{verdict}: document {id}; {} rows; {unexplained} unexplained, {known} known difference(s); through seq {}",
+                    report.stored_rows, report.through_seq
+                );
+            }
+        }
+        if !all {
+            break;
+        }
+        cursor = Some(id);
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} document(s) failed the projection check");
     }
     Ok(())
 }

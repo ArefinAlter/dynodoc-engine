@@ -23,6 +23,9 @@ pub mod snapshot;
 /// Legacy snapshot replay verification, immutable receipts and checked reads.
 pub mod snapshot_verification;
 
+/// Read-only comparison of the derived `node` table with a verified replay.
+pub mod projection;
+
 /// Opt-in content-addressed, document-scoped shared checkpoints.
 pub mod shared_checkpoint;
 
