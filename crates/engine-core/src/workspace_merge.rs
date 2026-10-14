@@ -72,6 +72,8 @@ fn select(
     match resolutions.get(&key).map(String::as_str) {
         Some("draft") => draft,
         Some("team") => team,
+        // Two names for one variable may also be resolved with a new name.
+        Some(name) if field == "var_name" => json!(name),
         _ => {
             conflicts.push(Conflict {
                 key,
@@ -160,6 +162,11 @@ pub fn merge(
             )
             .collect();
         for key in keys {
+            // Mirrors `var_name`, which is merged above.
+            if key == "var_name" {
+                n.current_fields[key] = json!(n.var_name);
+                continue;
+            }
             if key == "label"
                 && b.current_fields["content"].is_object()
                 && t.current_fields["content"].is_object()
@@ -299,19 +306,23 @@ fn validate_merged_tree(
             break;
         }
         let Some(cycle) = find_parent_cycle(out) else {
-            let Some((child, parent)) = find_orphan(out) else {
+            let changed = if let Some((child, parent)) = find_orphan(out) {
+                resolve_orphan(
+                    base,
+                    team,
+                    draft,
+                    out,
+                    conflicts,
+                    resolutions,
+                    &child,
+                    &parent,
+                )
+            } else if let Some(id) = find_duplicate_var_name(team, out) {
+                resolve_duplicate_var_name(base, team, draft, out, conflicts, resolutions, &id)
+            } else {
                 break;
             };
-            if !resolve_orphan(
-                base,
-                team,
-                draft,
-                out,
-                conflicts,
-                resolutions,
-                &child,
-                &parent,
-            ) {
+            if !changed {
                 break;
             }
             continue;
@@ -472,6 +483,76 @@ fn resolve_orphan(
     }
     changed
 }
+/// A live node sharing its `var_name` with another live node, where the name did
+/// not come from the team (whose names are already unique).
+fn find_duplicate_var_name(team: &DocumentState, state: &DocumentState) -> Option<NodeId> {
+    let mut by_name: BTreeMap<&str, Vec<&MaterializedNode>> = BTreeMap::new();
+    for n in state.nodes.values().filter(|n| !n.deleted) {
+        if let Some(name) = n.var_name.as_deref().filter(|v| !v.is_empty()) {
+            by_name.entry(name).or_default().push(n);
+        }
+    }
+    by_name
+        .values()
+        .filter(|nodes| nodes.len() > 1)
+        .flatten()
+        .find(|n| {
+            team.nodes
+                .get(&n.id)
+                .is_none_or(|t| t.deleted || t.var_name != n.var_name)
+        })
+        .map(|n| n.id.clone())
+}
+/// The block keeps the team's version of its name, or is left out when the team
+/// has no such block. A resolution other than "team" or "draft" is a new name. Returns
+/// whether anything changed.
+#[allow(clippy::too_many_arguments)]
+fn resolve_duplicate_var_name(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    out: &mut DocumentState,
+    conflicts: &mut Vec<Conflict>,
+    resolutions: &BTreeMap<String, String>,
+    id: &NodeId,
+) -> bool {
+    let key = format!("{}:var_name", id.0);
+    let choice = resolutions.get(&key);
+    let renamed = choice.filter(|name| {
+        !["team", "draft"].contains(&name.as_str())
+            && !out
+                .nodes
+                .values()
+                .any(|n| &n.id != id && !n.deleted && n.var_name.as_ref() == Some(name))
+    });
+    if renamed.is_none()
+        && choice.map(String::as_str) != Some("team")
+        && !conflicts.iter().any(|c| c.key == key)
+    {
+        let var_name = |s: &DocumentState| json!(s.nodes.get(id).and_then(|n| n.var_name.as_ref()));
+        conflicts.push(Conflict {
+            key,
+            node_id: id.clone(),
+            field: "var_name".into(),
+            ancestor: var_name(base),
+            team: var_name(team),
+            draft: var_name(draft),
+        });
+    }
+    let Some(n) = out.nodes.get_mut(id) else {
+        return false;
+    };
+    let before = (n.var_name.clone(), n.deleted);
+    match (renamed, team.nodes.get(id).filter(|t| !t.deleted)) {
+        (Some(name), _) => n.var_name = Some(name.clone()),
+        (None, Some(t)) => n.var_name = t.var_name.clone(),
+        (None, None) => n.deleted = true,
+    }
+    if n.current_fields.get("var_name").is_some() {
+        n.current_fields["var_name"] = json!(n.var_name);
+    }
+    (n.var_name.clone(), n.deleted) != before
+}
 // Each parent chain is traversed once. Iterative traversal avoids stack growth
 // for deeply nested imports; malformed cycles retain the old capped sort depth.
 fn depths(state: &DocumentState) -> BTreeMap<NodeId, usize> {
@@ -557,6 +638,10 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
             .collect();
         let mut derived_label = None;
         for field in keys {
+            // The `var_name` edit below sets this field too.
+            if field == "var_name" {
+                continue;
+            }
             let before = if field == "label" {
                 derived_label.as_ref().unwrap_or(&p.current_fields[field])
             } else {
@@ -1309,5 +1394,97 @@ mod tests {
             &BTreeMap::from([("box:$node".into(), "team".into())]),
         );
         assert_eq!(resolved.conflicts.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_var_names_from_both_sides_conflict() {
+        let id = |s: &str| NodeId(s.into());
+        let add = |s: &mut DocumentState, n: &str, var: &str| {
+            let mut node = s.nodes[&id("root")].clone();
+            node.id = id(n);
+            node.node_type = "item".into();
+            node.parent_id = Some(id("root"));
+            node.current_fields = json!({"label": n, "var_name": var});
+            node.var_name = Some(var.into());
+            s.nodes.insert(node.id.clone(), node);
+        };
+        let rename = |s: &mut DocumentState, n: &str, var: &str| {
+            let node = s.nodes.get_mut(&id(n)).unwrap();
+            node.current_fields["var_name"] = json!(var);
+            node.var_name = Some(var.into());
+        };
+        let check =
+            |b: &DocumentState, t: &DocumentState, d: &DocumentState, res: &[(&str, &str)]| {
+                let res = res
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                let plan = merge(b, t, d, &res);
+                let mut applied = t.clone();
+                for op in &plan.ops {
+                    crate::ops::validate_op(&applied, op).unwrap();
+                    crate::materializer::apply_payload(&mut applied, op).unwrap();
+                }
+                let keys: Vec<_> = plan.conflicts.iter().map(|c| c.key.clone()).collect();
+                (keys, plan.ops, applied)
+            };
+        let var = |s: &DocumentState, n: &str| {
+            s.nodes
+                .get(&id(n))
+                .filter(|n| !n.deleted)
+                .and_then(|n| n.var_name.clone())
+        };
+
+        // Both sides add a block named q.
+        let b = state();
+        let mut t = b.clone();
+        add(&mut t, "team_q", "q");
+        let mut d = b.clone();
+        add(&mut d, "draft_q", "q");
+        for res in [
+            &[][..],
+            &[("draft_q:var_name", "draft")],
+            &[("draft_q:var_name", "q")],
+        ] {
+            let (keys, _, applied) = check(&b, &t, &d, res);
+            assert_eq!(keys, ["draft_q:var_name"]);
+            assert_eq!(var(&applied, "draft_q"), None);
+        }
+        let (keys, _, applied) = check(&b, &t, &d, &[("draft_q:var_name", "team")]);
+        assert!(keys.is_empty());
+        assert_eq!(var(&applied, "draft_q"), None);
+        let (keys, _, applied) = check(&b, &t, &d, &[("draft_q:var_name", "q2")]);
+        assert!(keys.is_empty());
+        assert_eq!(var(&applied, "draft_q").as_deref(), Some("q2"));
+
+        // The team renames a to q while the draft renames b to q; both rename c.
+        let mut b = state();
+        for n in ["a", "b", "c"] {
+            add(&mut b, n, n);
+        }
+        let mut t = b.clone();
+        rename(&mut t, "a", "q");
+        rename(&mut t, "c", "x");
+        let mut d = b.clone();
+        rename(&mut d, "b", "q");
+        rename(&mut d, "c", "y");
+        let (keys, _, applied) = check(&b, &t, &d, &[]);
+        assert_eq!(keys, ["c:var_name", "b:var_name"]);
+        assert_eq!(var(&applied, "b").as_deref(), Some("b"));
+        let (keys, ops, applied) =
+            check(&b, &t, &d, &[("b:var_name", "r"), ("c:var_name", "draft")]);
+        assert!(keys.is_empty());
+        assert_eq!(var(&applied, "b").as_deref(), Some("r"));
+        assert_eq!(var(&applied, "c").as_deref(), Some("y"));
+        let renames = ops
+            .iter()
+            .filter(
+                |op| matches!(op, EventPayload::FieldEdited { field, .. } if field == "var_name"),
+            )
+            .count();
+        assert_eq!(renames, 2);
+        let (keys, _, applied) = check(&b, &t, &d, &[("b:var_name", "team"), ("c:var_name", "z")]);
+        assert!(keys.is_empty());
+        assert_eq!(var(&applied, "c").as_deref(), Some("z"));
     }
 }
