@@ -87,7 +87,8 @@ fn run(url: &str, args: &[&str]) -> (bool, String) {
         .env("RUST_LOG", "off")
         .output()
         .unwrap();
-    (out.status.success(), String::from_utf8(out.stdout).unwrap())
+    let text = String::from_utf8(out.stdout).unwrap() + &String::from_utf8(out.stderr).unwrap();
+    (out.status.success(), text)
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -126,6 +127,44 @@ async fn all_mode_reports_only_the_drifted_document(pool: PgPool) {
         "{out}"
     );
     assert!(run(&url, &["verify-projection", &clean.0.to_string()]).0);
+
+    drop_login(&pool, &role).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_accepts_only_a_head_in_the_verified_chain(pool: PgPool) {
+    let actor = actor(&pool).await;
+    let (doc, root) = document(&pool, actor, "Pinned").await;
+    let edit = EventPayload::FieldEdited {
+        node_id: NodeId(root),
+        field: "title".into(),
+        value: json!("Pinned again"),
+    };
+    log::append(&pool, doc, &edit, actor).await.unwrap();
+    let heads: Vec<Vec<u8>> =
+        sqlx::query_scalar("select chain_hash from event where document_id=$1 order by seq")
+            .bind(doc.0)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let to_hex = |h: &[u8]| h.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let (url, role) = runtime_login(&pool).await;
+    let id = doc.0.to_string();
+
+    let (ok, out) = run(&url, &["verify", &id, "--expect-head", &to_hex(&heads[1])]);
+    assert!(
+        ok && out.contains(&format!("; head {}", to_hex(&heads[1]))),
+        "{out}"
+    );
+    let (ok, out) = run(&url, &["verify", &id, "--expect-head", &to_hex(&heads[0])]);
+    assert!(ok && out.contains("chain hash at seq 1"), "{out}");
+    let unknown = "ab".repeat(32);
+    let (ok, out) = run(&url, &["verify", &id, "--expect-head", &unknown]);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains(&unknown) && out.contains(&to_hex(&heads[1])),
+        "{out}"
+    );
 
     drop_login(&pool, &role).await;
 }
