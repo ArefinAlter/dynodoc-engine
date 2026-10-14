@@ -881,3 +881,69 @@ async fn viewers_cannot_push_and_outsiders_cannot_see_requests(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed["items"].as_array().unwrap().len(), 1);
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "known bug: selective share of child without new parent returns 400 instead of clean 409"]
+async fn share_child_without_new_parent_is_clean_409(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let owner = identity(&pool, "share_parent_gap@example.test").await;
+    let (_, doc) = post(
+        &router,
+        "/documents",
+        &owner,
+        json!({"title":"SelectiveShare"}),
+    )
+    .await;
+    let doc = doc["id"].as_str().unwrap();
+    let root = ulid::Ulid::new().to_string();
+    let (status, data) = post(
+        &router,
+        &format!("/documents/{doc}/batch"),
+        &owner,
+        json!({"base_seq":0,"ops":[
+            {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{data}");
+
+    let (_, draft) = post(
+        &router,
+        &format!("/documents/{doc}/workspace-drafts"),
+        &owner,
+        json!({}),
+    )
+    .await;
+    let draft_id = draft["id"].as_str().unwrap();
+    let parent = ulid::Ulid::new().to_string();
+    let child = ulid::Ulid::new().to_string();
+    let (status, _) = post(
+        &router,
+        &format!("/documents/{doc}/workspace-drafts/{draft_id}/edit"),
+        &owner,
+        json!({"ops":[
+            {"type":"NodeCreated","node_id":parent,"node_type":"section","parent_id":root,"pos":"a0","fields":{"label":"New section"}},
+            {"type":"NodeCreated","node_id":child,"node_type":"item","parent_id":parent,"pos":"a0","fields":{"label":"New child"}}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let sync = format!("/documents/{doc}/workspace-drafts/{draft_id}/sync");
+    let (_, preview) = post(&router, &sync, &owner, json!({"action":"preview"})).await;
+
+    let (status, _) = post(
+        &router,
+        &sync,
+        &owner,
+        json!({
+            "action": "share",
+            "team_seq": preview["team_seq"],
+            "revision": preview["revision"],
+            "included_nodes": [child]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+}

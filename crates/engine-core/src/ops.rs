@@ -749,4 +749,51 @@ mod tests {
             OpError::SuggestionNotFound(_)
         ));
     }
+
+    #[test]
+    #[ignore = "known bug: node creation does not reject empty or unbounded node IDs"]
+    fn node_created_rejects_empty_and_100k_char_ids() {
+        let s = state(vec![n("01F", NodeType::Form, None, None)]);
+        let empty_id = created("", NodeType::Item, Some("01F"), None);
+        assert!(
+            validate_op(&s, &empty_id).is_err(),
+            "empty node_id should be rejected"
+        );
+        let huge_id = "a".repeat(100_000);
+        let huge = created(&huge_id, NodeType::Item, Some("01F"), None);
+        assert!(
+            validate_op(&s, &huge).is_err(),
+            "100k char node_id should be rejected"
+        );
+    }
+
+    #[test]
+    #[ignore = "known bug: node creation does not reject empty pos or duplicate sibling positions"]
+    fn node_created_rejects_empty_or_duplicate_pos() {
+        let s = state(vec![
+            n("01F", NodeType::Form, None, None),
+            MaterializedNode {
+                id: NodeId("01I1".into()),
+                parent_id: Some(NodeId("01F".into())),
+                node_type: "item".into(),
+                pos: "a0".into(),
+                current_fields: json!({}),
+                var_name: None,
+                deleted: false,
+            },
+        ]);
+        let mut empty_pos = created("01I2", NodeType::Item, Some("01F"), None);
+        if let EventPayload::NodeCreated { ref mut pos, .. } = empty_pos {
+            *pos = "".into();
+        }
+        assert!(
+            validate_op(&s, &empty_pos).is_err(),
+            "empty pos should be rejected"
+        );
+        let dup_pos = created("01I3", NodeType::Item, Some("01F"), None);
+        assert!(
+            validate_op(&s, &dup_pos).is_err(),
+            "duplicate pos under same parent should be rejected"
+        );
+    }
 }

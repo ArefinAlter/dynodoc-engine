@@ -655,4 +655,88 @@ mod tests {
         assert!(matches!(c, Cow::Owned(_)));
         assert!(c.nodes[&NodeId("root".into())].deleted);
     }
+
+    #[test]
+    #[ignore = "known bug: concurrent cross moves create a parent cycle"]
+    fn cross_moves_conflict_instead_of_cycle() {
+        let mut b = state();
+        let mut a_node = b.nodes[&NodeId("root".into())].clone();
+        a_node.id = NodeId("a".into());
+        a_node.node_type = "section".into();
+        a_node.parent_id = Some(NodeId("root".into()));
+        let mut b_node = a_node.clone();
+        b_node.id = NodeId("b".into());
+        b.nodes.insert(a_node.id.clone(), a_node);
+        b.nodes.insert(b_node.id.clone(), b_node);
+
+        let mut t = b.clone();
+        t.nodes.get_mut(&NodeId("a".into())).unwrap().parent_id = Some(NodeId("b".into()));
+
+        let mut d = b.clone();
+        d.nodes.get_mut(&NodeId("b".into())).unwrap().parent_id = Some(NodeId("a".into()));
+
+        let plan = merge(&b, &t, &d, &BTreeMap::new());
+        assert!(
+            !plan.conflicts.is_empty(),
+            "concurrent cross moves must produce a location conflict instead of a cycle"
+        );
+    }
+
+    #[test]
+    #[ignore = "known bug: deleting a container while adding a child creates an orphan"]
+    fn delete_parent_vs_add_child_conflicts() {
+        let mut b = state();
+        let mut container = b.nodes[&NodeId("root".into())].clone();
+        container.id = NodeId("container".into());
+        container.node_type = "section".into();
+        container.parent_id = Some(NodeId("root".into()));
+        b.nodes.insert(container.id.clone(), container);
+
+        let mut t = b.clone();
+        t.nodes
+            .get_mut(&NodeId("container".into()))
+            .unwrap()
+            .deleted = true;
+
+        let mut d = b.clone();
+        let mut child = b.nodes[&NodeId("root".into())].clone();
+        child.id = NodeId("child".into());
+        child.node_type = "item".into();
+        child.parent_id = Some(NodeId("container".into()));
+        d.nodes.insert(child.id.clone(), child);
+
+        let plan = merge(&b, &t, &d, &BTreeMap::new());
+        assert!(
+            !plan.conflicts.is_empty(),
+            "deleting a container while adding a child must produce a conflict"
+        );
+    }
+
+    #[test]
+    #[ignore = "known bug: deleting a document_tab container while adding a child creates an orphan"]
+    fn delete_tab_parent_vs_add_child_conflicts() {
+        let mut b = state();
+        let mut tab = b.nodes[&NodeId("root".into())].clone();
+        tab.id = NodeId("tab".into());
+        tab.node_type = "section".into();
+        tab.parent_id = Some(NodeId("root".into()));
+        tab.current_fields = json!({"kind": "document_tab"});
+        b.nodes.insert(tab.id.clone(), tab);
+
+        let mut t = b.clone();
+        t.nodes.get_mut(&NodeId("tab".into())).unwrap().deleted = true;
+
+        let mut d = b.clone();
+        let mut child = b.nodes[&NodeId("root".into())].clone();
+        child.id = NodeId("child".into());
+        child.node_type = "item".into();
+        child.parent_id = Some(NodeId("tab".into()));
+        d.nodes.insert(child.id.clone(), child);
+
+        let plan = merge(&b, &t, &d, &BTreeMap::new());
+        assert!(
+            !plan.conflicts.is_empty(),
+            "deleting a tab while adding a child must produce a conflict"
+        );
+    }
 }
