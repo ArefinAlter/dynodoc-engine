@@ -10,11 +10,8 @@ use engine_shared::{
 use ring::digest::{digest, SHA256};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use similar::{capture_diff_slices_deadline, Algorithm, DiffOp, DiffTag};
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use similar::{capture_diff_slices, Algorithm, DiffOp, DiffTag};
+use std::collections::BTreeMap;
 
 use crate::materializer::DocumentState;
 
@@ -146,17 +143,48 @@ fn children(tokens: &[Scalar], styles: &[Value]) -> Result<Vec<Value>, PatchErro
     }
     Ok(out)
 }
+/// Changed spans longer than this (old plus new, after the common prefix and suffix)
+/// become one replacement. A size, unlike a clock, gives every machine the same patch
+/// and merge; Myers on 4,000 unrelated characters takes about 17 ms in release.
+const DIFF_LIMIT: usize = 4_000;
 fn text_diff(a: &[Scalar], b: &[Scalar]) -> Vec<DiffOp> {
     let a: Vec<_> = a.iter().map(|t| t.ch).collect();
     let b: Vec<_> = b.iter().map(|t| t.ch).collect();
-    // The deadline bounds pathological edit distance. A coarse replacement remains
-    // exact for replay; it merely produces a more conservative merge conflict.
-    capture_diff_slices_deadline(
-        Algorithm::Myers,
-        &a,
-        &b,
-        Some(Instant::now() + Duration::from_millis(20)),
-    )
+    let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let suffix = a[prefix..]
+        .iter()
+        .rev()
+        .zip(b[prefix..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let (old_len, new_len) = (a.len() - prefix - suffix, b.len() - prefix - suffix);
+    if old_len == 0 || new_len == 0 || old_len + new_len <= DIFF_LIMIT {
+        return capture_diff_slices(Algorithm::Myers, &a, &b);
+    }
+    // A coarse replacement remains exact for replay; it merely produces a more
+    // conservative merge conflict.
+    let mut ops = Vec::new();
+    if prefix > 0 {
+        ops.push(DiffOp::Equal {
+            old_index: 0,
+            new_index: 0,
+            len: prefix,
+        });
+    }
+    ops.push(DiffOp::Replace {
+        old_index: prefix,
+        old_len,
+        new_index: prefix,
+        new_len,
+    });
+    if suffix > 0 {
+        ops.push(DiffOp::Equal {
+            old_index: prefix + old_len,
+            new_index: prefix + new_len,
+            len: suffix,
+        });
+    }
+    ops
 }
 fn delta(a: &[Scalar], b: &[Scalar]) -> Vec<TextOp> {
     let mut out = Vec::new();
@@ -654,4 +682,37 @@ pub fn analyze(value: &Value) -> Analysis {
     }
     result.distinct_styles = styles.values.len();
     result
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_changes_become_one_replacement_without_a_clock() {
+        let mut seed = 7u64;
+        let mut text = |n: usize| -> Vec<Scalar> {
+            let middle = (0..n).map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (b'a' + (seed % 26) as u8) as char
+            });
+            let chars: Vec<char> = "start "
+                .chars()
+                .chain(middle)
+                .chain(" end".chars())
+                .collect();
+            chars
+                .into_iter()
+                .map(|ch| Scalar { ch, style: 0 })
+                .collect()
+        };
+        let (a, b) = (text(3_000), text(3_000));
+        let ops = text_diff(&a, &b);
+        assert!(ops.len() <= 3, "{} ops", ops.len());
+        assert_eq!(
+            ops.iter().filter(|op| op.tag() == DiffTag::Replace).count(),
+            1
+        );
+    }
 }

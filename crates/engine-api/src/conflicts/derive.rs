@@ -169,7 +169,7 @@ pub fn find_conflict(state: &DocumentState, conflict_id: &str) -> Option<Conflic
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet};
 
     use engine_core::materializer::{DocumentState, MaterializedNode, SuggestionState};
     use engine_shared::NodeId;
@@ -214,7 +214,7 @@ mod tests {
             nodes,
             comments: Vec::new(),
             suggestions: sug,
-            removed_choices: HashSet::new(),
+            removed_choices: BTreeSet::new(),
         }
     }
 

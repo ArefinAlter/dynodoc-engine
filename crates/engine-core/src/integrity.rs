@@ -458,7 +458,7 @@ fn canonical_cycle(nodes: &[NodeId]) -> Vec<NodeId> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet};
 
     use serde_json::json;
 
@@ -498,7 +498,7 @@ mod tests {
             nodes: map,
             comments: Vec::new(),
             suggestions: BTreeMap::new(),
-            removed_choices: HashSet::new(),
+            removed_choices: BTreeSet::new(),
         }
     }
 

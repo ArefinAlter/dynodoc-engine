@@ -3,7 +3,7 @@
 //! The event log is the system of record; reads use a folded `DocumentState`
 //! rebuilt from a snapshot plus a short event tail.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use engine_shared::{Event, EventPayload, NodeId, Snapshot};
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ pub struct DocumentState {
     #[serde(default)]
     pub suggestions: BTreeMap<String, SuggestionState>,
     #[serde(default)]
-    pub removed_choices: HashSet<NodeId>,
+    pub removed_choices: BTreeSet<NodeId>,
 }
 
 /// Errors while folding or restoring materialized state.
@@ -459,7 +459,7 @@ mod tests {
                 nodes,
                 comments: Vec::new(),
                 suggestions: BTreeMap::new(),
-                removed_choices: HashSet::new(),
+                removed_choices: BTreeSet::new(),
             })
             .unwrap(),
             merkle_root: vec![0; 32],
@@ -489,5 +489,42 @@ mod tests {
             state.nodes[&NodeId("01BENCH00000000".to_string())].current_fields["label"],
             json!("Updated 0")
         );
+    }
+
+    #[test]
+    fn fold_is_deterministic() {
+        let question = NodeId("01Q".into());
+        let mut events = vec![event(
+            1,
+            EventPayload::NodeCreated {
+                node_id: question.clone(),
+                node_type: engine_shared::NodeType::Item,
+                parent_id: None,
+                pos: "a0".into(),
+                fields: json!({}),
+                var_name: Some("q".into()),
+            },
+        )];
+        for i in 0..8 {
+            let choice_id = NodeId(format!("01C{i}"));
+            events.push(event(
+                events.len() as i64 + 1,
+                EventPayload::ChoiceAdded {
+                    node_id: question.clone(),
+                    choice_id: choice_id.clone(),
+                    fields: json!({ "label": i }),
+                },
+            ));
+            events.push(event(
+                events.len() as i64 + 1,
+                EventPayload::ChoiceRemoved {
+                    node_id: question.clone(),
+                    choice_id,
+                },
+            ));
+        }
+        let bytes = || serde_json::to_vec(&Materializer::fold(&events).unwrap()).unwrap();
+        let first = bytes();
+        assert!((0..10).all(|_| bytes() == first));
     }
 }
