@@ -402,7 +402,7 @@ pub fn compact_event(state: &DocumentState, op: &EventPayload) -> EventPayload {
 
 /// Missing and explicit null are distinct. Merge marks by type and then property;
 /// two different choices for the same property remain a human-review conflict.
-fn merge_property(
+pub(crate) fn merge_property(
     base: Option<&Value>,
     team: Option<&Value>,
     draft: Option<&Value>,
@@ -597,6 +597,23 @@ pub fn merge(base: &Value, team: &Value, draft: &Value) -> Option<Value> {
     }
     if team == base {
         return Some(draft.clone());
+    }
+    // An image has no text to align; when nothing else changed, its attributes
+    // (size, alt text, ...) merge key by key.
+    let rest = |v: &Value| {
+        let mut v = v.clone();
+        v.as_object_mut().map(|o| o.remove("attrs"));
+        v
+    };
+    if base["type"] == "image" && rest(base) == rest(team) && rest(base) == rest(draft) {
+        let attrs =
+            merge_property(base.get("attrs"), team.get("attrs"), draft.get("attrs")).ok()?;
+        let mut out = team.clone();
+        out.as_object_mut()?.remove("attrs");
+        if let Some(attrs) = attrs {
+            out["attrs"] = attrs;
+        }
+        return Some(out);
     }
     // Nested structural edits remain explicit conflicts until nested stable IDs
     // are implemented. Never align moved table/list children by array position.

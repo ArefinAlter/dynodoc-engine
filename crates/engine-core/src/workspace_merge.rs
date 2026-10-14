@@ -61,6 +61,13 @@ fn select(
             return merged;
         }
     }
+    // Page setup holds independent settings, so it merges key by key.
+    if field == "page_setup" {
+        let base = (!base.is_null()).then_some(&base);
+        if let Ok(Some(merged)) = crate::richtext::merge_property(base, Some(&team), Some(&draft)) {
+            return merged;
+        }
+    }
     let key = format!("{}:{field}", id.0);
     match resolutions.get(&key).map(String::as_str) {
         Some("draft") => draft,
@@ -654,5 +661,50 @@ mod tests {
         let c = canonical(&s);
         assert!(matches!(c, Cow::Owned(_)));
         assert!(c.nodes[&NodeId("root".into())].deleted);
+    }
+    #[test]
+    fn page_setup_merges_key_by_key() {
+        let ps = json!({"size":"A4","landscape":false,"margin":25.4,"pageNumbers":true});
+        let with = |page_setup: Value| {
+            let mut s = state();
+            s.nodes
+                .get_mut(&NodeId("root".into()))
+                .unwrap()
+                .current_fields["page_setup"] = page_setup;
+            s
+        };
+        let setup = |plan: &MergePlan| {
+            plan.state.nodes[&NodeId("root".into())].current_fields["page_setup"].clone()
+        };
+        let mut margin = ps.clone();
+        margin["margin"] = json!(20);
+        let mut landscape = ps.clone();
+        landscape["landscape"] = json!(true);
+        let plan = merge(
+            &with(ps.clone()),
+            &with(margin.clone()),
+            &with(landscape),
+            &BTreeMap::new(),
+        );
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(
+            setup(&plan),
+            json!({"size":"A4","landscape":true,"margin":20,"pageNumbers":true})
+        );
+        // Both sides set it for the first time.
+        let plan = merge(
+            &state(),
+            &with(json!({"margin":20})),
+            &with(json!({"landscape":true})),
+            &BTreeMap::new(),
+        );
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(setup(&plan), json!({"margin":20,"landscape":true}));
+        // The same setting changed to different values still needs a choice.
+        let mut other = ps.clone();
+        other["margin"] = json!(30);
+        let plan = merge(&with(ps), &with(margin), &with(other), &BTreeMap::new());
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].key, "root:page_setup");
     }
 }
