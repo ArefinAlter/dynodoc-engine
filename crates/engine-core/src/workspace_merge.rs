@@ -184,6 +184,7 @@ pub fn merge(
     }
     out.removed_choices
         .retain(|id| out.nodes.get(id).is_some_and(|n| n.deleted));
+    validate_merged_tree(&base, &team, &draft, &mut out, &mut conflicts, resolutions);
     let ops = diff(&team, &out);
     MergePlan {
         state: out,
@@ -239,8 +240,143 @@ pub fn merge_strict(
     plan.state
         .removed_choices
         .retain(|id| plan.state.nodes.get(id).is_some_and(|n| n.deleted));
+    validate_merged_tree(
+        base,
+        team,
+        draft,
+        &mut plan.state,
+        &mut plan.conflicts,
+        resolutions,
+    );
     plan.ops = diff(team, &plan.state);
     plan
+}
+
+fn find_parent_cycles(state: &DocumentState) -> Vec<Vec<NodeId>> {
+    let mut cycles = Vec::new();
+    let mut visited: BTreeSet<NodeId> = BTreeSet::new();
+
+    for id in state.nodes.keys() {
+        if visited.contains(id) {
+            continue;
+        }
+
+        let mut path: Vec<NodeId> = Vec::new();
+        let mut on_path: BTreeSet<NodeId> = BTreeSet::new();
+        let mut curr = Some(id.clone());
+
+        while let Some(current_id) = curr {
+            if visited.contains(&current_id) {
+                break;
+            }
+            if on_path.contains(&current_id) {
+                if let Some(pos) = path.iter().position(|x| x == &current_id) {
+                    cycles.push(path[pos..].to_vec());
+                }
+                break;
+            }
+            on_path.insert(current_id.clone());
+            path.push(current_id.clone());
+            curr = state
+                .nodes
+                .get(&current_id)
+                .and_then(|n| n.parent_id.clone());
+        }
+
+        visited.extend(path);
+    }
+    cycles
+}
+
+fn validate_merged_tree(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    out: &mut DocumentState,
+    conflicts: &mut Vec<Conflict>,
+    resolutions: &BTreeMap<String, String>,
+) {
+    let max_passes = out.nodes.len() + 1;
+    let mut passes = 0;
+    while let Some(cycle) = find_parent_cycles(out).into_iter().next() {
+        passes += 1;
+        if passes > max_passes {
+            break;
+        }
+
+        // Pick a node in the loop whose merged location came from the draft (out_loc != team_loc).
+        // Since team's own tree has no loops, every loop has such a node, and restoring
+        // its location to team's location strictly makes progress toward team's acyclic tree.
+        let mut draft_moved: Vec<NodeId> = cycle
+            .iter()
+            .filter(|id| {
+                let out_loc = out.nodes.get(id).map(location);
+                let t_loc = team.nodes.get(id).map(location);
+                out_loc != t_loc
+            })
+            .cloned()
+            .collect();
+
+        if draft_moved.is_empty() {
+            draft_moved = cycle.to_vec();
+        }
+
+        let Some(d_id) = draft_moved.into_iter().next() else {
+            break;
+        };
+
+        let key = format!("{}:$location", d_id.0);
+        let b_loc = base.nodes.get(&d_id).map(location).unwrap_or(Value::Null);
+        let t_loc = team.nodes.get(&d_id).map(location).unwrap_or(Value::Null);
+        let d_loc = draft.nodes.get(&d_id).map(location).unwrap_or(Value::Null);
+
+        match resolutions.get(&key).map(String::as_str) {
+            Some("draft") => {
+                if let Some(d_node) = draft.nodes.get(&d_id) {
+                    if let Some(out_node) = out.nodes.get_mut(&d_id) {
+                        out_node.parent_id = d_node.parent_id.clone();
+                        out_node.pos = d_node.pos.clone();
+                    }
+                }
+                for other_id in &cycle {
+                    if other_id != &d_id {
+                        if let Some(b_node) = base.nodes.get(other_id) {
+                            if let Some(out_node) = out.nodes.get_mut(other_id) {
+                                out_node.parent_id = b_node.parent_id.clone();
+                                out_node.pos = b_node.pos.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            Some("team") => {
+                if let Some(t_node) = team.nodes.get(&d_id) {
+                    if let Some(out_node) = out.nodes.get_mut(&d_id) {
+                        out_node.parent_id = t_node.parent_id.clone();
+                        out_node.pos = t_node.pos.clone();
+                    }
+                }
+            }
+            _ => {
+                if !conflicts.iter().any(|c| c.key == key) {
+                    conflicts.push(Conflict {
+                        key,
+                        node_id: d_id.clone(),
+                        field: "$location".into(),
+                        ancestor: b_loc,
+                        team: t_loc,
+                        draft: d_loc,
+                    });
+                }
+                if let Some(t_node) = team.nodes.get(&d_id) {
+                    if let Some(out_node) = out.nodes.get_mut(&d_id) {
+                        out_node.parent_id = t_node.parent_id.clone();
+                        out_node.pos = t_node.pos.clone();
+                    }
+                }
+            }
+        }
+    }
 }
 // Each parent chain is traversed once. Iterative traversal avoids stack growth
 // for deeply nested imports; malformed cycles retain the old capped sort depth.
@@ -654,5 +790,145 @@ mod tests {
         let c = canonical(&s);
         assert!(matches!(c, Cow::Owned(_)));
         assert!(c.nodes[&NodeId("root".into())].deleted);
+    }
+
+    #[test]
+    fn cross_moves_conflict_instead_of_cycle() {
+        use crate::ops::validate_op;
+
+        let mut b = state();
+        let mut a_node = b.nodes[&NodeId("root".into())].clone();
+        a_node.id = NodeId("a".into());
+        a_node.node_type = "section".into();
+        a_node.parent_id = Some(NodeId("root".into()));
+        let mut b_node = a_node.clone();
+        b_node.id = NodeId("b".into());
+        b.nodes.insert(a_node.id.clone(), a_node);
+        b.nodes.insert(b_node.id.clone(), b_node);
+
+        let mut t = b.clone();
+        t.nodes.get_mut(&NodeId("a".into())).unwrap().parent_id = Some(NodeId("b".into()));
+
+        let mut d = b.clone();
+        d.nodes.get_mut(&NodeId("b".into())).unwrap().parent_id = Some(NodeId("a".into()));
+
+        // Unresolved preview surfaces the location conflict on b and keeps state acyclic
+        let plan = merge(&b, &t, &d, &BTreeMap::new());
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].key, "b:$location");
+        assert!(find_parent_cycles(&plan.state).is_empty());
+
+        // Choosing team keeps team's location for b and remains acyclic
+        let keep_team = merge(
+            &b,
+            &t,
+            &d,
+            &BTreeMap::from([("b:$location".into(), "team".into())]),
+        );
+        assert!(keep_team.conflicts.is_empty());
+        assert!(find_parent_cycles(&keep_team.state).is_empty());
+
+        // Choosing draft moves b under a and safely reverts opposing team move on a
+        let take_draft = merge(
+            &b,
+            &t,
+            &d,
+            &BTreeMap::from([("b:$location".into(), "draft".into())]),
+        );
+        assert!(take_draft.conflicts.is_empty());
+        assert!(find_parent_cycles(&take_draft.state).is_empty());
+        assert_eq!(
+            take_draft.state.nodes[&NodeId("b".into())].parent_id,
+            Some(NodeId("a".into()))
+        );
+
+        // Applying take_draft ops to team validates and produces a valid state
+        let mut applied = t.clone();
+        for op in &take_draft.ops {
+            validate_op(&applied, op).unwrap();
+            crate::materializer::apply_payload(&mut applied, op).unwrap();
+        }
+        assert!(find_parent_cycles(&applied).is_empty());
+    }
+
+    #[test]
+    fn three_node_cycle_conflict_blames_divergent_move() {
+        use crate::ops::validate_op;
+
+        let mut b = state();
+        let mut a_node = b.nodes[&NodeId("root".into())].clone();
+        a_node.id = NodeId("a".into());
+        a_node.node_type = "section".into();
+        a_node.parent_id = Some(NodeId("root".into()));
+        let mut b_node = a_node.clone();
+        b_node.id = NodeId("b".into());
+        let mut c_node = a_node.clone();
+        c_node.id = NodeId("c".into());
+        b.nodes.insert(a_node.id.clone(), a_node);
+        b.nodes.insert(b_node.id.clone(), b_node);
+        b.nodes.insert(c_node.id.clone(), c_node);
+
+        // Team moves a under b and b under c
+        let mut t = b.clone();
+        t.nodes.get_mut(&NodeId("a".into())).unwrap().parent_id = Some(NodeId("b".into()));
+        t.nodes.get_mut(&NodeId("b".into())).unwrap().parent_id = Some(NodeId("c".into()));
+
+        // Draft also moves a under b, and moves c under a
+        let mut d = b.clone();
+        d.nodes.get_mut(&NodeId("a".into())).unwrap().parent_id = Some(NodeId("b".into()));
+        d.nodes.get_mut(&NodeId("c".into())).unwrap().parent_id = Some(NodeId("a".into()));
+
+        // Both moved a under b identically; only c diverged from team's tree.
+        // The conflict must blame c:$location, not a.
+        let plan = merge(&b, &t, &d, &BTreeMap::new());
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].key, "c:$location");
+        assert!(find_parent_cycles(&plan.state).is_empty());
+
+        // Unresolved preview maintains a valid state that passes validate_op
+        let mut preview_applied = t.clone();
+        for op in &plan.ops {
+            validate_op(&preview_applied, op).unwrap();
+            crate::materializer::apply_payload(&mut preview_applied, op).unwrap();
+        }
+
+        // Choosing team keeps c at root, producing a valid acyclic tree
+        let keep_team = merge(
+            &b,
+            &t,
+            &d,
+            &BTreeMap::from([("c:$location".into(), "team".into())]),
+        );
+        assert!(keep_team.conflicts.is_empty());
+        assert!(find_parent_cycles(&keep_team.state).is_empty());
+        let mut team_applied = t.clone();
+        for op in &keep_team.ops {
+            validate_op(&team_applied, op).unwrap();
+            crate::materializer::apply_payload(&mut team_applied, op).unwrap();
+        }
+
+        // Choosing draft moves c under a and reverts opposing team move on b to base (root)
+        let take_draft = merge(
+            &b,
+            &t,
+            &d,
+            &BTreeMap::from([("c:$location".into(), "draft".into())]),
+        );
+        assert!(take_draft.conflicts.is_empty());
+        assert!(find_parent_cycles(&take_draft.state).is_empty());
+        assert_eq!(
+            take_draft.state.nodes[&NodeId("c".into())].parent_id,
+            Some(NodeId("a".into()))
+        );
+        assert_eq!(
+            take_draft.state.nodes[&NodeId("b".into())].parent_id,
+            Some(NodeId("root".into()))
+        );
+        let mut draft_applied = t.clone();
+        for op in &take_draft.ops {
+            validate_op(&draft_applied, op).unwrap();
+            crate::materializer::apply_payload(&mut draft_applied, op).unwrap();
+        }
+        assert!(find_parent_cycles(&draft_applied).is_empty());
     }
 }
