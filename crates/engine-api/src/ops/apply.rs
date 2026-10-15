@@ -378,6 +378,18 @@ pub(crate) async fn begin_write_locked(
     let role = role
         .and_then(|r| r.parse().ok())
         .ok_or(ApiError::Forbidden)?;
+    // Writes stay paused while an operator recovers a history that does not replay.
+    let paused: Option<i64> =
+        sqlx::query_scalar("select seq from document_quarantine where document_id=$1")
+            .bind(document_id.0)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(seq) = paused {
+        return Err(ApiError::Quarantined {
+            document_id: document_id.0,
+            seq,
+        });
+    }
     Ok((tx, role))
 }
 

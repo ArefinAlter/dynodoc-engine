@@ -95,6 +95,7 @@ const READ_ONLY: &[&str] = &[
     "project_ref_authority",
     "project_ref_authority_epoch",
     "project_ref_authority_revocation",
+    "document_quarantine",
 ];
 
 /// Read-only exact version/checksum check. Both missing and newer schemas fail.

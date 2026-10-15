@@ -73,6 +73,22 @@ enum Command {
     },
     /// Apply migrations using MIGRATION_DATABASE_URL in a separate operator process.
     Migrate,
+    /// Pause writes to a document whose history no longer replays (operator, using
+    /// MIGRATION_DATABASE_URL). Reads continue; events are never changed.
+    Quarantine {
+        /// Document id (UUID).
+        document_id: String,
+        /// The first event that does not replay (from `verify` or a `replay_failed` error).
+        #[arg(long)]
+        seq: i64,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Allow writes again after recovery (operator, using MIGRATION_DATABASE_URL).
+    Release {
+        /// Document id (UUID).
+        document_id: String,
+    },
     /// Give an existing restricted login the explicit runtime allowlist (operator only).
     GrantRuntime { role: String },
     /// Install the public receipt key using operator credentials; never replaces a key.
@@ -204,6 +220,32 @@ async fn main() -> anyhow::Result<()> {
             let pool = connect_migration().await?;
             engine_core::database::MIGRATOR.run(&pool).await?;
             println!("Database migrations complete; provision/check the runtime role before starting the API.");
+            Ok(())
+        }
+        Command::Quarantine {
+            document_id,
+            seq,
+            reason,
+        } => {
+            let doc = parse_document_id(&document_id)?;
+            sqlx::query("insert into document_quarantine(document_id,seq,reason) values($1,$2,$3) on conflict (document_id) do update set seq=excluded.seq,reason=excluded.reason")
+                .bind(doc.0)
+                .bind(seq)
+                .bind(reason)
+                .execute(&connect_migration().await?)
+                .await?;
+            println!("Writes to document {document_id} are paused; reads continue.");
+            Ok(())
+        }
+        Command::Release { document_id } => {
+            let doc = parse_document_id(&document_id)?;
+            let released = sqlx::query("delete from document_quarantine where document_id=$1")
+                .bind(doc.0)
+                .execute(&connect_migration().await?)
+                .await?
+                .rows_affected();
+            anyhow::ensure!(released == 1, "document {document_id} was not quarantined");
+            println!("Writes to document {document_id} are allowed again.");
             Ok(())
         }
         Command::GrantRuntime { role } => {

@@ -66,6 +66,9 @@ pub enum ApiError {
         document_id: uuid::Uuid,
         seq: Option<i64>,
     },
+    /// Writes are paused while an operator recovers the document's history → 423.
+    #[error("document {document_id} is paused for history recovery from event {seq}")]
+    Quarantined { document_id: uuid::Uuid, seq: i64 },
     /// An unexpected server-side failure → 500. The detail is logged, never returned.
     #[error("internal error: {0}")]
     Internal(String),
@@ -87,6 +90,7 @@ impl ApiError {
             ApiError::Deadline => StatusCode::GATEWAY_TIMEOUT,
             ApiError::Busy => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::StorageLimit => StatusCode::INSUFFICIENT_STORAGE,
+            ApiError::Quarantined { .. } => StatusCode::LOCKED,
         }
     }
 
@@ -104,6 +108,7 @@ impl ApiError {
             ApiError::Deadline => "deadline_exceeded",
             ApiError::Busy => "busy",
             ApiError::StorageLimit => "storage_limit",
+            ApiError::Quarantined { .. } => "document_quarantined",
         }
     }
 
@@ -117,6 +122,9 @@ impl ApiError {
             }
             ApiError::RateLimited { retry_after } => json!({ "retry_after": retry_after }),
             ApiError::ReplayFailed { document_id, seq } => {
+                json!({ "document_id": document_id, "seq": seq })
+            }
+            ApiError::Quarantined { document_id, seq } => {
                 json!({ "document_id": document_id, "seq": seq })
             }
             _ => json!({}),

@@ -373,6 +373,37 @@ async fn admin_overview_counts_error_responses(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn quarantined_document_refuses_writes_but_serves_reads(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let owner = bearer(seed_identity(&pool, "quarantine@example.test").await);
+    let doc = create_document(&router, &owner, "Paused").await;
+    sqlx::query(
+        "insert into document_quarantine(document_id,seq,reason) values($1,7,'recovering')",
+    )
+    .bind(doc)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let root = ulid::Ulid::generate().to_string();
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/batch"),
+            &owner,
+            &json!({"base_seq":0,"ops":[
+                {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::LOCKED);
+    assert_eq!(body["code"], "document_quarantined", "{body}");
+    assert_eq!(body["details"], json!({"document_id": doc, "seq": 7}));
+    let (status, _) = send(&router, auth_post_get(&format!("/documents/{doc}"), &owner)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn shared_draft_bases_reuse_content_preserve_responses_and_enforce_scope(pool: PgPool) {
     let mut state = test_state(pool.clone());
     state.shared_draft_bases = true;

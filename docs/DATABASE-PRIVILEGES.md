@@ -1,5 +1,10 @@
 # Database runtime boundary
 
+Schema 42 adds one SELECT-only table, `document_quarantine`: the API reads it to
+refuse writes to a document whose history no longer replays, and only the operator
+login, through `engine-cli quarantine` and `release`, writes it. Re-run
+`grant-runtime`, then `check-runtime`, after migrating.
+
 Schema 41 adds two SELECT-only tables, `project_ref_authority_epoch` (receipt
 authority epochs with their stored signed statements) and
 `project_ref_authority_revocation` (immutable revocation markers). They join the
