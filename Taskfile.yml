@@ -26,6 +26,6 @@ tasks:
       - cargo fmt --all -- --check
       - cargo clippy --locked --workspace --all-targets -- -D warnings
   docs:
-    cmds: ["cargo doc --locked --workspace --no-deps"]
+    cmds: ["RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps"]
   openapi:
     cmds: ["cargo run --locked -p engine-cli -- openapi --out openapi.yaml"]
