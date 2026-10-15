@@ -71,6 +71,20 @@ pub enum MaterializeError {
     MissingSuggestion { seq: i64, suggestion_id: String },
 }
 
+impl MaterializeError {
+    /// The event that could not be applied, when an event caused the failure.
+    pub fn seq(&self) -> Option<i64> {
+        match self {
+            Self::RichText { seq, .. }
+            | Self::InvalidPayload { seq, .. }
+            | Self::MissingNode { seq, .. }
+            | Self::NonObjectFields { seq, .. }
+            | Self::MissingSuggestion { seq, .. } => Some(*seq),
+            Self::Deserialize(_) => None,
+        }
+    }
+}
+
 /// Errors while applying a single [`EventPayload`] to a [`DocumentState`] out of the
 /// log context (no `seq`). Used by the merge engine (stage 21) when replaying a
 /// branch's payloads onto a cloned ancestor state.

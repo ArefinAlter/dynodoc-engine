@@ -52,6 +52,13 @@ pub enum SnapshotError {
     Event(#[from] log::EventError),
     #[error("state materialization failed: {0}")]
     Materialize(#[from] MaterializeError),
+    /// The document's own events no longer replay.
+    #[error("document {} does not replay: {source}", document.0)]
+    Replay {
+        document: DocumentId,
+        #[source]
+        source: MaterializeError,
+    },
     #[error("snapshot state serialization failed: {0}")]
     Serialize(#[from] serde_json::Error),
 }
@@ -195,7 +202,12 @@ async fn read_state_at_with_formats(
         }
         log::verify_event(&event, document_id, last_seq + 1, &previous)?;
         previous = event.chain_hash.clone();
-        Materializer::fold_into(&mut state, std::slice::from_ref(&event))?;
+        Materializer::fold_into(&mut state, std::slice::from_ref(&event)).map_err(|source| {
+            SnapshotError::Replay {
+                document: document_id,
+                source,
+            }
+        })?;
         last_seq = event.seq;
         replayed_events += 1;
     }
