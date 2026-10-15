@@ -168,6 +168,46 @@ async fn draft_sharing_remembers_exclusions_until_explicitly_included(pool: PgPo
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn sharing_a_new_block_brings_its_new_parent(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let owner = bearer(seed_identity(&pool, "new-parent@example.test").await);
+    let doc = create_document(&router, &owner, "New parents").await;
+    let root = ulid::Ulid::new().to_string();
+    let (status,result)=send(&router,auth_post(&format!("/documents/{doc}/batch"),&owner,&json!({"base_seq":0,"ops":[
+      {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{"label":"Root"}}
+    ]}))).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let (_, draft) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/drafts"),
+            &owner,
+            &json!({"name":"New section"}),
+        ),
+    )
+    .await;
+    let uri = format!("/documents/{doc}/drafts/{}", draft["id"].as_str().unwrap());
+    let section = ulid::Ulid::new().to_string();
+    let child = ulid::Ulid::new().to_string();
+    let (status,result)=send(&router,auth_post(&uri,&owner,&json!({"revision":0,"ops":[
+      {"type":"NodeCreated","node_id":section,"node_type":"section","parent_id":root,"pos":"a0","fields":{"label":"New section"}},
+      {"type":"NodeCreated","node_id":child,"node_type":"item","parent_id":section,"pos":"a0","fields":{"label":"New child","type":"text","name":"new_child"}}
+    ]}))).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let sync = format!("{uri}/sync");
+    let (_, preview) = send(
+        &router,
+        auth_post(&sync, &owner, &json!({"action":"preview"})),
+    )
+    .await;
+    let(status,result)=send(&router,auth_post(&sync,&owner,&json!({"action":"share","team_seq":preview["team_seq"],"revision":preview["revision"],"included_nodes":[child]}))).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["completed"], true);
+    let (_, team) = send(&router, auth_post_get(&format!("/documents/{doc}"), &owner)).await;
+    assert_eq!(team["state"]["nodes"][&child]["parent_id"], json!(section));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn shared_draft_bases_reuse_content_preserve_responses_and_enforce_scope(pool: PgPool) {
     let mut state = test_state(pool.clone());
     state.shared_draft_bases = true;
