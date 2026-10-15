@@ -500,6 +500,11 @@ async fn public_document(
         .filter_map(|id| id.as_str().map(str::to_owned))
         .collect();
     content["removed_choices"] = json!([]);
+    // Every id in the snapshot, hidden ones included, gets a pseudonym below.
+    let ids: Vec<String> = content["nodes"]
+        .as_object()
+        .map(|nodes| nodes.keys().cloned().collect())
+        .unwrap_or_default();
     if let Some(nodes) = content.get_mut("nodes").and_then(Value::as_object_mut) {
         for (id, node) in nodes.iter() {
             if node.get("deleted").and_then(Value::as_bool) == Some(true) {
@@ -546,7 +551,48 @@ async fn public_document(
             }
         }
     }
+    // Real block ids stay private: each one, wherever it appears in the copy, becomes a
+    // pseudonym that is stable for this link and cannot be reversed without its token.
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token.as_bytes());
+    let pseudonyms: std::collections::HashMap<String, String> = ids
+        .into_iter()
+        .map(|id| {
+            let pseudonym = pseudonym(&key, &id);
+            (id, pseudonym)
+        })
+        .collect();
+    replace_ids(&mut content, &pseudonyms);
     Ok(Json(json!({"title":title,"kind":kind,"state":content})))
+}
+
+/// A ULID-shaped stand-in for a block id: the first 128 bits of its HMAC.
+fn pseudonym(key: &ring::hmac::Key, id: &str) -> String {
+    const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let tag = ring::hmac::sign(key, id.as_bytes());
+    let bits = u128::from_be_bytes(tag.as_ref()[..16].try_into().unwrap());
+    (0..26)
+        .rev()
+        .map(|i| CROCKFORD[((bits >> (5 * i)) & 31) as usize] as char)
+        .collect()
+}
+
+/// Replaces ids used as object keys or string values anywhere in `value`.
+fn replace_ids(value: &mut Value, ids: &std::collections::HashMap<String, String>) {
+    match value {
+        Value::String(text) => {
+            if let Some(pseudonym) = ids.get(text.as_str()) {
+                *text = pseudonym.clone();
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|item| replace_ids(item, ids)),
+        Value::Object(map) => {
+            for (key, mut item) in std::mem::take(map) {
+                replace_ids(&mut item, ids);
+                map.insert(ids.get(&key).cloned().unwrap_or(key), item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn has_text_revisions(value: &Value) -> bool {
