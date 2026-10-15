@@ -15,6 +15,7 @@ pub mod integrity;
 pub mod log;
 pub mod materializer;
 pub mod ops;
+pub mod projection;
 pub mod repository;
 pub mod richtext;
 pub mod shared_checkpoint;

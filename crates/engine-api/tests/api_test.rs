@@ -966,6 +966,61 @@ async fn rich_text_history_replays_compact_edits_and_rejects_stale_patches(pool:
     assert_eq!(send(&router, request).await.0, StatusCode::FORBIDDEN);
 }
 
+/// Every node-table write path, checked as the runtime login: only the two documented
+/// encoding differences remain.
+#[sqlx::test(migrations = "../../migrations")]
+async fn node_table_matches_verified_replay(pool: PgPool) {
+    use engine_core::projection::{verify_projection, KNOWN_NULL_FIELDS, KNOWN_REMOVED_CHOICE};
+    let router = app(test_state(pool.clone()));
+    let token = bearer(seed_identity(&pool, "author@dynodoc.local").await);
+    let doc = create_document(&router, &token, "Projection").await;
+    let [root, section, question, notes, empty, keep, drop] =
+        std::array::from_fn(|_| ulid::Ulid::new().to_string());
+    let before = json!({"type":"paragraph","content":[{"type":"text","text":"Plain notes"}]});
+    let after =
+        json!({"type":"paragraph","content":[{"type":"text","text":"Plain notes, revised"}]});
+    for ops in [
+        json!([
+            {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{"title":"Survey"}},
+            {"type":"NodeCreated","node_id":section,"node_type":"section","parent_id":root,"pos":"a0","fields":{}},
+            {"type":"NodeCreated","node_id":question,"node_type":"item","parent_id":section,"pos":"a0","fields":{"label":"Age"},"var_name":"age"},
+            {"type":"NodeCreated","node_id":notes,"node_type":"item","parent_id":section,"pos":"a1","fields":{"label":"Plain notes","content":before}},
+            {"type":"NodeCreated","node_id":empty,"node_type":"item","parent_id":root,"pos":"a1","fields":null},
+            {"type":"ChoiceAdded","node_id":question,"choice_id":keep,"fields":{"label":"Under 18"}},
+            {"type":"ChoiceAdded","node_id":question,"choice_id":drop,"fields":{"label":"Unused"}},
+        ]),
+        json!([
+            {"type":"FieldEdited","node_id":notes,"field":"content","value":after},
+            {"type":"FieldEdited","node_id":question,"field":"var_name","value":"age_group"},
+            {"type":"NodeMoved","node_id":notes,"new_parent_id":root,"new_pos":"a2"},
+            {"type":"NodeDeleted","node_id":empty},
+            {"type":"NodeRestored","node_id":empty},
+            {"type":"ChoiceRemoved","node_id":question,"choice_id":drop},
+        ]),
+    ] {
+        let uri = format!("/documents/{doc}/batch");
+        let (status, body) = send(&router, auth_post(&uri, &token, &json!({ "ops": ops }))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let runtime = common::RuntimeDatabase::new(pool).await;
+    let report = verify_projection(&runtime.pool, DocumentId(doc))
+        .await
+        .unwrap();
+    runtime.close().await;
+    let found: Vec<_> = report
+        .differences
+        .iter()
+        .map(|d| (d.node_id.0.as_str(), d.field, d.known))
+        .collect();
+    let mut expected = vec![
+        (drop.as_str(), "deleted", Some(KNOWN_REMOVED_CHOICE)),
+        (empty.as_str(), "current_fields", Some(KNOWN_NULL_FIELDS)),
+    ];
+    expected.sort();
+    assert_eq!(found, expected);
+}
+
 fn test_state(pool: PgPool) -> AppState {
     AppState::new(
         pool,
