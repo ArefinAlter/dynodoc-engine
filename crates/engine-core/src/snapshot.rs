@@ -486,7 +486,7 @@ pub fn requires_immediate_snapshot(payload: &EventPayload) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet};
 
     use engine_shared::NodeId;
     use serde_json::json;
@@ -500,7 +500,7 @@ mod tests {
             nodes: BTreeMap::new(),
             comments: Vec::new(),
             suggestions: BTreeMap::new(),
-            removed_choices: HashSet::new(),
+            removed_choices: BTreeSet::new(),
         };
         state.nodes.insert(
             NodeId("01NODEA".into()),
