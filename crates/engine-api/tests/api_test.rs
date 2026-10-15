@@ -966,11 +966,11 @@ async fn rich_text_history_replays_compact_edits_and_rejects_stale_patches(pool:
     assert_eq!(send(&router, request).await.0, StatusCode::FORBIDDEN);
 }
 
-/// Every node-table write path, checked as the runtime login: only the two documented
-/// encoding differences remain.
+/// Every node-table write path, checked as the runtime login: only the removed-choice
+/// encoding differs. Rows written now follow the fold, so null fields match replay.
 #[sqlx::test(migrations = "../../migrations")]
 async fn node_table_matches_verified_replay(pool: PgPool) {
-    use engine_core::projection::{verify_projection, KNOWN_NULL_FIELDS, KNOWN_REMOVED_CHOICE};
+    use engine_core::projection::{verify_projection, KNOWN_REMOVED_CHOICE};
     let router = app(test_state(pool.clone()));
     let token = bearer(seed_identity(&pool, "author@dynodoc.local").await);
     let doc = create_document(&router, &token, "Projection").await;
@@ -1013,12 +1013,10 @@ async fn node_table_matches_verified_replay(pool: PgPool) {
         .iter()
         .map(|d| (d.node_id.0.as_str(), d.field, d.known))
         .collect();
-    let mut expected = vec![
-        (drop.as_str(), "deleted", Some(KNOWN_REMOVED_CHOICE)),
-        (empty.as_str(), "current_fields", Some(KNOWN_NULL_FIELDS)),
-    ];
-    expected.sort();
-    assert_eq!(found, expected);
+    assert_eq!(
+        found,
+        [(drop.as_str(), "deleted", Some(KNOWN_REMOVED_CHOICE))]
+    );
 }
 
 fn test_state(pool: PgPool) -> AppState {
