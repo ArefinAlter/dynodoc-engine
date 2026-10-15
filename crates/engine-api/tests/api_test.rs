@@ -203,6 +203,44 @@ async fn unreplayable_log_returns_specific_error(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn admin_overview_counts_error_responses(pool: PgPool) {
+    let mut state = test_state(pool.clone());
+    state.admin_emails = "counters@example.test".into();
+    let router = app(state);
+    let actor = seed_identity(&pool, "counters@example.test").await;
+    let owner = bearer(actor);
+    let doc = create_document(&router, &owner, "Counted").await;
+    let root = ulid::Ulid::new().to_string();
+    let batch = |base_seq: i64| json!({"base_seq":base_seq,"ops":[{"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}}]});
+    let uri = format!("/documents/{doc}/batch");
+    let (status, body) = send(&router, auth_post(&uri, &owner, &batch(0))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The same block again conflicts.
+    let (status, _) = send(&router, auth_post(&uri, &owner, &batch(1))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let accepted = engine_shared::EventPayload::SuggestionAccepted {
+        suggestion_id: "missing".into(),
+    };
+    engine_core::log::append(
+        &pool,
+        DocumentId(doc),
+        &accepted,
+        engine_shared::IdentityId(actor),
+    )
+    .await
+    .unwrap();
+    let (status, _) = send(&router, auth_post(&uri, &owner, &batch(2))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let (status, overview) = send(&router, auth_post_get("/admin/overview", &owner)).await;
+    assert_eq!(status, StatusCode::OK, "{overview}");
+    assert_eq!(
+        overview["errors"],
+        json!({"internal":0,"replay_failed":1,"conflict":1,"rate_limited":0,"busy":0})
+    );
+    assert_eq!(overview["counts"]["content_patches"], 0);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn shared_draft_bases_reuse_content_preserve_responses_and_enforce_scope(pool: PgPool) {
     let mut state = test_state(pool.clone());
     state.shared_draft_bases = true;
