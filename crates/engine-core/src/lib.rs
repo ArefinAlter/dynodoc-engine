@@ -14,7 +14,6 @@ pub mod governance;
 pub mod integrity;
 pub mod log;
 pub mod materializer;
-pub mod merge;
 pub mod ops;
 pub mod repository;
 pub mod richtext;

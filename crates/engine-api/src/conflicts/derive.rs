@@ -7,10 +7,9 @@
 //! `FieldEdited` targeting the same `(node_id, field)` but propose *distinct* values,
 //! that is a four-card conflict for the author to resolve.
 //!
-//! This is the PoC instantiation of the merge engine's `BothDifferent` classification
-//! (see [`engine_core::merge::FourCardConflict`]), generalized to *N* proposals;
-//! `engine_core::merge::three_way_merge` remains the pure 2-branch primitive for the
-//! engine. Conflicts are NOT stored — they are recomputed from current state on every
+//! This is the same-field divergence that [`engine_core::workspace_merge`] reports
+//! between two versions, generalized to *N* proposals.
+//! Conflicts are NOT stored — they are recomputed from current state on every
 //! `/conflicts` read and every `/resolve` call, so a `conflict_id` always re-derives the
 //! same live conflict (or 404s once it is gone).
 //!
