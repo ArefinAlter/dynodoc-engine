@@ -49,6 +49,8 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
       - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --workspace --no-deps
       - name: OpenAPI consistency
         run: cargo run --locked -p engine-cli -- openapi --out /tmp/openapi.yaml && diff -u openapi.yaml /tmp/openapi.yaml
