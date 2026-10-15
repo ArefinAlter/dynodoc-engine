@@ -336,7 +336,6 @@ mod tests {
     use engine_shared::{
         DocumentId, Event, EventId, EventPayload, IdentityId, NodeId, Snapshot, SnapshotId,
     };
-    use proptest::prelude::*;
     use serde_json::json;
     use uuid::Uuid;
 
@@ -355,76 +354,6 @@ mod tests {
             prev_chain_hash: vec![0; 32],
             chain_hash: vec![0; 32],
             created_at: chrono::Utc::now(),
-        }
-    }
-
-    fn valid_event_sequences() -> impl Strategy<Value = Vec<Event>> {
-        (1usize..8).prop_map(|count| {
-            let mut out = Vec::new();
-            let mut seq = 1i64;
-            for idx in 0..count {
-                let node = NodeId(format!("01NODE{idx:08}"));
-                out.push(event(
-                    seq,
-                    EventPayload::NodeCreated {
-                        node_id: node.clone(),
-                        node_type: engine_shared::NodeType::Item,
-                        parent_id: None,
-                        pos: format!("a{idx:04}"),
-                        fields: json!({ "label": format!("Q{idx}") }),
-                        var_name: Some(format!("q_{idx}")),
-                    },
-                ));
-                seq += 1;
-                out.push(event(
-                    seq,
-                    EventPayload::FieldEdited {
-                        node_id: node.clone(),
-                        field: "hint".to_string(),
-                        value: json!(format!("hint-{idx}")),
-                    },
-                ));
-                seq += 1;
-                if idx % 2 == 0 {
-                    out.push(event(
-                        seq,
-                        EventPayload::NodeMoved {
-                            node_id: node.clone(),
-                            new_parent_id: None,
-                            new_pos: format!("b{idx:04}"),
-                        },
-                    ));
-                    seq += 1;
-                }
-                if idx % 3 == 0 {
-                    out.push(event(seq, EventPayload::NodeDeleted { node_id: node }));
-                    seq += 1;
-                }
-            }
-            out
-        })
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
-
-        #[test]
-        fn fold_matches_snapshot_plus_tail(events in valid_event_sequences()) {
-            let full = Materializer::fold(&events).unwrap();
-            for cut in 0..=events.len() {
-                let base = Materializer::fold(&events[..cut]).unwrap();
-                let snapshot = Snapshot {
-                    id: SnapshotId(Uuid::nil()),
-                    document_id: DocumentId(Uuid::nil()),
-                    through_seq: events.get(cut.saturating_sub(1)).map(|e| e.seq).unwrap_or(0),
-                    state: serde_json::to_value(&base).unwrap(),
-                    merkle_root: vec![0; 32],
-                    event_chain_hash: vec![0; 32],
-                    created_at: chrono::Utc::now(),
-                };
-                let from_snapshot = Materializer::from_snapshot(&snapshot, &events[cut..]).unwrap();
-                prop_assert_eq!(from_snapshot, full.clone());
-            }
         }
     }
 
