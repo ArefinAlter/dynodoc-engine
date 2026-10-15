@@ -21,6 +21,10 @@ use engine_core::snapshot::SnapshotError;
 
 use crate::auth::AuthError;
 
+/// The error code of a response, for counting ([`crate::counters`]).
+#[derive(Clone, Copy)]
+pub struct ErrorCode(pub &'static str);
+
 /// Everything an API handler can fail with, mapped to one HTTP status + JSON body.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -141,6 +145,7 @@ impl IntoResponse for ApiError {
         });
 
         let mut response = (status, Json(body)).into_response();
+        response.extensions_mut().insert(ErrorCode(self.code()));
         if let ApiError::RateLimited { retry_after } = self {
             if let Ok(value) = retry_after.to_string().parse() {
                 response.headers_mut().insert("retry-after", value);
