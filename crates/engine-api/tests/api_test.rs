@@ -168,6 +168,41 @@ async fn draft_sharing_remembers_exclusions_until_explicitly_included(pool: PgPo
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn unreplayable_log_returns_specific_error(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let actor = seed_identity(&pool, "replay@example.test").await;
+    let owner = bearer(actor);
+    let doc = create_document(&router, &owner, "Broken history").await;
+    // No write path accepts this: it accepts a suggestion that never existed.
+    let accepted = engine_shared::EventPayload::SuggestionAccepted {
+        suggestion_id: "missing".into(),
+    };
+    engine_core::log::append(
+        &pool,
+        DocumentId(doc),
+        &accepted,
+        engine_shared::IdentityId(actor),
+    )
+    .await
+    .unwrap();
+    let root = ulid::Ulid::new().to_string();
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/batch"),
+            &owner,
+            &json!({"base_seq":1,"ops":[
+                {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["code"], "replay_failed", "{body}");
+    assert_eq!(body["details"], json!({"document_id": doc, "seq": 1}));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn shared_draft_bases_reuse_content_preserve_responses_and_enforce_scope(pool: PgPool) {
     let mut state = test_state(pool.clone());
     state.shared_draft_bases = true;
