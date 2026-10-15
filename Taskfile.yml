@@ -27,5 +27,11 @@ tasks:
       - cargo clippy --locked --workspace --all-targets -- -D warnings
   docs:
     cmds: ["RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps"]
+  bench:
+    desc: In-memory synthetic benchmarks; database ones need a disposable database (see each example's header)
+    cmds:
+      - cargo run --release --locked -p engine-core --example merge_bench
+      - cargo run --release --locked -p engine-core --example richtext_bench
+      - cargo run --release --locked -p engine-core --example similarity_bench
   openapi:
     cmds: ["cargo run --locked -p engine-cli -- openapi --out openapi.yaml"]
