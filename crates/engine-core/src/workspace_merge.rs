@@ -189,6 +189,7 @@ pub fn merge(
         }
         out.nodes.insert(id.clone(), n);
     }
+    keep_runs_together(&base, &team, &mut out);
     out.removed_choices
         .retain(|id| out.nodes.get(id).is_some_and(|n| n.deleted));
     let ops = diff(&team, &out);
@@ -196,6 +197,52 @@ pub fn merge(
         state: out,
         conflicts,
         ops,
+    }
+}
+/// Blocks both sides place between the same two unchanged siblings interleave when
+/// their keys do, and `between()` gives both sides the same keys for one spot. So the
+/// draft's blocks there go behind the team's last one: putting that key in front of
+/// theirs keeps their order, unless it would pass the next unchanged sibling.
+fn keep_runs_together(base: &DocumentState, team: &DocumentState, out: &mut DocumentState) {
+    let at = |s: &DocumentState, n: &MaterializedNode| {
+        s.nodes
+            .get(&n.id)
+            .is_some_and(|o| o.parent_id == n.parent_id && o.pos == n.pos)
+    };
+    let mut children: BTreeMap<&Option<NodeId>, Vec<&MaterializedNode>> = BTreeMap::new();
+    for n in out.nodes.values().filter(|n| !n.deleted) {
+        children.entry(&n.parent_id).or_default().push(n);
+    }
+    let mut moves = Vec::new();
+    for mut siblings in children.into_values() {
+        siblings.sort_by(|a, b| (&a.pos, &a.id).cmp(&(&b.pos, &b.id)));
+        let (mut last, mut draft) = (None, Vec::new());
+        // An unchanged sibling, or the end, closes the gap before it.
+        for n in siblings.into_iter().map(Some).chain([None]) {
+            match n {
+                Some(n) if !at(team, n) => draft.push(n),
+                Some(n) if !at(base, n) => last = Some(&n.pos),
+                _ => {
+                    if let Some(last) = last.take() {
+                        let keys: Vec<_> = draft
+                            .iter()
+                            .map(|d| (d.id.clone(), format!("{last}{}", d.pos)))
+                            .collect();
+                        if draft.iter().any(|d| &d.pos <= last)
+                            && keys.iter().all(|(_, key)| n.is_none_or(|n| *key < n.pos))
+                        {
+                            moves.extend(keys);
+                        }
+                    }
+                    draft.clear();
+                }
+            }
+        }
+    }
+    for (id, pos) in moves {
+        if let Some(n) = out.nodes.get_mut(&id) {
+            n.pos = pos;
+        }
     }
 }
 /// Merge for content that does not share history with the team version, such as a
@@ -810,5 +857,38 @@ mod tests {
         let plan = merge(&with(ps), &with(margin), &with(other), &BTreeMap::new());
         assert_eq!(plan.conflicts.len(), 1);
         assert_eq!(plan.conflicts[0].key, "root:page_setup");
+    }
+
+    #[test]
+    fn inserts_at_one_spot_keep_each_sides_run_together() {
+        let add = |s: &mut DocumentState, id: &str, pos: &str| {
+            let mut n = s.nodes[&NodeId("root".into())].clone();
+            n.id = NodeId(id.into());
+            n.parent_id = Some(NodeId("root".into()));
+            n.pos = pos.into();
+            s.nodes.insert(n.id.clone(), n);
+        };
+        let order = |next: &str| {
+            let mut base = state();
+            add(&mut base, "a", "a");
+            add(&mut base, "z", next);
+            let (mut team, mut draft) = (base.clone(), base.clone());
+            for (side, s) in [(&mut team, "t"), (&mut draft, "d")] {
+                add(side, &format!("{s}1"), "m");
+                add(side, &format!("{s}2"), "n");
+            }
+            let plan = merge(&base, &team, &draft, &BTreeMap::new());
+            let mut blocks: Vec<_> = plan
+                .state
+                .nodes
+                .into_values()
+                .filter(|n| n.parent_id.is_some())
+                .collect();
+            blocks.sort_by(|a, b| (&a.pos, &a.id).cmp(&(&b.pos, &b.id)));
+            blocks.into_iter().map(|n| n.id.0).collect::<Vec<_>>()
+        };
+        assert_eq!(order("z"), ["a", "t1", "t2", "d1", "d2", "z"]);
+        // "nm" would pass "n0", so those keys stay.
+        assert_eq!(order("n0"), ["a", "d1", "t1", "d2", "t2", "z"]);
     }
 }
