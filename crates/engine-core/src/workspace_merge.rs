@@ -718,15 +718,31 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
             node_id: n.id.clone(),
         });
     }
-    // A name is free once its holder is deleted or renamed, so renames that wait on
-    // each other go in that order; only a cycle (two names swapped) still fails.
-    while !later.is_empty() {
-        let ready = later
-            .iter()
-            .position(|(_, holder, _)| later.iter().all(|(id, _, _)| id != holder))
-            .unwrap_or(0);
-        result.push(later.remove(ready).2);
-    }
+    // A name is free once its holder is deleted or renamed. Each block waits on at most
+    // one holder, so release them in that order; only a cycle (two names swapped) is
+    // left over, and still fails.
+    let order = {
+        let waiting: BTreeSet<&NodeId> = later.iter().map(|(id, _, _)| id).collect();
+        let mut dependents: BTreeMap<&NodeId, Vec<usize>> = BTreeMap::new();
+        let mut ready = std::collections::VecDeque::new();
+        for (i, (_, holder, _)) in later.iter().enumerate() {
+            if waiting.contains(holder) {
+                dependents.entry(holder).or_default().push(i);
+            } else {
+                ready.push_back(i);
+            }
+        }
+        let mut order = Vec::with_capacity(later.len());
+        while let Some(i) = ready.pop_front() {
+            order.push(i);
+            ready.extend(dependents.remove(&later[i].0).into_iter().flatten());
+        }
+        let placed: BTreeSet<usize> = order.iter().copied().collect();
+        order.extend((0..later.len()).filter(|i| !placed.contains(i)));
+        order
+    };
+    let mut ops: Vec<_> = later.into_iter().map(|(_, _, op)| Some(op)).collect();
+    result.extend(order.into_iter().filter_map(|i| ops[i].take()));
     // A snapshot can enable protection together with content changes. Apply that
     // flag last; explicit unprotection of an existing live sheet must happen first.
     // Never implicitly unprotect an already-protected worksheet.
