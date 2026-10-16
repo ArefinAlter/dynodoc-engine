@@ -242,6 +242,63 @@ async fn unreplayable_log_returns_specific_error(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn requests_that_leave_the_content_alone_skip_the_replay(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let actor = seed_identity(&pool, "no-replay@example.test").await;
+    let owner = bearer(actor);
+    let doc = create_document(&router, &owner, "Broken history").await;
+    let (_, draft) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/drafts"),
+            &owner,
+            &json!({"name":"Kept"}),
+        ),
+    )
+    .await;
+    let draft = format!("/documents/{doc}/drafts/{}", draft["id"].as_str().unwrap());
+    let request = draft.replace("/drafts/", "/change-requests/");
+    let accepted = engine_shared::EventPayload::SuggestionAccepted {
+        suggestion_id: "missing".into(),
+    };
+    engine_core::log::append(
+        &pool,
+        DocumentId(doc),
+        &accepted,
+        engine_shared::IdentityId(actor),
+    )
+    .await
+    .unwrap();
+    let root = ulid::Ulid::new().to_string();
+    for (uri, body) in [
+        (
+            format!("/documents/{doc}/members"),
+            json!({"email":"reader@example.test","role":"viewer"}),
+        ),
+        (
+            format!("/documents/{doc}/metadata"),
+            json!({"title":"Renamed"}),
+        ),
+        (
+            draft.clone(),
+            json!({"revision":0,"ops":[{"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}}]}),
+        ),
+        (format!("{draft}/submit"), json!({"note":"Ready"})),
+        (
+            format!("{request}/reviews"),
+            json!({"verdict":"commented","note":"Noted"}),
+        ),
+        (format!("{draft}/withdraw"), json!({})),
+    ] {
+        let (status, body) = send(&router, auth_post(&uri, &owner, &body)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    }
+    // Reading the content still replays it.
+    let (_, body) = send(&router, auth_post_get(&format!("/documents/{doc}"), &owner)).await;
+    assert_eq!(body["code"], "replay_failed", "{body}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn admin_overview_counts_error_responses(pool: PgPool) {
     let mut state = test_state(pool.clone());
     state.admin_emails = "counters@example.test".into();
