@@ -2527,10 +2527,13 @@ async fn office_review_is_private_and_unresolved_changes_cannot_be_published(poo
         "{encoded}"
     );
     assert!(encoded.contains("Public wording"));
-    assert_eq!(
-        public["state"]["nodes"][node.as_str()]["current_fields"]["format_0"]["bold"],
-        true
-    );
+    let formatted = public["state"]["nodes"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|n| n["current_fields"].get("format_0").is_some())
+        .unwrap();
+    assert_eq!(formatted["current_fields"]["format_0"]["bold"], true);
     let mut tracked = content.clone();
     tracked["content"][0]["marks"] =
         json!([{"type":"trackedChange","attrs":{"kind":"insert","id":"revision"}}]);
@@ -2546,6 +2549,68 @@ async fn office_review_is_private_and_unresolved_changes_cannot_be_published(poo
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.to_string().contains("Accept or reject"));
+}
+
+/// A block of a public copy by label; public copies use pseudonymous block ids.
+fn public_block<'a>(public: &'a Value, label: &str) -> Option<&'a Value> {
+    public["state"]["nodes"]
+        .as_object()?
+        .values()
+        .find(|n| n["current_fields"]["label"] == label)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn public_copy_contains_no_real_node_ids(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let owner = bearer(seed_identity(&pool, "pseudonyms@example.org").await);
+    let doc = create_document(&router, &owner, "Pseudonyms").await;
+    let [root, row, gone] = std::array::from_fn(|_| ulid::Ulid::new().to_string());
+    let content = json!({"type":"paragraph","attrs":{"blockId":row},"content":[{"type":"text","text":"Row"}]});
+    let (status, body) = send(&router, auth_post(&format!("/documents/{doc}/batch"), &owner, &json!({"base_seq":0,"ops":[
+      {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a","fields":{"sheet_layout":{"merges":[{"fromRow":row,"toRow":gone}]}}},
+      {"type":"NodeCreated","node_id":row,"node_type":"item","parent_id":root,"pos":"a","fields":{"content":content}},
+      {"type":"NodeCreated","node_id":gone,"node_type":"item","parent_id":root,"pos":"b","fields":{"label":"Gone"}},
+      {"type":"NodeDeleted","node_id":gone}
+    ]}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let publish = || async {
+        let (status, link) = send(
+            &router,
+            auth_post(
+                &format!("/documents/{doc}/public-links"),
+                &owner,
+                &json!({"base_seq":4}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{link}");
+        format!("/public/documents/{}", link["token"].as_str().unwrap())
+    };
+    let path = publish().await;
+    let (status, public) = send(&router, get(&path)).await;
+    assert_eq!(status, StatusCode::OK);
+    let encoded = public.to_string();
+    for id in [&root, &row, &gone] {
+        assert!(!encoded.contains(id.as_str()), "{encoded}");
+    }
+    let nodes = public["state"]["nodes"].as_object().unwrap();
+    let (row_key, row_node) = nodes
+        .iter()
+        .find(|(_, n)| n["current_fields"]["label"] == "Row")
+        .unwrap();
+    assert_eq!(
+        row_node["current_fields"]["content"]["attrs"]["blockId"],
+        json!(row_key)
+    );
+    let root_node = nodes.values().find(|n| n["parent_id"].is_null()).unwrap();
+    assert_eq!(
+        root_node["current_fields"]["sheet_layout"]["merges"][0]["fromRow"],
+        json!(row_key)
+    );
+    // Stable for one link, different for another.
+    assert_eq!(send(&router, get(&path)).await.1, public);
+    let (_, other) = send(&router, get(&publish().await)).await;
+    assert!(other["state"]["nodes"].get(row_key.as_str()).is_none());
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -2605,15 +2670,10 @@ async fn product_public_copy_is_frozen_private_and_revocable(pool: PgPool) {
     let path = format!("/public/documents/{}", link["token"].as_str().unwrap());
     let (status, public) = send(&router, get(&path)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        public["state"]["nodes"][item]["current_fields"]["label"],
-        "Original question"
-    );
-    assert!(public["state"]["nodes"][item]["current_fields"]
-        .get("research_source")
-        .is_none());
-    assert!(public["state"]["nodes"].get(hidden).is_none());
-    assert!(public["state"]["nodes"].get(child).is_none());
+    let original = public_block(&public, "Original question").unwrap();
+    assert!(original["current_fields"].get("research_source").is_none());
+    assert!(public_block(&public, "Removed private group").is_none());
+    assert!(public_block(&public, "Descendant private content").is_none());
     assert_eq!(public["state"]["comments"], json!([]));
     let update = json!({"base_seq":seq,"ops":[{"type":"FieldEdited","node_id":item,"field":"label","value":"Private later edit"}]});
     assert_eq!(
@@ -2640,10 +2700,7 @@ async fn product_public_copy_is_frozen_private_and_revocable(pool: PgPool) {
     );
     let (_, public) = send(&router, get(&path)).await;
     assert_eq!(public["title"], "Published protocol");
-    assert_eq!(
-        public["state"]["nodes"][item]["current_fields"]["label"],
-        "Original question"
-    );
+    assert!(public_block(&public, "Original question").is_some());
     assert_eq!(
         send(
             &router,
