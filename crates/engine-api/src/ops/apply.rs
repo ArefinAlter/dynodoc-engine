@@ -19,7 +19,7 @@
 
 use engine_core::governance::{self, Role};
 use engine_core::log;
-use engine_core::materializer::{apply_payload, DocumentState, MaterializedNode};
+use engine_core::materializer::{apply_payload, ApplyError, DocumentState, MaterializedNode};
 use engine_shared::{DocumentId, Event, EventPayload, IdentityId, NodeId};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -242,15 +242,30 @@ pub(crate) async fn materialize_node_change(
             },
         );
     }
-    apply_payload(&mut state, op).map_err(|e| ApiError::BadRequest {
-        reason: e.to_string(),
+    apply_payload(&mut state, op).map_err(|e| match e {
+        // A patch that does not apply to the stored content is the caller's to fix;
+        // anything else means the table broke its own invariants.
+        ApplyError::RichText(_) => ApiError::BadRequest {
+            reason: e.to_string(),
+        },
+        _ => ApiError::Internal(e.to_string()),
     })?;
     let created = matches!(
         op,
         EventPayload::NodeCreated { .. } | EventPayload::ChoiceAdded { .. }
     );
-    for id in ids {
-        let node = &state.nodes[&NodeId(id)];
+    // Moves, deletes and restores leave the (possibly large) fields untouched.
+    let fields = matches!(
+        op,
+        EventPayload::FieldEdited { .. } | EventPayload::RichTextPatched { .. }
+    );
+    for id in &ids {
+        let Some(node) = state.nodes.get(&NodeId(id.clone())) else {
+            return Err(ApiError::Internal(format!(
+                "node {id} has no row in document {}",
+                document_id.0
+            )));
+        };
         if created {
             insert_node(
                 tx,
@@ -265,20 +280,26 @@ pub(crate) async fn materialize_node_change(
             .await?;
             continue;
         }
-        sqlx::query(
-            "update node set parent_id = $3, pos = $4, current_fields = $5, var_name = $6,
-                 deleted = $7, updated_at = now()
-             where id = $1 and document_id = $2",
-        )
-        .bind(&node.id.0)
-        .bind(document_id.0)
-        .bind(node.parent_id.as_ref().map(|p| p.0.as_str()))
-        .bind(&node.pos)
-        .bind(&node.current_fields)
-        .bind(node.var_name.as_deref())
-        .bind(node.deleted || state.removed_choices.contains(&node.id))
-        .execute(&mut **tx)
-        .await?;
+        let sql = if fields {
+            "update node set parent_id = $3, pos = $4, var_name = $5, deleted = $6,
+                 current_fields = $7, updated_at = now()
+             where id = $1 and document_id = $2"
+        } else {
+            "update node set parent_id = $3, pos = $4, var_name = $5, deleted = $6,
+                 updated_at = now()
+             where id = $1 and document_id = $2"
+        };
+        let mut query = sqlx::query(sql)
+            .bind(&node.id.0)
+            .bind(document_id.0)
+            .bind(node.parent_id.as_ref().map(|p| p.0.as_str()))
+            .bind(&node.pos)
+            .bind(node.var_name.as_deref())
+            .bind(node.deleted || state.removed_choices.contains(&node.id));
+        if fields {
+            query = query.bind(&node.current_fields);
+        }
+        query.execute(&mut **tx).await?;
     }
     Ok(())
 }

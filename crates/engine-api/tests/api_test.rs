@@ -1019,6 +1019,56 @@ async fn node_table_matches_verified_replay(pool: PgPool) {
     );
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn node_rows_follow_restored_choices_and_report_missing_rows(pool: PgPool) {
+    use engine_core::projection::verify_projection;
+    let router = app(test_state(pool.clone()));
+    let token = bearer(seed_identity(&pool, "rows@example.test").await);
+    let doc = create_document(&router, &token, "Rows").await;
+    let [root, question, kept, lost] = std::array::from_fn(|_| ulid::Ulid::new().to_string());
+    let uri = format!("/documents/{doc}/batch");
+    for ops in [
+        json!([
+            {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}},
+            {"type":"NodeCreated","node_id":question,"node_type":"item","parent_id":root,"pos":"a0","fields":{"label":"Q"}},
+            {"type":"ChoiceAdded","node_id":question,"choice_id":kept,"fields":{"label":"Kept"}},
+            {"type":"ChoiceAdded","node_id":question,"choice_id":lost,"fields":{"label":"Lost"}},
+        ]),
+        // Restoring a removed choice clears the table's deleted flag, as replay does.
+        json!([
+            {"type":"ChoiceRemoved","node_id":question,"choice_id":kept},
+            {"type":"NodeRestored","node_id":kept},
+        ]),
+    ] {
+        let (status, body) = send(&router, auth_post(&uri, &token, &json!({ "ops": ops }))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let deleted: bool = sqlx::query_scalar("select deleted from node where id=$1")
+        .bind(&kept)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!deleted);
+    let report = verify_projection(&pool, DocumentId(doc)).await.unwrap();
+    assert_eq!(report.differences, []);
+
+    // A row the table lost (here moved to another document) is a server fault, not a panic.
+    let other = create_document(&router, &token, "Elsewhere").await;
+    sqlx::query("update node set document_id=$2 where id=$1")
+        .bind(&lost)
+        .bind(other)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let removal = json!({"ops":[{"type":"ChoiceRemoved","node_id":question,"choice_id":lost}]});
+    let (status, body) = send(&router, auth_post(&uri, &token, &removal)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let edit =
+        json!({"ops":[{"type":"FieldEdited","node_id":lost,"field":"label","value":"Edited"}]});
+    let (status, body) = send(&router, auth_post(&uri, &token, &edit)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+}
+
 fn test_state(pool: PgPool) -> AppState {
     AppState::new(
         pool,
