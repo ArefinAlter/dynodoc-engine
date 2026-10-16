@@ -646,16 +646,31 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
             continue;
         }
         let p = prior.unwrap();
-        if p.deleted {
-            result.push(EventPayload::NodeRestored {
-                node_id: n.id.clone(),
-            });
-        }
+        let renamed_later = p.var_name != n.var_name && name_later(n);
         if p.parent_id != n.parent_id || p.pos != n.pos {
             result.push(EventPayload::NodeMoved {
                 node_id: n.id.clone(),
                 new_parent_id: n.parent_id.clone(),
                 new_pos: n.pos.clone(),
+            });
+        }
+        // A restore checks the parent and name the block comes back with, so it moves
+        // and takes its name first; a name another block still holds comes later.
+        if p.deleted {
+            let name = if renamed_later {
+                ""
+            } else {
+                n.var_name.as_deref().unwrap_or("")
+            };
+            if name != p.var_name.as_deref().unwrap_or("") {
+                result.push(EventPayload::FieldEdited {
+                    node_id: n.id.clone(),
+                    field: "var_name".into(),
+                    value: json!(name),
+                });
+            }
+            result.push(EventPayload::NodeRestored {
+                node_id: n.id.clone(),
             });
         }
         let keys: BTreeSet<_> = p
@@ -696,7 +711,7 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
                 result.push(compact);
             }
         }
-        if p.var_name != n.var_name && !name_later(n) {
+        if p.var_name != n.var_name && !renamed_later && !p.deleted {
             result.push(EventPayload::FieldEdited {
                 node_id: n.id.clone(),
                 field: "var_name".into(),
@@ -1604,6 +1619,69 @@ mod tests {
         assert_eq!(
             apply(&from, &to),
             (Some("q".into()), Some("r".into()), Some("s".into()))
+        );
+    }
+
+    #[test]
+    fn a_restored_block_can_come_back_moved_or_renamed() {
+        let id = |s: &str| NodeId(s.into());
+        let add = |s: &mut DocumentState, n: &str, parent: &str, var: Option<&str>| {
+            let mut node = s.nodes[&id("root")].clone();
+            node.id = id(n);
+            node.node_type = if var.is_some() { "item" } else { "section" }.into();
+            node.parent_id = Some(id(parent));
+            node.current_fields = json!({ "var_name": var });
+            node.var_name = var.map(Into::into);
+            s.nodes.insert(node.id.clone(), node);
+        };
+        let set = |s: &mut DocumentState, n: &str, deleted: bool, parent: &str, var: &str| {
+            let node = s.nodes.get_mut(&id(n)).unwrap();
+            node.deleted = deleted;
+            node.parent_id = Some(id(parent));
+            node.current_fields["var_name"] = json!(var);
+            node.var_name = Some(var.into());
+        };
+        let apply = |from: &DocumentState, to: &DocumentState| {
+            let mut state = from.clone();
+            for op in diff(from, to) {
+                crate::ops::validate_op(&state, &op).unwrap();
+                crate::materializer::apply_payload(&mut state, &op).unwrap();
+            }
+            let x = &state.nodes[&id("x")];
+            (x.deleted, x.parent_id.clone(), x.var_name.clone())
+        };
+        // Back in another container, after its old one was deleted.
+        let mut from = state();
+        add(&mut from, "old", "root", None);
+        add(&mut from, "new", "root", None);
+        add(&mut from, "x", "old", Some("q"));
+        set(&mut from, "x", true, "old", "q");
+        from.nodes.get_mut(&id("old")).unwrap().deleted = true;
+        let mut to = from.clone();
+        set(&mut to, "x", false, "new", "q");
+        assert_eq!(
+            apply(&from, &to),
+            (false, Some(id("new")), Some("q".into()))
+        );
+        // Back under a new name, while another block holds its old one.
+        let mut from = state();
+        add(&mut from, "x", "root", Some("q"));
+        set(&mut from, "x", true, "root", "q");
+        add(&mut from, "y", "root", Some("q"));
+        let mut to = from.clone();
+        set(&mut to, "x", false, "root", "r");
+        assert_eq!(
+            apply(&from, &to),
+            (false, Some(id("root")), Some("r".into()))
+        );
+        // ...and when the new name is freed in the same change.
+        add(&mut from, "w", "root", Some("r"));
+        let mut to = from.clone();
+        to.nodes.get_mut(&id("w")).unwrap().deleted = true;
+        set(&mut to, "x", false, "root", "r");
+        assert_eq!(
+            apply(&from, &to),
+            (false, Some(id("root")), Some("r".into()))
         );
     }
 }
