@@ -192,8 +192,8 @@ async fn share(
     auth: AuthContext,
     Json(req): Json<ShareRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let (mut tx, role, _) =
-        apply::begin_write(&state, DocumentId(id), IdentityId(auth.identity_id)).await?;
+    let (mut tx, role) =
+        apply::begin_write_locked(&state, DocumentId(id), IdentityId(auth.identity_id)).await?;
     if role != Role::Author
         || !sqlx::query_scalar::<_, bool>("select can_manage_document($1,$2)")
             .bind(id)
@@ -392,8 +392,8 @@ async fn metadata(
     auth: AuthContext,
     Json(req): Json<Metadata>,
 ) -> Result<Json<Value>, ApiError> {
-    let (mut tx, role, _) =
-        apply::begin_write(&state, DocumentId(id), IdentityId(auth.identity_id)).await?;
+    let (mut tx, role) =
+        apply::begin_write_locked(&state, DocumentId(id), IdentityId(auth.identity_id)).await?;
     if role != Role::Author {
         return Err(ApiError::Forbidden);
     }
@@ -580,8 +580,8 @@ async fn edit_draft(
     if req.ops.is_empty() || req.ops.len() > 5000 {
         return Err(bad("A draft save must contain 1–5000 changes"));
     }
-    let (mut tx, role, _) =
-        apply::begin_write(&state, DocumentId(id), IdentityId(auth.identity_id)).await?;
+    let (mut tx, role) =
+        apply::begin_write_locked(&state, DocumentId(id), IdentityId(auth.identity_id)).await?;
     if role == Role::Auditor {
         return Err(ApiError::Forbidden);
     }
