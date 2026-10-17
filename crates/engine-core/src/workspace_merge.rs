@@ -295,13 +295,17 @@ fn validate_merged_tree(
     let mut passes = 0;
     loop {
         passes += 1;
-        if passes > max_passes {
-            break;
-        }
         let Some(cycle) = find_parent_cycle(out) else {
             let Some((child, parent)) = find_orphan(out) else {
                 break;
             };
+            if passes > max_passes {
+                let conflict = orphan_conflict(base, team, draft, &parent);
+                if !conflicts.iter().any(|c| c.key == conflict.key) {
+                    conflicts.push(conflict);
+                }
+                break;
+            }
             if !resolve_orphan(
                 base,
                 team,
@@ -319,7 +323,8 @@ fn validate_merged_tree(
 
         // Pick a node in the loop whose merged location came from the draft (out_loc != team_loc).
         // A valid team tree has no loops, so every loop has such a node, and restoring
-        // its location to team's location strictly makes progress toward team's acyclic tree.
+        // its location to team's location makes progress toward team's acyclic tree.
+        // Mixed explicit choices can undo that progress, so the budget must fail closed.
         let d_id = cycle
             .iter()
             .find(|id| out.nodes.get(id).map(location) != team.nodes.get(id).map(location))
@@ -330,13 +335,6 @@ fn validate_merged_tree(
         let b_loc = base.nodes.get(&d_id).map(location).unwrap_or(Value::Null);
         let t_loc = team.nodes.get(&d_id).map(location).unwrap_or(Value::Null);
         let d_loc = draft.nodes.get(&d_id).map(location).unwrap_or(Value::Null);
-        let locations = |out: &DocumentState| -> Vec<_> {
-            cycle
-                .iter()
-                .map(|id| out.nodes.get(id).map(location))
-                .collect()
-        };
-        let before = locations(out);
         let conflict = Conflict {
             key: key.clone(),
             node_id: d_id.clone(),
@@ -345,6 +343,21 @@ fn validate_merged_tree(
             team: t_loc,
             draft: d_loc,
         };
+        if passes > max_passes {
+            // Every pass may change a location yet alternate between cycles.
+            // A resolution is not successful while any parent cycle remains.
+            if !conflicts.iter().any(|c| c.key == key) {
+                conflicts.push(conflict);
+            }
+            break;
+        }
+        let locations = |out: &DocumentState| -> Vec<_> {
+            cycle
+                .iter()
+                .map(|id| out.nodes.get(id).map(location))
+                .collect()
+        };
+        let before = locations(out);
 
         match resolutions.get(&key).map(String::as_str) {
             Some("draft") => {
@@ -403,6 +416,21 @@ fn find_orphan(state: &DocumentState) -> Option<(NodeId, NodeId)> {
         Some((n.id.clone(), parent.clone()))
     })
 }
+fn orphan_conflict(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    parent: &NodeId,
+) -> Conflict {
+    Conflict {
+        key: format!("{}:$node", parent.0),
+        node_id: parent.clone(),
+        field: "$node".into(),
+        ancestor: value(base.nodes.get(parent)),
+        team: value(team.nodes.get(parent)),
+        draft: value(draft.nodes.get(parent)),
+    }
+}
 /// One side deleted `parent` while the other placed `child` inside it. Like a
 /// deletion against an edit, this is a `$node` conflict on the parent. The chosen
 /// side's version either brings the parent back, with any deleted ancestors in
@@ -419,15 +447,8 @@ fn resolve_orphan(
     child: &NodeId,
     parent: &NodeId,
 ) -> bool {
-    let key = format!("{}:$node", parent.0);
-    let conflict = Conflict {
-        key: key.clone(),
-        node_id: parent.clone(),
-        field: "$node".into(),
-        ancestor: value(base.nodes.get(parent)),
-        team: value(team.nodes.get(parent)),
-        draft: value(draft.nodes.get(parent)),
-    };
+    let conflict = orphan_conflict(base, team, draft, parent);
+    let key = conflict.key.clone();
     let side = match resolutions.get(&key).map(String::as_str) {
         Some("draft") => draft,
         Some("team") => team,
@@ -1180,6 +1201,59 @@ mod tests {
     }
 
     #[test]
+    fn incompatible_cycle_resolutions_remain_conflicted() {
+        let mut base = state();
+        for (id, parent) in [("a", "b"), ("b", "root"), ("c", "b")] {
+            let mut node = base.nodes[&NodeId("root".into())].clone();
+            node.id = NodeId(id.into());
+            node.node_type = "section".into();
+            node.parent_id = Some(NodeId(parent.into()));
+            base.nodes.insert(node.id.clone(), node);
+        }
+        let mut team = base.clone();
+        for (id, parent) in [("a", "c"), ("b", "c"), ("c", "root")] {
+            team.nodes.get_mut(&NodeId(id.into())).unwrap().parent_id = Some(NodeId(parent.into()));
+        }
+        let mut draft = base.clone();
+        draft.nodes.get_mut(&NodeId("c".into())).unwrap().parent_id = Some(NodeId("a".into()));
+        for input in [&base, &team, &draft] {
+            assert!(find_parent_cycle(input).is_none());
+        }
+
+        // Keeping a at team's location while taking c from draft alternates
+        // between a -> c -> a and a -> b -> c -> a. Every pass changes
+        // something, so the no-progress guard alone cannot stop this safely.
+        let mut resolutions = BTreeMap::from([
+            ("a:$location".into(), "team".into()),
+            ("c:$location".into(), "draft".into()),
+            ("c:$block".into(), "draft".into()),
+        ]);
+        for merge_fn in [merge, merge_strict] {
+            let plan = merge_fn(&base, &team, &draft, &resolutions);
+            assert!(find_parent_cycle(&plan.state).is_some());
+            assert!(
+                !plan.conflicts.is_empty(),
+                "a remaining cycle must never be returned as a clean merge"
+            );
+            assert!(plan.conflicts.iter().all(|c| c.field == "$location"));
+        }
+
+        // A compatible choice still resolves normally and emits applicable ops.
+        resolutions.insert("a:$location".into(), "draft".into());
+        for merge_fn in [merge, merge_strict] {
+            let plan = merge_fn(&base, &team, &draft, &resolutions);
+            assert!(plan.conflicts.is_empty());
+            assert!(find_parent_cycle(&plan.state).is_none());
+            let mut applied = team.clone();
+            for op in &plan.ops {
+                crate::ops::validate_op(&applied, op).unwrap();
+                crate::materializer::apply_payload(&mut applied, op).unwrap();
+            }
+            assert_eq!(applied, plan.state);
+        }
+    }
+
+    #[test]
     fn a_cycle_already_in_the_team_version_is_reported_once() {
         // Typed objects can hand such a state to `converge()`; no choice here breaks it.
         let mut b = state();
@@ -1279,6 +1353,61 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn incompatible_orphan_resolutions_remain_conflicted() {
+        let id = |s: &str| NodeId(s.into());
+        let mut base = state();
+        for name in ["a", "b", "x"] {
+            let mut node = base.nodes[&id("root")].clone();
+            node.id = id(name);
+            node.node_type = "section".into();
+            node.parent_id = Some(id("root"));
+            base.nodes.insert(node.id.clone(), node);
+        }
+        let mut team = base.clone();
+        team.nodes.get_mut(&id("b")).unwrap().deleted = true;
+        team.nodes.get_mut(&id("x")).unwrap().parent_id = Some(id("a"));
+        let mut draft = base.clone();
+        draft.nodes.get_mut(&id("a")).unwrap().deleted = true;
+        draft.nodes.get_mut(&id("x")).unwrap().parent_id = Some(id("b"));
+        for input in [&base, &team, &draft] {
+            assert!(find_parent_cycle(input).is_none());
+            assert!(find_orphan(input).is_none());
+        }
+
+        // Both parents stay deleted, but x remains live. Fixing the orphan
+        // under b moves it to a; fixing the orphan under a moves it back to b.
+        let mut resolutions = BTreeMap::from([
+            ("a:$node".into(), "draft".into()),
+            ("b:$node".into(), "team".into()),
+            ("x:$location".into(), "draft".into()),
+            ("a:$block".into(), "draft".into()),
+            ("x:$block".into(), "draft".into()),
+        ]);
+        for merge_fn in [merge, merge_strict] {
+            let plan = merge_fn(&base, &team, &draft, &resolutions);
+            assert!(
+                !plan.conflicts.is_empty(),
+                "incompatible deletion choices must remain conflicted"
+            );
+            assert!(plan.conflicts.iter().any(|c| c.field == "$node"));
+        }
+
+        resolutions.insert("a:$node".into(), "team".into());
+        for merge_fn in [merge, merge_strict] {
+            let plan = merge_fn(&base, &team, &draft, &resolutions);
+            assert!(plan.conflicts.is_empty());
+            assert!(find_parent_cycle(&plan.state).is_none());
+            assert!(find_orphan(&plan.state).is_none());
+            let mut applied = team.clone();
+            for op in &plan.ops {
+                crate::ops::validate_op(&applied, op).unwrap();
+                crate::materializer::apply_payload(&mut applied, op).unwrap();
+            }
+            assert_eq!(applied, plan.state);
         }
     }
 
