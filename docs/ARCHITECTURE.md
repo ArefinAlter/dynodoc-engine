@@ -63,14 +63,6 @@ text/format changes combine. Competing values, overlapping wording and ambiguous
 structural operations surface conflicts. Read `tests/richtext_test.rs` and
 `tests/fixtures/richtext-fixtures.json` for executable examples.
 
-Both ordinary and strict workspace merges check parent cycles after combining
-locations. A no-progress pass or exhausted repair budget retains a `$location`
-conflict, including when mixed team/draft choices alternate between cycles.
-Such a preview can still contain a cycle; callers must resolve its conflicts
-before applying it. This is bounded conflict detection, not general automatic
-tree repair or a complete convergence guarantee. Event readers and hashes do not
-change.
-
 Events and migration files are public compatibility contracts. Add new migrations;
 never rewrite applied ones. Readers of historical events must remain compatible.
 The API exposes only authorized states. Content hashes do not cover every metadata
