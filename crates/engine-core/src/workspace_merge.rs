@@ -295,13 +295,11 @@ fn validate_merged_tree(
     let mut passes = 0;
     while let Some(cycle) = find_parent_cycle(out) {
         passes += 1;
-        if passes > max_passes {
-            break;
-        }
 
         // Pick a node in the loop whose merged location came from the draft (out_loc != team_loc).
         // A valid team tree has no loops, so every loop has such a node, and restoring
-        // its location to team's location strictly makes progress toward team's acyclic tree.
+        // its location to team's location makes progress toward team's acyclic tree.
+        // Mixed explicit choices can undo that progress, so the budget must fail closed.
         let d_id = cycle
             .iter()
             .find(|id| out.nodes.get(id).map(location) != team.nodes.get(id).map(location))
@@ -312,13 +310,6 @@ fn validate_merged_tree(
         let b_loc = base.nodes.get(&d_id).map(location).unwrap_or(Value::Null);
         let t_loc = team.nodes.get(&d_id).map(location).unwrap_or(Value::Null);
         let d_loc = draft.nodes.get(&d_id).map(location).unwrap_or(Value::Null);
-        let locations = |out: &DocumentState| -> Vec<_> {
-            cycle
-                .iter()
-                .map(|id| out.nodes.get(id).map(location))
-                .collect()
-        };
-        let before = locations(out);
         let conflict = Conflict {
             key: key.clone(),
             node_id: d_id.clone(),
@@ -327,6 +318,21 @@ fn validate_merged_tree(
             team: t_loc,
             draft: d_loc,
         };
+        if passes > max_passes {
+            // Every pass may change a location yet alternate between cycles.
+            // A resolution is not successful while any parent cycle remains.
+            if !conflicts.iter().any(|c| c.key == key) {
+                conflicts.push(conflict);
+            }
+            break;
+        }
+        let locations = |out: &DocumentState| -> Vec<_> {
+            cycle
+                .iter()
+                .map(|id| out.nodes.get(id).map(location))
+                .collect()
+        };
+        let before = locations(out);
 
         match resolutions.get(&key).map(String::as_str) {
             Some("draft") => {
@@ -1082,6 +1088,59 @@ mod tests {
             crate::materializer::apply_payload(&mut draft_applied, op).unwrap();
         }
         assert!(find_parent_cycle(&draft_applied).is_none());
+    }
+
+    #[test]
+    fn incompatible_cycle_resolutions_remain_conflicted() {
+        let mut base = state();
+        for (id, parent) in [("a", "b"), ("b", "root"), ("c", "b")] {
+            let mut node = base.nodes[&NodeId("root".into())].clone();
+            node.id = NodeId(id.into());
+            node.node_type = "section".into();
+            node.parent_id = Some(NodeId(parent.into()));
+            base.nodes.insert(node.id.clone(), node);
+        }
+        let mut team = base.clone();
+        for (id, parent) in [("a", "c"), ("b", "c"), ("c", "root")] {
+            team.nodes.get_mut(&NodeId(id.into())).unwrap().parent_id = Some(NodeId(parent.into()));
+        }
+        let mut draft = base.clone();
+        draft.nodes.get_mut(&NodeId("c".into())).unwrap().parent_id = Some(NodeId("a".into()));
+        for input in [&base, &team, &draft] {
+            assert!(find_parent_cycle(input).is_none());
+        }
+
+        // Keeping a at team's location while taking c from draft alternates
+        // between a -> c -> a and a -> b -> c -> a. Every pass changes
+        // something, so the no-progress guard alone cannot stop this safely.
+        let mut resolutions = BTreeMap::from([
+            ("a:$location".into(), "team".into()),
+            ("c:$location".into(), "draft".into()),
+            ("c:$block".into(), "draft".into()),
+        ]);
+        for merge_fn in [merge, merge_strict] {
+            let plan = merge_fn(&base, &team, &draft, &resolutions);
+            assert!(find_parent_cycle(&plan.state).is_some());
+            assert!(
+                !plan.conflicts.is_empty(),
+                "a remaining cycle must never be returned as a clean merge"
+            );
+            assert!(plan.conflicts.iter().all(|c| c.field == "$location"));
+        }
+
+        // A compatible choice still resolves normally and emits applicable ops.
+        resolutions.insert("a:$location".into(), "draft".into());
+        for merge_fn in [merge, merge_strict] {
+            let plan = merge_fn(&base, &team, &draft, &resolutions);
+            assert!(plan.conflicts.is_empty());
+            assert!(find_parent_cycle(&plan.state).is_none());
+            let mut applied = team.clone();
+            for op in &plan.ops {
+                crate::ops::validate_op(&applied, op).unwrap();
+                crate::materializer::apply_payload(&mut applied, op).unwrap();
+            }
+            assert_eq!(applied, plan.state);
+        }
     }
 
     #[test]
