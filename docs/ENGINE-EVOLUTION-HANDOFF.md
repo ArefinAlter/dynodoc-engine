@@ -1,5 +1,38 @@
 # Engine evolution handoff
 
+## Source: mixed parent-cycle resolutions (17 October 2026)
+
+Engine source commit `1d65d5d` follows PR #14 head `c46d13b` on branch
+`merge-parent-cycles`, based on main `7b7edde`. No application port or deployment
+was made.
+
+A valid base/team/draft can produce alternating parent cycles when one location
+chooses team and another chooses draft. Every pass changes a location, so the
+existing no-progress check does not catch this. The old pass limit returned a
+cyclic state with no conflict. The limit now retains a `$location` conflict;
+ordinary and strict merges both require a compatible choice before application.
+
+The regression `incompatible_cycle_resolutions_remain_conflicted` failed on the
+submitted code, then passed with this fix. It also checks that compatible choices
+emit operations accepted by `validate_op` and replay to the planned state.
+
+Validation: all 13 workspace-merge unit tests, `task lint`, `task test` and
+`task docs` pass. The complete workspace run passed 525 tests with zero failures;
+one compression measurement is intentionally ignored. The SSE timing test passed.
+Tests used a fresh disposable PostgreSQL 16 container on loopback port 55419;
+that container was stopped and removed after validation. Task 3.54.0 was downloaded
+under `/tmp/dynodoc-pr14-tools`; test output is `/tmp/dynodoc-pr14-test.log`.
+No hosted database, credentials or user documents were used.
+
+Compatibility: no migrations, API schemas, event bytes, historical readers or
+hashes change. A conflicted preview may still contain a cycle. The existing
+node-count pass budget remains; this does not establish a latency bound or
+complete convergence. The new behavior rejects a previously falsely clean plan.
+
+Next: carry this follow-up through the dependent merge stack and validate the
+combined source before merging. The earlier green CI on `c46d13b` does not cover
+this follow-up; a fresh PR check is required. No merge or deployment is recorded.
+
 ## Source: engine PR integration (15 October 2026)
 
 Reviewed all 24 open standalone-engine PRs. Fourteen were merged through one integration PR
