@@ -201,7 +201,7 @@ pub fn merge(
     out.removed_choices
         .retain(|id| out.nodes.get(id).is_some_and(|n| n.deleted));
     validate_merged_tree(&base, &team, &draft, &mut out, &mut conflicts, resolutions);
-    let ops = diff(&team, &out);
+    let ops = diff_for_merge(&team, &out, &mut conflicts);
     MergePlan {
         state: out,
         conflicts,
@@ -222,7 +222,7 @@ pub fn merge_strict(
     let mut plan = merge(base, team, draft, resolutions);
     let canonical_team = canonical(team);
     let canonical_draft = canonical(draft);
-    let touched: BTreeSet<NodeId> = diff(base, draft)
+    let touched: BTreeSet<NodeId> = diff_for_merge(base, draft, &mut plan.conflicts)
         .iter()
         .filter_map(|op| op.target_node_id().cloned())
         .collect();
@@ -264,7 +264,7 @@ pub fn merge_strict(
         &mut plan.conflicts,
         resolutions,
     );
-    plan.ops = diff(team, &plan.state);
+    plan.ops = diff_for_merge(team, &plan.state, &mut plan.conflicts);
     plan
 }
 
@@ -697,7 +697,49 @@ fn depths(state: &DocumentState) -> BTreeMap<NodeId, usize> {
     }
     depths
 }
-pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
+/// A requested state cannot be represented by the supported event vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DiffError {
+    #[error("node {node_id} has unsupported type {node_type:?}")]
+    UnsupportedNodeType { node_id: NodeId, node_type: String },
+    #[error("node {node_id} cannot change type from {before:?} to {after:?}")]
+    NodeTypeChanged {
+        node_id: NodeId,
+        before: String,
+        after: String,
+    },
+}
+
+fn diff_for_merge(
+    from: &DocumentState,
+    to: &DocumentState,
+    conflicts: &mut Vec<Conflict>,
+) -> Vec<EventPayload> {
+    match diff(from, to) {
+        Ok(ops) => ops,
+        Err(
+            DiffError::UnsupportedNodeType { node_id, .. }
+            | DiffError::NodeTypeChanged { node_id, .. },
+        ) => {
+            let key = format!("{}:$node", node_id.0);
+            if !conflicts.iter().any(|c| c.key == key) {
+                conflicts.push(Conflict {
+                    key,
+                    node_id: node_id.clone(),
+                    field: "$node".into(),
+                    ancestor: Value::Null,
+                    team: value(from.nodes.get(&node_id)),
+                    draft: value(to.nodes.get(&node_id)),
+                });
+            }
+            Vec::new()
+        }
+    }
+}
+
+/// Build semantic operations without silently omitting unsupported new node types.
+/// Errors return no partial operation list. Historical readers are unchanged.
+pub fn diff(from: &DocumentState, to: &DocumentState) -> Result<Vec<EventPayload>, DiffError> {
     let from = canonical(from);
     let to = canonical(to);
     let mut result = Vec::new();
@@ -734,7 +776,14 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
     for n in nodes.into_iter().filter(|n| !n.deleted) {
         let prior = from.nodes.get(&n.id);
         if prior.is_none() {
-            if let Ok(node_type) = n.node_type.parse() {
+            {
+                let node_type =
+                    n.node_type
+                        .parse()
+                        .map_err(|_| DiffError::UnsupportedNodeType {
+                            node_id: n.id.clone(),
+                            node_type: n.node_type.clone(),
+                        })?;
                 let mut fields = n.current_fields.clone();
                 let var_name = if name_later(n) {
                     fields.as_object_mut().map(|f| f.remove("var_name"));
@@ -754,6 +803,13 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
             continue;
         }
         let p = prior.unwrap();
+        if p.node_type != n.node_type {
+            return Err(DiffError::NodeTypeChanged {
+                node_id: n.id.clone(),
+                before: p.node_type.clone(),
+                after: n.node_type.clone(),
+            });
+        }
         let renamed_later = (p.var_name != n.var_name || p.deleted) && name_later(n);
         if p.parent_id != n.parent_id || p.pos != n.pos {
             result.push(EventPayload::NodeMoved {
@@ -906,7 +962,7 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
     }
     unlocks.extend(content);
     unlocks.extend(locks);
-    unlocks
+    Ok(unlocks)
 }
 /// Extends a selection of changed nodes with what their operations need to apply:
 /// a parent that `ops` creates, restores or moves into place, and the children
@@ -967,6 +1023,69 @@ pub fn with_dependencies<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_rejects_unknown_new_node_without_returning_partial_ops() {
+        let from = state();
+        let mut to = from.clone();
+        let mut node = to.nodes[&NodeId("root".into())].clone();
+        node.id = NodeId("future".into());
+        node.parent_id = Some(NodeId("root".into()));
+        node.node_type = "future-widget".into();
+        to.nodes.insert(node.id.clone(), node);
+        to.nodes
+            .get_mut(&NodeId("root".into()))
+            .unwrap()
+            .current_fields["a"] = json!(2);
+        assert_eq!(
+            diff(&from, &to),
+            Err(DiffError::UnsupportedNodeType {
+                node_id: NodeId("future".into()),
+                node_type: "future-widget".into(),
+            })
+        );
+        for strict in [false, true] {
+            let plan = if strict {
+                merge_strict(&from, &from, &to, &BTreeMap::new())
+            } else {
+                merge(&from, &from, &to, &BTreeMap::new())
+            };
+            assert!(plan.ops.is_empty());
+            assert!(plan.conflicts.iter().any(|c| c.key == "future:$node"));
+        }
+    }
+
+    #[test]
+    fn unknown_unchanged_historical_type_does_not_block_supported_edits() {
+        let mut from = state();
+        from.nodes
+            .get_mut(&NodeId("root".into()))
+            .unwrap()
+            .node_type = "historical".into();
+        let mut to = from.clone();
+        to.nodes
+            .get_mut(&NodeId("root".into()))
+            .unwrap()
+            .current_fields["a"] = json!(2);
+        let ops = diff(&from, &to).unwrap();
+        assert_eq!(ops.len(), 1);
+        for op in ops {
+            crate::materializer::apply_payload(&mut from, &op).unwrap();
+        }
+        assert_eq!(from, to);
+    }
+
+    #[test]
+    fn diff_rejects_unrepresentable_type_change() {
+        let from = state();
+        let mut to = from.clone();
+        to.nodes.get_mut(&NodeId("root".into())).unwrap().node_type = "clause".into();
+        assert!(matches!(
+            diff(&from, &to),
+            Err(DiffError::NodeTypeChanged { .. })
+        ));
+    }
+
     #[test]
     fn cached_depths_match_legacy_order_for_cycles_missing_parents_and_deep_trees() {
         fn legacy(state: &DocumentState, node: &MaterializedNode) -> usize {
@@ -1055,7 +1174,7 @@ mod tests {
         );
         let apply = |from: &DocumentState, to: &DocumentState| {
             let mut state = from.clone();
-            for op in diff(from, to) {
+            for op in diff(from, to).unwrap() {
                 authorize(Role::Author, &op, &state).unwrap();
                 crate::materializer::apply_payload(&mut state, &op).unwrap();
             }
@@ -1195,7 +1314,7 @@ mod tests {
             .unwrap()
             .deleted = true;
         assert!(
-            matches!(&diff(&deleted,&b)[0],EventPayload::NodeRestored{node_id} if node_id.0=="root")
+            matches!(&diff(&deleted,&b).unwrap()[0],EventPayload::NodeRestored{node_id} if node_id.0=="root")
         );
     }
 
@@ -1237,7 +1356,7 @@ mod tests {
             .get_mut(&NodeId("moved".into()))
             .unwrap()
             .parent_id = Some(NodeId("section".into()));
-        let ops = diff(&team, &target);
+        let ops = diff(&team, &target).unwrap();
         for (selected, expected) in [
             ("child", vec!["child", "section"]),
             ("moved", vec!["moved", "section"]),
@@ -2082,7 +2201,7 @@ mod tests {
         };
         let apply = |from: &DocumentState, to: &DocumentState| {
             let mut state = from.clone();
-            for op in diff(from, to) {
+            for op in diff(from, to).unwrap() {
                 crate::ops::validate_op(&state, &op).unwrap();
                 crate::materializer::apply_payload(&mut state, &op).unwrap();
             }
@@ -2144,7 +2263,7 @@ mod tests {
         };
         let apply = |from: &DocumentState, to: &DocumentState| {
             let mut state = from.clone();
-            for op in diff(from, to) {
+            for op in diff(from, to).unwrap() {
                 crate::ops::validate_op(&state, &op).unwrap();
                 crate::materializer::apply_payload(&mut state, &op).unwrap();
             }

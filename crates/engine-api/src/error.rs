@@ -21,6 +21,14 @@ use engine_core::snapshot::SnapshotError;
 
 use crate::auth::AuthError;
 
+impl From<engine_core::workspace_merge::DiffError> for ApiError {
+    fn from(error: engine_core::workspace_merge::DiffError) -> Self {
+        Self::Conflict {
+            reason: error.to_string(),
+        }
+    }
+}
+
 /// The error code of a response, for counting ([`crate::counters`]).
 #[derive(Clone, Copy)]
 pub struct ErrorCode(pub &'static str);
