@@ -31,6 +31,9 @@ Member settings, metadata and draft saves now succeed when canonical history doe
 content reads and review transitions still return `replay_failed`
 ([HISTORY-RECOVERY.md](HISTORY-RECOVERY.md)). Deleted blocks may be moved and renamed (not edited)
 so a restore can bring them back elsewhere.
+Siblings with exactly equal position keys may render in a different order in a shared link than
+in the owner's view, because a public copy lists blocks by pseudonym and the viewer breaks ties by
+list order; the viewer does not sort by id.
 
 **Held: #39.** It flips insert runs that do not interleave, loses deleted or moved siblings as
 separators and grows keys on every pull, and its "team run first" rule contradicts the
