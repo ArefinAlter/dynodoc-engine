@@ -242,7 +242,7 @@ async fn unreplayable_log_returns_specific_error(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn requests_that_leave_the_content_alone_skip_the_replay(pool: PgPool) {
+async fn content_neutral_settings_skip_replay_but_review_transitions_fail_closed(pool: PgPool) {
     let router = app(test_state(pool.clone()));
     let actor = seed_identity(&pool, "no-replay@example.test").await;
     let owner = bearer(actor);
@@ -258,6 +258,17 @@ async fn requests_that_leave_the_content_alone_skip_the_replay(pool: PgPool) {
     .await;
     let draft = format!("/documents/{doc}/drafts/{}", draft["id"].as_str().unwrap());
     let request = draft.replace("/drafts/", "/change-requests/");
+    let draft_id: Uuid = draft.rsplit('/').next().unwrap().parse().unwrap();
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!("{draft}/submit"),
+            &owner,
+            &json!({"note":"Before corruption"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let accepted = engine_shared::EventPayload::SuggestionAccepted {
         suggestion_id: "missing".into(),
     };
@@ -283,16 +294,41 @@ async fn requests_that_leave_the_content_alone_skip_the_replay(pool: PgPool) {
             draft.clone(),
             json!({"revision":0,"ops":[{"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}}]}),
         ),
+    ] {
+        let (status, body) = send(&router, auth_post(&uri, &owner, &body)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    }
+    // Review state must not advance when nobody can reconstruct the content being
+    // submitted, reviewed or closed.
+    for (uri, body) in [
         (format!("{draft}/submit"), json!({"note":"Ready"})),
         (
             format!("{request}/reviews"),
             json!({"verdict":"commented","note":"Noted"}),
         ),
+        (format!("{request}/reviews"), json!({"verdict":"approved"})),
         (format!("{draft}/withdraw"), json!({})),
+        (format!("{request}/decline"), json!({"note":"Declined"})),
     ] {
         let (status, body) = send(&router, auth_post(&uri, &owner, &body)).await;
-        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}: {body}");
+        assert_eq!(body["code"], "replay_failed", "{uri}: {body}");
     }
+    let (note, outcome): (String, Option<String>) =
+        sqlx::query_as("select submission_note,review_outcome from workspace_draft where id=$1")
+            .bind(draft_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(note, "Before corruption");
+    assert!(outcome.is_none());
+    let reviews: i64 =
+        sqlx::query_scalar("select count(*) from change_request_review where draft_id=$1")
+            .bind(draft_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reviews, 0);
     // Reading the content still replays it.
     let (_, body) = send(&router, auth_post_get(&format!("/documents/{doc}"), &owner)).await;
     assert_eq!(body["code"], "replay_failed", "{body}");

@@ -102,10 +102,11 @@ the content state and chain anchor refer to the requested revision.
 
 ## A document whose history no longer replays
 
-Reads of its current state and content writes fail with `replay_failed`, naming the
-document and the first event that does not apply; the admin overview counts them by
-error code. Members, title and settings, draft saves and review steps still work.
-Events are never edited or deleted.
+Reads of its current state, content writes and review transitions fail with
+`replay_failed`, naming the document and the first event that does not apply; the
+admin overview counts them by error code. Member access, title and settings, and
+private draft saves still work, but a request cannot be submitted, reviewed or
+closed while its content cannot be reconstructed. Events are never edited or deleted.
 
 1. Confirm it with `engine-cli verify DOC`, which replays from the first event and
    names the failing seq N.

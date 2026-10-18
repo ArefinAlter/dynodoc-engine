@@ -624,8 +624,8 @@ async fn close_request(
     if note.len() > 4000 {
         return Err(bad("Keep the note under 4,000 characters"));
     }
-    let (mut tx, role) =
-        apply::begin_write_locked(state, DocumentId(id), IdentityId(auth.identity_id)).await?;
+    let (mut tx, role, _) =
+        apply::begin_write(state, DocumentId(id), IdentityId(auth.identity_id)).await?;
     let request = request_row(&mut tx, id, draft, auth.identity_id).await?;
     let mine = request["mine"] == true;
     if (outcome == "declined" && role != Role::Author) || (outcome == "withdrawn" && !mine) {
@@ -705,8 +705,8 @@ async fn submit(
     if req.note.len() > 4000 {
         return Err(bad("Keep the description under 4,000 characters"));
     }
-    let (mut tx, role) =
-        apply::begin_write_locked(&state, DocumentId(id), IdentityId(auth.identity_id)).await?;
+    let (mut tx, role, _) =
+        apply::begin_write(&state, DocumentId(id), IdentityId(auth.identity_id)).await?;
     if role == Role::Auditor {
         return Err(ApiError::Forbidden);
     }
@@ -765,8 +765,8 @@ async fn review(
     if req.verdict != "approved" && req.note.trim().is_empty() {
         return Err(bad("Add a note explaining what should change"));
     }
-    let (mut tx, _) =
-        apply::begin_write_locked(&state, DocumentId(id), IdentityId(auth.identity_id)).await?;
+    let (mut tx, _, _) =
+        apply::begin_write(&state, DocumentId(id), IdentityId(auth.identity_id)).await?;
     let request = request_row(&mut tx, id, draft, auth.identity_id).await?;
     if request["status"] != "open" || request["submitted_at"].is_null() {
         return Err(ApiError::Conflict {
