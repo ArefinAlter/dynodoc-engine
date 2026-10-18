@@ -1,63 +1,50 @@
 # Engine evolution handoff
 
-## PR #37: Skip canonical replay for member settings, metadata and draft saves (18 October 2026, source only)
+## Source: engine PR integration and dependency migrations (18 October 2026)
 
-Source: `2f03a8a`, based on engine `7b7edde`.
-Member settings, document metadata and private draft saves take the existing
-document/project locks and role checks without reconstructing canonical state that these
-handlers discard. Draft operations still decode and validate against their own stored
-base and edits. Submission, review, decline and withdrawal retain their existing
-canonical replay requirement; the regression verifies that replay failure records no
-review or outcome change.
+Reviewed the thirteen open standalone-engine PRs with four independent read-only reviews, then
+merged twelve through one integration PR (merge commits, authors kept): #14, #16, #17 (conflict
+handling for parent cycles, blocks placed in deleted containers and clashing variable names),
+#29 (names freed in the same change), #30 (merge-law property tests), #38 (restore a moved or
+renamed block), #27 (inline atoms in the rich-text merge), #34 (node rows follow the event fold),
+#35 (per-link pseudonyms in public copies), #37 (no canonical replay for member settings,
+metadata and draft saves), and the two dependency PRs #5 (ulid 3) and #22 (axum 0.8), which
+needed code migrations (`Ulid::generate`, brace path parameters, native async extractors).
+#13 was closed by its author. **#39 (keep each side's insert runs together) is held**; see below.
 
-Verification: full workspace suite on isolated loopback PostgreSQL 16: 522 passed, 0
-## PR #35: Preserve document text while pseudonymizing public node references (18 October 2026, source only)
+Patches added on top of the contributor work, each with a test that fails without it:
 
-Source: `4b6fade`, based on engine `7b7edde`.
-Public copies replace node-map keys, node identities, parents and recognized
-node-reference fields with stable per-link pseudonyms. Literal text and custom object
-keys are preserved even when they equal a real node ID. Regression tests cover both
-semantic preservation and reference consistency.
+| PR | Problem found in review | Fix |
+|---|---|---|
+| #34 | every op read `current_fields` and created blocks did a lookup; property test still accepted the null-field difference | creates skip the lookup, only field edits read fields; the test accepts only the removed-choice marker; hand test for a removed choice that is edited, deleted and restored |
+| #27 | atoms align by position, so a deletion or swap on one side plus an edit on the other moved the edit to a different image | both sides changing the atom at one slot differently is a conflict; a literal U+FFFC is refused |
+| #35 | nested editor `blockId`s and an orphan `parent_id` still carried a real ULID into every link; unlabelled HMAC | those ids get the same pseudonyms; the HMAC input is domain-separated |
+| #14 | a cycle through a draft-new block could not be repaired with "team" | the repair picks a block the team also has |
+| #16 | one scan per orphaned block under the document lock | all blocks in the missing container leave in one pass |
+| #17 | typed names unchecked; rejecting a draft-only block orphaned its children | names must be non-empty, trimmed, at most 128 bytes; the draft-only subtree is removed with it |
+| #14, #16, #17 | contradictory explicit choices ran to the 2N+1 pass budget under the lock | meeting the same repair twice reports the conflict and stops |
+| #30 | random seeds (red runs not reproducible), thin laws, no proof the generator reaches its cases | fixed seed with environment override; identity, label-conflict, determinism and replay laws; coverage floors |
+| #38 | a second nameless restore failed; a restore that kept its name came before its holder's deletion | clearing a name is never a clash; such a restore waits for the holder to leave |
 
-Verification: full workspace suite on isolated loopback PostgreSQL 16: 523 passed, 0
-failed, 1 intentionally ignored compression measurement. Formatting, all-target Clippy
-and Rustdoc with warnings denied passed; generated OpenAPI is unchanged. Task is
-unavailable here; the Taskfile Cargo commands were run directly.
+Behaviour to know. Public-copy node ids change per link (clients must use ids from the response).
+Member settings, metadata and draft saves now succeed when canonical history does not replay;
+content reads and review transitions still return `replay_failed`
+([HISTORY-RECOVERY.md](HISTORY-RECOVERY.md)). Deleted blocks may be moved and renamed (not edited)
+so a restore can bring them back elsewhere.
 
-Compatibility and limits: No schema, migration, event-reader or OpenAPI change. Member
-settings, metadata and draft saves can succeed when canonical history cannot replay.
-Content reads and review transitions continue returning replay_failed.
-HISTORY-RECOVERY.md documents this boundary and recovery through the last readable
-revision.
-Private-application synchronization and deployment have not been performed. Review and
-merge remain pending.
-## PR #34: node projection and batch rollback (18 October 2026, source only)
+**Held: #39.** It flips insert runs that do not interleave, loses deleted or moved siblings as
+separators and grows keys on every pull, and its "team run first" rule contradicts the
+documented tie-break (order same-position inserts by node id and mark them for review). It needs
+a design decision and fixes before it can merge.
 
-Source: `7931f4e`, following `709dc5b`; based on engine `7b7edde`.
-Node rows follow the event fold within the document scope. Missing projection rows
-return a server error. The strengthened regression applies a valid field edit before
-a missing-choice failure and checks that both the event append and earlier row edit
-roll back; the row moved to another document remains unchanged.
+**Owner decision still open.** The merge changes (#14 to #17, #21, #27, #38) alter the result of
+`merge` for existing inputs, and `verify_same_file_resolutions` re-runs it for strategy
+`dynodoc.same-file.node-field.v1`. No v3 commits exist in production, so nothing breaks today.
+Before the first v3 commit is created anywhere, either bump the strategy id (the
+[node-conflict design](DESIGN-NODE-CONFLICT-RESOLUTION.md) requires a new id for a different
+algorithm) or freeze merge behaviour.
 
-Verification: workspace suite on isolated loopback PostgreSQL 16: **522 passed,
-0 failed, 1 intentionally ignored compression measurement**. After extending the
-batch-rollback assertions, that regression passed again. Formatting, Clippy across
-all targets and Rustdoc with warnings denied passed; generated OpenAPI is unchanged.
-Task is unavailable here; the commands from Taskfile were run directly.
-
-Compatibility: no migration, schema or event-reader change. New null fields follow
-replay's `{"value":null}` representation; historical rows retain their documented
-encoding difference. Removed choices retain the table's deleted-flag encoding.
-Private-application synchronization, production-copy rehearsal and deployment have
-not been performed. Review and merge remain pending.
-Compatibility and limits: No schema, migration, event-reader or OpenAPI change.
-Public-copy IDs change, so consumers must use IDs from the public response. This is a
-projection over recognized reference fields, not a generalized scrubber of arbitrary
-content or an anonymity guarantee against a token holder who already knows candidate
-IDs. Unknown reference encodings require explicit format support. The private
-public-view client and browser acceptance have not been exercised here.
-Private-application synchronization and deployment have not been performed. Review and
-merge remain pending.
+Not deployed. Production runs the schema 41 release; none of these changes alter the schema.
 
 ## Source: engine PR integration (15 October 2026)
 

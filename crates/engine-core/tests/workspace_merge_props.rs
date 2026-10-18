@@ -173,7 +173,7 @@ fn config() -> ProptestConfig {
         .unwrap_or(1000);
     let mut config = ProptestConfig::with_cases(cases);
     if std::env::var_os("PROPTEST_RNG_SEED").is_none() {
-        config.rng_seed = RngSeed::Fixed(0x6d65_7267_65);
+        config.rng_seed = RngSeed::Fixed(0x6d65_7267_6500);
     }
     config.failure_persistence = None;
     config
