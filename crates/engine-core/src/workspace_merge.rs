@@ -93,6 +93,28 @@ pub fn merge(
     draft: &DocumentState,
     resolutions: &BTreeMap<String, String>,
 ) -> MergePlan {
+    merge_impl(base, team, draft, resolutions, true)
+}
+
+/// Signed-v1 convergence uses state, not event plans. Preserve its historical
+/// state/conflict behavior instead of introducing new diff-validation gates.
+/// This freezes only this increment, not other outstanding strategy revisions.
+pub(crate) fn merge_for_signed_v1(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    resolutions: &BTreeMap<String, String>,
+) -> MergePlan {
+    merge_impl(base, team, draft, resolutions, false)
+}
+
+fn merge_impl(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    resolutions: &BTreeMap<String, String>,
+    build_event_plan: bool,
+) -> MergePlan {
     let base = canonical(base);
     let team = canonical(team);
     let draft = canonical(draft);
@@ -108,7 +130,9 @@ pub fn merge(
         // be silently merged by treating the deleted flag as an independent field.
         if b.is_none()
             || t.is_none()
-            || b.is_some_and(|b| b.deleted != d.deleted || b.node_type != d.node_type)
+            || b.is_some_and(|b| {
+                b.deleted != d.deleted || (build_event_plan && b.node_type != d.node_type)
+            })
             || t.zip(b).is_some_and(|(t, b)| t.deleted != b.deleted)
         {
             let picked = select(
@@ -201,7 +225,11 @@ pub fn merge(
     out.removed_choices
         .retain(|id| out.nodes.get(id).is_some_and(|n| n.deleted));
     validate_merged_tree(&base, &team, &draft, &mut out, &mut conflicts, resolutions);
-    let ops = diff_for_merge(&base, &team, &out, &mut conflicts);
+    let ops = if build_event_plan {
+        diff_for_merge(&base, &team, &out, &mut conflicts)
+    } else {
+        Vec::new()
+    };
     MergePlan {
         state: out,
         conflicts,

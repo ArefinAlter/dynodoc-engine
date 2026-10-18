@@ -173,7 +173,7 @@ fn merge_states(base: &DocumentState, team: &DocumentState, draft: &DocumentStat
         }
     }
     let team = adjusted.as_ref().unwrap_or(team);
-    let plan = workspace_merge::merge(base, team, draft, &BTreeMap::new());
+    let plan = workspace_merge::merge_for_signed_v1(base, team, draft, &BTreeMap::new());
     conflicts.extend(plan.conflicts.into_iter().map(|c| RawConflict {
         node: Some(c.node_id),
         field: c.field,
@@ -377,6 +377,25 @@ impl LocalRepository {
 mod tests {
     use super::*;
     use crate::materializer::{CommentState, MaterializedNode, SuggestionState};
+
+    #[test]
+    fn signed_v1_does_not_inherit_new_event_diff_validation() {
+        let base = document(vec![node("p", plain("base", "note"))]);
+        let team = document(vec![node("p", plain("edited", "note"))]);
+        let mut future = node("future", json!({}));
+        future.node_type = "future-widget".into();
+        let mut draft = base.clone();
+        draft.nodes.insert(future.id.clone(), future.clone());
+        for (left, right) in [(&team, &draft), (&draft, &team)] {
+            let result = merge_states(&base, left, right);
+            assert!(result.conflicts.is_empty());
+            assert_eq!(result.state.nodes[&future.id], future);
+            assert_eq!(field(&result.state, "p", "label"), "edited");
+        }
+        let checked = workspace_merge::merge(&base, &team, &draft, &BTreeMap::new());
+        assert!(!checked.conflicts.is_empty());
+        assert!(checked.ops.is_empty());
+    }
 
     fn node(id: &str, fields: Value) -> MaterializedNode {
         MaterializedNode {
