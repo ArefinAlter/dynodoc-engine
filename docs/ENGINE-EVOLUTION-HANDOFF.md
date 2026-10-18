@@ -1,5 +1,27 @@
 # Engine evolution handoff
 
+## PR #35: Preserve document text while pseudonymizing public node references (18 October 2026, source only)
+
+Source: `4b6fade`, based on engine `7b7edde`.
+Public copies replace node-map keys, node identities, parents and recognized
+node-reference fields with stable per-link pseudonyms. Literal text and custom object
+keys are preserved even when they equal a real node ID. Regression tests cover both
+semantic preservation and reference consistency.
+
+Verification: full workspace suite on isolated loopback PostgreSQL 16: 523 passed, 0
+failed, 1 intentionally ignored compression measurement. Formatting, all-target Clippy
+and Rustdoc with warnings denied passed; generated OpenAPI is unchanged. Task is
+unavailable here; the Taskfile Cargo commands were run directly.
+
+Compatibility and limits: No schema, migration, event-reader or OpenAPI change.
+Public-copy IDs change, so consumers must use IDs from the public response. This is a
+projection over recognized reference fields, not a generalized scrubber of arbitrary
+content or an anonymity guarantee against a token holder who already knows candidate
+IDs. Unknown reference encodings require explicit format support. The private
+public-view client and browser acceptance have not been exercised here.
+Private-application synchronization and deployment have not been performed. Review and
+merge remain pending.
+
 ## Source: engine PR integration (15 October 2026)
 
 Reviewed all 24 open standalone-engine PRs. Fourteen were merged through one integration PR
