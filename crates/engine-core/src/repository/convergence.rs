@@ -173,7 +173,7 @@ fn merge_states(base: &DocumentState, team: &DocumentState, draft: &DocumentStat
         }
     }
     let team = adjusted.as_ref().unwrap_or(team);
-    let plan = workspace_merge::merge(base, team, draft, &BTreeMap::new());
+    let plan = workspace_merge::merge_for_signed_v1(base, team, draft, &BTreeMap::new());
     conflicts.extend(plan.conflicts.into_iter().map(|c| RawConflict {
         node: Some(c.node_id),
         field: c.field,
@@ -457,6 +457,33 @@ mod tests {
             assert_eq!((&a.left, &a.right), (&b.right, &b.left));
         }
         forward
+    }
+
+    #[tokio::test]
+    async fn signed_v1_keeps_original_concurrent_insertion_positions() {
+        let base = document(vec![]);
+        let (mut left, mut right) = (base.clone(), base.clone());
+        for (side, prefix) in [(&mut left, "left"), (&mut right, "right")] {
+            for (suffix, pos) in [("1", "m"), ("2", "n")] {
+                let mut added = node(&format!("{prefix}{suffix}"), plain(prefix, ""));
+                added.pos = pos.into();
+                side.nodes.insert(added.id.clone(), added);
+            }
+        }
+        let report = mirrored(&base, &left, &right).await;
+        assert!(report.clean && report.conflicts.is_empty());
+        let mut expected = left.clone();
+        expected.nodes.extend(right.nodes.clone());
+        assert_eq!(report.merged.as_ref(), Some(&expected));
+        assert_eq!(
+            report.address,
+            Some(state_address(doc_id(), &expected).await.unwrap())
+        );
+
+        // The workspace intentionally offers different ordering. Only a new
+        // signed strategy may adopt that ordering for portable resolutions.
+        let workspace = workspace_merge::merge(&base, &left, &right, &BTreeMap::new());
+        assert_ne!(workspace.state, expected);
     }
 
     #[tokio::test]

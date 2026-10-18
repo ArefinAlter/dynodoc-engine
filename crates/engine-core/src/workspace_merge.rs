@@ -91,6 +91,27 @@ pub fn merge(
     draft: &DocumentState,
     resolutions: &BTreeMap<String, String>,
 ) -> MergePlan {
+    merge_with_insert_ordering(base, team, draft, resolutions, true)
+}
+
+/// Signed v1 same-file resolutions retain their original insertion positions.
+/// Grouping changes state addresses and cannot silently change their verifier.
+pub(crate) fn merge_for_signed_v1(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    resolutions: &BTreeMap<String, String>,
+) -> MergePlan {
+    merge_with_insert_ordering(base, team, draft, resolutions, false)
+}
+
+fn merge_with_insert_ordering(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    resolutions: &BTreeMap<String, String>,
+    group_inserts: bool,
+) -> MergePlan {
     let base = canonical(base);
     let team = canonical(team);
     let draft = canonical(draft);
@@ -189,7 +210,9 @@ pub fn merge(
         }
         out.nodes.insert(id.clone(), n);
     }
-    keep_runs_together(&base, &team, &mut out);
+    if group_inserts {
+        keep_runs_together(&base, &team, &mut out);
+    }
     out.removed_choices
         .retain(|id| out.nodes.get(id).is_some_and(|n| n.deleted));
     let ops = diff(&team, &out);
