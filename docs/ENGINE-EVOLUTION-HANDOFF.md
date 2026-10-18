@@ -1,5 +1,19 @@
 # Engine evolution handoff
 
+## Source proposal: column-ID spreadsheet matching (18 October 2026)
+
+Engine source `eec1006` (base `d675538`) reads row `cell_<id>` fields in the
+parent sheet's optional `column_ids` array order. Without that array, numeric
+`cell_N` behavior stays unchanged. Undeclared cells are excluded when the array
+is present. Fingerprint version 2 requests background reindexing; fingerprint
+normalization and hashes for legacy inputs are unchanged. App/editor adoption of
+this optional metadata is separate; no sheet or historical event is migrated.
+
+Checks: complete serial workspace suite on disposable PostgreSQL 16: **639 passed,
+0 failed, 2 existing measurement/large-tree tests ignored**. Task is unavailable;
+the equivalent Cargo fmt, all-target Clippy, warning-denying rustdoc and generated
+OpenAPI comparison passed. No schema/API format change or deployment.
+
 ## Source: memory-hard key derivation for encrypted key files (18 October 2026)
 
 `dynodoc-key-v1` files written for a passphrase now use Argon2id (RFC 9106, 3 passes, 64 MiB,
