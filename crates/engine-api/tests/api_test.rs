@@ -91,8 +91,8 @@ async fn draft_sharing_remembers_exclusions_until_explicitly_included(pool: PgPo
     let router = app(shared_state);
     let owner = bearer(seed_identity(&pool, "selection@example.test").await);
     let doc = create_document(&router, &owner, "Selections").await;
-    let root = ulid::Ulid::new().to_string();
-    let child = ulid::Ulid::new().to_string();
+    let root = ulid::Ulid::generate().to_string();
+    let child = ulid::Ulid::generate().to_string();
     let (status,result)=send(&router,auth_post(&format!("/documents/{doc}/batch"),&owner,&json!({"base_seq":0,"ops":[
       {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{"label":"Original root"}},
       {"type":"NodeCreated","node_id":child,"node_type":"item","parent_id":root,"pos":"a0","fields":{"label":"Original child","type":"text","name":"question"}}
@@ -172,7 +172,7 @@ async fn sharing_a_new_block_brings_its_new_parent(pool: PgPool) {
     let router = app(test_state(pool.clone()));
     let owner = bearer(seed_identity(&pool, "new-parent@example.test").await);
     let doc = create_document(&router, &owner, "New parents").await;
-    let root = ulid::Ulid::new().to_string();
+    let root = ulid::Ulid::generate().to_string();
     let (status,result)=send(&router,auth_post(&format!("/documents/{doc}/batch"),&owner,&json!({"base_seq":0,"ops":[
       {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{"label":"Root"}}
     ]}))).await;
@@ -187,8 +187,8 @@ async fn sharing_a_new_block_brings_its_new_parent(pool: PgPool) {
     )
     .await;
     let uri = format!("/documents/{doc}/drafts/{}", draft["id"].as_str().unwrap());
-    let section = ulid::Ulid::new().to_string();
-    let child = ulid::Ulid::new().to_string();
+    let section = ulid::Ulid::generate().to_string();
+    let child = ulid::Ulid::generate().to_string();
     let (status,result)=send(&router,auth_post(&uri,&owner,&json!({"revision":0,"ops":[
       {"type":"NodeCreated","node_id":section,"node_type":"section","parent_id":root,"pos":"a0","fields":{"label":"New section"}},
       {"type":"NodeCreated","node_id":child,"node_type":"item","parent_id":section,"pos":"a0","fields":{"label":"New child","type":"text","name":"new_child"}}
@@ -224,7 +224,7 @@ async fn unreplayable_log_returns_specific_error(pool: PgPool) {
     )
     .await
     .unwrap();
-    let root = ulid::Ulid::new().to_string();
+    let root = ulid::Ulid::generate().to_string();
     let (status, body) = send(
         &router,
         auth_post(
@@ -249,7 +249,7 @@ async fn admin_overview_counts_error_responses(pool: PgPool) {
     let actor = seed_identity(&pool, "counters@example.test").await;
     let owner = bearer(actor);
     let doc = create_document(&router, &owner, "Counted").await;
-    let root = ulid::Ulid::new().to_string();
+    let root = ulid::Ulid::generate().to_string();
     let batch = |base_seq: i64| json!({"base_seq":base_seq,"ops":[{"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}}]});
     let uri = format!("/documents/{doc}/batch");
     let (status, body) = send(&router, auth_post(&uri, &owner, &batch(0))).await;
@@ -910,8 +910,8 @@ async fn rich_text_history_replays_compact_edits_and_rejects_stale_patches(pool:
     let owner = seed_identity(&pool, "richtext@example.test").await;
     let token = bearer(owner);
     let doc = create_document(&router, &token, "Research protocol").await;
-    let node = ulid::Ulid::new().to_string();
-    let root = ulid::Ulid::new().to_string();
+    let node = ulid::Ulid::generate().to_string();
+    let root = ulid::Ulid::generate().to_string();
     let content = json!({"type":"paragraph","content":[{"type":"text","text":"Research evidence. ".repeat(1200)}]});
     let (status, _) = send(&router, auth_post(&format!("/documents/{doc}/batch"), &token, &json!({"base_seq":0,"ops":[{"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a","fields":{}},{"type":"NodeCreated","node_id":node,"node_type":"item","parent_id":root,"pos":"a","fields":{"content":content,"label":engine_core::richtext::plain_text(&content)}}]}))).await;
     assert_eq!(status, StatusCode::OK);
@@ -975,7 +975,7 @@ async fn node_table_matches_verified_replay(pool: PgPool) {
     let token = bearer(seed_identity(&pool, "author@dynodoc.local").await);
     let doc = create_document(&router, &token, "Projection").await;
     let [root, section, question, notes, empty, keep, drop] =
-        std::array::from_fn(|_| ulid::Ulid::new().to_string());
+        std::array::from_fn(|_| ulid::Ulid::generate().to_string());
     let before = json!({"type":"paragraph","content":[{"type":"text","text":"Plain notes"}]});
     let after =
         json!({"type":"paragraph","content":[{"type":"text","text":"Plain notes, revised"}]});
@@ -1980,7 +1980,7 @@ async fn batch_rolls_back_and_deploy_pins_its_exact_state(pool: PgPool) {
     let owner = seed_identity(&pool, "owner@example.test").await;
     let token = bearer(owner);
     let doc = create_document(&router, &token, "Study").await;
-    let node = engine_shared::NodeId(ulid::Ulid::new().to_string());
+    let node = engine_shared::NodeId(ulid::Ulid::generate().to_string());
     let create = json!({"type":"NodeCreated","node_id":node,"node_type":"form","pos":"a0","fields":{"label":"Study"}});
     let bad = json!({"type":"FieldEdited","node_id":"missing","field":"label","value":"bad"});
     let (status, _) = send(
@@ -2273,7 +2273,7 @@ async fn file_import_batches_can_exceed_the_framework_default_limit(pool: PgPool
     let text = "a".repeat(2 * 1024 * 1024 + 1);
     let (status, response) = send(&router, auth_post(
         &format!("/documents/{doc}/batch"), &token,
-        &json!({"base_seq":0,"ops":[{"type":"NodeCreated","node_id":ulid::Ulid::new().to_string(),"node_type":"form","pos":"a0","fields":{"label":text}}]})
+        &json!({"base_seq":0,"ops":[{"type":"NodeCreated","node_id":ulid::Ulid::generate().to_string(),"node_type":"form","pos":"a0","fields":{"label":text}}]})
     )).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["events"].as_array().unwrap().len(), 1);
@@ -2495,8 +2495,8 @@ async fn office_review_is_private_and_unresolved_changes_cannot_be_published(poo
     let router = app(test_state(pool.clone()));
     let owner = bearer(seed_identity(&pool, "office-privacy@example.org").await);
     let doc = create_document(&router, &owner, "Office review").await;
-    let root = ulid::Ulid::new().to_string();
-    let node = ulid::Ulid::new().to_string();
+    let root = ulid::Ulid::generate().to_string();
+    let node = ulid::Ulid::generate().to_string();
     let content = json!({"type":"paragraph","content":[{"type":"text","text":"Public wording","marks":[{"type":"sourceComment","attrs":{"body":"Private Word comment","author":"Private author"}}]}]});
     let (status, body) = send(&router, auth_post(&format!("/documents/{doc}/batch"), &owner, &json!({"base_seq":0,"ops":[
       {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a","fields":{"fonts":[{"family":"Private font","uploadId":"secret-file"}]}},
@@ -2790,7 +2790,7 @@ async fn corrupt_snapshot_boundaries(pool: PgPool, shared: bool) {
     let owner = bearer(seed_identity(&pool, "snapshot-owner@example.test").await);
     let outsider = bearer(seed_identity(&pool, "snapshot-outsider@example.test").await);
     let doc = create_document(&router, &owner, "Verified history").await;
-    let node = ulid::Ulid::new().to_string();
+    let node = ulid::Ulid::generate().to_string();
     let (status, body) = send(&router, auth_post(&format!("/documents/{doc}/batch"), &owner,
         &json!({"base_seq":0,"ops":[{"type":"NodeCreated","node_id":node,"node_type":"form","pos":"a0","fields":{"label":"Original"}}]}))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
