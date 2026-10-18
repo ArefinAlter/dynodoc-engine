@@ -121,7 +121,8 @@ fn inline(value: &Value, styles: &mut Styles, atoms: bool) -> Option<Vec<Scalar>
         metadata.remove("text");
         let style = styles.intern(Value::Object(metadata));
         for ch in text.chars() {
-            if out.len() == MAX_SCALARS {
+            // A literal object-replacement character would align with an atom.
+            if out.len() == MAX_SCALARS || (atoms && ch == ATOM) {
                 return None;
             }
             out.push(Scalar { ch, style });
@@ -620,6 +621,11 @@ fn merge_inline(base: &Value, team: &Value, draft: &Value) -> Option<Value> {
         for i in cursor..h.start {
             let ts = t[*tm.get(i)?.as_ref()?].style;
             let ds = d[*dm.get(i)?.as_ref()?].style;
+            // Atoms align by position, not identity: if both sides changed the one at
+            // this slot differently they may be different atoms, so never merge them.
+            if b[i].ch == ATOM && ts != b[i].style && ds != b[i].style && ts != ds {
+                return None;
+            }
             let metadata = merge_property(
                 Some(&styles.values[b[i].style]),
                 Some(&styles.values[ts]),
