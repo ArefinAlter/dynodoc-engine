@@ -1148,6 +1148,7 @@ pub struct WorkspaceApi;
 #[cfg(test)]
 mod diff_tests {
     use super::*;
+    use engine_shared::NodeId;
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn unsupported_target_cannot_partially_append_draft_edits(pool: sqlx::PgPool) {
