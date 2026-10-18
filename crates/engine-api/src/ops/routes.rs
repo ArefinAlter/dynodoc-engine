@@ -111,7 +111,10 @@ pub async fn op_node_create(
     Json(req): Json<NodeCreateRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let document_id = DocumentId(id);
-    let node_id = NodeId(req.node_id.unwrap_or_else(|| ulid::Ulid::generate().to_string()));
+    let node_id = NodeId(
+        req.node_id
+            .unwrap_or_else(|| ulid::Ulid::generate().to_string()),
+    );
     let op = EventPayload::NodeCreated {
         node_id,
         node_type: req.node_type,

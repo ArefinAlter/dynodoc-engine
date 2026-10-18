@@ -501,10 +501,11 @@ async fn public_document(
         .collect();
     content["removed_choices"] = json!([]);
     // Every id in the snapshot, hidden ones included, gets a pseudonym below.
-    let ids: Vec<String> = content["nodes"]
+    let mut ids: Vec<String> = content["nodes"]
         .as_object()
         .map(|nodes| nodes.keys().cloned().collect())
         .unwrap_or_default();
+    reference_ids(&content, &mut ids);
     if let Some(nodes) = content.get_mut("nodes").and_then(Value::as_object_mut) {
         for (id, node) in nodes.iter() {
             if node.get("deleted").and_then(Value::as_bool) == Some(true) {
@@ -567,10 +568,49 @@ async fn public_document(
     Ok(Json(json!({"title":title,"kind":kind,"state":content})))
 }
 
-/// A ULID-shaped stand-in for a block id: the first 128 bits of its HMAC.
+/// Identifiers that are not node-map keys but still carry a real id (and its creation
+/// time): a parent the map no longer holds, and ULID-shaped references nested in fields,
+/// such as the `blockId` of a paragraph inside a list. Semantic ids like "intro" stay.
+fn reference_ids(content: &Value, out: &mut Vec<String>) {
+    fn nested(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Array(items) => items.iter().for_each(|item| nested(item, out)),
+            Value::Object(map) => {
+                for (field, item) in map {
+                    match item {
+                        Value::String(id)
+                            if is_node_reference(field) && ulid::Ulid::from_string(id).is_ok() =>
+                        {
+                            out.push(id.clone())
+                        }
+                        _ => nested(item, out),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for node in content
+        .get("nodes")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|nodes| nodes.values())
+    {
+        if let Some(parent) = node["parent_id"].as_str() {
+            out.push(parent.to_owned());
+        }
+        nested(&node["current_fields"], out);
+    }
+}
+
+/// A ULID-shaped stand-in for a block id: the first 128 bits of its HMAC, labelled so the
+/// same key could never produce a tag that means something else.
 fn pseudonym(key: &ring::hmac::Key, id: &str) -> String {
     const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    let tag = ring::hmac::sign(key, id.as_bytes());
+    let tag = ring::hmac::sign(
+        key,
+        &[b"dynodoc.public-node-id\0v1\0".as_slice(), id.as_bytes()].concat(),
+    );
     let bits = u128::from_be_bytes(tag.as_ref()[..16].try_into().unwrap());
     (0..26)
         .rev()
@@ -736,6 +776,36 @@ mod office_public_tests {
         assert_eq!(fields["content"]["content"][0]["text"], "real-row");
         assert_eq!(fields["real-row"], "real-root");
         assert!(state["nodes"].get("real-row").is_none());
+    }
+
+    #[test]
+    fn nested_block_ids_and_orphan_parents_get_pseudonyms_too() {
+        let real = ulid::Ulid::generate().to_string();
+        let orphan_parent = ulid::Ulid::generate().to_string();
+        let mut state = json!({"nodes": {
+            "root": {"id":"root", "parent_id":orphan_parent, "current_fields":{
+                "content":{"type":"bulletList","content":[
+                    {"type":"paragraph","attrs":{"blockId":real},"content":[{"type":"text","text":real}]},
+                    {"type":"paragraph","attrs":{"blockId":"intro"}}
+                ]}
+            }}
+        }});
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"token");
+        let mut ids = vec!["root".to_owned()];
+        reference_ids(&state, &mut ids);
+        let map: std::collections::HashMap<_, _> = ids
+            .into_iter()
+            .map(|id| (id.clone(), pseudonym(&key, &id)))
+            .collect();
+        replace_node_ids(&mut state, &map);
+        let text = state.to_string();
+        assert!(!text.contains(&orphan_parent), "{text}");
+        let nested = &state["nodes"][&map["root"]]["current_fields"]["content"]["content"];
+        assert_eq!(nested[0]["attrs"]["blockId"], map[&real]);
+        assert_ne!(nested[0]["attrs"]["blockId"], real);
+        // Prose that equals the id, and non-ULID semantic ids, are left alone.
+        assert_eq!(nested[0]["content"][0]["text"], real);
+        assert_eq!(nested[1]["attrs"]["blockId"], "intro");
     }
 
     #[test]

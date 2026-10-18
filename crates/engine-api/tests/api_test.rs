@@ -2771,7 +2771,7 @@ async fn public_copy_pseudonymizes_structural_ids_without_changing_content(pool:
     let router = app(test_state(pool.clone()));
     let owner = bearer(seed_identity(&pool, "pseudonyms@example.org").await);
     let doc = create_document(&router, &owner, "Pseudonyms").await;
-    let [root, row, gone] = std::array::from_fn(|_| ulid::Ulid::new().to_string());
+    let [root, row, gone] = std::array::from_fn(|_| ulid::Ulid::generate().to_string());
     let content = json!({"type":"paragraph","attrs":{"blockId":row},"content":[{"type":"text","text":"Row"}]});
     let (status, body) = send(&router, auth_post(&format!("/documents/{doc}/batch"), &owner, &json!({"base_seq":0,"ops":[
       {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a","fields":{"sheet_layout":{"merges":[{"fromRow":row,"toRow":gone}]}}},
