@@ -201,7 +201,7 @@ pub fn merge(
     out.removed_choices
         .retain(|id| out.nodes.get(id).is_some_and(|n| n.deleted));
     validate_merged_tree(&base, &team, &draft, &mut out, &mut conflicts, resolutions);
-    let ops = diff_for_merge(&team, &out, &mut conflicts);
+    let ops = diff_for_merge(&base, &team, &out, &mut conflicts);
     MergePlan {
         state: out,
         conflicts,
@@ -222,7 +222,7 @@ pub fn merge_strict(
     let mut plan = merge(base, team, draft, resolutions);
     let canonical_team = canonical(team);
     let canonical_draft = canonical(draft);
-    let touched: BTreeSet<NodeId> = diff_for_merge(base, draft, &mut plan.conflicts)
+    let touched: BTreeSet<NodeId> = diff_for_merge(base, base, draft, &mut plan.conflicts)
         .iter()
         .filter_map(|op| op.target_node_id().cloned())
         .collect();
@@ -264,7 +264,7 @@ pub fn merge_strict(
         &mut plan.conflicts,
         resolutions,
     );
-    plan.ops = diff_for_merge(team, &plan.state, &mut plan.conflicts);
+    plan.ops = diff_for_merge(base, team, &plan.state, &mut plan.conflicts);
     plan
 }
 
@@ -711,6 +711,7 @@ pub enum DiffError {
 }
 
 fn diff_for_merge(
+    base: &DocumentState,
     from: &DocumentState,
     to: &DocumentState,
     conflicts: &mut Vec<Conflict>,
@@ -727,7 +728,7 @@ fn diff_for_merge(
                     key,
                     node_id: node_id.clone(),
                     field: "$node".into(),
-                    ancestor: Value::Null,
+                    ancestor: value(base.nodes.get(&node_id)),
                     team: value(from.nodes.get(&node_id)),
                     draft: value(to.nodes.get(&node_id)),
                 });
@@ -1086,7 +1087,15 @@ mod tests {
         ));
         let plan = merge(&from, &from, &to, &BTreeMap::new());
         assert!(plan.ops.is_empty());
-        assert!(plan.conflicts.iter().any(|c| c.key == "root:$node"));
+        let conflict = plan
+            .conflicts
+            .iter()
+            .find(|c| c.key == "root:$node")
+            .unwrap();
+        assert_eq!(
+            conflict.ancestor,
+            value(from.nodes.get(&NodeId("root".into())))
+        );
     }
 
     #[test]
