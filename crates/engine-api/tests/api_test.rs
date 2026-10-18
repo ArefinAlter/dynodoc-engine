@@ -1060,13 +1060,44 @@ async fn node_rows_follow_restored_choices_and_report_missing_rows(pool: PgPool)
         .execute(&pool)
         .await
         .unwrap();
-    let removal = json!({"ops":[{"type":"ChoiceRemoved","node_id":question,"choice_id":lost}]});
+    let before: i64 =
+        sqlx::query_scalar("select coalesce(max(seq),0) from event where document_id=$1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let removal = json!({"ops":[
+        {"type":"FieldEdited","node_id":question,"field":"label","value":"Must roll back"},
+        {"type":"ChoiceRemoved","node_id":question,"choice_id":lost}
+    ]});
     let (status, body) = send(&router, auth_post(&uri, &token, &removal)).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     let edit =
         json!({"ops":[{"type":"FieldEdited","node_id":lost,"field":"label","value":"Edited"}]});
     let (status, body) = send(&router, auth_post(&uri, &token, &edit)).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let after: i64 =
+        sqlx::query_scalar("select coalesce(max(seq),0) from event where document_id=$1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(after, before, "projection failures must append no event");
+    let question_fields: Value = sqlx::query_scalar("select current_fields from node where id=$1")
+        .bind(&question)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        question_fields["label"], "Q",
+        "earlier batch writes roll back"
+    );
+    let fields: Value = sqlx::query_scalar("select current_fields from node where id=$1")
+        .bind(&lost)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(fields["label"], "Lost", "another document stays untouched");
 }
 
 fn test_state(pool: PgPool) -> AppState {
