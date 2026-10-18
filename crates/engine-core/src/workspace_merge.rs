@@ -754,7 +754,7 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
             continue;
         }
         let p = prior.unwrap();
-        let renamed_later = p.var_name != n.var_name && name_later(n);
+        let renamed_later = (p.var_name != n.var_name || p.deleted) && name_later(n);
         if p.parent_id != n.parent_id || p.pos != n.pos {
             result.push(EventPayload::NodeMoved {
                 node_id: n.id.clone(),
@@ -2184,5 +2184,59 @@ mod tests {
             apply(&from, &to),
             (false, Some(id("root")), Some("r".into()))
         );
+    }
+
+    #[test]
+    fn restored_blocks_take_back_names_their_holders_have_just_left() {
+        let mut b = state();
+        for (id, var, gone) in [
+            ("w1", "x", false),
+            ("w2", "y", false),
+            ("a", "x", true),
+            ("c", "y", true),
+        ] {
+            block(&mut b, id, "root", Some(var));
+            b.nodes.get_mut(&NodeId(id.into())).unwrap().deleted = gone;
+        }
+        // The draft deletes both holders and restores both blocks under their old names.
+        let mut d = b.clone();
+        for id in ["w1", "w2"] {
+            d.nodes.get_mut(&NodeId(id.into())).unwrap().deleted = true;
+        }
+        for id in ["a", "c"] {
+            d.nodes.get_mut(&NodeId(id.into())).unwrap().deleted = false;
+        }
+        let plan = merge(&b, &b, &d, &BTreeMap::new());
+        assert!(plan.conflicts.is_empty());
+        let end = applied(&b, &plan);
+        let var = |id: &str| end.nodes[&NodeId(id.into())].var_name.clone();
+        assert_eq!((var("a"), var("c")), (Some("x".into()), Some("y".into())));
+        assert!(end.nodes[&NodeId("w1".into())].deleted);
+        assert!(!end.nodes[&NodeId("a".into())].deleted);
+    }
+
+    #[test]
+    fn renaming_a_restored_block_whose_old_name_is_taken_replays() {
+        let mut b = state();
+        block(&mut b, "q", "root", Some("q"));
+        b.nodes.get_mut(&NodeId("q".into())).unwrap().deleted = true;
+        let mut t = b.clone();
+        block(&mut t, "taker", "root", Some("q"));
+        let mut d = b.clone();
+        d.nodes.get_mut(&NodeId("q".into())).unwrap().deleted = false;
+        let plan = merge(&b, &t, &d, &BTreeMap::new());
+        let keys: Vec<_> = plan.conflicts.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, ["q:var_name"]);
+        let plan = merge(
+            &b,
+            &t,
+            &d,
+            &BTreeMap::from([("q:var_name".into(), "q2".into())]),
+        );
+        assert!(plan.conflicts.is_empty());
+        let end = applied(&t, &plan);
+        let q = &end.nodes[&NodeId("q".into())];
+        assert!(!q.deleted);
+        assert_eq!(q.var_name.as_deref(), Some("q2"));
     }
 }
