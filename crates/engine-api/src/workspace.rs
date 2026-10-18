@@ -1144,3 +1144,56 @@ async fn search(
     structure
 ))]
 pub struct WorkspaceApi;
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unsupported_target_cannot_partially_append_draft_edits(pool: sqlx::PgPool) {
+        let mut local = DocumentState::default();
+        apply_payload(
+            &mut local,
+            &EventPayload::NodeCreated {
+                node_id: NodeId("root".into()),
+                node_type: engine_shared::NodeType::Form,
+                parent_id: None,
+                pos: "a0".into(),
+                fields: json!({"label":"before"}),
+                var_name: None,
+            },
+        )
+        .unwrap();
+        let original = local.clone();
+        let mut target = local.clone();
+        target
+            .nodes
+            .get_mut(&NodeId("root".into()))
+            .unwrap()
+            .current_fields["label"] = json!("after");
+        let mut unsupported = target.nodes[&NodeId("root".into())].clone();
+        unsupported.id = NodeId("future".into());
+        unsupported.node_type = "future-widget".into();
+        unsupported.parent_id = Some(NodeId("root".into()));
+        target.nodes.insert(unsupported.id.clone(), unsupported);
+        let mut tx = pool.begin().await.unwrap();
+        let error = carry_into_draft(&mut tx, Uuid::nil(), Uuid::nil(), &mut local, &target)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Conflict { .. }));
+        assert_eq!(
+            local, original,
+            "even the supported first edit must not be applied"
+        );
+        let count: i64 = sqlx::query_scalar("select count(*) from draft_edit")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let count: i64 = sqlx::query_scalar("select count(*) from event")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+}
