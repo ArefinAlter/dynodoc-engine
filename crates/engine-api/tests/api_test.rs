@@ -2560,7 +2560,7 @@ fn public_block<'a>(public: &'a Value, label: &str) -> Option<&'a Value> {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn public_copy_contains_no_real_node_ids(pool: PgPool) {
+async fn public_copy_pseudonymizes_structural_ids_without_changing_content(pool: PgPool) {
     let router = app(test_state(pool.clone()));
     let owner = bearer(seed_identity(&pool, "pseudonyms@example.org").await);
     let doc = create_document(&router, &owner, "Pseudonyms").await;
@@ -2568,7 +2568,7 @@ async fn public_copy_contains_no_real_node_ids(pool: PgPool) {
     let content = json!({"type":"paragraph","attrs":{"blockId":row},"content":[{"type":"text","text":"Row"}]});
     let (status, body) = send(&router, auth_post(&format!("/documents/{doc}/batch"), &owner, &json!({"base_seq":0,"ops":[
       {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a","fields":{"sheet_layout":{"merges":[{"fromRow":row,"toRow":gone}]}}},
-      {"type":"NodeCreated","node_id":row,"node_type":"item","parent_id":root,"pos":"a","fields":{"content":content}},
+      {"type":"NodeCreated","node_id":row,"node_type":"item","parent_id":root,"pos":"a","fields":{"content":content,"literal":row}},
       {"type":"NodeCreated","node_id":gone,"node_type":"item","parent_id":root,"pos":"b","fields":{"label":"Gone"}},
       {"type":"NodeDeleted","node_id":gone}
     ]}))).await;
@@ -2590,10 +2590,11 @@ async fn public_copy_contains_no_real_node_ids(pool: PgPool) {
     let (status, public) = send(&router, get(&path)).await;
     assert_eq!(status, StatusCode::OK);
     let encoded = public.to_string();
-    for id in [&root, &row, &gone] {
+    for id in [&root, &gone] {
         assert!(!encoded.contains(id.as_str()), "{encoded}");
     }
     let nodes = public["state"]["nodes"].as_object().unwrap();
+    assert!(nodes.get(&row).is_none());
     let (row_key, row_node) = nodes
         .iter()
         .find(|(_, n)| n["current_fields"]["label"] == "Row")
@@ -2602,6 +2603,8 @@ async fn public_copy_contains_no_real_node_ids(pool: PgPool) {
         row_node["current_fields"]["content"]["attrs"]["blockId"],
         json!(row_key)
     );
+    // A user's text may happen to equal a real id; it is content, not a reference.
+    assert_eq!(row_node["current_fields"]["literal"], json!(row));
     let root_node = nodes.values().find(|n| n["parent_id"].is_null()).unwrap();
     assert_eq!(
         root_node["current_fields"]["sheet_layout"]["merges"][0]["fromRow"],
