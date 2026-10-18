@@ -1,8 +1,6 @@
 //! Merge laws over random histories. Both sides start from one base and make only
-//! changes an author may make. Two known limits are left out: a side never moves or
-//! renames a block it restored (the restore is checked against the block's old parent
-//! and name), and never takes a name that a block it keeps still held in the base (so
-//! no two names are swapped).
+//! changes an author may make. One known limit is left out: a side never takes a name
+//! that a block it keeps still held in the base (so no two names are swapped).
 use engine_core::{
     governance::{authorize, Role},
     materializer::{apply_payload, DocumentState},
@@ -12,7 +10,7 @@ use engine_core::{
 use engine_shared::{EventPayload, NodeId, NodeType};
 use proptest::{prelude::*, test_runner::RngSeed};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 struct Rng(u64);
 impl Rng {
@@ -101,7 +99,6 @@ fn base(rng: &mut Rng) -> DocumentState {
 
 fn side(rng: &mut Rng, base: &DocumentState, prefix: &str) -> DocumentState {
     let mut state = base.clone();
-    let mut restored = BTreeSet::new();
     let names: Vec<String> = (0..4)
         .map(|i| format!("p{i}"))
         .chain((0..8).map(|i| format!("v{i}")))
@@ -132,17 +129,11 @@ fn side(rng: &mut Rng, base: &DocumentState, prefix: &str) -> DocumentState {
                     free.then_some(name),
                 )
             }
-            1 if !live.is_empty() => {
-                let node = live[rng.below(live.len())].clone();
-                if restored.contains(&node) {
-                    continue;
-                }
-                EventPayload::NodeMoved {
-                    node_id: node,
-                    new_parent_id: Some(containers[rng.below(containers.len())].clone()),
-                    new_pos: format!("m{}", rng.below(4)),
-                }
-            }
+            1 if !live.is_empty() => EventPayload::NodeMoved {
+                node_id: live[rng.below(live.len())].clone(),
+                new_parent_id: Some(containers[rng.below(containers.len())].clone()),
+                new_pos: format!("m{}", rng.below(4)),
+            },
             2 if !live.is_empty() => EventPayload::NodeDeleted {
                 node_id: live[rng.below(live.len())].clone(),
             },
@@ -151,26 +142,20 @@ fn side(rng: &mut Rng, base: &DocumentState, prefix: &str) -> DocumentState {
                 if deleted.is_empty() {
                     continue;
                 }
-                let node = deleted[rng.below(deleted.len())].clone();
-                restored.insert(node.clone());
-                EventPayload::NodeRestored { node_id: node }
+                EventPayload::NodeRestored {
+                    node_id: deleted[rng.below(deleted.len())].clone(),
+                }
             }
             4 if !live.is_empty() => EventPayload::FieldEdited {
                 node_id: live[rng.below(live.len())].clone(),
                 field: "label".into(),
                 value: json!(format!("{prefix}{step}")),
             },
-            5 if !live.is_empty() && free => {
-                let node = live[rng.below(live.len())].clone();
-                if restored.contains(&node) {
-                    continue;
-                }
-                EventPayload::FieldEdited {
-                    node_id: node,
-                    field: "var_name".into(),
-                    value: json!(name),
-                }
-            }
+            5 if !live.is_empty() && free => EventPayload::FieldEdited {
+                node_id: live[rng.below(live.len())].clone(),
+                field: "var_name".into(),
+                value: json!(name),
+            },
             _ => continue,
         };
         apply(&mut state, op);

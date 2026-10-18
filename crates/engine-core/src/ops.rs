@@ -99,14 +99,18 @@ pub fn validate_op(state: &DocumentState, op: &EventPayload) -> Result<(), OpErr
             field,
             value,
         } => {
-            require_live(state, node_id)?;
             if field == "var_name" || field == "varName" {
+                // A deleted block may take the name it comes back with; the restore
+                // checks it.
+                require_present(state, node_id)?;
                 let name = value.as_str().ok_or_else(|| {
                     OpError::InvalidWrappedOp("Variable name must be text".into())
                 })?;
                 if var_name_taken(state, name, Some(node_id)) {
                     return Err(OpError::DuplicateVarName(name.into()));
                 }
+            } else {
+                require_live(state, node_id)?;
             }
             Ok(())
         }
@@ -295,7 +299,8 @@ fn validate_node_moved(
     node_id: &NodeId,
     new_parent_id: Option<&NodeId>,
 ) -> Result<(), OpError> {
-    let node = require_live(state, node_id)?;
+    // A deleted block may move to where it comes back; the restore checks the parent.
+    let node = require_present(state, node_id)?;
     let Some(new_parent_id) = new_parent_id else {
         // Moving to the root: legal only for a root-eligible type.
         let node_type = parse_node_type(&node.node_type);
