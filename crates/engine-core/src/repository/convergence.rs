@@ -482,7 +482,10 @@ mod tests {
 
         // The workspace intentionally offers different ordering. Only a new
         // signed strategy may adopt that ordering for portable resolutions.
-        let workspace = workspace_merge::merge(&base, &left, &right, &BTreeMap::new());
+        let default = workspace_merge::merge(&base, &left, &right, &BTreeMap::new());
+        assert_eq!(default.state, expected);
+        let workspace =
+            workspace_merge::merge_with_grouped_insertions(&base, &left, &right, &BTreeMap::new());
         assert_ne!(workspace.state, expected);
     }
 
