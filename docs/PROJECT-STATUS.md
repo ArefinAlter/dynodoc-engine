@@ -1,5 +1,28 @@
 # Dynodoc: intent, current implementation and remaining work
 
+## PR #37: Skip canonical replay for member settings, metadata and draft saves (18 October 2026, source only)
+
+Source: `2f03a8a`, based on engine `7b7edde`.
+Member settings, document metadata and private draft saves take the existing
+document/project locks and role checks without reconstructing canonical state that these
+handlers discard. Draft operations still decode and validate against their own stored
+base and edits. Submission, review, decline and withdrawal retain their existing
+canonical replay requirement; the regression verifies that replay failure records no
+review or outcome change.
+
+Verification: full workspace suite on isolated loopback PostgreSQL 16: 522 passed, 0
+failed, 1 intentionally ignored compression measurement. Formatting, all-target Clippy
+and Rustdoc with warnings denied passed; generated OpenAPI is unchanged. Task is
+unavailable here; the Taskfile Cargo commands were run directly.
+
+Compatibility and limits: No schema, migration, event-reader or OpenAPI change. Member
+settings, metadata and draft saves can succeed when canonical history cannot replay.
+Content reads and review transitions continue returning replay_failed.
+HISTORY-RECOVERY.md documents this boundary and recovery through the last readable
+revision.
+Private-application synchronization and deployment have not been performed. Review and
+merge remain pending.
+
 ## Source: engine PR integration (15 October 2026)
 
 Reviewed all 24 open standalone-engine PRs. Fourteen were merged through one integration PR
