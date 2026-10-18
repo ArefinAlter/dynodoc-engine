@@ -108,7 +108,7 @@ pub fn merge(
         // be silently merged by treating the deleted flag as an independent field.
         if b.is_none()
             || t.is_none()
-            || b.is_some_and(|b| b.deleted != d.deleted)
+            || b.is_some_and(|b| b.deleted != d.deleted || b.node_type != d.node_type)
             || t.zip(b).is_some_and(|(t, b)| t.deleted != b.deleted)
         {
             let picked = select(
@@ -1084,6 +1084,9 @@ mod tests {
             diff(&from, &to),
             Err(DiffError::NodeTypeChanged { .. })
         ));
+        let plan = merge(&from, &from, &to, &BTreeMap::new());
+        assert!(plan.ops.is_empty());
+        assert!(plan.conflicts.iter().any(|c| c.key == "root:$node"));
     }
 
     #[test]

@@ -270,3 +270,24 @@ impl From<engine_core::shared_checkpoint::Error> for ApiError {
         }
     }
 }
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsupported_diff_is_an_explicit_conflict_response() {
+        let error = engine_core::workspace_merge::DiffError::UnsupportedNodeType {
+            node_id: engine_shared::NodeId("unsupported-node".into()),
+            node_type: "future-widget".into(),
+        };
+        let response = ApiError::from(error).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "conflict");
+        assert!(body["error"].as_str().unwrap().contains("unsupported-node"));
+    }
+}
