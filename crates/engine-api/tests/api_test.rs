@@ -280,7 +280,7 @@ async fn content_neutral_settings_skip_replay_but_review_transitions_fail_closed
     )
     .await
     .unwrap();
-    let root = ulid::Ulid::new().to_string();
+    let root = ulid::Ulid::generate().to_string();
     for (uri, body) in [
         (
             format!("/documents/{doc}/members"),
@@ -1118,7 +1118,7 @@ async fn node_rows_follow_restored_choices_and_report_missing_rows(pool: PgPool)
     let router = app(test_state(pool.clone()));
     let token = bearer(seed_identity(&pool, "rows@example.test").await);
     let doc = create_document(&router, &token, "Rows").await;
-    let [root, question, kept, lost] = std::array::from_fn(|_| ulid::Ulid::new().to_string());
+    let [root, question, kept, lost] = std::array::from_fn(|_| ulid::Ulid::generate().to_string());
     let uri = format!("/documents/{doc}/batch");
     for ops in [
         json!([
@@ -1191,6 +1191,41 @@ async fn node_rows_follow_restored_choices_and_report_missing_rows(pool: PgPool)
         .await
         .unwrap();
     assert_eq!(fields["label"], "Lost", "another document stays untouched");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn removed_choices_stay_consistent_when_edited_deleted_and_restored(pool: PgPool) {
+    use engine_core::projection::{verify_projection, KNOWN_REMOVED_CHOICE};
+    let router = app(test_state(pool.clone()));
+    let token = bearer(seed_identity(&pool, "choices@example.test").await);
+    let doc = create_document(&router, &token, "Choices").await;
+    let [root, question, choice] = std::array::from_fn(|_| ulid::Ulid::generate().to_string());
+    let uri = format!("/documents/{doc}/batch");
+    for (step, op) in [
+        json!({"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}}),
+        json!({"type":"NodeCreated","node_id":question,"node_type":"item","parent_id":root,"pos":"a0","fields":{"label":"Q"}}),
+        json!({"type":"ChoiceAdded","node_id":question,"choice_id":choice,"fields":{"label":"C"}}),
+        json!({"type":"ChoiceRemoved","node_id":question,"choice_id":choice}),
+        json!({"type":"FieldEdited","node_id":choice,"field":"label","value":"Edited after removal"}),
+        json!({"type":"NodeDeleted","node_id":choice}),
+        json!({"type":"NodeRestored","node_id":choice}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, body) = send(&router, auth_post(&uri, &token, &json!({ "ops": [op] }))).await;
+        assert_eq!(status, StatusCode::OK, "step {step}: {body}");
+        // The table may differ from replay only by the known removed-choice marker.
+        let report = verify_projection(&pool, DocumentId(doc)).await.unwrap();
+        assert!(
+            report
+                .differences
+                .iter()
+                .all(|d| d.known == Some(KNOWN_REMOVED_CHOICE)),
+            "step {step}: {:?}",
+            report.differences
+        );
+    }
 }
 
 fn test_state(pool: PgPool) -> AppState {

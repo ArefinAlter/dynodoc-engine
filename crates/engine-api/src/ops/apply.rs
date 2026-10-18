@@ -178,7 +178,8 @@ pub async fn reject_proposal(
 /// so the `event.target_node_id → node(id)` FK holds when the event is inserted. Rows
 /// follow the fold: the op is applied with [`apply_payload`] to the stored rows it
 /// touches, and those rows are written back; a removed choice stays `deleted` in the
-/// table. Suggestion/comment/deploy ops touch no node row.
+/// table. Suggestion/comment/deploy ops touch no node row. The caller must hold the
+/// document writer lock (`begin_write*`); the row lookup does not lock the rows itself.
 pub(crate) async fn materialize_node_change(
     tx: &mut Transaction<'_, Postgres>,
     document_id: DocumentId,
@@ -219,14 +220,32 @@ pub(crate) async fn materialize_node_change(
         Option<String>,
         bool,
     );
-    let rows: Vec<Row> = sqlx::query_as(
-        "select id, parent_id, type, pos, current_fields, var_name, deleted
-         from node where document_id = $1 and id = any($2)",
-    )
-    .bind(document_id.0)
-    .bind(&ids)
-    .fetch_all(&mut **tx)
-    .await?;
+    let created = matches!(
+        op,
+        EventPayload::NodeCreated { .. } | EventPayload::ChoiceAdded { .. }
+    );
+    // Moves, deletes and restores leave the (possibly large) fields untouched, so
+    // they are neither read nor written.
+    let fields = matches!(
+        op,
+        EventPayload::FieldEdited { .. } | EventPayload::RichTextPatched { .. }
+    );
+    // A create has no stored row to fold onto; only field edits read `current_fields`.
+    let rows: Vec<Row> = if created {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "select id, parent_id, type, pos,
+                    case when $3 then current_fields else '{}'::jsonb end,
+                    var_name, deleted
+             from node where document_id = $1 and id = any($2)",
+        )
+        .bind(document_id.0)
+        .bind(&ids)
+        .bind(fields)
+        .fetch_all(&mut **tx)
+        .await?
+    };
     let mut state = DocumentState::default();
     for (id, parent_id, node_type, pos, current_fields, var_name, deleted) in rows {
         state.nodes.insert(
@@ -250,15 +269,6 @@ pub(crate) async fn materialize_node_change(
         },
         _ => ApiError::Internal(e.to_string()),
     })?;
-    let created = matches!(
-        op,
-        EventPayload::NodeCreated { .. } | EventPayload::ChoiceAdded { .. }
-    );
-    // Moves, deletes and restores leave the (possibly large) fields untouched.
-    let fields = matches!(
-        op,
-        EventPayload::FieldEdited { .. } | EventPayload::RichTextPatched { .. }
-    );
     for id in &ids {
         let Some(node) = state.nodes.get(&NodeId(id.clone())) else {
             return Err(ApiError::Internal(format!(
