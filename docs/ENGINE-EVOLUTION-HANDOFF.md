@@ -22,6 +22,25 @@ HISTORY-RECOVERY.md documents this boundary and recovery through the last readab
 revision.
 Private-application synchronization and deployment have not been performed. Review and
 merge remain pending.
+## PR #34: node projection and batch rollback (18 October 2026, source only)
+
+Source: `7931f4e`, following `709dc5b`; based on engine `7b7edde`.
+Node rows follow the event fold within the document scope. Missing projection rows
+return a server error. The strengthened regression applies a valid field edit before
+a missing-choice failure and checks that both the event append and earlier row edit
+roll back; the row moved to another document remains unchanged.
+
+Verification: workspace suite on isolated loopback PostgreSQL 16: **522 passed,
+0 failed, 1 intentionally ignored compression measurement**. After extending the
+batch-rollback assertions, that regression passed again. Formatting, Clippy across
+all targets and Rustdoc with warnings denied passed; generated OpenAPI is unchanged.
+Task is unavailable here; the commands from Taskfile were run directly.
+
+Compatibility: no migration, schema or event-reader change. New null fields follow
+replay's `{"value":null}` representation; historical rows retain their documented
+encoding difference. Removed choices retain the table's deleted-flag encoding.
+Private-application synchronization, production-copy rehearsal and deployment have
+not been performed. Review and merge remain pending.
 
 ## Source: engine PR integration (15 October 2026)
 
