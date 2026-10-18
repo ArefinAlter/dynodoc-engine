@@ -73,7 +73,7 @@ fn select(
         Some("draft") => draft,
         Some("team") => team,
         // Two names for one variable may also be resolved with a new name.
-        Some(name) if field == "var_name" => json!(name),
+        Some(name) if field == "var_name" && is_new_name(name) => json!(name),
         _ => {
             conflicts.push(Conflict {
                 key,
@@ -302,11 +302,14 @@ fn validate_merged_tree(
 ) {
     let max_passes = 2 * out.nodes.len() + 1;
     let mut passes = 0;
+    // Meeting the same repair twice means two explicit choices undo each other, so
+    // the conflict is reported at once instead of looping to the pass budget.
+    let mut seen: BTreeSet<(u8, NodeId, Option<NodeId>)> = BTreeSet::new();
     loop {
         passes += 1;
         let Some(cycle) = find_parent_cycle(out) else {
             let changed = if let Some((child, parent)) = find_orphan(out) {
-                if passes > max_passes {
+                if passes > max_passes || !seen.insert((0, child.clone(), Some(parent.clone()))) {
                     let conflict = orphan_conflict(base, team, draft, &parent);
                     if !conflicts.iter().any(|c| c.key == conflict.key) {
                         conflicts.push(conflict);
@@ -324,7 +327,7 @@ fn validate_merged_tree(
                     &parent,
                 )
             } else if let Some(id) = find_duplicate_var_name(team, out) {
-                if passes > max_passes {
+                if passes > max_passes || !seen.insert((1, id.clone(), None)) {
                     let conflict = var_name_conflict(base, team, draft, &id);
                     if !conflicts.iter().any(|c| c.key == conflict.key) {
                         conflicts.push(conflict);
@@ -345,9 +348,14 @@ fn validate_merged_tree(
         // A valid team tree has no loops, so every loop has such a node, and restoring
         // its location to team's location makes progress toward team's acyclic tree.
         // Mixed explicit choices can undo that progress, so the budget must fail closed.
+        // A cycle through a draft-new node always holds a moved node the team also has;
+        // choose that one, since a node the team lacks has no team location to restore.
+        let moved =
+            |id: &&NodeId| out.nodes.get(*id).map(location) != team.nodes.get(*id).map(location);
         let d_id = cycle
             .iter()
-            .find(|id| out.nodes.get(id).map(location) != team.nodes.get(id).map(location))
+            .find(|id| team.nodes.contains_key(*id) && moved(id))
+            .or_else(|| cycle.iter().find(moved))
             .unwrap_or(&cycle[0])
             .clone();
 
@@ -363,7 +371,7 @@ fn validate_merged_tree(
             team: t_loc,
             draft: d_loc,
         };
-        if passes > max_passes {
+        if passes > max_passes || !seen.insert((2, d_id.clone(), None)) {
             // Every pass may change a location yet alternate between cycles.
             // A resolution is not successful while any parent cycle remains.
             if !conflicts.iter().any(|c| c.key == key) {
@@ -495,13 +503,26 @@ fn resolve_orphan(
             out.removed_choices.remove(&id);
             out.nodes.insert(id, n);
         }
-    } else if let Some(n) = out.nodes.get_mut(child) {
-        match side.nodes.get(child).filter(|s| !s.deleted) {
-            Some(s) => {
-                n.parent_id = s.parent_id.clone();
-                n.pos = s.pos.clone();
+    } else {
+        // Every block placed in the missing container leaves it in this one pass, so
+        // M orphans cost one scan instead of M.
+        let inside: Vec<NodeId> = out
+            .nodes
+            .values()
+            .filter(|n| !n.deleted && n.parent_id.as_ref() == Some(parent))
+            .map(|n| n.id.clone())
+            .collect();
+        for id in inside {
+            let Some(n) = out.nodes.get_mut(&id) else {
+                continue;
+            };
+            match side.nodes.get(&id).filter(|s| !s.deleted) {
+                Some(s) => {
+                    n.parent_id = s.parent_id.clone();
+                    n.pos = s.pos.clone();
+                }
+                None => n.deleted = true,
             }
-            None => n.deleted = true,
         }
     }
     let changed = (
@@ -549,6 +570,14 @@ fn var_name_conflict(
         draft: var_name(draft),
     }
 }
+/// A resolution that is a typed variable name: not a side, not empty, no stray
+/// whitespace, and bounded in length.
+fn is_new_name(name: &str) -> bool {
+    !matches!(name, "team" | "draft")
+        && !name.is_empty()
+        && name.trim() == name
+        && name.len() <= 128
+}
 /// The block keeps the team's version of its name, or is left out when the team
 /// has no such block. A resolution other than "team" or "draft" is a new name. Returns
 /// whether anything changed.
@@ -566,7 +595,7 @@ fn resolve_duplicate_var_name(
     let key = conflict.key.clone();
     let choice = resolutions.get(&key);
     let renamed = choice.filter(|name| {
-        !["team", "draft"].contains(&name.as_str())
+        is_new_name(name)
             && !out
                 .nodes
                 .values()
@@ -583,6 +612,20 @@ fn resolve_duplicate_var_name(
         // emitted operations cannot reproduce. A rejected restore keeps the
         // team's original tombstone and fields.
         let before = out.nodes.remove(id);
+        // Its draft-only children go too; left behind they would become orphans.
+        let mut stack = vec![id.clone()];
+        while let Some(p) = stack.pop() {
+            let kids: Vec<NodeId> = out
+                .nodes
+                .values()
+                .filter(|n| n.parent_id.as_ref() == Some(&p) && !team.nodes.contains_key(&n.id))
+                .map(|n| n.id.clone())
+                .collect();
+            for kid in kids {
+                out.nodes.remove(&kid);
+                stack.push(kid);
+            }
+        }
         if let Some(t) = team.nodes.get(id) {
             out.nodes.insert(id.clone(), t.clone());
         }
@@ -1799,5 +1842,150 @@ mod tests {
         let (keys, _, applied) = check(&b, &t, &d, &[("b:var_name", "team"), ("c:var_name", "z")]);
         assert!(keys.is_empty());
         assert_eq!(var(&applied, "c").as_deref(), Some("z"));
+    }
+
+    /// Applies a plan's operations to the team state and returns the result.
+    fn applied(team: &DocumentState, plan: &MergePlan) -> DocumentState {
+        let mut applied = team.clone();
+        for op in &plan.ops {
+            crate::ops::validate_op(&applied, op).unwrap();
+            crate::materializer::apply_payload(&mut applied, op).unwrap();
+        }
+        applied
+    }
+
+    fn block(s: &mut DocumentState, id: &str, parent: &str, var: Option<&str>) {
+        let mut node = s.nodes[&NodeId("root".into())].clone();
+        node.id = NodeId(id.into());
+        node.node_type = "section".into();
+        node.parent_id = Some(NodeId(parent.into()));
+        node.pos = id.into();
+        node.current_fields = match var {
+            Some(v) => json!({"label": id, "var_name": v}),
+            None => json!({"label": id}),
+        };
+        node.var_name = var.map(str::to_owned);
+        s.nodes.insert(node.id.clone(), node);
+    }
+
+    #[test]
+    fn a_cycle_through_a_draft_new_block_is_fixed_at_a_block_the_team_has() {
+        let mut b = state();
+        for id in ["01M", "01X", "01Y"] {
+            block(&mut b, id, "root", None);
+        }
+        // The team puts X under Y; the draft wraps Y and M in a new group under X.
+        let mut t = b.clone();
+        t.nodes.get_mut(&NodeId("01X".into())).unwrap().parent_id = Some(NodeId("01Y".into()));
+        let mut d = b.clone();
+        block(&mut d, "02N", "01X", None);
+        for id in ["01Y", "01M"] {
+            d.nodes.get_mut(&NodeId(id.into())).unwrap().parent_id = Some(NodeId("02N".into()));
+        }
+        let plan = merge(&b, &t, &d, &BTreeMap::new());
+        let keys: Vec<_> = plan.conflicts.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, ["01Y:$location"]);
+        assert!(find_parent_cycle(&plan.state).is_none());
+        let resolved = merge(
+            &b,
+            &t,
+            &d,
+            &BTreeMap::from([("01Y:$location".into(), "team".into())]),
+        );
+        assert!(resolved.conflicts.is_empty());
+        assert!(find_parent_cycle(&applied(&t, &resolved)).is_none());
+    }
+
+    #[test]
+    fn every_block_placed_in_a_deleted_container_leaves_it_together() {
+        let mut b = state();
+        block(&mut b, "p", "root", None);
+        let mut t = b.clone();
+        t.nodes.get_mut(&NodeId("p".into())).unwrap().deleted = true;
+        let mut d = b.clone();
+        for i in 0..50 {
+            block(&mut d, &format!("c{i:02}"), "p", None);
+        }
+        let plan = merge(&b, &t, &d, &BTreeMap::new());
+        let keys: Vec<_> = plan.conflicts.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, ["p:$node"]);
+        let resolved = merge(
+            &b,
+            &t,
+            &d,
+            &BTreeMap::from([("p:$node".into(), "team".into())]),
+        );
+        assert!(resolved.conflicts.is_empty());
+        let end = applied(&t, &resolved);
+        assert!(end.nodes.values().all(|n| n.deleted || n.id.0 == "root"));
+    }
+
+    #[test]
+    fn a_typed_variable_name_must_be_usable() {
+        let b = state();
+        let mut t = b.clone();
+        block(&mut t, "team_q", "root", Some("q"));
+        let mut d = b.clone();
+        block(&mut d, "draft_q", "root", Some("q"));
+        for bad in ["", " q2", "q2 ", &"x".repeat(129)] {
+            let plan = merge(
+                &b,
+                &t,
+                &d,
+                &BTreeMap::from([("draft_q:var_name".into(), bad.into())]),
+            );
+            let keys: Vec<_> = plan.conflicts.iter().map(|c| c.key.as_str()).collect();
+            assert_eq!(keys, ["draft_q:var_name"], "{bad:?}");
+        }
+        let plan = merge(
+            &b,
+            &t,
+            &d,
+            &BTreeMap::from([("draft_q:var_name".into(), "q2".into())]),
+        );
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn rejecting_a_draft_only_block_takes_its_draft_only_children_along() {
+        let b = state();
+        let mut t = b.clone();
+        block(&mut t, "team_q", "root", Some("q"));
+        let mut d = b.clone();
+        block(&mut d, "draft_q", "root", Some("q"));
+        block(&mut d, "child", "draft_q", None);
+        let plan = merge(
+            &b,
+            &t,
+            &d,
+            &BTreeMap::from([("draft_q:var_name".into(), "team".into())]),
+        );
+        assert!(plan.conflicts.is_empty(), "{:?}", plan.conflicts);
+        assert!(!plan.state.nodes.contains_key(&NodeId("draft_q".into())));
+        assert!(!plan.state.nodes.contains_key(&NodeId("child".into())));
+    }
+
+    #[test]
+    fn contradictory_choices_stop_at_the_first_repeat() {
+        // Two blocks, each placed by one side inside a container the other side deleted;
+        // choosing opposite sides for them re-creates each other's orphan forever.
+        let mut b = state();
+        block(&mut b, "p", "root", None);
+        block(&mut b, "q", "root", None);
+        let mut t = b.clone();
+        t.nodes.get_mut(&NodeId("p".into())).unwrap().deleted = true;
+        block(&mut t, "x", "q", None);
+        let mut d = b.clone();
+        d.nodes.get_mut(&NodeId("q".into())).unwrap().deleted = true;
+        block(&mut d, "y", "p", None);
+        let choices = BTreeMap::from([
+            ("p:$node".into(), "draft".into()),
+            ("q:$node".into(), "team".into()),
+        ]);
+        let plan = merge(&b, &t, &d, &choices);
+        // Whatever the outcome, it must come from a bounded number of repairs and
+        // leave no live block under a deleted parent that is not reported.
+        let orphan = find_orphan(&plan.state);
+        assert!(orphan.is_none() || !plan.conflicts.is_empty(), "{orphan:?}");
     }
 }
