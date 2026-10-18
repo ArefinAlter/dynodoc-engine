@@ -700,9 +700,9 @@ fn depths(state: &DocumentState) -> BTreeMap<NodeId, usize> {
 /// A requested state cannot be represented by the supported event vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiffError {
-    #[error("node {node_id} has unsupported type {node_type:?}")]
+    #[error("node {node_id:?} has unsupported type {node_type:?}")]
     UnsupportedNodeType { node_id: NodeId, node_type: String },
-    #[error("node {node_id} cannot change type from {before:?} to {after:?}")]
+    #[error("node {node_id:?} cannot change type from {before:?} to {after:?}")]
     NodeTypeChanged {
         node_id: NodeId,
         before: String,
