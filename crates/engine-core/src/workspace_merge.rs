@@ -199,6 +199,10 @@ pub fn merge(
         ops,
     }
 }
+/// Re-keying is an output-quality improvement, not a correctness requirement. Keep
+/// it bounded so repeated merges cannot grow fractional positions without limit.
+const MAX_MERGED_POS_BYTES: usize = 256;
+
 /// Blocks both sides place between the same two unchanged siblings interleave when
 /// their keys do, and `between()` gives both sides the same keys for one spot. So the
 /// draft's blocks there go behind the team's last one: putting that key in front of
@@ -224,6 +228,14 @@ fn keep_runs_together(base: &DocumentState, team: &DocumentState, out: &mut Docu
                 Some(n) if !at(base, n) => last = Some(&n.pos),
                 _ => {
                     if let Some(last) = last.take() {
+                        // Reject oversized candidates before formatting or copying them.
+                        if draft
+                            .iter()
+                            .any(|d| last.len().saturating_add(d.pos.len()) > MAX_MERGED_POS_BYTES)
+                        {
+                            draft.clear();
+                            continue;
+                        }
                         let keys: Vec<_> = draft
                             .iter()
                             .map(|d| (d.id.clone(), format!("{last}{}", d.pos)))
@@ -890,5 +902,80 @@ mod tests {
         assert_eq!(order("z"), ["a", "t1", "t2", "d1", "d2", "z"]);
         // "nm" would pass "n0", so those keys stay.
         assert_eq!(order("n0"), ["a", "d1", "t1", "d2", "t2", "z"]);
+    }
+
+    #[test]
+    fn grouping_never_grows_positions_past_its_bound() {
+        let add = |s: &mut DocumentState, id: &str, pos: String| {
+            let mut n = s.nodes[&NodeId("root".into())].clone();
+            n.id = NodeId(id.into());
+            n.parent_id = Some(NodeId("root".into()));
+            n.pos = pos;
+            s.nodes.insert(n.id.clone(), n);
+        };
+        let mut base = state();
+        add(&mut base, "a", "a".into());
+        add(&mut base, "z", "z".into());
+        let (mut team, mut draft) = (base.clone(), base.clone());
+        let team_pos = "y".repeat(200);
+        let draft_pos = "x".repeat(100);
+        add(&mut team, "team", team_pos);
+        add(&mut draft, "draft", draft_pos.clone());
+
+        let plan = merge(&base, &team, &draft, &BTreeMap::new());
+        assert_eq!(plan.state.nodes[&NodeId("draft".into())].pos, draft_pos);
+        assert!(plan
+            .state
+            .nodes
+            .values()
+            .all(|node| node.pos.len() <= MAX_MERGED_POS_BYTES));
+    }
+
+    #[test]
+    fn repeated_concurrent_inserts_keep_replayable_bounded_positions() {
+        use crate::{materializer::apply_payload, ops::validate_op};
+
+        let mut base = state();
+        let mut next = "m".to_owned();
+        let mut bounded_fallback = false;
+        for round in 0..12 {
+            let (mut team, mut draft) = (base.clone(), base.clone());
+            for (side, prefix) in [(&mut team, "t"), (&mut draft, "d")] {
+                let mut node = base.nodes[&NodeId("root".into())].clone();
+                node.id = NodeId(format!("{prefix}{round}"));
+                node.node_type = "item".into();
+                node.parent_id = Some(NodeId("root".into()));
+                node.pos = next.clone();
+                side.nodes.insert(node.id.clone(), node);
+            }
+            let plan = merge(&base, &team, &draft, &BTreeMap::new());
+            assert!(plan.conflicts.is_empty());
+            bounded_fallback |= plan.state.nodes[&NodeId(format!("d{round}"))].pos == next;
+            for op in &plan.ops {
+                validate_op(&team, op).unwrap();
+                apply_payload(&mut team, op).unwrap();
+            }
+            assert_eq!(team, plan.state);
+            assert!(plan
+                .state
+                .nodes
+                .values()
+                .all(|n| n.pos.len() <= MAX_MERGED_POS_BYTES));
+            // New positions append after the current last sibling on both sides.
+            next = plan
+                .state
+                .nodes
+                .values()
+                .map(|n| &n.pos)
+                .max()
+                .unwrap()
+                .clone();
+            if next.len() == MAX_MERGED_POS_BYTES {
+                break;
+            }
+            next.push('m');
+            base = plan.state;
+        }
+        assert!(bounded_fallback, "exercise the cap after repeated grouping");
     }
 }
