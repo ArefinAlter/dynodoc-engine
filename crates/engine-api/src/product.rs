@@ -20,19 +20,19 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/spaces", get(spaces).post(create_space))
         .route(
-            "/spaces/:id/members",
+            "/spaces/{id}/members",
             get(space_members).post(set_space_member),
         )
         .route("/workspace/index", get(index))
-        .route("/documents/:id/access", get(document_access))
-        .route("/documents/:id/location", post(move_document))
-        .route("/documents/:id/trash", post(trash_document))
+        .route("/documents/{id}/access", get(document_access))
+        .route("/documents/{id}/location", post(move_document))
+        .route("/documents/{id}/trash", post(trash_document))
         .route(
-            "/documents/:id/public-links",
+            "/documents/{id}/public-links",
             get(public_links).post(publish),
         )
-        .route("/documents/:id/public-links/:link/revoke", post(revoke))
-        .route("/public/documents/:token", get(public_document))
+        .route("/documents/{id}/public-links/{link}/revoke", post(revoke))
+        .route("/public/documents/{token}", get(public_document))
 }
 fn bad(reason: &str) -> ApiError {
     ApiError::BadRequest {

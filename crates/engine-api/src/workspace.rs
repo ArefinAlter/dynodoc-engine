@@ -28,30 +28,30 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/search", get(search))
         .route(
-            "/documents/:id/uploads",
+            "/documents/{id}/uploads",
             get(uploads)
                 .post(upload)
                 .layer(axum::extract::DefaultBodyLimit::max(
                     MAX_UPLOAD_BASE64 + 65_536,
                 )),
         )
-        .route("/documents/:id/uploads/:upload_id", get(download_upload))
-        .route("/documents/:id/batch", post(batch))
-        .route("/documents/:id/structure", get(structure))
-        .route("/documents/:id/drafts/:draft_id/sync", post(sync_draft))
+        .route("/documents/{id}/uploads/{upload_id}", get(download_upload))
+        .route("/documents/{id}/batch", post(batch))
+        .route("/documents/{id}/structure", get(structure))
+        .route("/documents/{id}/drafts/{draft_id}/sync", post(sync_draft))
         .route(
-            "/documents/:id/versions/:version_id/restore",
+            "/documents/{id}/versions/{version_id}/restore",
             post(restore_version),
         )
-        .route("/documents/:id/members", get(members).post(share))
-        .route("/documents/:id/versions", get(versions).post(save_version))
+        .route("/documents/{id}/members", get(members).post(share))
+        .route("/documents/{id}/versions", get(versions).post(save_version))
         .route(
-            "/documents/:id/metadata",
+            "/documents/{id}/metadata",
             post(metadata).layer(axum::extract::DefaultBodyLimit::max(80 * 1024)),
         )
-        .route("/documents/:id/drafts", get(drafts).post(create_draft))
+        .route("/documents/{id}/drafts", get(drafts).post(create_draft))
         .route(
-            "/documents/:id/drafts/:draft_id",
+            "/documents/{id}/drafts/{draft_id}",
             get(get_draft).post(edit_draft),
         )
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))

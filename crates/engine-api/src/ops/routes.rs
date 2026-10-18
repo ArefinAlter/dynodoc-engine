@@ -31,13 +31,13 @@ use crate::{idempotency, AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/documents/:id/ops/node-create", post(op_node_create))
-        .route("/documents/:id/ops/field-edit", post(op_field_edit))
-        .route("/documents/:id/ops/comment", post(op_comment))
-        .route("/documents/:id/ops/suggest", post(op_suggest))
-        .route("/documents/:id/proposals/:event_id/accept", post(accept))
-        .route("/documents/:id/proposals/:event_id/reject", post(reject))
-        .route("/documents/:id/deploy", post(deploy))
+        .route("/documents/{id}/ops/node-create", post(op_node_create))
+        .route("/documents/{id}/ops/field-edit", post(op_field_edit))
+        .route("/documents/{id}/ops/comment", post(op_comment))
+        .route("/documents/{id}/ops/suggest", post(op_suggest))
+        .route("/documents/{id}/proposals/{event_id}/accept", post(accept))
+        .route("/documents/{id}/proposals/{event_id}/reject", post(reject))
+        .route("/documents/{id}/deploy", post(deploy))
 }
 
 // --- request bodies -------------------------------------------------------------
