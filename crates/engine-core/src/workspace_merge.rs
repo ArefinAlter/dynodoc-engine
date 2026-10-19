@@ -117,7 +117,12 @@ fn merge_impl(
 ) -> MergePlan {
     let base = canonical(base);
     let team = canonical(team);
-    let draft = canonical(draft);
+    let resolved_draft = if build_event_plan {
+        resolve_unsupported_nodes(&team, draft, resolutions)
+    } else {
+        Cow::Borrowed(draft)
+    };
+    let draft = canonical(&resolved_draft);
     let mut out = team.clone().into_owned();
     let mut conflicts = Vec::new();
     for (id, d) in &draft.nodes {
@@ -247,6 +252,8 @@ pub fn merge_strict(
     draft: &DocumentState,
     resolutions: &BTreeMap<String, String>,
 ) -> MergePlan {
+    let resolved_draft = resolve_unsupported_nodes(team, draft, resolutions);
+    let draft = resolved_draft.as_ref();
     let mut plan = merge(base, team, draft, resolutions);
     let canonical_team = canonical(team);
     let canonical_draft = canonical(draft);
@@ -738,6 +745,44 @@ pub enum DiffError {
     },
 }
 
+// A checked event-plan conflict may arise even when the team equals the
+// ancestor. Honor an explicit rejection before select() takes that fast path.
+// Keep this out of signed-v1 state convergence, which never needed event plans.
+fn resolve_unsupported_nodes<'a>(
+    team: &DocumentState,
+    draft: &'a DocumentState,
+    resolutions: &BTreeMap<String, String>,
+) -> Cow<'a, DocumentState> {
+    let mut resolved = Cow::Borrowed(draft);
+    if resolutions.is_empty() {
+        return resolved;
+    }
+    for (id, node) in &draft.nodes {
+        if node.deleted
+            || draft.removed_choices.contains(id)
+            || resolutions
+                .get(&format!("{}:$node", id.0))
+                .map(String::as_str)
+                != Some("team")
+        {
+            continue;
+        }
+        let prior = team.nodes.get(id);
+        let unsupported = prior.map_or_else(
+            || node.node_type.parse::<engine_shared::NodeType>().is_err(),
+            |prior| prior.node_type != node.node_type,
+        );
+        if unsupported {
+            if let Some(prior) = prior {
+                resolved.to_mut().nodes.insert(id.clone(), prior.clone());
+            } else {
+                resolved.to_mut().nodes.remove(id);
+            }
+        }
+    }
+    resolved
+}
+
 fn diff_for_merge(
     base: &DocumentState,
     from: &DocumentState,
@@ -1081,6 +1126,58 @@ mod tests {
             };
             assert!(plan.ops.is_empty());
             assert!(plan.conflicts.iter().any(|c| c.key == "future:$node"));
+        }
+    }
+
+    #[test]
+    fn unsupported_node_conflicts_can_be_rejected_without_losing_supported_edits() {
+        let base = state();
+        for new_node in [false, true] {
+            let mut draft = base.clone();
+            let id = if new_node { "future" } else { "root" };
+            let mut node = draft.nodes[&NodeId("root".into())].clone();
+            node.id = NodeId(id.into());
+            node.node_type = "future-widget".into();
+            if new_node {
+                node.parent_id = Some(NodeId("root".into()));
+                draft
+                    .nodes
+                    .get_mut(&NodeId("root".into()))
+                    .unwrap()
+                    .current_fields["a"] = json!(2);
+            }
+            draft.nodes.insert(node.id.clone(), node);
+            for strict in [false, true] {
+                let merge = if strict { merge_strict } else { merge };
+                let key = format!("{id}:$node");
+                for choice in [None, Some("draft"), Some("team")] {
+                    let resolutions = choice
+                        .map(|choice| (key.clone(), choice.into()))
+                        .into_iter()
+                        .collect();
+                    let plan = merge(&base, &base, &draft, &resolutions);
+                    if choice == Some("team") {
+                        assert!(plan.conflicts.is_empty());
+                        let mut replay = base.clone();
+                        for op in &plan.ops {
+                            crate::materializer::apply_payload(&mut replay, op).unwrap();
+                        }
+                        assert_eq!(replay, plan.state);
+                        if new_node {
+                            assert!(!plan.state.nodes.contains_key(&NodeId(id.into())));
+                            assert_eq!(
+                                plan.state.nodes[&NodeId("root".into())].current_fields["a"],
+                                json!(2)
+                            );
+                        } else {
+                            assert_eq!(plan.state, base);
+                        }
+                    } else {
+                        assert!(plan.ops.is_empty());
+                        assert!(plan.conflicts.iter().any(|conflict| conflict.key == key));
+                    }
+                }
+            }
         }
     }
 
