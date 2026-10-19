@@ -296,12 +296,61 @@ fn validate_merged_tree(
     conflicts: &mut Vec<Conflict>,
     resolutions: &BTreeMap<String, String>,
 ) {
+    // Resolving an orphan can undo a move and create a cycle; resolving a
+    // cycle can move a block back beneath a deleted container. Recheck both.
+    for _ in 0..=out.nodes.len() {
+        if !resolve_parent_cycles(base, team, draft, out, conflicts, resolutions) {
+            break;
+        }
+        resolve_orphans(base, team, draft, out, conflicts, resolutions);
+        if find_parent_cycles(out).is_empty() && find_direct_orphan(out).is_none() {
+            return;
+        }
+    }
+
+    // Incompatible choices must remain conflicts, never a successful plan with
+    // an invalid tree. Fall back to team's structure while retaining merged
+    // fields on its live nodes. This is a preview; callers reject conflicts.
+    for (id, node) in &mut out.nodes {
+        let team_node = team.nodes.get(id);
+        if team_node.is_none_or(|t| location(t) != location(node) || t.deleted != node.deleted) {
+            let key = format!("{}:$location", id.0);
+            if !conflicts.iter().any(|c| c.key == key) {
+                conflicts.push(Conflict {
+                    key,
+                    node_id: id.clone(),
+                    field: "$location".into(),
+                    ancestor: base.nodes.get(id).map(location).unwrap_or(Value::Null),
+                    team: team_node.map(location).unwrap_or(Value::Null),
+                    draft: draft.nodes.get(id).map(location).unwrap_or(Value::Null),
+                });
+            }
+        }
+        if let Some(team_node) = team_node {
+            node.parent_id = team_node.parent_id.clone();
+            node.pos = team_node.pos.clone();
+            node.deleted = !is_node_live(id, team);
+        } else {
+            node.deleted = true;
+        }
+    }
+    out.removed_choices = team.removed_choices.clone();
+}
+
+fn resolve_parent_cycles(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    out: &mut DocumentState,
+    conflicts: &mut Vec<Conflict>,
+    resolutions: &BTreeMap<String, String>,
+) -> bool {
     let max_passes = out.nodes.len() + 1;
     let mut passes = 0;
     while let Some(cycle) = find_parent_cycles(out).into_iter().next() {
         passes += 1;
         if passes > max_passes {
-            break;
+            return false;
         }
 
         // Pick a node in the loop whose merged location came from the draft (out_loc != team_loc).
@@ -377,6 +426,161 @@ fn validate_merged_tree(
             }
         }
     }
+
+    true
+}
+
+fn resolve_orphans(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    out: &mut DocumentState,
+    conflicts: &mut Vec<Conflict>,
+    resolutions: &BTreeMap<String, String>,
+) {
+    while let Some((child_id, parent_id)) = find_direct_orphan(out) {
+        let key = format!("{}:$location", child_id.0);
+        let choice = resolutions.get(&key).map(String::as_str);
+        let team_deleted_parent = !is_node_live(&parent_id, team);
+        let restore = match choice {
+            Some("restore container") => true,
+            Some("drop block") => false,
+            Some("draft") => team_deleted_parent,
+            _ => !team_deleted_parent,
+        };
+        let resolved = matches!(
+            choice,
+            Some("team" | "draft" | "restore container" | "drop block")
+        );
+        let repaired = if restore {
+            restore_ancestor_chain(&parent_id, base, team, draft, out)
+        } else {
+            // Choosing a side that removed the container can still keep a block
+            // that side moved elsewhere. The explicit drop choice deletes it.
+            let side = if team_deleted_parent { team } else { draft };
+            let moved = side.nodes.get(&child_id).filter(|node| {
+                choice != Some("drop block")
+                    && is_node_live(&child_id, side)
+                    && node.parent_id.as_ref() != Some(&parent_id)
+            });
+            if let Some(node) = moved {
+                let target = out.nodes.get_mut(&child_id).unwrap();
+                target.parent_id = node.parent_id.clone();
+                target.pos = node.pos.clone();
+            } else {
+                delete_subtree(&child_id, out);
+            }
+            true
+        };
+        if (!resolved || !repaired) && !conflicts.iter().any(|c| c.key == key) {
+            conflicts.push(Conflict {
+                key,
+                node_id: child_id.clone(),
+                field: "$location".into(),
+                ancestor: base
+                    .nodes
+                    .get(&child_id)
+                    .map(location)
+                    .unwrap_or(Value::Null),
+                team: team
+                    .nodes
+                    .get(&child_id)
+                    .map(location)
+                    .unwrap_or(Value::Null),
+                draft: draft
+                    .nodes
+                    .get(&child_id)
+                    .map(location)
+                    .unwrap_or(Value::Null),
+            });
+        }
+        if !repaired {
+            // Missing ancestry cannot be restored. Keep the conflict visible and
+            // provide a safe preview instead of silently exhausting a pass limit.
+            delete_subtree(&child_id, out);
+        }
+    }
+    out.removed_choices
+        .retain(|id| out.nodes.get(id).is_some_and(|n| n.deleted));
+}
+
+fn is_node_live(id: &NodeId, state: &DocumentState) -> bool {
+    state
+        .nodes
+        .get(id)
+        .is_some_and(|n| !n.deleted && !state.removed_choices.contains(id))
+}
+
+fn find_direct_orphan(state: &DocumentState) -> Option<(NodeId, NodeId)> {
+    for (id, node) in &state.nodes {
+        if !is_node_live(id, state) {
+            continue;
+        }
+        if let Some(parent_id) = &node.parent_id {
+            if !is_node_live(parent_id, state) {
+                return Some((id.clone(), parent_id.clone()));
+            }
+        }
+    }
+    None
+}
+
+fn delete_subtree(root: &NodeId, out: &mut DocumentState) {
+    let mut children: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+    for (id, node) in &out.nodes {
+        if let Some(parent) = &node.parent_id {
+            children.entry(parent.clone()).or_default().push(id.clone());
+        }
+    }
+    let mut pending = vec![root.clone()];
+    let mut visited = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        if let Some(node) = out.nodes.get_mut(&id) {
+            node.deleted = true;
+        }
+        pending.extend(children.remove(&id).unwrap_or_default());
+    }
+}
+
+fn restore_ancestor_chain(
+    start_id: &NodeId,
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    out: &mut DocumentState,
+) -> bool {
+    // Collect first so an unavailable ancestor cannot partially restore a chain.
+    let mut cursor = Some(start_id.clone());
+    let mut visited = BTreeSet::new();
+    let mut restore = Vec::new();
+    while let Some(id) = cursor {
+        if !visited.insert(id.clone()) {
+            return false;
+        }
+        if is_node_live(&id, out) {
+            break;
+        }
+        let Some(node) = out
+            .nodes
+            .get(&id)
+            .or_else(|| base.nodes.get(&id))
+            .or_else(|| draft.nodes.get(&id))
+            .or_else(|| team.nodes.get(&id))
+        else {
+            return false;
+        };
+        cursor = node.parent_id.clone();
+        restore.push(node.clone());
+    }
+    for mut node in restore {
+        node.deleted = false;
+        out.removed_choices.remove(&node.id);
+        out.nodes.insert(node.id.clone(), node);
+    }
+    true
 }
 // Each parent chain is traversed once. Iterative traversal avoids stack growth
 // for deeply nested imports; malformed cycles retain the old capped sort depth.
@@ -790,6 +994,275 @@ mod tests {
         let c = canonical(&s);
         assert!(matches!(c, Cow::Owned(_)));
         assert!(c.nodes[&NodeId("root".into())].deleted);
+    }
+
+    fn add_section(state: &mut DocumentState, id: &str, parent: &str) {
+        let mut node = state.nodes[&NodeId("root".into())].clone();
+        node.id = NodeId(id.into());
+        node.parent_id = Some(NodeId(parent.into()));
+        node.node_type = "section".into();
+        state.nodes.insert(node.id.clone(), node);
+    }
+
+    fn assert_valid_merge_replay(team: &DocumentState, plan: &MergePlan) {
+        let mut applied = team.clone();
+        for op in &plan.ops {
+            crate::ops::validate_op(&applied, op).unwrap_or_else(|err| {
+                panic!("invalid merge operation {op:?}: {err}");
+            });
+            crate::materializer::apply_payload(&mut applied, op).unwrap();
+        }
+        let live = |state: &DocumentState| {
+            state
+                .nodes
+                .iter()
+                .filter(|(id, _)| is_node_live(id, state))
+                .map(|(id, node)| (id.clone(), node.clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(live(&applied), live(&plan.state));
+        assert_eq!(applied.removed_choices, plan.state.removed_choices);
+        assert!(find_parent_cycles(&plan.state).is_empty());
+        assert!(find_direct_orphan(&plan.state).is_none());
+    }
+
+    #[test]
+    fn deleted_container_and_new_subtree_require_an_explicit_location_choice() {
+        let mut base = state();
+        add_section(&mut base, "container", "root");
+        let mut deleted = base.clone();
+        deleted
+            .nodes
+            .get_mut(&NodeId("container".into()))
+            .unwrap()
+            .deleted = true;
+        let mut added = base.clone();
+        add_section(&mut added, "child", "container");
+        add_section(&mut added, "grandchild", "child");
+        for (team, draft, keep, drop) in [
+            (&deleted, &added, "draft", "team"),
+            (&added, &deleted, "team", "draft"),
+        ] {
+            let preview = merge(&base, team, draft, &BTreeMap::new());
+            assert_eq!(preview.conflicts.len(), 1);
+            assert_eq!(preview.conflicts[0].key, "child:$location");
+            assert_valid_merge_replay(team, &preview);
+            for (choice, survives) in [
+                (keep, true),
+                (drop, false),
+                ("restore container", true),
+                ("drop block", false),
+            ] {
+                let plan = merge(
+                    &base,
+                    team,
+                    draft,
+                    &BTreeMap::from([("child:$location".into(), choice.into())]),
+                );
+                assert!(plan.conflicts.is_empty(), "{choice}: {:?}", plan.conflicts);
+                assert_eq!(is_node_live(&NodeId("child".into()), &plan.state), survives);
+                assert_eq!(
+                    is_node_live(&NodeId("grandchild".into()), &plan.state),
+                    survives
+                );
+                assert_valid_merge_replay(team, &plan);
+            }
+        }
+    }
+
+    #[test]
+    fn orphan_resolution_restores_all_deleted_ancestors_before_creating_child() {
+        let mut base = state();
+        add_section(&mut base, "outer", "root");
+        add_section(&mut base, "container", "outer");
+        let mut team = base.clone();
+        for id in ["outer", "container"] {
+            team.nodes.get_mut(&NodeId(id.into())).unwrap().deleted = true;
+        }
+        let mut draft = base.clone();
+        add_section(&mut draft, "child", "container");
+        let plan = merge(
+            &base,
+            &team,
+            &draft,
+            &BTreeMap::from([("child:$location".into(), "draft".into())]),
+        );
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.ops.len(), 3);
+        assert_valid_merge_replay(&team, &plan);
+    }
+
+    #[test]
+    fn moving_into_a_deleted_container_can_keep_the_original_location() {
+        let mut base = state();
+        add_section(&mut base, "container", "root");
+        add_section(&mut base, "child", "root");
+        let mut deleted = base.clone();
+        deleted
+            .nodes
+            .get_mut(&NodeId("container".into()))
+            .unwrap()
+            .deleted = true;
+        let mut moved = base.clone();
+        moved
+            .nodes
+            .get_mut(&NodeId("child".into()))
+            .unwrap()
+            .parent_id = Some(NodeId("container".into()));
+        for (team, draft, keep) in [(&deleted, &moved, "team"), (&moved, &deleted, "draft")] {
+            let plan = merge(
+                &base,
+                team,
+                draft,
+                &BTreeMap::from([("child:$location".into(), keep.into())]),
+            );
+            assert!(plan.conflicts.is_empty());
+            assert_eq!(
+                plan.state.nodes[&NodeId("child".into())].parent_id,
+                Some(NodeId("root".into()))
+            );
+            assert_valid_merge_replay(team, &plan);
+            let dropped = merge(
+                &base,
+                team,
+                draft,
+                &BTreeMap::from([("child:$location".into(), "drop block".into())]),
+            );
+            assert!(!is_node_live(&NodeId("child".into()), &dropped.state));
+            assert_valid_merge_replay(team, &dropped);
+        }
+    }
+
+    #[test]
+    fn unrelated_parent_resolution_does_not_hide_an_orphan_conflict() {
+        let mut base = state();
+        add_section(&mut base, "container", "root");
+        let mut team = base.clone();
+        team.nodes
+            .get_mut(&NodeId("container".into()))
+            .unwrap()
+            .deleted = true;
+        let mut draft = base.clone();
+        add_section(&mut draft, "child", "container");
+        let plan = merge(
+            &base,
+            &team,
+            &draft,
+            &BTreeMap::from([("container:$location".into(), "team".into())]),
+        );
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].key, "child:$location");
+        assert_valid_merge_replay(&team, &plan);
+    }
+
+    #[test]
+    fn orphan_relocation_rechecks_cycles_from_other_merged_moves() {
+        let mut base = state();
+        add_section(&mut base, "a", "root");
+        add_section(&mut base, "child", "a");
+        add_section(&mut base, "container", "root");
+        let mut team = base.clone();
+        team.nodes
+            .get_mut(&NodeId("container".into()))
+            .unwrap()
+            .deleted = true;
+        let mut draft = base.clone();
+        draft
+            .nodes
+            .get_mut(&NodeId("child".into()))
+            .unwrap()
+            .parent_id = Some(NodeId("container".into()));
+        draft.nodes.get_mut(&NodeId("a".into())).unwrap().parent_id = Some(NodeId("child".into()));
+        let choices = BTreeMap::from([("child:$location".into(), "team".into())]);
+        let plan = merge(&base, &team, &draft, &choices);
+        assert!(!plan.conflicts.is_empty());
+        assert_valid_merge_replay(&team, &plan);
+        for (choice, resolves) in [("team", true), ("draft", false)] {
+            let mut choices = choices.clone();
+            choices.insert("a:$location".into(), choice.into());
+            let plan = merge(&base, &team, &draft, &choices);
+            assert_eq!(plan.conflicts.is_empty(), resolves);
+            assert_valid_merge_replay(&team, &plan);
+        }
+    }
+
+    #[test]
+    fn restoring_a_removed_choice_also_restores_its_deleted_parent() {
+        let mut base = state();
+        add_section(&mut base, "item", "root");
+        base.nodes
+            .get_mut(&NodeId("item".into()))
+            .unwrap()
+            .node_type = "item".into();
+        add_section(&mut base, "choice", "item");
+        base.nodes
+            .get_mut(&NodeId("choice".into()))
+            .unwrap()
+            .node_type = "choice".into();
+        let mut team = base.clone();
+        team.removed_choices.insert(NodeId("choice".into()));
+        team.nodes.get_mut(&NodeId("item".into())).unwrap().deleted = true;
+        let mut draft = base.clone();
+        draft
+            .nodes
+            .get_mut(&NodeId("choice".into()))
+            .unwrap()
+            .current_fields["a"] = json!(2);
+        let plan = merge(
+            &base,
+            &team,
+            &draft,
+            &BTreeMap::from([
+                ("choice:$node".into(), "draft".into()),
+                ("choice:$location".into(), "draft".into()),
+            ]),
+        );
+        assert!(plan.conflicts.is_empty());
+        assert!(plan.state.removed_choices.is_empty());
+        assert_valid_merge_replay(&team, &plan);
+    }
+
+    #[test]
+    fn missing_ancestry_cannot_be_silently_resolved_by_restoration() {
+        let base = state();
+        let mut draft = base.clone();
+        add_section(&mut draft, "child", "missing");
+        let plan = merge(
+            &base,
+            &base,
+            &draft,
+            &BTreeMap::from([("child:$location".into(), "restore container".into())]),
+        );
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].key, "child:$location");
+        assert_valid_merge_replay(&base, &plan);
+    }
+
+    #[test]
+    fn strict_merge_rechecks_orphans_after_keeping_a_team_block() {
+        let mut base = state();
+        add_section(&mut base, "container", "root");
+        add_section(&mut base, "child", "container");
+        let team = base.clone();
+        let mut draft = base.clone();
+        draft
+            .nodes
+            .get_mut(&NodeId("container".into()))
+            .unwrap()
+            .deleted = true;
+        draft
+            .nodes
+            .get_mut(&NodeId("child".into()))
+            .unwrap()
+            .parent_id = Some(NodeId("root".into()));
+        let choices = BTreeMap::from([
+            ("container:$block".into(), "draft".into()),
+            ("child:$block".into(), "team".into()),
+        ]);
+        let plan = merge_strict(&base, &team, &draft, &choices);
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].key, "child:$location");
+        assert_valid_merge_replay(&team, &plan);
     }
 
     #[test]
