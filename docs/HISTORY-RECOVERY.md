@@ -113,13 +113,13 @@ closed while its content cannot be reconstructed. Events are never edited or del
 2. Pause content writes and draft/review transitions with
    `engine-cli quarantine DOC --seq N --reason "..."` (operator, using
    `MIGRATION_DATABASE_URL`). These requests then fail with `document_quarantined`
-   (423). Member access, title and document settings remain available.
+   (423), including workspace member, metadata and private draft saves. Separate
+   access administration and audited erasure remain available.
 3. Recover the content: `GET /documents/{id}/state?through_seq=N-1` still returns the
    last good revision, which can be recreated as a new document. Recovery drafts
    (above) cannot be used, because they start from the current head.
 4. Allow writes again with `engine-cli release DOC` once the document replays, or
    leave it paused and point people to the recovered copy. Tell the document's owner.
-
 
 ## Remaining work
 

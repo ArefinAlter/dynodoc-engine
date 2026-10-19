@@ -239,6 +239,34 @@ async fn unreplayable_log_returns_specific_error(pool: PgPool) {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["code"], "replay_failed", "{body}");
     assert_eq!(body["details"], json!({"document_id": doc, "seq": 1}));
+    sqlx::query(
+        "insert into document_quarantine(document_id,seq,reason) values($1,1,'failed replay')",
+    )
+    .bind(doc)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/batch"),
+            &owner,
+            &json!({"base_seq":1,"ops":[
+                {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::LOCKED, "{body}");
+    let (status, body) = send(
+        &router,
+        auth_post_get(&format!("/documents/{doc}/state?through_seq=0"), &owner),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(&router, auth_post_get(&format!("/documents/{doc}"), &owner)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["code"], "replay_failed", "{body}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -385,15 +413,19 @@ async fn quarantined_document_refuses_writes_but_serves_reads(pool: PgPool) {
     .await
     .unwrap();
     let root = ulid::Ulid::generate().to_string();
+    let batch = json!({"base_seq":0,"ops":[
+        {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}}
+    ]});
+    let outsider = bearer(seed_identity(&pool, "quarantine-outsider@example.test").await);
     let (status, body) = send(
         &router,
-        auth_post(
-            &format!("/documents/{doc}/batch"),
-            &owner,
-            &json!({"base_seq":0,"ops":[
-                {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}}
-            ]}),
-        ),
+        auth_post(&format!("/documents/{doc}/batch"), &outsider, &batch),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = send(
+        &router,
+        auth_post(&format!("/documents/{doc}/batch"), &owner, &batch),
     )
     .await;
     assert_eq!(status, StatusCode::LOCKED);
@@ -401,6 +433,38 @@ async fn quarantined_document_refuses_writes_but_serves_reads(pool: PgPool) {
     assert_eq!(body["details"], json!({"document_id": doc, "seq": 7}));
     let (status, _) = send(&router, auth_post_get(&format!("/documents/{doc}"), &owner)).await;
     assert_eq!(status, StatusCode::OK);
+    for (path, body) in [
+        ("metadata", json!({"title":"Changed"})),
+        (
+            "members",
+            json!({"email":"reader@example.test","role":"viewer"}),
+        ),
+        ("drafts", json!({"name":"Paused draft"})),
+    ] {
+        let (status, body) = send(
+            &router,
+            auth_post(&format!("/documents/{doc}/{path}"), &owner, &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::LOCKED, "{path}: {body}");
+    }
+    let events: i64 = sqlx::query_scalar("select count(*) from event where document_id=$1")
+        .bind(doc)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(events, 0);
+    sqlx::query("delete from document_quarantine where document_id=$1")
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &router,
+        auth_post(&format!("/documents/{doc}/batch"), &owner, &batch),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -755,6 +819,13 @@ async fn admin_erasure_removes_whole_document_but_cannot_bypass_history_guards(p
     )
     .await
     .unwrap();
+    sqlx::query(
+        "insert into document_quarantine(document_id,seq,reason) values($1,1,'recovering')",
+    )
+    .bind(doc)
+    .execute(&runtime.owner)
+    .await
+    .unwrap();
     assert_eq!(
         send(&router, auth_post_get(&preview_uri, &owner)).await.0,
         StatusCode::FORBIDDEN
@@ -846,6 +917,7 @@ async fn admin_erasure_removes_whole_document_but_cannot_bypass_history_guards(p
         "workspace_draft",
         "public_document_view",
         "document_access",
+        "document_quarantine",
     ] {
         let column = if table == "document" {
             "id"

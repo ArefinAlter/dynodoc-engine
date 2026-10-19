@@ -61,6 +61,7 @@ async fn runtime_cannot_rewrite_history_disable_guards_or_escalate(pool: PgPool)
         ("shared_checkpoint", "through_seq"),
         ("change_request_review", "verdict"),
         ("_sqlx_migrations", "success"),
+        ("document_quarantine", "seq"),
     ] {
         for statement in [
             format!("update {table} set {column}={column} where false"),
@@ -78,6 +79,17 @@ async fn runtime_cannot_rewrite_history_disable_guards_or_escalate(pool: PgPool)
             );
         }
     }
+    let error = sqlx::query(
+        "insert into document_quarantine(document_id,seq,reason) values($1,1,'runtime pause')",
+    )
+    .bind(doc.0)
+    .execute(&runtime.pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("42501")
+    );
     let owner = runtime.owner.connect_options().get_username().to_owned();
     for statement in [
         "alter table event disable trigger all".to_owned(),

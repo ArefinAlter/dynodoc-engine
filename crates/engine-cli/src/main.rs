@@ -228,23 +228,40 @@ async fn main() -> anyhow::Result<()> {
             reason,
         } => {
             let doc = parse_document_id(&document_id)?;
+            let pool = connect_migration().await?;
+            let mut tx = pool.begin().await?;
+            // Serialize the pause with API writes that check quarantine under this lock.
+            let exists: Option<Uuid> =
+                sqlx::query_scalar("select id from document where id=$1 for no key update")
+                    .bind(doc.0)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            anyhow::ensure!(exists.is_some(), "document {document_id} was not found");
             sqlx::query("insert into document_quarantine(document_id,seq,reason) values($1,$2,$3) on conflict (document_id) do update set seq=excluded.seq,reason=excluded.reason")
                 .bind(doc.0)
                 .bind(seq)
                 .bind(reason)
-                .execute(&connect_migration().await?)
+                .execute(&mut *tx)
                 .await?;
+            tx.commit().await?;
             println!("Writes to document {document_id} are paused; reads continue.");
             Ok(())
         }
         Command::Release { document_id } => {
             let doc = parse_document_id(&document_id)?;
+            let pool = connect_migration().await?;
+            let mut tx = pool.begin().await?;
+            sqlx::query("select id from document where id=$1 for no key update")
+                .bind(doc.0)
+                .execute(&mut *tx)
+                .await?;
             let released = sqlx::query("delete from document_quarantine where document_id=$1")
                 .bind(doc.0)
-                .execute(&connect_migration().await?)
+                .execute(&mut *tx)
                 .await?
                 .rows_affected();
             anyhow::ensure!(released == 1, "document {document_id} was not quarantined");
+            tx.commit().await?;
             println!("Writes to document {document_id} are allowed again.");
             Ok(())
         }
