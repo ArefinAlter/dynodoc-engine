@@ -1,6 +1,7 @@
 # Dynodoc Engine
 
 [![CI](https://github.com/ArefinAlter/dynodoc-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/ArefinAlter/dynodoc-engine/actions/workflows/ci.yml)
+[![Platforms](https://github.com/ArefinAlter/dynodoc-engine/actions/workflows/platforms.yml/badge.svg)](https://github.com/ArefinAlter/dynodoc-engine/actions/workflows/platforms.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Semantic version control for documents edited in existing tools. Rust libraries,
@@ -101,6 +102,17 @@ See [current capabilities](docs/CAPABILITIES.md), [architecture](docs/ARCHITECTU
 [API and authentication](docs/API.md),
 [contributing](CONTRIBUTING.md), [security](SECURITY.md),
 [code of conduct](CODE_OF_CONDUCT.md) and [roadmap](ROADMAP.md).
+
+## Platforms and prebuilt binaries
+
+The engine, API and command line are built and tested on Linux, macOS and Windows,
+on x86-64 and on Arm (aarch64), by GitHub-hosted runners on every change
+([platform workflow](.github/workflows/platforms.yml)). Windows on Arm is tier 2.
+Tagged `cli-v*` releases attach `engine-cli` and `engine-api` archives for all six
+OS and processor pairs with a `SHA256SUMS` file; they are not code-signed, so
+macOS Gatekeeper and Windows SmartScreen will warn. The support matrix, what CI
+proves, what is excluded, platform differences and how to verify a download are in
+[PLATFORM-SUPPORT.md](docs/PLATFORM-SUPPORT.md).
 
 ## Guarantees and limits
 
