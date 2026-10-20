@@ -17,11 +17,11 @@ name: engine-platforms
 #
 # The one skipped test: `sse_delivers_a_new_event_within_100ms` asserts that a server
 # sent event arrives within 100 ms. That is a latency check, not a behaviour check.
-# It has failed on the Windows runners and, once in three runs, on macOS x86-64 (an
+# It has failed on the Windows runners and, once in four runs, on macOS x86-64 (an
 # Intel image); it passed every run on Linux aarch64 and macOS aarch64, where it still
 # runs and blocks. It is NOT weakened. On the platforms with skip_sse it is excluded
-# from the blocking run with `--skip` and run again in its own non-blocking step, so
-# its result is still recorded (see docs/PLATFORM-SUPPORT.md for the numbers).
+# from the blocking run with `--skip` and run again in its own non-blocking step that
+# writes PASSED or FAILED to the job summary (see docs/PLATFORM-SUPPORT.md).
 
 on:
   push:
@@ -198,8 +198,12 @@ jobs:
           awk '/^test result:/ {p+=$4; f+=$6; i+=$8} END {print "macOS ${{ matrix.arch }}: " p " passed, " f " failed, " i " ignored"}' "$RUNNER_TEMP/test.log" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: SSE 100 ms timing test (recorded, not blocking)
         if: ${{ !cancelled() && matrix.skip_sse }}
-        continue-on-error: true
-        run: cargo test --locked -p engine-api --test api_test sse_delivers_a_new_event_within_100ms
+        run: |
+          if cargo test --locked -p engine-api --test api_test sse_delivers_a_new_event_within_100ms; then
+            echo "SSE 100 ms timing test on ${{ matrix.runner }}: PASSED" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "SSE 100 ms timing test on ${{ matrix.runner }}: FAILED (not blocking)" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
       - name: OpenAPI consistency
         run: |
           target/debug/engine-cli openapi --out "$RUNNER_TEMP/openapi.yaml"
@@ -328,8 +332,12 @@ jobs:
           awk '/^test result:/ {p+=$4; f+=$6; i+=$8} END {print "Windows ${{ matrix.arch }}: " p " passed, " f " failed, " i " ignored (sse timing test skipped)"}' "$RUNNER_TEMP/test.log" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: SSE 100 ms timing test (recorded, not blocking)
         if: ${{ !cancelled() && matrix.skip_sse }}
-        continue-on-error: true
-        run: cargo test --locked -p engine-api --test api_test sse_delivers_a_new_event_within_100ms
+        run: |
+          if cargo test --locked -p engine-api --test api_test sse_delivers_a_new_event_within_100ms; then
+            echo "SSE 100 ms timing test on ${{ matrix.runner }}: PASSED" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "SSE 100 ms timing test on ${{ matrix.runner }}: FAILED (not blocking)" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
       - name: OpenAPI consistency
         if: ${{ !cancelled() }}
         run: |
