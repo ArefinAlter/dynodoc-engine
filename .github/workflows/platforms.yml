@@ -85,6 +85,7 @@ jobs:
       - name: Test summary
         if: always()
         run: |
+          [ -f "$RUNNER_TEMP/test.log" ] || { echo "no test log (an earlier step failed)"; exit 0; }
           awk '/^test result:/ {p+=$4; f+=$6; i+=$8} END {print "Linux aarch64: " p " passed, " f " failed, " i " ignored"}' "$RUNNER_TEMP/test.log" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: OpenAPI consistency
         run: |
@@ -145,7 +146,7 @@ jobs:
             -o "-c listen_addresses=127.0.0.1 -c port=5432" -w start
           PGPASSWORD=dynodoc "$PGBIN/createdb" -h 127.0.0.1 -U dynodoc dynodoc
           PGPASSWORD=dynodoc "$PGBIN/psql" -h 127.0.0.1 -U dynodoc -d dynodoc -Atc \
-            "select version(), current_setting('server_encoding'), current_setting('lc_collate')"
+            "select version(), current_setting('server_encoding'), (select datcollate from pg_database where datname = current_database())"
       - name: Build
         run: cargo build --locked --workspace
       - name: Clippy
@@ -157,6 +158,7 @@ jobs:
       - name: Test summary
         if: always()
         run: |
+          [ -f "$RUNNER_TEMP/test.log" ] || { echo "no test log (an earlier step failed)"; exit 0; }
           awk '/^test result:/ {p+=$4; f+=$6; i+=$8} END {print "macOS ${{ matrix.arch }}: " p " passed, " f " failed, " i " ignored"}' "$RUNNER_TEMP/test.log" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: OpenAPI consistency
         run: |
@@ -259,7 +261,7 @@ jobs:
           export PGPASSWORD=dynodoc
           "$BIN/createdb.exe" -h 127.0.0.1 -U dynodoc dynodoc
           "$BIN/psql.exe" -h 127.0.0.1 -U dynodoc -d dynodoc -Atc \
-            "select version(), current_setting('server_encoding'), current_setting('lc_collate')"
+            "select version(), current_setting('server_encoding'), (select datcollate from pg_database where datname = current_database())"
       - name: Build
         run: cargo build --locked --workspace
       - name: Clippy
@@ -275,6 +277,7 @@ jobs:
       - name: Test summary
         if: always()
         run: |
+          [ -f "$RUNNER_TEMP/test.log" ] || { echo "no test log (an earlier step failed)"; exit 0; }
           awk '/^test result:/ {p+=$4; f+=$6; i+=$8} END {print "Windows ${{ matrix.arch }}: " p " passed, " f " failed, " i " ignored (sse timing test skipped)"}' "$RUNNER_TEMP/test.log" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: SSE 100 ms timing test (recorded, not blocking)
         if: matrix.skip_sse
