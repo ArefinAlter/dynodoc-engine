@@ -81,7 +81,7 @@ jobs:
         run: cargo build --locked --workspace
       - name: Test
         run: |
-          cargo test --locked --workspace 2>&1 | tee "$RUNNER_TEMP/test.log"
+          cargo test --locked --workspace --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: Test summary
         if: always()
         run: |
@@ -154,7 +154,7 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
         run: |
-          cargo test --locked --workspace 2>&1 | tee "$RUNNER_TEMP/test.log"
+          cargo test --locked --workspace --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: Test summary
         if: always()
         run: |
@@ -190,6 +190,13 @@ jobs:
           }
           trap restore EXIT
           cargo test --locked -p engine-cli --test native_keystore -- --ignored --nocapture
+      - name: Native key store left nothing in the login keychain
+        if: always()
+        run: |
+          if security find-generic-password -s dynodoc-key-v1 "$HOME/Library/Keychains/login.keychain-db" > /dev/null 2>&1; then
+            echo "a dynodoc-key-v1 item is in the login keychain"; exit 1
+          fi
+          echo "no dynodoc-key-v1 item in the login keychain"
 
   windows:
     name: Windows ${{ matrix.arch }}
@@ -273,7 +280,7 @@ jobs:
           if [ "${{ matrix.skip_sse }}" = "true" ]; then
             SKIP=(--skip sse_delivers_a_new_event_within_100ms)
           fi
-          cargo test --locked --workspace -- "${SKIP[@]}" 2>&1 | tee "$RUNNER_TEMP/test.log"
+          cargo test --locked --workspace --no-fail-fast -- "${SKIP[@]}" 2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: Test summary
         if: always()
         run: |
