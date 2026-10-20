@@ -309,13 +309,17 @@ jobs:
           [ -f "$RUNNER_TEMP/test.log" ] || { echo "no test log (an earlier step failed)"; exit 0; }
           awk '/^test result:/ {p+=$4; f+=$6; i+=$8} END {print "Windows ${{ matrix.arch }}: " p " passed, " f " failed, " i " ignored (sse timing test skipped)"}' "$RUNNER_TEMP/test.log" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: SSE 100 ms timing test (recorded, not blocking)
-        if: matrix.skip_sse
+        if: ${{ !cancelled() && matrix.skip_sse }}
         continue-on-error: true
         run: cargo test --locked -p engine-api --test api_test sse_delivers_a_new_event_within_100ms
       - name: OpenAPI consistency
+        if: ${{ !cancelled() }}
         run: |
           target/debug/engine-cli.exe openapi --out "$RUNNER_TEMP/openapi.yaml"
+          # The generated file must itself be LF only; the checkout may be CRLF.
+          if grep -q $'\r' "$RUNNER_TEMP/openapi.yaml"; then echo "CR in the generated OpenAPI file"; exit 1; fi
           diff -u --strip-trailing-cr openapi.yaml "$RUNNER_TEMP/openapi.yaml"
       - name: Native key store (DPAPI)
+        if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test --locked -p engine-cli --test native_keystore -- --ignored --nocapture
