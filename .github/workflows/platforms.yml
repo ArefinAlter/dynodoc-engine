@@ -5,6 +5,7 @@ name: engine-platforms
 # lints and tests the whole workspace on the other supported platforms:
 #
 #   Linux aarch64     ubuntu-24.04-arm   PostgreSQL 16 service container, like ci.yml
+#   Linux x86-64      ubuntu-latest      key store test only (ci.yml runs everything else)
 #   macOS aarch64     macos-latest       PostgreSQL 16 from Homebrew
 #   macOS x86-64      macos-15-intel     PostgreSQL 16 from Homebrew
 #   Windows x86-64    windows-latest     PostgreSQL from the runner image
@@ -100,7 +101,28 @@ jobs:
           # job is touched.
           dbus-run-session -- bash -ec '
             eval "$(printf "%s" dynodoc-ci-keyring | gnome-keyring-daemon --unlock --daemonize --components=secrets)"
-            secret-tool search --all service nothing-stored || true
+            cargo test --locked -p engine-cli --test native_keystore -- --ignored --nocapture
+          '
+
+  linux-x64-key-store:
+    # ci.yml runs the whole suite on Linux x86-64 but cannot reach a Secret Service,
+    # so this small job runs the real key store test there as well.
+    name: Linux x86-64 key store
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: key-store
+      - name: Native key store (Secret Service through secret-tool)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gnome-keyring libsecret-tools dbus
+          dbus-run-session -- bash -ec '
+            eval "$(printf "%s" dynodoc-ci-keyring | gnome-keyring-daemon --unlock --daemonize --components=secrets)"
             cargo test --locked -p engine-cli --test native_keystore -- --ignored --nocapture
           '
 
