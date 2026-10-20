@@ -90,12 +90,18 @@ fn acl_principals(output: &str, path: &Path) -> Option<Vec<String>> {
         if line.trim().is_empty() {
             break;
         }
-        let entry = if index == 0 {
+        let entry = if index == 0 && path.is_ascii() {
             let head = line.get(..path.len())?;
             if !head.eq_ignore_ascii_case(&path) {
                 return None;
             }
             &line[path.len()..]
+        } else if index == 0 {
+            // icacls prints in the console code page, where letters outside it (a
+            // Bengali or accented folder name) arrive as `?`, so the printed path
+            // cannot be compared with ours. The whole line stays; the user name is
+            // still the text after its last backslash.
+            line
         } else {
             line
         };
@@ -112,7 +118,29 @@ fn acl_principals(output: &str, path: &Path) -> Option<Vec<String>> {
 /// Exactly one entry and it is `username`'s (icacls prints `DOMAIN\name`).
 #[cfg(any(windows, test))]
 fn only_user(principals: &[String], username: &str) -> bool {
-    matches!(principals, [one] if one.rsplit('\\').next().is_some_and(|name| name.eq_ignore_ascii_case(username)))
+    matches!(principals, [one] if one.rsplit('\\').next().is_some_and(|name| same_account_name(name, username)))
+}
+
+/// An ASCII name must match exactly (ignoring case). A name with letters outside
+/// the console code page is printed with `?` or U+FFFD in their place, so it is
+/// compared by its ASCII letters and the positions of the others.
+#[cfg(any(windows, test))]
+fn same_account_name(printed: &str, username: &str) -> bool {
+    if printed.eq_ignore_ascii_case(username) {
+        return true;
+    }
+    let shape = |text: &str| -> Vec<char> {
+        text.chars()
+            .map(|c| {
+                if c.is_ascii() && c != '?' {
+                    c.to_ascii_lowercase()
+                } else {
+                    '?'
+                }
+            })
+            .collect()
+    };
+    !username.is_ascii() && shape(printed) == shape(username)
 }
 
 #[cfg(windows)]
@@ -400,6 +428,30 @@ mod tests {
         assert!(acl_principals("D:\\other\\k.der PC\\maya:(F)\n", path).is_none());
         assert!(acl_principals("C:\\Users\\Maya Chen\\k.der no entries here\n", path).is_none());
         assert!(!only_user(&[], "maya"));
+    }
+
+    #[test]
+    fn icacls_output_with_letters_outside_the_console_code_page_still_verifies() {
+        // icacls prints `?` for letters its code page lacks, in the path and in the
+        // user name alike; the single entry must still be recognised as the user's.
+        let path = Path::new("C:\\Users\\Maya\\ফোল্ডার\\কী.der");
+        let one = "C:\\Users\\Maya\\????????\\??.der PC\\Jos?:(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n";
+        let found = acl_principals(one, path).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(only_user(&found, "José"));
+        assert!(only_user(&found, "JOS\u{e9}"));
+        // Another user is still refused: an ASCII name must match exactly, and a
+        // non-ASCII one by its ASCII letters.
+        assert!(!only_user(&found, "Jose"));
+        assert!(!only_user(&found, "Zoé"));
+        // Several entries, or no entry at all, still fail closed.
+        let many = "C:\\Users\\Maya\\????????\\??.der NT AUTHORITY\\SYSTEM:(I)(F)\n                                   PC\\Jos?:(I)(F)\n";
+        assert!(!only_user(&acl_principals(many, path).unwrap(), "José"));
+        assert!(acl_principals("garbage\n", path).is_none());
+        // A plain ASCII path is still compared strictly.
+        assert!(
+            acl_principals("D:\\other\\k.der PC\\maya:(F)\n", Path::new("C:\\k.der")).is_none()
+        );
     }
 
     #[test]
