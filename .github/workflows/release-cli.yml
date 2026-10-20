@@ -14,7 +14,6 @@ name: release-cli
 on:
   push:
     tags: ["cli-v*"]
-    branches: [ci/platform-matrix] # TEMP-BRANCH-TRIGGER
   workflow_dispatch:
 
 permissions:

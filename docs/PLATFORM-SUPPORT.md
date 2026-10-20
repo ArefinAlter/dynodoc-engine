@@ -26,24 +26,56 @@ glibc), and Linux distributions older than the glibc floor listed below.
 
 ## What CI verifies
 
-Evidence run: [engine-platforms 39488859505](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/39488859505)
-(commit `e2c1055`). Every job builds with `cargo build --workspace --locked`, runs
+Evidence run: [engine-platforms 39493540615](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/39493540615)
+(commit `7346a61`; later commits change only a temporary trigger, comments and this
+page). Every job builds with `cargo build --workspace --locked`, runs
 `cargo test --workspace --locked --no-fail-fast` against PostgreSQL, regenerates
 `openapi.yaml` and compares it, and exercises the real operating-system key store.
 Tests run one at a time (`RUST_TEST_THREADS=1`, as in `ci.yml`) with
 `CARGO_PROFILE_DEV_DEBUG=0` and `CARGO_INCREMENTAL=0`.
 
-@RESULTS@
+| Platform | Image | PostgreSQL | Build | Clippy | Tests passed / failed / ignored | SSE timing test | Real key store | Job time |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Linux aarch64 | `ubuntu-24.04-arm`, Ubuntu 24.04 (20261018.154.1) | 16.15, service container | pass | not run (see below) | 1285 / 0 / 4 | passed, blocking | Secret Service (gnome-keyring): pass | 13 min |
+| macOS aarch64 | macOS 26.6.2, Apple silicon (`macos-latest`) | 16.15, Homebrew, `en_US.UTF-8` | pass | pass | 1285 / 0 / 4 | passed, blocking | Keychain (temporary keychain): pass; login keychain left clean | 16 min |
+| macOS x86-64 | macOS 15.7.9, Intel (`macos-15-intel`) | 16.15, Homebrew, `en_US.UTF-8` | pass | not run | 1284 / 0 / 4 | excluded; alone: passed | Keychain (temporary keychain): pass; login keychain left clean | 23 min |
+| Windows x86-64 | Windows Server 2025 Datacenter 10.0.26100 (`windows-latest`) | 17.11, from the runner image, UTF-8, `en-US` | pass | pass | 1285 / 0 / 4 | excluded; alone: **failed** | DPAPI: pass | 22 min |
+| Windows aarch64 (tier 2) | Windows 11 Enterprise 10.0.26200, ARM64 (`windows-11-arm`) | 16.15, x64 build under emulation, UTF-8, `en-US` | pass | not run | 1285 / 0 / 4 | excluded; alone: **failed** | DPAPI: pass | 40 min |
+| Linux x86-64 | `ci.yml` | `ci.yml` | `ci.yml` | `ci.yml` | `ci.yml` | `ci.yml` | Secret Service (gnome-keyring), job `linux-x64-key-store`: pass | 2 min |
+
+Counts differ by platform only through `cfg(unix)` and `cfg(windows)` tests and through
+the excluded timing test. "Ignored" is the same four tests everywhere (see below). All
+six jobs concluded `success`. The Windows jobs check out with CRLF line endings
+(`core.autocrlf=true`).
 
 Earlier runs of the same workflow that informed the fixes below:
 [39470062867](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/39470062867),
 [39472623633](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/39472623633),
 [39477250840](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/39477250840),
-[39482886733](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/39482886733).
+[39482886733](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/39482886733),
+[39488859505](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/39488859505).
 
 ## Excluded or different in CI, and why
 
-@EXCLUSIONS@
+- **`sse_delivers_a_new_event_within_100ms`** (`crates/engine-api/tests/api_test.rs`) asserts
+  that a server-sent event arrives within 100 ms. It is a latency check, not a
+  behaviour check, and it is not weakened. It is excluded from the blocking run with
+  `--skip` on Windows x86-64, Windows aarch64 and macOS x86-64, and run again alone in a
+  non-blocking step whose PASSED or FAILED is written to the job summary. Measured so
+  far: `windows-latest` failed in every recorded run (3 of 3 runs), `windows-11-arm` failed in
+  every recorded run (2 of 2 runs), `macos-15-intel` failed once in four runs, while
+  `ubuntu-24.04-arm` and `macos-latest` passed it in every run (6 and 5 blocking
+  runs), so it still runs and blocks there. If it fails on one of those two, add
+  `skip_sse` for that matrix entry rather than editing the test.
+- **Four `#[ignore]`d tests** are not run on any platform, `ci.yml` included: the key
+  store test (run separately, see below), a compression measurement, planning a hundred
+  thousand commits, and a million-leaf transparency property. They are listed as
+  "ignored" in the table.
+- **Clippy** runs on macOS aarch64 and Windows x86-64 (the `cfg(unix)` and `cfg(windows)`
+  code) and, via `ci.yml`, Linux x86-64. The workspace has no `target_arch` code, so
+  the other jobs would lint the same sources. `cargo fmt --check` and `cargo doc` stay
+  in `ci.yml` only.
+- **PostgreSQL** is 16 everywhere except Windows x86-64 (17.11); see the limits.
 
 ## Platform differences and how each is tested
 
@@ -81,7 +113,8 @@ entry): `cargo test -p engine-cli --test native_keystore -- --ignored`.
 
 ### Bugs this work found and fixed
 
-All three were found by running on a real runner, none by reading code.
+All three were found by running tests: the first on a Windows PC while writing the
+new path test, the other two on the CI runners.
 
 1. **Windows, non-ASCII key path.** `icacls` prints in the console code page, so a
    Bengali or accented folder name came back as `?` and `device keygen`, `protect`
@@ -128,7 +161,21 @@ not show who wrote the source.
   choose More info, then Run anyway.
 - Linux shows no warning; `chmod +x` the files.
 
-@BINARIES@
+What a release binary needs from the system, read from the binaries themselves in the
+release runs (sizes are the archives):
+
+| Target | Archive | Needs |
+| --- | --- | --- |
+| `x86_64-unknown-linux-gnu` | about 15 MB | glibc 2.34 or newer (highest symbol version `GLIBC_2.34`; built on the Ubuntu 22.04 image), `libgcc_s`, `libm` |
+| `aarch64-unknown-linux-gnu` | about 14.5 MB | glibc 2.34 or newer (`GLIBC_2.34`) |
+| `x86_64-apple-darwin` | about 15 MB | macOS 11 or newer (`LC_BUILD_VERSION` minos 11.0), system libraries only |
+| `aarch64-apple-darwin` | about 14 MB | macOS 11 or newer (minos 11.0) |
+| `x86_64-pc-windows-msvc` | about 14.5 MB | the C runtime is linked statically: no `VCRUNTIME140` import, so no Visual C++ redistributable; Windows 10 or newer is Rust's own minimum for the target and was not tested on a Windows 10 host |
+| `aarch64-pc-windows-msvc` | about 13.5 MB | same, on Windows on Arm |
+
+glibc 2.34 covers Ubuntu 22.04 (2.35), Debian 12 (2.36) and RHEL 9 (2.34). The floor is
+set by the runner image the Linux archives are built on; when GitHub retires the
+Ubuntu 22.04 image the floor rises to that of the next image unless a container is used.
 
 ## Releases
 
@@ -138,11 +185,59 @@ binary it built, unpacks the archive into a clean directory and runs that too, a
 writes `SHA256SUMS`. A manual run stops at workflow artifacts (kept 30 days). Only a
 tag push creates a GitHub Release; that last step has not been exercised, see below.
 
-@RELEASE@
+Verification (each of these runs built all six targets natively; none created a release):
+
+- Every build job ran its own binaries on a runner of the target processor:
+  `engine-cli --version`, `engine-cli --help`, and `engine-api` with no configuration
+  (it must exit non-zero and name `DATABASE_URL`). It then packed the archive,
+  unpacked it into a clean directory and ran `engine-cli --version` from there.
+  Runs: [39472623743](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/39472623743),
+  [39482886720](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/39482886720),
+  [39488859525](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/39488859525),
+  [39493540654](https://github.com/ArefinAlter/dynodoc-engine/actions/runs/39493540654).
+- Archives were also downloaded from the last run to a Windows PC and checked against
+  `SHA256SUMS`. The Windows x86-64 one ran there (`engine-cli --version` printed
+  `engine-cli 0.1.0`; `engine-api` refused to start without configuration; an earlier
+  archive's `device keygen` produced a key file whose access list names only the
+  current user). The Linux x86-64 one ran in a clean `ubuntu:22.04` container (glibc
+  2.35). The Linux aarch64 one ran in an `ubuntu:22.04` `linux/arm64` container under
+  QEMU emulation. The macOS and Windows aarch64 archives were run only by their own
+  jobs on native runners, not downloaded and run elsewhere.
+- **Not exercised: the tag path.** The `publish` job (`gh release create` on a
+  `cli-v*` tag) has not run, because a test would publish a release in the public
+  repository. It is guarded by `github.event_name == 'push'` and a `cli-v` tag ref,
+  and was skipped in every run above. Before the first real release, push a throwaway
+  tag such as `cli-v0.0.0-test`, check the release, then delete the release and the tag.
 
 ## Known limits
 
-@LIMITS@
+- Tier 2 means what it says: Windows aarch64 has no native PostgreSQL. Its job
+  downloads the EDB x64 build of PostgreSQL 16.15 (zip, pinned by a SHA-256 taken from
+  a download on 20 October 2026, so trust on first use) and runs it under the
+  operating system's x64 emulation; the engine under test is native aarch64. That
+  job takes about 40 minutes, mostly slow emulated database tests.
+- Windows x86-64 uses the PostgreSQL 17.11 that the runner image ships, not 16 (the
+  policy version); its tests pass on 17. Both Windows clusters are created fresh with
+  UTF-8 and the `en-US` collation. macOS uses `en_US.UTF-8`; Linux uses the
+  `postgres:16` image default. The suite passing on all of them says the engine does
+  not depend on collation order, not that every collation is equivalent.
+- Hosted macOS Arm runners have limited capacity: jobs queued for 10 to 20 minutes and
+  one release job was cancelled with "the job was not acquired by Runner of type
+  hosted"; a re-run fixes it.
+- Linux Secret Service needs a running Secret Service. Headless servers usually have
+  none, in which case `--keystore` is refused with a pointer to passphrase mode. On
+  macOS, a locked login keychain in a headless session can make `security` ask for
+  a password; the tests used an unlocked temporary keychain, so what an ordinary user's
+  keychain does is not tested.
+- Secret files read by the API (`NAME_FILE`) and at-rest KEK files are not permission
+  checked on Windows (see the table); the hidden passphrase prompt is not tested in CI.
+- Tests run on the debug profile. The release binaries are only smoke tested
+  (`--version`, `--help`, the configuration refusal), not run through the suite.
+- Not covered anywhere: real hardware and devices, 32-bit, big-endian, RISC-V, musl,
+  Linux distributions other than Ubuntu 24.04 (tests) and 22.04 (release builds), macOS
+  before 15 and Windows 10 hosts (the macOS 11 and Windows 10 floors are build
+  settings, not test results), and the Android and iOS applications.
+- The binaries are unsigned and not notarised.
 
 ## Running the checks yourself
 

@@ -25,7 +25,7 @@ name: engine-platforms
 
 on:
   push:
-    branches: [main, ci/platform-matrix] # TEMP-BRANCH-TRIGGER
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
