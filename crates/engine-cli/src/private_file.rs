@@ -538,8 +538,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Runs the real system `icacls` on this host: a created file and an atomically
-    /// replaced file each end with exactly one access entry, the current user's.
     #[cfg(windows)]
     #[test]
     fn explicit_system_and_administrators_entries_of_an_elevated_token_are_removed() {
@@ -568,6 +566,8 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Runs the real system `icacls` on this host: a created file and an atomically
+    /// replaced file each end with exactly one access entry, the current user's.
     #[cfg(windows)]
     #[test]
     fn windows_files_carry_a_one_entry_acl_for_the_current_user() {
