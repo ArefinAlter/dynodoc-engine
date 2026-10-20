@@ -69,11 +69,20 @@ fn restrict(_path: &Path) -> Result<(), String> {
 
 /// `icacls` arguments that drop inherited entries and leave one entry for
 /// `principal` with full control. Built separately so it is testable everywhere.
+///
+/// A process with an elevated (Administrator) token creates files whose own access
+/// list already holds explicit entries for SYSTEM and the Administrators group, and
+/// those are not inherited ones, so dropping inheritance leaves them. They are
+/// removed by well-known SID (S-1-5-18, S-1-5-32-544: no language dependence)
+/// before the grant, so the grant stays even when the user is SYSTEM itself.
 #[cfg(any(windows, test))]
 fn icacls_apply_args(path: &Path, principal: &str) -> Vec<std::ffi::OsString> {
     vec![
         path.as_os_str().to_owned(),
         "/inheritance:r".into(),
+        "/remove:g".into(),
+        "*S-1-5-18".into(),
+        "*S-1-5-32-544".into(),
         "/grant:r".into(),
         format!("{principal}:F").into(),
     ]
@@ -404,6 +413,9 @@ mod tests {
             [
                 r"C:\keys\signing key.der",
                 "/inheritance:r",
+                "/remove:g",
+                "*S-1-5-18",
+                "*S-1-5-32-544",
                 "/grant:r",
                 r"PC\maya:F"
             ]
@@ -528,6 +540,34 @@ mod tests {
 
     /// Runs the real system `icacls` on this host: a created file and an atomically
     /// replaced file each end with exactly one access entry, the current user's.
+    #[cfg(windows)]
+    #[test]
+    fn explicit_system_and_administrators_entries_of_an_elevated_token_are_removed() {
+        // An elevated process gets these two as explicit (not inherited) entries on
+        // every file it creates; reproduce that, then restrict the file.
+        let dir = dir();
+        let key = dir.join("signing-key.der");
+        std::fs::write(&key, b"secret").unwrap();
+        let root = std::env::var_os("SystemRoot").unwrap();
+        let exe = PathBuf::from(root).join("System32").join("icacls.exe");
+        let run = |args: &[&std::ffi::OsStr]| {
+            let out = std::process::Command::new(&exe)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+        run(&[
+            key.as_os_str(),
+            "/grant".as_ref(),
+            r"NT AUTHORITY\SYSTEM:F".as_ref(),
+            r"BUILTIN\Administrators:F".as_ref(),
+        ]);
+        restrict(&key).unwrap();
+        assert_owner_only(&key);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_files_carry_a_one_entry_acl_for_the_current_user() {
