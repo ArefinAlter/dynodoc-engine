@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
-description = "dynodoc agent protocol read path: refs, hashes, Dynodoc Compact Text, outline/read/find/diff."
+description = "dynodoc agent protocol: refs, hashes, Dynodoc Compact Text, outline/read/find/diff and the propose operation compiler."
 
 [dependencies]
 engine-shared = { workspace = true }
