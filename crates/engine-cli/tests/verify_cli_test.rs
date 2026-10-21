@@ -169,8 +169,8 @@ async fn verify_accepts_only_a_head_in_the_verified_chain(pool: PgPool) {
     drop_login(&pool, &role).await;
 }
 
-/// Exercise the real scheduled entry point against a disposable DB, not a mock CLI.
-#[cfg(unix)]
+/// Exercise the Linux/GNU-timeout scheduler against a disposable DB, not a mock CLI.
+#[cfg(target_os = "linux")]
 #[sqlx::test(migrations = "../../migrations")]
 async fn scheduled_checks_notify_on_projection_or_snapshot_failure(pool: PgPool) {
     use std::os::unix::fs::PermissionsExt;
