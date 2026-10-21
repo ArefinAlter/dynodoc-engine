@@ -57,6 +57,10 @@ jobs:
         run: cargo build --locked --workspace
       - name: Test
         run: cargo test --locked --workspace
+      - name: Run append, verify and merge example
+        env:
+          DYNODOC_EXAMPLE_DATABASE: disposable
+        run: cargo run --locked -p engine-core --example append_verify_merge
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings
