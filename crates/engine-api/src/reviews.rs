@@ -312,6 +312,7 @@ pub(crate) async fn create(
     } else {
         None
     };
+    apply::ensure_new_node_ids_available(&mut tx, &req.ops).await?;
     let latest = latest_seq(&mut tx, id).await?;
     if req.base_seq < 0 || req.base_seq > latest {
         return Err(bad(
