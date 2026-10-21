@@ -248,6 +248,22 @@ measured. Raised for the owner: how `$n` handles several blocks created by one `
 default (the compiler: yes; `find`: no); the style of inserted replacement text; rejecting versus flagging hidden characters in
 agent writes (the compiler rejects); the missing `cycle` error in the section 10 table; the grammar for `fmt=md`.
 
+## Source: scheduled integrity verification and failure notifications (21 October 2026)
+
+Engine source `bb041aa`, based on main `3637dc6`, adds a daily/manual GitHub Actions
+job that runs the actual CLI all-document checks on isolated synthetic fixtures. The
+Linux operator wrapper attempts both projection and snapshot verification, bounds each
+with a timeout, calls a required executable notifier on failure, and exits 1. A real-CLI
+regression proves clean receipt backfill stays quiet and deliberate projection/snapshot
+corruption each calls the alert sink. Alert messages contain no document IDs/content.
+
+Checks: three focused CLI cases, `task lint`, `task test` (**1,286 passed, 0 failed,
+4 existing ignored**), `task docs`, shell syntax, workflow YAML parsing and unchanged
+OpenAPI all pass on disposable local PostgreSQL 16. The runbook describes privileges,
+restricted logs, locks/backfill, failed/missed-run monitoring and owner notification setup.
+The scheduled workflow runs after merge; production installation and actual page/email
+delivery remain operator acceptance. No production schedule or credentials were accessed.
+
 ## Source: self-hosted Phase 0, API retention job and secret files (20 October 2026)
 
 Two API-side tasks of [SELF-HOSTED-EDITION.md](SELF-HOSTED-EDITION.md) Phase 0 are built: **P0-8**, the retention job, and the
