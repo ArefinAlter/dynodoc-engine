@@ -235,6 +235,41 @@ fn golden_browser_replay_fixture() {
 }
 
 #[test]
+fn image_attr_edit_event_size() {
+    let src = format!("data:image/png;base64,{}", "A".repeat(375_000));
+    let mut content = json!({"type":"image","attrs":{"src":src,"alt":"Original","width":100}});
+    let mut current = state(content.clone());
+    for (attribute, value) in [
+        ("alt", json!("Revised alternative text")),
+        ("width", json!(640)),
+    ] {
+        content["attrs"][attribute] = value;
+        let edit = EventPayload::FieldEdited {
+            node_id: NodeId("stable".into()),
+            field: "content".into(),
+            value: content.clone(),
+        };
+        let compacted = richtext::compact_event(&current, &edit);
+        let bytes = serde_json::to_vec(&compacted).unwrap().len();
+        eprintln!("image {attribute} edit: {bytes} serialized payload bytes");
+        // V1 replaces the attribute object, including the embedded source. A future
+        // attribute-only patch format must deliberately revise this known limit.
+        assert!(matches!(compacted, EventPayload::FieldEdited { .. }));
+        assert!(
+            bytes > 375_000,
+            "the current event still contains the image: {bytes}"
+        );
+        assert!(bytes < 376_024, "unexpected overhead: {bytes}");
+        apply_payload(&mut current, &compacted).unwrap();
+        assert_eq!(
+            current.nodes[&NodeId("stable".into())].current_fields["content"],
+            content
+        );
+        assert_eq!(content["attrs"]["src"], src);
+    }
+}
+
+#[test]
 fn image_attributes_merge_key_by_key() {
     let img = json!({"type":"image","attrs":{"src":"a.png","width":100,"alt":""}});
     let mut width = img.clone();
