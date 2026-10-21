@@ -246,6 +246,7 @@ fn materializes_large_document_from_snapshot_plus_tail() -> anyhow::Result<()> {
         state: snapshot_value,
         merkle_root: vec![0; 32],
         event_chain_hash: vec![0; 32],
+        event_merkle_root: None,
         created_at: chrono::Utc::now(),
     };
 
@@ -732,7 +733,7 @@ async fn shared_named_snapshots_reuse_objects_and_preserve_mixed_history(
     .bind(doc.0)
     .fetch_all(&pool)
     .await?;
-    assert_eq!(versions, vec![1, 2, 2, 1]);
+    assert_eq!(versions, vec![3, 4, 4, 3]);
     assert_eq!(verify_document(&pool, doc, true).await?.snapshots, 4);
     Ok(())
 }
@@ -871,7 +872,7 @@ async fn concurrent_mixed_snapshot_writers_keep_one_format_and_receipt(
         .bind(doc.0).bind(a.id.0).fetch_one(&pool).await?;
     assert_eq!(
         objects == 0,
-        version == 1,
+        version == 3,
         "losing typed publication must not leave objects"
     );
     assert_eq!(verify_document(&pool, doc, false).await?.snapshots, 1);
