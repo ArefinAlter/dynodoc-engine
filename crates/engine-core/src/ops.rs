@@ -27,6 +27,9 @@ pub enum OpError {
     /// it can only be moved or renamed so that a restore brings it back elsewhere.
     #[error("node {0} is deleted")]
     NodeDeleted(String),
+    /// Only a deleted node or a removed choice can be restored by a new write.
+    #[error("node {0} is already live")]
+    NodeAlreadyLive(String),
     #[error("move or remove the children of node {0} before removing it")]
     NodeHasChildren(String),
     /// A `NodeCreated`/`ChoiceAdded` reused an id already present in the tree.
@@ -124,6 +127,9 @@ pub fn validate_op(state: &DocumentState, op: &EventPayload) -> Result<(), OpErr
 
         EventPayload::NodeRestored { node_id } => {
             let node = require_present(state, node_id)?;
+            if !node.deleted && !state.removed_choices.contains(node_id) {
+                return Err(OpError::NodeAlreadyLive(node_id.0.clone()));
+            }
             if let Some(parent) = &node.parent_id {
                 require_live(state, parent)?;
             }
@@ -467,6 +473,51 @@ mod tests {
             suggestions: BTreeMap::new(),
             removed_choices: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn restoring_requires_a_deleted_node_or_removed_choice() {
+        let mut s = state(vec![
+            n("root", NodeType::Form, None, None),
+            n("item", NodeType::Item, Some("root"), None),
+            n("choice", NodeType::Choice, Some("item"), None),
+        ]);
+        let restore = |id: &str| EventPayload::NodeRestored {
+            node_id: NodeId(id.into()),
+        };
+        assert_eq!(
+            validate_op(&s, &restore("item")),
+            Err(OpError::NodeAlreadyLive("item".into()))
+        );
+        assert!(matches!(
+            validate_op(&s, &restore("missing")),
+            Err(OpError::NodeNotFound(_))
+        ));
+        s.nodes.get_mut(&NodeId("item".into())).unwrap().deleted = true;
+        validate_op(&s, &restore("item")).unwrap();
+        s.nodes.get_mut(&NodeId("item".into())).unwrap().deleted = false;
+        s.removed_choices.insert(NodeId("choice".into()));
+        validate_op(&s, &restore("choice")).unwrap();
+        s.nodes.get_mut(&NodeId("item".into())).unwrap().deleted = true;
+        assert!(matches!(
+            validate_op(&s, &restore("choice")),
+            Err(OpError::NodeDeleted(_))
+        ));
+    }
+
+    #[test]
+    fn historical_live_restore_keeps_replaying_without_new_write_validation() {
+        let mut s = state(vec![n("legacy", NodeType::Form, None, None)]);
+        let before = s.clone();
+        let op = EventPayload::NodeRestored {
+            node_id: NodeId("legacy".into()),
+        };
+        assert!(matches!(
+            validate_op(&s, &op),
+            Err(OpError::NodeAlreadyLive(_))
+        ));
+        crate::materializer::apply_payload(&mut s, &op).unwrap();
+        assert_eq!(s, before);
     }
 
     fn created(id: &str, ty: NodeType, parent: Option<&str>, var: Option<&str>) -> EventPayload {
