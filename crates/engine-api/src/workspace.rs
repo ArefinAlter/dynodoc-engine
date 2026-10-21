@@ -72,6 +72,7 @@ async fn batch(
     auth: AuthContext,
     Json(mut req): Json<BatchRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::ops::ids::operations(&req.ops)?;
     if req.ops.is_empty() || req.ops.len() > 20_000 {
         return Err(bad(
             "A batch must contain 1–5000 changes, or up to 20,000 initial import nodes",
@@ -590,6 +591,7 @@ async fn edit_draft(
     auth: AuthContext,
     Json(req): Json<BatchRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::ops::ids::operations(&req.ops)?;
     if req.ops.is_empty() || req.ops.len() > 5000 {
         return Err(bad("A draft save must contain 1–5000 changes"));
     }
@@ -932,6 +934,8 @@ async fn sync_draft(
     auth: AuthContext,
     Json(req): Json<SyncRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::ops::ids::selection(req.included_nodes.as_deref().unwrap_or_default())?;
+    crate::ops::ids::selection(&req.dropped_nodes)?;
     let doc = DocumentId(id);
     let actor = IdentityId(auth.identity_id);
     let (mut tx, role, mut team) = apply::begin_write(&state, doc, actor).await?;

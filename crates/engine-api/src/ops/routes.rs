@@ -45,7 +45,9 @@ pub fn router() -> Router<AppState> {
 /// `POST /ops/node-create`. `node_id` is optional; absent, the server mints a ULID.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct NodeCreateRequest {
+    /// A new canonical uppercase ULID; historical node readers remain permissive.
     #[serde(default)]
+    #[schema(pattern = "^[0-7][0-9A-HJKMNP-TV-Z]{25}$")]
     pub node_id: Option<String>,
     #[schema(value_type = String)]
     pub node_type: NodeType,
@@ -319,6 +321,7 @@ async fn write(
 ) -> Result<Json<Value>, ApiError> {
     let actor = IdentityId(auth.identity_id);
     with_idempotency(state, headers, actor, path, document_id, || async {
+        super::ids::new_identities(&op)?;
         let event = apply::apply_op(state, document_id, actor, op.clone()).await?;
         Ok(json!({ "event": event }))
     })
