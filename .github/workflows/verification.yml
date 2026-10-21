@@ -1,0 +1,53 @@
+name: scheduled-verification
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/verification.yml'
+      - 'scripts/verify-scheduled.sh'
+      - 'crates/engine-cli/tests/verify_cli_test.rs'
+      - 'crates/engine-core/src/projection.rs'
+      - 'crates/engine-core/src/snapshot_verification.rs'
+
+permissions:
+  contents: read
+concurrency:
+  group: scheduled-verification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  disposable-verification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dynodoc_verification
+          POSTGRES_PASSWORD: synthetic-verification-only
+          POSTGRES_DB: dynodoc_verification
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U dynodoc_verification -d dynodoc_verification"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      DATABASE_URL: postgres://dynodoc_verification:synthetic-verification-only@127.0.0.1:5432/dynodoc_verification
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check scheduler syntax
+        run: sh -n scripts/verify-scheduled.sh
+      - name: Seed disposable databases and verify, including failure notifications
+        # These tests invoke the actual CLI --all commands as a restricted login.
+        # Corruption and the alert sink exist only in isolated synthetic fixtures.
+        run: cargo test --locked -p engine-cli --test verify_cli_test -- --test-threads=1
+      - name: Mark an actionable failure
+        if: failure()
+        run: echo '::error::Scheduled verification failed. The repository owner must investigate this run. Enable failed-workflow notifications as documented in docs/SCHEDULED-VERIFICATION.md.'
