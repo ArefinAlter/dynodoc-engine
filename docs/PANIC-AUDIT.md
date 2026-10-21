@@ -29,6 +29,9 @@ Changing a listed proof requires revisiting the allowance.
 | `engine-core/src/merge_policy/evidence.rs` | `to_json` | evidence is plain JSON data |
 | `engine-core/src/merge_policy/policy.rs` | `canonical_value` | a policy is plain JSON data |
 | `engine-core/src/merge_policy/registry.rs` | `builtin` | built-in strategy ids are unique |
+| `engine-core/src/repository/horizon.rs` | `sha256` | ring SHA-256 always returns exactly 32 bytes |
+| `engine-core/src/repository/horizon.rs` | `raw` | Address construction validates exactly 64 hexadecimal digits |
+| `engine-core/src/repository/horizon.rs` | `address_of` | hex encoding 32 bytes yields a valid 64-digit Address |
 | `engine-core/src/repository/horizon/plan.rs` | `build` | the while-let guard found the last stack entry |
 | `engine-core/src/repository/horizon/plan.rs` | `compute_hash` | a plan is an object |
 | `engine-core/src/repository/horizon/plan.rs` | `plan` | Graph::build validated every recovery reference exists |
