@@ -421,14 +421,6 @@ is complete. Not implemented: markdown cell-format annotations on ranges. Owner 
 zero-width characters may ever be stripped, whether reading a cell should cover only its first text
 container, and the spec's diff for sheets and decks (left undefined; the crate extends it).
 
-## Source: generated engine identity properties (21 October 2026)
-
-Engine source `8effce2`. Two fixed-seed properties run 1,000 examples each. Concurrent generated drafts preserve input/base node identities and untouched fields in both merge orientations; conflict-free replay preserves the live and previously canonical identity sets. The split/join model uses tombstone plus fresh-create operations, preserves Bengali text and leaves neighbors unchanged.
-
-Validation: task lint, task test (1,294 passed, 0 failed, 4 existing ignored), task docs and unchanged regenerated OpenAPI pass on isolated PostgreSQL 16. The count includes six structural-checker dependency cases and the two new 1,000-example properties plus a named private-create/delete regression.
-
-Compatibility and rollout: Depends on #42. Its submitted structural checker is integrated locally and appears in this draft until the dependency lands; the original PR was not changed. These bounded in-memory histories model concurrent drafts, not thread scheduling or network delivery. Split/join is an engine delete/create model, not native editor behavior or nested editor identities. Existing full-state replay and signed-history semantics are unchanged. Never-shared private create/delete pairs intentionally emit no canonical identity.
-
 ## Source: transparency log core and verifier library (18 October 2026)
 
 Phases W0, W1 (core only) and W2 (verifier library only) of
@@ -743,6 +735,14 @@ publication is refused. Read [the release record](operations/2026-10-13-schema38
 for evidence, rollback and next steps. CI on both repositories passed on the deployed
 revisions (application `49ada1e`, engine `e5b9d94`). Older entries below that record production at
 `858801c`/schema 29 describe the state before this release.
+
+## Source: generated engine identity properties (21 October 2026)
+
+Engine source `8effce2`. Two fixed-seed properties run 1,000 examples each. Concurrent generated drafts preserve input/base node identities and untouched fields in both merge orientations; conflict-free replay preserves the live and previously canonical identity sets. The split/join model uses tombstone plus fresh-create operations, preserves Bengali text and leaves neighbors unchanged.
+
+Validation: task lint, task test (1,294 passed, 0 failed, 4 existing ignored), task docs and unchanged regenerated OpenAPI pass on isolated PostgreSQL 16. The count includes six structural-checker dependency cases and the two new 1,000-example properties plus a named private-create/delete regression.
+
+Compatibility and rollout: Depends on #42. Its submitted structural checker is integrated locally and appears in this draft until the dependency lands; the original PR was not changed. These bounded in-memory histories model concurrent drafts, not thread scheduling or network delivery. Split/join is an engine delete/create model, not native editor behavior or nested editor identities. Existing full-state replay and signed-history semantics are unchanged. Never-shared private create/delete pairs intentionally emit no canonical identity.
 
 ## Source: public site redesign, GitHub-style workspace, device sessions (13 October 2026)
 
