@@ -583,7 +583,8 @@ fn check_ops(fx: &Fixture, c: &Compiled) {
     }
     assert_eq!(state, c.after);
     // The diff of the two states rebuilds the result and touches nothing else.
-    let d = workspace_merge::diff(&fx.state, &c.after);
+    let d = workspace_merge::diff(&fx.state, &c.after)
+        .expect("compiled states have representable node kinds");
     let mut replay = fx.state.clone();
     for op in &d {
         apply_payload(&mut replay, op).unwrap();

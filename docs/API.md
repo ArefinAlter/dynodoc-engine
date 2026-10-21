@@ -88,3 +88,20 @@ require immutable verification receipts. CLI `verify-snapshots DOCUMENT_UUID` or
 without writing receipts. An existing database must complete this backfill before
 traffic is restored. An old API that ignores receipts is not safe rollback. Read
 [the release gate and limitations](VERIFIED-SNAPSHOTS.md).
+
+## Event diffs that cannot represent a state
+
+Event-backed draft sharing, review merging and history recovery return HTTP 409
+when the proposed state requires a new unsupported node kind or changes an existing
+node's kind. These cases previously risked omitting a node from the generated event
+plan. A conflict leaves canonical events and document projections unchanged.
+An explicit team-side resolution can reject the unsupported draft addition while
+retaining unrelated representable edits; unresolved structure still needs review.
+
+The Rust `workspace_merge::diff` function now returns `Result<Vec<EventPayload>,
+DiffError>` instead of a vector. Direct library callers must handle failure. Existing
+historical unsupported nodes remain readable when unchanged. Signed v1 portable
+state convergence retains its original state semantics, including policy selection
+and decision evidence; it does not acquire an event-diff representability gate.
+This does not add node kinds, rewrite stored events, or resolve the separate root
+selection policy decision.
