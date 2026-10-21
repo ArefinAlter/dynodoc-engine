@@ -221,6 +221,14 @@ one a minute per grant and outcome, file overrides loosenable only by a project 
 scans the day, a cut-off trigger that also refuses clearing it, a per-person admission bucket for the management routes, `PUT`
 keeping omitted fields (and requiring `enabled`), bounded usage dates and a strict session cut-off.
 
+## Source: canonical new IDs at write boundaries (21 October 2026)
+
+Engine source `fec05f8`. Caller-created nodes, new choices and included/dropped selections now require canonical uppercase ULIDs at HTTP write boundaries. Node-create OpenAPI documents the pattern. Draft, batch, review, suggestion and recovery entry points share the checks; successful historical idempotency responses remain replayable.
+
+Validation: task lint, task test (1,289 passed, 0 failed, 4 existing ignored), task docs and OpenAPI regeneration pass on isolated PostgreSQL 16. Four new unit/router cases cover invalid and canonical IDs, selection limits and unchanged historical validation; the existing idempotency test also exercises a cached legacy response.
+
+Compatibility and rollout: Historical event readers, NodeId decoding, existing node references and server-generated recovery operations retain old IDs. Selecting a noncanonical historical ID now returns 400; inventory those IDs before rollout. Selection limits remain 20,000 for sync/merge and 5,000 for recovery. Global node-ID reservation is a separate follow-up; no applied migrations or production data were changed.
+
 ## Source: agent operation compiler, connector Phase 1 library (20 October 2026)
 
 The pure core of connector Phase 1 is built in `engine-agent`: a strict parser for the operation grammar of
