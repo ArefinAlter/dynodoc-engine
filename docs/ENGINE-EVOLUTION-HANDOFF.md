@@ -787,6 +787,14 @@ Per-project key grants, OS key storage and project-wide branch authoring in the 
 remain open. Marketplace publication, legal operator details and real-host acceptance
 need the owner.
 
+## Source: explicit errors for unrepresentable event diffs (21 October 2026)
+
+Engine source `38cf070`. Event diffs now fail explicitly for a new unsupported node kind or an existing node-kind change instead of returning a partial plan. Checked merges surface node conflicts and allow explicit team-side rejection without losing unrelated representable edits. API callers propagate 409 and agent callers report unsupported structure. All current agent/test callers were refreshed against main.
+
+Validation: task lint, task test (1,293 passed, 0 failed, 4 existing ignored), task docs and unchanged regenerated OpenAPI pass on isolated PostgreSQL 16. Eight added regressions include partial-plan refusal, explicit rejection and replay, HTTP error mapping, and signed-v1 convergence in both orientations with default and selected policy.
+
+Compatibility and rollout: The public Rust diff function now returns Result<Vec<EventPayload>, DiffError>; direct callers must handle errors. Unchanged historical unsupported kinds remain readable. Signed-v1 portable state convergence retains its existing policy and decision-evidence semantics, without the new event-plan gate. This does not settle the separate root/merge-strategy decision, add node kinds, or rewrite stored history.
+
 ## Source: engine PR review and application synchronization (12 October 2026)
 
 Reviewed all ten open standalone-engine PRs and merged **#1, #2, #3, #4, #6,

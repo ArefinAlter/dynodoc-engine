@@ -482,7 +482,7 @@ async fn detail(
     }
     let ctx = load_draft(&mut tx, id, draft, None).await?;
     let plan = plan(&request, &ctx.base, &team, &ctx.local, &BTreeMap::new());
-    let own = engine_core::workspace_merge::diff(&ctx.base, &ctx.local);
+    let own = engine_core::workspace_merge::diff(&ctx.base, &ctx.local)?;
     // Before/after of every block the contributor touched, for side-by-side review.
     let touched: BTreeSet<NodeId> = own
         .iter()
@@ -602,7 +602,8 @@ async fn merge(
     let events = append_to_team(&mut tx, doc, actor, role, &mut team, &chosen).await?;
     let mut local = ctx.local;
     carry_into_draft(&mut tx, draft, auth.identity_id, &mut local, &plan.state).await?;
-    let completed = engine_core::workspace_merge::diff(&team, &local).is_empty();
+    let remaining = engine_core::workspace_merge::diff(&team, &local)?.len();
+    let completed = remaining == 0;
     let next_seq = events.last().map_or(seq, |e| e.seq);
     let stored =
         crate::draft_storage::encode(&mut tx, doc, &team, state.shared_draft_bases).await?;
@@ -641,7 +642,7 @@ async fn merge(
         state.subscriptions.publish(doc, event.clone());
     }
     Ok(Json(
-        json!({"events":events,"completed":completed,"team_seq":next_seq,"remaining":engine_core::workspace_merge::diff(&team, &local).len()}),
+        json!({"events":events,"completed":completed,"team_seq":next_seq,"remaining":remaining}),
     ))
 }
 
