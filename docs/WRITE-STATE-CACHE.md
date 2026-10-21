@@ -56,3 +56,19 @@ checked-reader calls, each with a 500-event tail. Snapshot JSONB text was
 These are local debug measurements, not release or production estimates; the full
 result is in `benchmarks/write-state-cache-baseline-2026-10-21.json`. The larger
 fixture motivates a 16 MiB per-entry cap rather than the agent read cache's 8 MiB cap.
+
+## Comparison after implementation
+
+The same debug build and disposable corpus measured:
+
+| Blocks | Checked incremental read | Cached incremental read | Warm unchanged cache |
+| --- | ---: | ---: | ---: |
+| 1,000 | 110.960 ms | 23.467 ms | 3.943 ms |
+| 8,000 | 803.521 ms | 215.931 ms | 29.831 ms |
+
+Each median uses nine samples. Each incremental sample follows one committed semantic
+edit and asserts equality with the ordinary checked reader; it excludes the append,
+lock acquisition and role check. Each cache recorded 18 hits, one miss and one retained
+entry. Serialized retained state was 854,223 / 8,597,579 bytes. These are warm, sequential
+local debug results with no contention, not end-to-end API, release or production
+latencies. The report is `benchmarks/write-state-cache-comparison-2026-10-21.json`.
