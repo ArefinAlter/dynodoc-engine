@@ -969,6 +969,14 @@ reachability GC/packing, complete same-file offline convergence and realistic
 large-document/service acceptance remain open. These APIs do not advance centralized
 per-file events or replace web drafts. The full roadmap is not complete.
 
+## Source: cross-document node identity conflicts (21 October 2026)
+
+Engine source `6aaffc3`. Node inserts map SQLSTATE 23505 on node_pkey to a generic 409 that names neither the ID nor the other document. New draft and review/connector uploads check global availability before storing new content. The primary key remains authoritative when another document claims an ID later.
+
+Validation: task lint, task test (1,294 passed, 0 failed, 4 existing ignored), task docs and unchanged OpenAPI pass on isolated PostgreSQL 16. Five new router cases cover ordinary/batch/choice/share collisions, early private uploads, a genuinely blocked concurrent insert, another unique constraint, and atomic connector upload/replay. Restricted runtime logins exercise the write paths.
+
+Compatibility and rollout: Stacked on #58 for canonical new-ID checks. Preflight is not a reservation: private drafts can become unshareable after a later foreign insert. Existing connector receipts replay before preflight. Other unique constraints keep their prior error handling. Failed transactions leave canonical events, node rows and upload records unchanged; no historical IDs or applied migrations change.
+
 ## Source: private project history transfers (12 October 2026)
 
 Schema 35 adds account-private authenticated object/commit exchange, described in
