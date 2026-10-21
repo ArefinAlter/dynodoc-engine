@@ -250,7 +250,7 @@ agent writes (the compiler rejects); the missing `cycle` error in the section 10
 
 ## Source: scheduled integrity verification and failure notifications (21 October 2026)
 
-Engine source `bb041aa`, based on main `3637dc6`, adds a daily/manual GitHub Actions
+Engine source `a3168a0` (initial implementation `bb041aa`), based on main `3637dc6`, adds a daily/manual GitHub Actions
 job that runs the actual CLI all-document checks on isolated synthetic fixtures. The
 Linux operator wrapper attempts both projection and snapshot verification, bounds each
 with a timeout, calls a required executable notifier on failure, and exits 1. A real-CLI
@@ -263,6 +263,11 @@ OpenAPI all pass on disposable local PostgreSQL 16. The runbook describes privil
 restricted logs, locks/backfill, failed/missed-run monitoring and owner notification setup.
 The scheduled workflow runs after merge; production installation and actual page/email
 delivery remain operator acceptance. No production schedule or credentials were accessed.
+
+The GNU-timeout integration fixture is explicitly Linux-only. The initial Unix gate
+incorrectly included macOS; source `a3168a0` fixes that boundary. GitHub CI on this
+source passed build-test, all six platform jobs and disposable verification on
+21 October. The isolated full-suite count above records the initial implementation.
 
 ## Source: self-hosted Phase 0, API retention job and secret files (20 October 2026)
 
