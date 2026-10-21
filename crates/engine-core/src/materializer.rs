@@ -407,6 +407,7 @@ mod tests {
             .unwrap(),
             merkle_root: vec![0; 32],
             event_chain_hash: vec![0; 32],
+            event_merkle_root: None,
             created_at: chrono::Utc::now(),
         };
 

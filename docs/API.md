@@ -79,6 +79,26 @@ in 100-row pages before live delivery, supports Last-Event-ID and rejects negati
 or future positions. Byte/tenant/time limits and expensive search remain open.
 
 
+## Event roots in snapshot metadata (schema 45)
+
+Snapshot metadata from schema 45 includes optional `event_merkle_root` for new rows.
+It covers the ordered event prefix through `through_seq` using the audit endpoint's
+zero-padded event tree. `merkle_root` retains its node-tree meaning. Immutable old rows
+remain NULL and omit the new JSON field; receipt versions 1/2 keep their exact envelopes.
+New inline/shared snapshots use receipt versions 3/4, which also bind the event root.
+Upgrade readers and coordinate migration 0045 with the application before rollout.
+
+The event tree uses SHA-256 leaves `H(0x00 || content_hash)` and parents
+`H(0x01 || left || right)`, with a raw 32-zero sibling at each odd layer and
+a 32-zero root for an empty prefix. It is not the RFC 6962 transparency tree.
+The HTTP proof root must match a stored event root when present; later events
+are excluded. Existing v1 event-hash metadata exclusions remain unchanged.
+
+Rust callers constructing `Snapshot` literals must supply the new optional field
+(`None` for a historical envelope). Older readers cannot verify receipt versions
+3/4 and must be upgraded before new snapshots are written. This root adds an
+internal commitment; it does not provide an independent witness of database history.
+
 ## Legacy snapshot verification (schema 28)
 
 `GET /documents/:id/verify` independently checks the event chain and all legacy
