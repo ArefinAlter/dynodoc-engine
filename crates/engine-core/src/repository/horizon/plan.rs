@@ -374,6 +374,7 @@ impl HorizonPlan {
         canonical_bytes(self)
     }
 
+    #[allow(clippy::expect_used, reason = "a plan is an object")]
     fn compute_hash(&self) -> Result<String, Error> {
         let mut value = serde_json::to_value(self)?;
         let object = value.as_object_mut().expect("a plan is an object");
@@ -504,6 +505,10 @@ struct Scratch {
 }
 
 impl<'a> Graph<'a> {
+    #[allow(
+        clippy::expect_used,
+        reason = "the while-let guard found the last stack entry"
+    )]
     fn build(view: &'a HistoryView) -> Result<Self, Error> {
         let mut order: Vec<usize> = (0..view.commits.len()).collect();
         order.sort_by_key(|i| view.commits[*i].address);
@@ -565,7 +570,10 @@ impl<'a> Graph<'a> {
             state[start] = 1;
             while let Some(&(node, next)) = stack.last() {
                 if let Some(&parent) = parents[node].get(next) {
-                    stack.last_mut().expect("non-empty").1 += 1;
+                    stack
+                        .last_mut()
+                        .expect("the while-let guard found the last stack entry")
+                        .1 += 1;
                     match state[parent as usize] {
                         0 => {
                             state[parent as usize] = 1;
@@ -674,6 +682,10 @@ fn mark(keep: &mut [Option<Reason>], node: u32, reason: Reason) {
     keep[node as usize].get_or_insert(reason);
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "Graph::build validated every recovery reference exists"
+)]
 pub fn plan(
     view: &HistoryView,
     policy: &Policy,
@@ -820,7 +832,9 @@ pub fn plan(
             2 => {
                 for source in &commit.recovery {
                     evidence.push((
-                        graph.find(source).expect("checked"),
+                        graph
+                            .find(source)
+                            .expect("Graph::build validated every recovery reference exists"),
                         Reason::EvidenceRecovery,
                     ));
                 }

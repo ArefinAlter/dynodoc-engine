@@ -167,6 +167,10 @@ pub fn merge_with_registry(
     );
     (plan, evidence)
 }
+#[allow(
+    clippy::expect_used,
+    reason = "the absent-base branch continued above; the absent-team branch continued above"
+)]
 fn merge_with<S: Selector>(
     base: &DocumentState,
     team: &DocumentState,
@@ -209,8 +213,8 @@ fn merge_with<S: Selector>(
             }
             continue;
         }
-        let b = b.unwrap();
-        let t = t.unwrap();
+        let b = b.expect("the absent-base branch continued above");
+        let t = t.expect("the absent-team branch continued above");
         let mut n = t.clone();
         let at = |field| At {
             id,
@@ -783,6 +787,10 @@ fn depths(state: &DocumentState) -> BTreeMap<NodeId, usize> {
     }
     depths
 }
+#[allow(
+    clippy::expect_used,
+    reason = "the preceding branch handled an absent prior node"
+)]
 pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
     let from = canonical(from);
     let to = canonical(to);
@@ -839,7 +847,7 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Vec<EventPayload> {
             }
             continue;
         }
-        let p = prior.unwrap();
+        let p = prior.expect("the preceding branch handled an absent prior node");
         let renamed_later = (p.var_name != n.var_name || p.deleted) && name_later(n);
         if p.parent_id != n.parent_id || p.pos != n.pos {
             result.push(EventPayload::NodeMoved {

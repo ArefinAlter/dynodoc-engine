@@ -413,6 +413,7 @@ pub(crate) fn canonical_json(value: &Value) -> Vec<u8> {
     out
 }
 
+#[allow(clippy::expect_used, reason = "scalar JSON is infallible")]
 fn write_canonical(value: &Value, out: &mut Vec<u8>) {
     match value {
         Value::Object(map) => {
@@ -444,6 +445,7 @@ fn write_canonical(value: &Value, out: &mut Vec<u8>) {
     }
 }
 
+#[allow(clippy::expect_used, reason = "string JSON is infallible")]
 fn write_json_string(s: &str, out: &mut Vec<u8>) {
     serde_json::to_writer(out, &Value::String(s.to_string())).expect("string JSON is infallible");
 }

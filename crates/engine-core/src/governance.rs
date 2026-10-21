@@ -243,6 +243,10 @@ pub fn proposal_status(state: &DocumentState, suggestion_id: &str) -> Option<Pro
 /// is appended (docs/16 "a proposal that would create a cycle when accepted is
 /// rejected"). Errors: `Unauthorized` (non-author), `Op` (not pending, or the wrapped
 /// op is no longer valid).
+#[allow(
+    clippy::expect_used,
+    reason = "authorize() confirmed the suggestion is pending, so it exists"
+)]
 pub fn plan_acceptance(
     role: Role,
     state: &DocumentState,

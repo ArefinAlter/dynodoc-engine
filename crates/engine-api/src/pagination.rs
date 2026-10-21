@@ -30,6 +30,7 @@ pub struct Cursor {
 
 impl Cursor {
     /// Encode to the opaque URL-safe base64 form returned as `next_cursor`.
+    #[allow(clippy::expect_used, reason = "cursor serialization is infallible")]
     pub fn encode(&self) -> String {
         // serializing a two-field struct is infallible.
         let json = serde_json::to_vec(self).expect("cursor serialization is infallible");
