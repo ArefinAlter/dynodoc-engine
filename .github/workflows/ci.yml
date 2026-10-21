@@ -63,3 +63,17 @@ jobs:
         run: cargo doc --locked --workspace --no-deps
       - name: OpenAPI consistency
         run: cargo run --locked -p engine-cli -- openapi --out /tmp/openapi.yaml && diff -u openapi.yaml /tmp/openapi.yaml
+
+  dependency-policy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check dependency licenses, advisories and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1, cargo-deny 0.20.2
+        with:
+          rust-version: "1.96.0"
+          arguments: --locked --all-features
+          command: check
+          command-arguments: licenses advisories bans sources
