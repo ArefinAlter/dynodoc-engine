@@ -309,7 +309,13 @@ pub(crate) async fn materialize_node_change(
         if fields {
             query = query.bind(&node.current_fields);
         }
-        query.execute(&mut **tx).await?;
+        let result = query.execute(&mut **tx).await?;
+        if result.rows_affected() != 1 {
+            return Err(ApiError::Internal(format!(
+                "node {id} no longer has a row in document {}",
+                document_id.0
+            )));
+        }
     }
     Ok(())
 }

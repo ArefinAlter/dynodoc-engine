@@ -2104,7 +2104,36 @@ async fn private_document_reads_are_scoped_to_members(pool: PgPool) {
     let owner = seed_identity(&pool, "owner@example.test").await;
     let stranger = seed_identity(&pool, "stranger@example.test").await;
     let doc = create_document(&router, &bearer(owner), "Private study").await;
-    for suffix in ["", "/events", "/stream", "/verify", "/conflicts"] {
+    let (status, created) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &bearer(owner),
+            &json!({"node_type":"form","pos":"a0","fields":{"label":"Private text"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let node = created["event"]["target_node_id"].as_str().unwrap();
+    let event = created["event"]["id"].as_str().unwrap();
+    let snapshot = engine_core::snapshot::SnapshotEngine::new(pool.clone())
+        .take(
+            DocumentId(doc),
+            engine_core::snapshot::SnapshotReason::Periodic,
+        )
+        .await
+        .unwrap();
+    for suffix in [
+        "".into(),
+        "/events".into(),
+        "/stream".into(),
+        "/verify".into(),
+        "/conflicts".into(),
+        "/discussions".into(),
+        format!("/node/{node}"),
+        format!("/merkle-proof/{event}"),
+        format!("/snapshot/{}", snapshot.id.0),
+    ] {
         let (status, _) = send(
             &router,
             auth_post_get(&format!("/documents/{doc}{suffix}"), &bearer(stranger)),
@@ -2118,6 +2147,151 @@ async fn private_document_reads_are_scoped_to_members(pool: PgPool) {
     }
     let (_, list) = send(&router, auth_post_get("/documents", &bearer(stranger))).await;
     assert!(list["items"].as_array().unwrap().is_empty());
+}
+
+/// A concurrent projection move can commit after the scoped SELECT and before
+/// UPDATE. PostgreSQL must recheck the UPDATE predicate and roll back the event.
+#[sqlx::test(migrations = "../../migrations")]
+async fn node_updates_never_touch_another_documents_rows(pool: PgPool) {
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let router = app(test_state(runtime.pool.clone()));
+    let owner = bearer(seed_identity(&runtime.pool, "update-scope-owner@example.test").await);
+    let stranger = bearer(seed_identity(&runtime.pool, "update-scope-other@example.test").await);
+    for kind in ["FieldEdited", "NodeDeleted"] {
+        let doc = create_document(&router, &owner, "Source projection").await;
+        let other = create_document(&router, &stranger, "Foreign projection").await;
+        let root = ulid::Ulid::generate().to_string();
+        let node = ulid::Ulid::generate().to_string();
+        let (status,body)=send(&router,auth_post(&format!("/documents/{doc}/batch"),&owner,&json!({"ops":[
+            {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}},
+            {"type":"NodeCreated","node_id":node,"node_type":"item","parent_id":root,"pos":"a0","fields":{"label":"Original"}}
+        ]}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut mover = pool.begin().await.unwrap();
+        let pid: i32 = sqlx::query_scalar("select pg_backend_pid()")
+            .fetch_one(&mut *mover)
+            .await
+            .unwrap();
+        sqlx::query("update node set document_id=$2 where id=$1")
+            .bind(&node)
+            .bind(other)
+            .execute(&mut *mover)
+            .await
+            .unwrap();
+        let expected: Value = sqlx::query_scalar("select to_jsonb(n) from node n where id=$1")
+            .bind(&node)
+            .fetch_one(&mut *mover)
+            .await
+            .unwrap();
+        let op = if kind == "FieldEdited" {
+            json!({"type":kind,"node_id":node,"field":"label","value":"Must roll back"})
+        } else {
+            json!({"type":kind,"node_id":node})
+        };
+        let (writer_router, writer_token) = (router.clone(), owner.clone());
+        let writer = tokio::spawn(async move {
+            send(
+                &writer_router,
+                auth_post(
+                    &format!("/documents/{doc}/batch"),
+                    &writer_token,
+                    &json!({"ops":[op]}),
+                ),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5),async {
+            loop {
+                let blocked:bool=sqlx::query_scalar("select exists(select 1 from pg_stat_activity where datname=current_database() and $1=any(pg_blocking_pids(pid)) and lower(query) like '%update node set%')")
+                    .bind(pid).fetch_one(&pool).await.unwrap();
+                if blocked { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("writer did not reach the node UPDATE after its scoped SELECT");
+        mover.commit().await.unwrap();
+        let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{kind}: {body}");
+        let actual: Value = sqlx::query_scalar("select to_jsonb(n) from node n where id=$1")
+            .bind(&node)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected, "{kind} must not change the foreign row");
+        let count: i64 = sqlx::query_scalar("select count(*) from event where document_id=$1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "a lost projection must append no event");
+        let foreign_count: i64 =
+            sqlx::query_scalar("select count(*) from event where document_id=$1")
+                .bind(other)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(foreign_count, 0);
+    }
+    runtime.close().await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn cross_document_node_event_and_snapshot_ids_are_not_found(pool: PgPool) {
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let router = app(test_state(runtime.pool.clone()));
+    let token = bearer(seed_identity(&runtime.pool, "scope-owner@example.test").await);
+    let a = create_document(&router, &token, "First synthetic document").await;
+    let b = create_document(&router, &token, "Second synthetic document").await;
+    let mut rows = Vec::new();
+    for doc in [a, b] {
+        let (status, body) = send(
+            &router,
+            auth_post(
+                &format!("/documents/{doc}/ops/node-create"),
+                &token,
+                &json!({"node_type":"form","pos":"a0","fields":{"label":"Scoped content"}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let snapshot = engine_core::snapshot::SnapshotEngine::new(runtime.pool.clone())
+            .take(
+                DocumentId(doc),
+                engine_core::snapshot::SnapshotReason::Periodic,
+            )
+            .await
+            .unwrap();
+        rows.push((
+            doc,
+            body["event"]["target_node_id"].as_str().unwrap().to_owned(),
+            body["event"]["id"].as_str().unwrap().to_owned(),
+            snapshot.id.0,
+        ));
+    }
+    for (i, (doc, node, event, snapshot)) in rows.iter().enumerate() {
+        for suffix in [
+            format!("/node/{node}"),
+            format!("/merkle-proof/{event}"),
+            format!("/snapshot/{snapshot}"),
+        ] {
+            let (status, body) = send(
+                &router,
+                auth_post_get(&format!("/documents/{doc}{suffix}"), &token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{suffix}: {body}");
+            let other = rows[1 - i].0;
+            let (status, body) = send(
+                &router,
+                auth_post_get(&format!("/documents/{other}{suffix}"), &token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{suffix}: {body}");
+        }
+    }
+    runtime.close().await;
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -2468,12 +2642,34 @@ async fn content_search_never_returns_another_teams_document(pool: PgPool) {
     let (status, found) = send(&router, auth_post_get("/search?q=community", &token)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(found["items"].as_array().unwrap().len(), 1);
-    let (_, hidden) = send(
+    // The stranger owns matching content too. A missing document/node join must not
+    // let their authorized row drag another team's node into the search results.
+    let own = create_document(&router, &bearer(stranger), "Community notes").await;
+    let (created, body) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{own}/ops/node-create"),
+            &bearer(stranger),
+            &json!({"node_type":"form","pos":"a0","fields":{"label":"public community notes"}}),
+        ),
+    )
+    .await;
+    assert_eq!(created, StatusCode::OK, "{body}");
+    let (status, found) = send(
         &router,
         auth_post_get("/search?q=community", &bearer(stranger)),
     )
     .await;
-    assert!(hidden["items"].as_array().unwrap().is_empty());
+    assert_eq!(status, StatusCode::OK, "{found}");
+    let items = found["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{found}");
+    assert!(
+        items
+            .iter()
+            .all(|item| item["document_id"] == own.to_string()),
+        "{found}"
+    );
+    assert!(!found.to_string().contains("confidential"), "{found}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
