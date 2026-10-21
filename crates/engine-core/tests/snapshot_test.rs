@@ -291,7 +291,7 @@ async fn legacy_fixture(
     let events = engine_core::log::read_range(pool, doc, 1, seq).await?;
     let state = Materializer::fold(&events)?;
     let chain = events.last().map_or(vec![0; 32], |e| e.chain_hash.clone());
-    Ok(sqlx::query_as("insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash) values($1,$2,$3,$4,$5) returning *")
+    Ok(sqlx::query_as("insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash) values($1,$2,$3,$4,$5) returning id,document_id,through_seq,state,merkle_root,event_chain_hash,created_at,null::bytea as event_merkle_root")
         .bind(doc.0).bind(seq).bind(json!(state)).bind(engine_core::snapshot::merkle_root(&state)?.as_slice())
         .bind(chain).fetch_one(pool).await?)
 }
