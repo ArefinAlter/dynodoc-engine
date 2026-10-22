@@ -317,6 +317,7 @@ async fn write(
     path: &str,
     op: EventPayload,
 ) -> Result<Json<Value>, ApiError> {
+    super::pos::validate_operation_pos(&op)?;
     let actor = IdentityId(auth.identity_id);
     with_idempotency(state, headers, actor, path, document_id, || async {
         let event = apply::apply_op(state, document_id, actor, op.clone()).await?;

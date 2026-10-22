@@ -3292,3 +3292,102 @@ async fn expensive_reads_share_identity_budget_but_not_other_members(pool: PgPoo
         StatusCode::OK
     );
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn new_pos_keys_are_validated_at_write_boundaries(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let token = bearer(seed_identity(&pool, "pos-validator@example.test").await);
+    let doc = create_document(&router, &token, "Pos Validation").await;
+    let node_id = ulid::Ulid::generate().to_string();
+
+    // Batch with empty pos returns 400 Bad Request
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/batch"),
+            &token,
+            &json!({
+                "ops": [{
+                    "type": "NodeCreated",
+                    "node_id": node_id,
+                    "node_type": "form",
+                    "pos": "",
+                    "fields": {}
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expected 400 for empty pos: {body}"
+    );
+
+    // Batch with trailing space pos "m " returns 400 Bad Request
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/batch"),
+            &token,
+            &json!({
+                "ops": [{
+                    "type": "NodeCreated",
+                    "node_id": node_id,
+                    "node_type": "form",
+                    "pos": "m ",
+                    "fields": {}
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expected 400 for trailing space pos: {body}"
+    );
+
+    // Batch with valid pos succeeds
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/batch"),
+            &token,
+            &json!({
+                "ops": [{
+                    "type": "NodeCreated",
+                    "node_id": node_id,
+                    "node_type": "form",
+                    "pos": "a0",
+                    "fields": {}
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "expected 200 for valid pos: {body}");
+
+    // NodeMoved with invalid new_pos returns 400 Bad Request
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/batch"),
+            &token,
+            &json!({
+                "base_seq": 1,
+                "ops": [{
+                    "type": "NodeMoved",
+                    "node_id": node_id,
+                    "new_pos": "\n"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expected 400 for newline new_pos: {body}"
+    );
+}
