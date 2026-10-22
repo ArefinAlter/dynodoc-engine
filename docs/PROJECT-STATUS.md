@@ -98,23 +98,6 @@ algorithm) or freeze merge behaviour.
 
 Not deployed. Production runs the schema 41 release; none of these changes alter the schema.
 
-## Source proposal: read-only structural invariants (18 October 2026)
-
-Engine source `df1ebde`, checked after syncing docs-only main `514eb8e`, adds
-`integrity::check_invariants`: deterministic diagnostics for map-key/node-ID
-mismatches, missing or non-live parents, parent cycles and duplicate live names.
-Live excludes tombstones and historical removed-choice markers. Traversal is
-iterative; a 20,000-node tree and 1,000 generated-history cases pass. Multiple
-roots and equal positions remain allowed. This is an additive library diagnostic,
-not an automatic API/CLI validation gate, format certification or history rewrite.
-
-Checks: full serial workspace suite on disposable PostgreSQL 16: **642 passed,
-0 failed, 2 existing measurement/large-tree tests ignored**. Task is absent;
-equivalent Cargo fmt, all-target Clippy and rustdoc with warnings denied pass.
-Generated OpenAPI is unchanged. An initial cross-worktree cache mismatch was
-discarded; these checks used a separate build directory (debug info/incremental
-compilation disabled). No migrations, deployment or app adoption.
-
 ## Source: engine PR integration (15 October 2026)
 
 Reviewed all 24 open standalone-engine PRs. Fourteen were merged through one integration PR
