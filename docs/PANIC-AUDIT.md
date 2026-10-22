@@ -1,18 +1,10 @@
 # Core and API panic audit
 
-Production core and API libraries and the API binary warn on Clippy's
-`unwrap_used` and `expect_used`; `task lint` makes warnings failures. Unit-test
-code keeps ordinary assertions. No crate-wide allowance suppresses these lints.
+Production core and API libraries enforce Clippy's `unwrap_used` and `expect_used`
+under `-D warnings`. SSE registries recover valid state after poisoned locks, and
+history range and receipt lookups return typed errors rather than unwrapping options.
 
-The SSE registry now recovers its valid HashMap after a poisoned lock. A regression
-poisons the real mutex, reconnects, and checks the per-document subscriber cap.
-History range handling and portable receipt history return typed errors instead
-of extracting unchecked optional values. Event readers and hashes are unchanged.
-
-Remaining expectations have an explicit local proof and a function-local lint
-allowance with its reason. They cover immutable validated options, fixed-width
-cryptographic output, checked content headers and infallible owned JSON encoding.
-Changing a listed proof requires revisiting the allowance.
+Remaining expectations have an explicit local proof and a function-local lint allowance:
 
 | Source | Function | Proof |
 | --- | --- | --- |
@@ -52,13 +44,4 @@ Changing a listed proof requires revisiting the allowance.
 | `engine-core/src/workspace_merge.rs` | `diff` | the preceding branch handled an absent prior node |
 | `engine-core/src/workspace_merge.rs` | `merge_with` | the absent-base branch continued above; the absent-team branch continued above |
 
-Nearby content-parser and cryptographic slices were checked against their length
-guards. This adds no `indexing_slicing` gate and does not claim all Rust code is
-panic-free: assertions, allocation failures and dependencies remain separate.
-The existing historical replay, corruption and parser suites remain required.
-
-Suggestion acceptance now uses a checked lookup after authorization on the same
-immutable state. Its documented expectation replaces the older unchecked map
-index and retains the already-proven pending-suggestion invariant. The production
-scan includes shared checkpoints, snapshot verification, database and workload
-modules; their existing conditional/error handling needs no blanket allowance.
+Remaining assertions, allocation failures, and third-party dependencies are covered by existing historical replay and parser test suites.

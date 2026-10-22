@@ -452,14 +452,6 @@ freshness window is symmetric); which checkpoint L3 compares against (today only
 ones); how to express a log-only policy (threshold 0 is refused); fixing the `seq` (u64
 big-endian) and `doc_uuid` (16 raw bytes) tag encodings before any tag is published.
 
-## Source: production panic audit and poisoned subscription recovery (21 October 2026)
-
-Engine source `d98d73f`. The SSE registry recovers a poisoned mutex and retains its subscriber cap. History range and receipt-history handling return typed errors instead of unchecked optional extractions. Core/API production crates warn on unwrap/expect, with proof-specific local allowances for audited invariants; the audit records the checked modules and remaining limits.
-
-Validation: task lint, task test (1,294 passed, 0 failed, 4 existing ignored), task docs and unchanged OpenAPI pass on isolated PostgreSQL 16. A new poisoned-lock regression reconnects and checks the cap. Two deliberately unchecked production unwrap/expect controls are rejected by the lint and removed; restored lint passes.
-
-Compatibility and rollout: Stacked on #59 so its typed diff code and signed-v1 compatibility are retained while the existing extraction sites are audited. The count includes its eight regressions. Forty-one expectations remain in proof-specific function scopes; assertions, indexing, allocation and dependency panics are not claimed eliminated. Event hashes/readers and wire schemas are unchanged.
-
 ## Source: memory-hard key derivation for encrypted key files (18 October 2026)
 
 `dynodoc-key-v1` files written for a passphrase now use Argon2id (RFC 9106, 3 passes, 64 MiB,
@@ -794,14 +786,6 @@ storage packing, offline convergence, witnesses and large-file acceptance remain
 Per-project key grants, OS key storage and project-wide branch authoring in the web UI
 remain open. Marketplace publication, legal operator details and real-host acceptance
 need the owner.
-
-## Source: explicit errors for unrepresentable event diffs (21 October 2026)
-
-Engine source `38cf070`. Event diffs now fail explicitly for a new unsupported node kind or an existing node-kind change instead of returning a partial plan. Checked merges surface node conflicts and allow explicit team-side rejection without losing unrelated representable edits. API callers propagate 409 and agent callers report unsupported structure. All current agent/test callers were refreshed against main.
-
-Validation: task lint, task test (1,293 passed, 0 failed, 4 existing ignored), task docs and unchanged regenerated OpenAPI pass on isolated PostgreSQL 16. Eight added regressions include partial-plan refusal, explicit rejection and replay, HTTP error mapping, and signed-v1 convergence in both orientations with default and selected policy.
-
-Compatibility and rollout: The public Rust diff function now returns Result<Vec<EventPayload>, DiffError>; direct callers must handle errors. Unchanged historical unsupported kinds remain readable. Signed-v1 portable state convergence retains its existing policy and decision-evidence semantics, without the new event-plan gate. This does not settle the separate root/merge-strategy decision, add node kinds, or rewrite stored history.
 
 ## Source: engine PR review and application synchronization (12 October 2026)
 
