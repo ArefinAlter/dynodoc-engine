@@ -498,38 +498,6 @@ freshness window is symmetric); which checkpoint L3 compares against (today only
 ones); how to express a log-only policy (threshold 0 is refused); fixing the `seq` (u64
 big-endian) and `doc_uuid` (16 raw bytes) tag encodings before any tag is published.
 
-## PR #39: explicit insertion-grouping proposal after review (18 October 2026)
-
-Source: `135d672`; integrated with engine `efc7c80`, then synchronized to
-`1602a1c` through `75209ea`. This replaces the automatic grouping described in
-#40's held-PR entry below; activation and policy adoption remain subject to review.
-
-Default merge, strict merge and signed v1 insertion ordering remain unchanged. Two new
-Rust library entrypoints explicitly opt into grouping after conflict resolution and tree
-validation. Grouping requires at least two side switches, retains deleted and moved base
-siblings as gap separators, and caps generated keys at 200 bytes before allocation.
-Regressions cover disjoint runs, repeated pulls, deleted/moved separators, three-way
-alternation, strict merges, bounded repeated insertions and unchanged signed v1 results.
-No API handler, CLI or editor enables the preference.
-
-Full workspace suite on isolated PostgreSQL 16 at source 135d672, based on integration
-efc7c80: 560 passed, 0 failed, 1 intentionally ignored compression measurement. After
-synchronizing main 1602a1c (Argon2 key files) in 75209ea, the complete CLI suite passed
-63 tests; core/API source was unchanged by that synchronization. Formatting, all-target
-Clippy and Rustdoc with warnings denied passed on the final code; generated OpenAPI is
-unchanged. Task is unavailable here; its Cargo commands were run directly.
-
-New opt-in Rust APIs are documented in GROUPED-INSERTION-PROPOSAL.md; HTTP OpenAPI,
-migrations and event readers are unchanged. Grouping is a policy proposal for review,
-not a replacement for the existing position/id tie-break. Oversized or out-of-gap
-rewrites fall back to unchanged keys. Native between() acceptance and user-facing
-preference selection remain open. Enabling grouping in signed portable resolutions
-requires a new strategy id and retaining the old verifier. The strategy-version decision
-covering other already merged changes remains separate.
-Read [the proposal and adoption gates](GROUPED-INSERTION-PROPOSAL.md).
-Private-application synchronization of this preference and deployment have not been
-performed. No consumer enables it; approval and merge remain pending.
-
 ## Source: memory-hard key derivation for encrypted key files (18 October 2026)
 
 `dynodoc-key-v1` files written for a passphrase now use Argon2id (RFC 9106, 3 passes, 64 MiB,
