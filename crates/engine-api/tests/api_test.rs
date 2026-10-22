@@ -1479,7 +1479,7 @@ async fn non_participant_is_forbidden(pool: PgPool) {
 // --- proposal lifecycle ---------------------------------------------------------
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn suggest_then_accept_applies_the_wrapped_op(pool: PgPool) {
+async fn accepted_suggestion_records_acceptor_as_actor(pool: PgPool) {
     let router = app(test_state(pool.clone()));
     let author = seed_identity(&pool, "author@dynodoc.local").await;
     let reviewer = seed_identity(&pool, "reviewer@dynodoc.local").await;
@@ -1537,6 +1537,25 @@ async fn suggest_then_accept_applies_the_wrapped_op(pool: PgPool) {
     )
     .await;
     assert_eq!(body["current_fields"]["title"], "New");
+
+    let actors: Vec<(String, Uuid)> =
+        sqlx::query_as("select type, actor_id from event where document_id=$1 order by seq")
+            .bind(doc_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        actors,
+        vec![
+            ("NodeCreated".into(), author),
+            ("SuggestionProposed".into(), reviewer),
+            ("FieldEdited".into(), author),
+            ("SuggestionAccepted".into(), author),
+        ]
+    );
+    assert!(engine_core::log::verify_chain(&pool, DocumentId(doc_id))
+        .await
+        .is_ok());
 }
 
 // --- four-card conflicts (stage 21) ---------------------------------------------
@@ -1613,9 +1632,9 @@ async fn conflicts_list_groups_two_pending_edits_on_one_field(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn resolve_accept_makes_chosen_value_canonical_and_rejects_others(pool: PgPool) {
+async fn conflict_resolution_records_resolver_as_actor(pool: PgPool) {
     let router = app(test_state(pool.clone()));
-    let (doc_id, node_id, token, _reviewer) = seed_conflict(&pool, &router).await;
+    let (doc_id, node_id, token, reviewer) = seed_conflict(&pool, &router).await;
 
     let (_, list) = send(
         &router,
@@ -1639,6 +1658,37 @@ async fn resolve_accept_makes_chosen_value_canonical_and_rejects_others(pool: Pg
     .await;
     assert_eq!(status, StatusCode::OK, "resolve failed: {body}");
     assert!(body["events"].as_array().unwrap().len() >= 2);
+
+    let resolver: Uuid =
+        sqlx::query_scalar("select actor_id from event where document_id=$1 and seq=1")
+            .bind(doc_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(resolver, reviewer);
+    let actors: Vec<(String, Uuid)> = sqlx::query_as(
+        "select type,actor_id from event where document_id=$1 and seq>3 order by seq",
+    )
+    .bind(doc_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        actors,
+        vec![
+            ("FieldEdited".into(), resolver),
+            ("SuggestionAccepted".into(), resolver),
+            ("SuggestionRejected".into(), resolver),
+        ]
+    );
+    assert!(body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event["actor_id"] == resolver.to_string()));
+    assert!(engine_core::log::verify_chain(&pool, DocumentId(doc_id))
+        .await
+        .is_ok());
 
     // The accepted value is now canonical.
     let (_, node) = send(
@@ -3291,4 +3341,72 @@ async fn expensive_reads_share_identity_budget_but_not_other_members(pool: PgPoo
             .0,
         StatusCode::OK
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn title_and_settings_change_writes_no_event_but_one_audit_row(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let actor = seed_identity(&pool, "metadata-actor@example.test").await;
+    let owner = bearer(actor);
+    let doc = create_document(&router, &owner, "Original title").await;
+    let (status, seeded) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_type":"form","pos":"a0","fields":{"title":"Content title"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{seeded}");
+    let before: Vec<(i64, String)> = sqlx::query_as(
+        "select seq,encode(chain_hash,'hex') from event where document_id=$1 order by seq",
+    )
+    .bind(doc)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let change = json!({"title":"Renamed document","settings":{"import_warnings":["Synthetic import warning"]}});
+    let uri = format!("/documents/{doc}/metadata");
+    let (status, response) = send(&router, auth_post(&uri, &owner, &change)).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (title, settings): (String, Value) =
+        sqlx::query_as("select title,settings from document where id=$1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(title, "Renamed document");
+    assert_eq!(
+        settings["import_warnings"],
+        json!(["Synthetic import warning"])
+    );
+    let audit: Vec<(Uuid, Value)> = sqlx::query_as(
+        "select actor_id,detail from operation_audit where resource_id=$1 and action='document.metadata_changed'",
+    ).bind(doc).fetch_all(&pool).await.unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].0, actor);
+    assert_eq!(audit[0].1["format"], "dynodoc.metadata-audit.v1");
+    assert_eq!(audit[0].1["fields"], json!(["title", "settings"]));
+    assert_ne!(audit[0].1["before_hash"], audit[0].1["after_hash"]);
+    assert!(!audit[0].1.to_string().contains("Synthetic import warning"));
+    let (status, response) = send(&router, auth_post(&uri, &owner, &change)).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let count: i64 = sqlx::query_scalar("select count(*) from operation_audit where resource_id=$1 and action='document.metadata_changed'")
+        .bind(doc).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        count, 1,
+        "repeating unchanged metadata must not add an audit row"
+    );
+    let after: Vec<(i64, String)> = sqlx::query_as(
+        "select seq,encode(chain_hash,'hex') from event where document_id=$1 order by seq",
+    )
+    .bind(doc)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+    assert!(engine_core::log::verify_chain(&pool, DocumentId(doc))
+        .await
+        .is_ok());
 }
