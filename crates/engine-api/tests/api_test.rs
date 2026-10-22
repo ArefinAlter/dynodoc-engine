@@ -1388,6 +1388,194 @@ async fn anonymous_read_requires_auth(pool: PgPool) {
 // --- write path + governance ----------------------------------------------------
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn new_node_ids_are_strict_at_each_wire_write_boundary(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let token = bearer(seed_identity(&pool, "strict-ids@example.test").await);
+    let malformed = [
+        String::new(),
+        "<script>".into(),
+        "X".repeat(100_000),
+        "random".repeat(500),
+        "01arz3ndektsv4rrffq69g5fav".into(),
+        "8ZZZZZZZZZZZZZZZZZZZZZZZZZ".into(),
+    ];
+    for kind in ["node-create", "batch", "draft", "review", "suggest"] {
+        let doc = create_document(&router, &token, "Synthetic ID boundary").await;
+        let draft = if kind == "draft" {
+            let (status, body) = send(
+                &router,
+                auth_post(
+                    &format!("/documents/{doc}/drafts"),
+                    &token,
+                    &json!({"name":"Private"}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["id"].as_str().unwrap().to_owned()
+        } else {
+            Uuid::nil().to_string()
+        };
+        let valid = ulid::Ulid::generate().to_string();
+        for (id, expected) in malformed
+            .iter()
+            .map(|id| (id, StatusCode::BAD_REQUEST))
+            .chain(std::iter::once((&valid, StatusCode::OK)))
+        {
+            let op = json!({"type":"NodeCreated","node_id":id,"node_type":"form","pos":"a0","fields":{}});
+            let (path, body) = match kind {
+                "node-create" => (format!("/documents/{doc}/ops/node-create"), op.clone()),
+                "batch" => (format!("/documents/{doc}/batch"), json!({"ops":[op]})),
+                "draft" => (
+                    format!("/documents/{doc}/drafts/{draft}"),
+                    json!({"revision":0,"ops":[op]}),
+                ),
+                "review" => (
+                    format!("/documents/{doc}/change-requests"),
+                    json!({"name":"File change","base_seq":0,"ops":[op]}),
+                ),
+                _ => (
+                    format!("/documents/{doc}/ops/suggest"),
+                    json!({"detail":op}),
+                ),
+            };
+            let (status, result) = send(&router, auth_post(&path, &token, &body)).await;
+            assert_eq!(status, expected, "{kind}, id length {}: {result}", id.len());
+            if expected == StatusCode::BAD_REQUEST {
+                assert!(result.to_string().len() < 1024, "do not echo oversized IDs");
+            }
+        }
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn selection_ids_and_new_choice_ids_are_validated_without_partial_writes(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let token = bearer(seed_identity(&pool, "selection-ids@example.test").await);
+    let doc = create_document(&router, &token, "Synthetic selected IDs").await;
+    let (status, draft) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/drafts"),
+            &token,
+            &json!({"name":"Selection"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{draft}");
+    let draft = draft["id"].as_str().unwrap();
+    for field in ["included_nodes", "dropped_nodes"] {
+        for ids in [
+            json!(["bad"]),
+            json!(vec![ulid::Ulid::generate().to_string(); 20_001]),
+        ] {
+            let mut body = json!({"action":"preview"});
+            body[field] = ids;
+            let (status, result) = send(
+                &router,
+                auth_post(
+                    &format!("/documents/{doc}/drafts/{draft}/sync"),
+                    &token,
+                    &body,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {result}");
+        }
+        let mut body = json!({"action":"preview"});
+        body[field] = json!([ulid::Ulid::generate().to_string()]);
+        let (status, result) = send(
+            &router,
+            auth_post(
+                &format!("/documents/{doc}/drafts/{draft}/sync"),
+                &token,
+                &body,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+    }
+    let root = ulid::Ulid::generate().to_string();
+    let question = ulid::Ulid::generate().to_string();
+    let (status,result)=send(&router,auth_post(&format!("/documents/{doc}/batch"),&token,&json!({"ops":[
+        {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}},
+        {"type":"NodeCreated","node_id":question,"parent_id":root,"node_type":"item","pos":"a0","fields":{"label":"Question"}}
+    ]}))).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    for choice in ["bad".to_owned(), ulid::Ulid::generate().to_string()] {
+        let (status,result)=send(&router,auth_post(&format!("/documents/{doc}/batch"),&token,&json!({"ops":[
+            {"type":"ChoiceAdded","node_id":question,"choice_id":choice,"fields":{"label":"Choice"}}
+        ]}))).await;
+        assert_eq!(
+            status,
+            if choice == "bad" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::OK
+            },
+            "{result}"
+        );
+    }
+    let other = create_document(&router, &token, "Review selection").await;
+    let review_id = ulid::Ulid::generate().to_string();
+    let (status, review) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{other}/change-requests"),
+            &token,
+            &json!({"name":"Selected review","base_seq":0,"submit":true,"ops":[
+                {"type":"NodeCreated","node_id":review_id,"node_type":"form","pos":"a0","fields":{}}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    let review = review["id"].as_str().unwrap();
+    for ids in [
+        json!(["bad"]),
+        json!(vec![review_id.clone(); 20_001]),
+        json!([review_id]),
+    ] {
+        let expected = if ids.as_array().unwrap().len() == 1 && ids[0] != "bad" {
+            StatusCode::OK
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        let (status, result) = send(
+            &router,
+            auth_post(
+                &format!("/documents/{other}/change-requests/{review}/merge"),
+                &token,
+                &json!({"team_seq":0,"revision":1,"included_nodes":ids,"override_rules":true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, expected, "{result}");
+    }
+}
+
+#[test]
+fn historical_node_ids_still_validate_and_fold_without_rewriting() {
+    let id = engine_shared::NodeId("01NODE00000000".into());
+    let op = engine_shared::EventPayload::NodeCreated {
+        node_id: id.clone(),
+        node_type: engine_shared::NodeType::Form,
+        parent_id: None,
+        pos: "a0".into(),
+        fields: json!({}),
+        var_name: None,
+    };
+    let mut state = engine_core::materializer::DocumentState::default();
+    engine_core::ops::validate_op(&state, &op).unwrap();
+    engine_core::materializer::apply_payload(&mut state, &op).unwrap();
+    assert_eq!(state.nodes[&id].id, id);
+    assert_eq!(
+        serde_json::to_value(&op).unwrap()["node_id"],
+        "01NODE00000000"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn node_create_and_field_edit_round_trip(pool: PgPool) {
     let router = app(test_state(pool.clone()));
     let author = seed_identity(&pool, "author@dynodoc.local").await;
@@ -1813,7 +2001,7 @@ async fn idempotency_key_dedupes_writes(pool: PgPool) {
     let token = bearer(author);
     let doc_id = create_document(&router, &token, "Form").await;
 
-    let body = json!({ "node_type": "form", "pos": "a0", "node_id": "01IDEMPOTENT0000000000000" });
+    let body = json!({ "node_type": "form", "pos": "a0", "node_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV" });
     let req = || {
         Request::builder()
             .method("POST")
@@ -1841,6 +2029,32 @@ async fn idempotency_key_dedupes_writes(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(count, 1, "idempotent replay must not duplicate the event");
+
+    // A response stored before the stricter boundary remains replayable during
+    // the existing idempotency TTL, even when its historical request ID is old.
+    let path = format!("/documents/{doc_id}/ops/node-create");
+    let cached = json!({"historical_response": true});
+    sqlx::query("insert into idempotency_key(identity_id,idempotency_key,request_path,response_status,response_body) values($1,'legacy-key',$2,200,$3)")
+        .bind(author).bind(&path).bind(&cached).execute(&pool).await.unwrap();
+    let request = Request::builder()
+        .method("POST")
+        .uri(&path)
+        .header("content-type", "application/json")
+        .header(header::AUTHORIZATION, &token)
+        .header("idempotency-key", "legacy-key")
+        .body(Body::from(
+            json!({"node_type":"form","pos":"a0","node_id":"legacy-node"}).to_string(),
+        ))
+        .unwrap();
+    let (status, replay) = send(&router, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay, cached);
+    let after: i64 = sqlx::query_scalar("select count(*) from event where document_id=$1")
+        .bind(doc_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after, 1);
 }
 
 // --- pagination -----------------------------------------------------------------

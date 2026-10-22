@@ -88,3 +88,23 @@ require immutable verification receipts. CLI `verify-snapshots DOCUMENT_UUID` or
 without writing receipts. An existing database must complete this backfill before
 traffic is restored. An old API that ignores receipts is not safe rollback. Read
 [the release gate and limitations](VERIFIED-SNAPSHOTS.md).
+
+## New write identities and selection IDs
+
+Caller-created `NodeCreated.node_id` and `ChoiceAdded.choice_id` must be canonical
+uppercase ULIDs: exactly 26 ASCII Crockford base32 characters, with first character
+`0`–`7`. Node-create, batch, draft edit, change-request creation and proposed
+suggestion operations use the same check. Malformed values return HTTP 400 before
+any operation is applied. Missing node-create IDs still use server-generated ULIDs.
+
+Sync included/dropped selections and change-request merge selections accept at most
+20,000 IDs and validate each ID. History recovery retains its existing 5,000-ID
+limit and also validates selections. Error messages never include supplied IDs.
+
+This is a write-boundary change. Historical event readers, `NodeId` deserialization,
+server-generated history recovery operations and references to existing nodes keep
+legacy ID compatibility. Existing successful idempotency responses can still replay.
+Operators must inventory legacy IDs before rollout: an old noncanonical node can
+still be read and edited by reference, but selecting it for these merge/recovery
+requests now returns 400. A canonical ULID alone does not reserve a global node ID;
+database uniqueness remains authoritative. No historical IDs or migrations change.

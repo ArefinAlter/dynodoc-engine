@@ -339,6 +339,7 @@ pub(crate) async fn create(
     auth: AuthContext,
     Json(req): Json<CreateRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::ops::ids::operations(&req.ops)?;
     if req.name.trim().is_empty() || req.name.len() > 200 {
         return Err(bad("Name this change in 1–200 characters"));
     }
@@ -604,6 +605,7 @@ async fn merge(
     auth: AuthContext,
     Json(req): Json<MergeRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::ops::ids::selection(req.included_nodes.as_deref().unwrap_or_default())?;
     if req.note.len() > 4000 {
         return Err(bad("Keep the review note under 4,000 characters"));
     }

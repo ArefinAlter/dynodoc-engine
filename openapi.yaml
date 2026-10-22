@@ -7562,6 +7562,8 @@ components:
           type:
           - string
           - 'null'
+          description: A new canonical uppercase ULID; historical node readers remain permissive.
+          pattern: ^[0-7][0-9A-HJKMNP-TV-Z]{25}$
         node_type:
           type: string
         parent_id:
