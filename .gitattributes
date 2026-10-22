@@ -1,2 +1,5 @@
 # SQLx hashes exact migration bytes. Keep committed LF bytes on every platform.
 migrations/*.sql text eol=lf
+# The Claude Code plugin is installed from these files and a test asserts LF only; a
+# Windows checkout with core.autocrlf=true would otherwise turn them into CRLF.
+integrations/** text eol=lf

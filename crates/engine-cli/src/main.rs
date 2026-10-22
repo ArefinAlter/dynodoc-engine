@@ -21,6 +21,7 @@ mod authority;
 mod device;
 mod keyfile;
 mod keystore;
+mod mcp;
 mod passphrase;
 mod private_file;
 mod receipt;
@@ -50,6 +51,9 @@ struct Cli {
 enum Command {
     /// Selected-history transfer. Remote heads are pinned separately from local branches.
     Sync(sync::Options),
+    /// Read-only MCP server for AI agents over standard input and output (Claude Code,
+    /// Claude Desktop). Launched by the client, not run by hand.
+    Mcp(mcp::Options),
     /// Enroll a local signing key in an authenticated Dynodoc account.
     Device {
         #[command(subcommand)]
@@ -163,19 +167,39 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+/// Stack of the thread that runs the CLI. In a debug build the derived argument
+/// parser and the command futures need almost exactly the 1 MiB a Windows main
+/// thread has (adding one subcommand overflowed it before parsing finished), so the
+/// work runs on a thread with room to spare.
+const CLI_STACK_BYTES: usize = 32 * 1024 * 1024;
 
+fn main() -> anyhow::Result<()> {
+    let worker = std::thread::Builder::new()
+        .name("engine-cli".into())
+        .stack_size(CLI_STACK_BYTES)
+        .spawn(run)?;
+    worker
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+#[tokio::main]
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let logs = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+    );
+    if matches!(cli.command, Command::Mcp(_)) {
+        // `mcp` speaks its protocol on stdout: its logs, and only its, go to stderr.
+        logs.with_writer(std::io::stderr).init();
+    } else {
+        logs.init();
+    }
     private_file::allow_insecure(cli.allow_insecure_key_file);
     passphrase::set_file(cli.passphrase_file);
     match cli.command {
         Command::Sync(options) => sync::run(options).await,
+        Command::Mcp(options) => mcp::run(options).await,
         Command::Device { action } => device::run(action),
         Command::Receipt {
             journal,

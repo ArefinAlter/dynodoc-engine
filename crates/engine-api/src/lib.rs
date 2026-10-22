@@ -15,8 +15,10 @@
 pub mod access;
 pub mod admin;
 mod admin_controls;
+pub mod agent;
 pub mod audit;
 pub mod auth;
+pub mod config;
 pub mod conflicts;
 pub mod copies;
 pub mod counters;
@@ -40,7 +42,9 @@ mod project_issues;
 mod project_staging;
 pub mod projects;
 pub mod provenance;
+pub mod retention;
 pub mod reviews;
+pub mod secrets;
 pub mod stream;
 pub mod workloads;
 pub mod workspace;
@@ -69,12 +73,19 @@ pub struct AppState {
     pub workloads: workloads::Workloads,
     /// Error responses counted by code since start (admin overview).
     pub counters: counters::Counters,
+    /// Rows pruned by the retention loop since start (admin overview).
+    pub retention: retention::Stats,
     /// Explicitly loaded secret outside the database; required for shared ref writes.
     pub ref_signer: Option<std::sync::Arc<ring::signature::Ed25519KeyPair>>,
     /// Explicit opt-in; new draft/rebase bases use typed shared objects.
     pub shared_draft_bases: bool,
     /// Explicit opt-in; named versions, public pins and deploys share typed state.
     pub named_snapshot_storage: engine_core::snapshot::NamedStorage,
+    /// `AGENT_GATEWAY=on` mounts the agent data plane ([`agent`]); anything else leaves
+    /// its routes absent. Off by default.
+    pub agent_gateway: bool,
+    /// Bounded cache of verified document states for the agent routes.
+    pub agent_cache: agent::StateCache,
     /// The immutable installation ID, read once for device-session challenges.
     device_authority: std::sync::Arc<tokio::sync::OnceCell<uuid::Uuid>>,
 }
@@ -90,6 +101,7 @@ impl AppState {
             copy_index: copies::CopyIndex::default(),
             workloads: workloads::Workloads::default(),
             counters: Default::default(),
+            retention: Default::default(),
             ref_signer: None,
             shared_draft_bases: std::env::var("DYNODOC_SHARED_DRAFT_BASES").as_deref()
                 == Ok("shared-v2"),
@@ -100,6 +112,8 @@ impl AppState {
             } else {
                 engine_core::snapshot::NamedStorage::Legacy
             },
+            agent_gateway: std::env::var("AGENT_GATEWAY").as_deref() == Ok("on"),
+            agent_cache: Default::default(),
             device_authority: Default::default(),
         }
     }
@@ -119,7 +133,7 @@ pub fn app(state: AppState) -> Router {
         .allow_headers(Any)
         .allow_origin(Any);
 
-    Router::new()
+    let routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/openapi.json", get(openapi_json))
         .merge(auth::router())
@@ -145,7 +159,18 @@ pub fn app(state: AppState) -> Router {
         .merge(discussions::router())
         .merge(notifications::router())
         .merge(copies::router())
-        .merge(people::router())
+        .merge(people::router());
+    // Off (the default): the agent routes are not mounted at all, so they answer exactly
+    // as a path that never existed.
+    let routes = if state.agent_gateway {
+        routes.merge(agent::router())
+    } else {
+        routes
+    };
+    // The policy and kill-switch routes belong to the account, not to the agent plane, so
+    // a project can be prepared before the gateway is switched on.
+    let routes = routes.merge(agent::manage_router());
+    routes
         .layer(axum::middleware::from_fn_with_state(
             state.workloads.clone(),
             workloads::admission,
@@ -160,7 +185,12 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
         .layer(cors)
         .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
+        // The span records the path only: a query can hold search text.
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                tracing::info_span!("http", method = %request.method(), path = %request.uri().path())
+            }),
+        )
 }
 
 /// Liveness probe. Returns 200 with a small JSON body.
@@ -170,8 +200,17 @@ async fn healthz() -> Json<Value> {
 
 /// Serve the generated OpenAPI document as JSON (the committed `openapi.yaml` is the
 /// source of truth for codegen; this endpoint is a convenience for tooling).
-async fn openapi_json() -> Json<Value> {
-    Json(serde_json::to_value(ApiDoc::openapi()).unwrap_or_else(|_| json!({})))
+async fn openapi_json(axum::extract::State(state): axum::extract::State<AppState>) -> Json<Value> {
+    let mut doc = serde_json::to_value(ApiDoc::openapi()).unwrap_or_else(|_| json!({}));
+    // With the agent gateway off, the document must not advertise it.
+    if !state.agent_gateway {
+        if let Some(paths) = doc.get_mut("paths").and_then(Value::as_object_mut) {
+            paths.retain(|path, _| {
+                !path.contains("/agent/") && path != "/.well-known/dynodoc-agent"
+            });
+        }
+    }
+    Json(doc)
 }
 
 /// The OpenAPI document, derived from the annotated handlers (docs/18 §3). `engine-cli
@@ -252,6 +291,8 @@ impl utoipa::Modify for WorkspaceDocs {
         api.merge(project_staging::ProjectStagingApi::openapi());
         api.merge(project_history::ProjectHistoryApi::openapi());
         api.merge(project_issues::ProjectIssuesApi::openapi());
+        api.merge(agent::AgentApi::openapi());
+        api.merge(agent::AgentManageApi::openapi());
         // A workspace that declares no licence (`license-file` only) leaves the derived name
         // empty; an empty licence object is invalid OpenAPI, so drop it.
         if api.info.license.as_ref().is_some_and(|l| l.name.is_empty()) {

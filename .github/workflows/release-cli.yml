@@ -1,0 +1,214 @@
+name: release-cli
+
+# Prebuilt command-line binaries (decision 016, docs/PLATFORM-SUPPORT.md).
+#
+# Builds RELEASE binaries of engine-cli and engine-api natively on a runner of each
+# target (no cross compilation), runs them, packages them, and writes SHA256SUMS.
+# A workflow_dispatch run stops at workflow artifacts: it never creates a release.
+# Pushing a tag named cli-v* additionally attaches the archives to a GitHub Release.
+#
+# The binaries are NOT signed or notarised (the project has no certificates yet).
+# macOS Gatekeeper and Windows SmartScreen will warn; the release notes say how to
+# verify the checksum first.
+
+on:
+  push:
+    tags: ["cli-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest Ubuntu image with an Arm runner sets the glibc floor.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            ext: ""
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            ext: ""
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            ext: ""
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            ext: ""
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            ext: .exe
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            ext: .exe
+            archive: zip
+    env:
+      # Run on macOS 11 and newer even though the runner image is newer.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Show the toolchain in use
+        run: |
+          rustc --version --verbose
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build release binaries
+        env:
+          # Windows binaries carry the C runtime: no Visual C++ redistributable needed.
+          RUSTFLAGS: ${{ contains(matrix.target, 'windows') && '-C target-feature=+crt-static' || '' }}
+        run: cargo build --release --locked -p engine-cli -p engine-api
+      - name: Run what was built
+        run: |
+          BIN=target/release
+          "$BIN/engine-cli${{ matrix.ext }}" --version
+          "$BIN/engine-cli${{ matrix.ext }}" --help > /dev/null
+          # engine-api has no --version: with no configuration it must refuse to start
+          # and say why, which proves the binary runs on this processor.
+          set +e
+          OUT="$("$BIN/engine-api${{ matrix.ext }}" 2>&1)"; CODE=$?
+          set -e
+          echo "engine-api exit code $CODE"
+          echo "$OUT" | head -5
+          test "$CODE" -ne 0
+          echo "$OUT" | grep -q "DATABASE_URL is not set"
+      - name: Record what the binary needs from the system
+        run: |
+          BIN=target/release
+          file "$BIN/engine-cli${{ matrix.ext }}" || true
+          case "${{ matrix.target }}" in
+            *linux*)
+              echo "highest glibc symbol version required:"
+              objdump -T "$BIN/engine-cli" "$BIN/engine-api" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+              ldd "$BIN/engine-cli" ;;
+            *apple*)
+              otool -l "$BIN/engine-cli" | grep -A3 -E "LC_BUILD_VERSION|LC_VERSION_MIN" | head -8
+              otool -L "$BIN/engine-cli" ;;
+            *windows*)
+              # A static C runtime means no VCRUNTIME140.dll in the import table.
+              for f in engine-cli.exe engine-api.exe; do
+                echo "$f imports of VCRUNTIME140: $(grep -c -a VCRUNTIME140 "$BIN/$f" || true)"
+              done ;;
+          esac
+      - name: Package
+        id: package
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            VERSION="${GITHUB_REF_NAME#cli-}"
+          else
+            VERSION="dev-${GITHUB_SHA::7}"
+          fi
+          NAME="dynodoc-engine-cli-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          cp "target/release/engine-cli${{ matrix.ext }}" "target/release/engine-api${{ matrix.ext }}" "dist/$NAME/"
+          cp LICENSE "dist/$NAME/LICENSE"
+          cp .github/release/CLI-README.md "dist/$NAME/README.md"
+          cd dist
+          if [ "${{ matrix.archive }}" = zip ]; then
+            7z a -tzip -bso0 "$NAME.zip" "$NAME"
+            FILE="$NAME.zip"
+          else
+            tar -czf "$NAME.tar.gz" "$NAME"
+            FILE="$NAME.tar.gz"
+          fi
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          ls -l "$FILE"
+      - name: Run the packaged archive from a clean directory
+        run: |
+          mkdir "$RUNNER_TEMP/unpacked"
+          cd "$RUNNER_TEMP/unpacked"
+          if [ "${{ matrix.archive }}" = zip ]; then
+            7z x -bso0 "$GITHUB_WORKSPACE/dist/${{ steps.package.outputs.file }}"
+          else
+            tar -xzf "$GITHUB_WORKSPACE/dist/${{ steps.package.outputs.file }}"
+          fi
+          ls -l "${{ steps.package.outputs.name }}"
+          "./${{ steps.package.outputs.name }}/engine-cli${{ matrix.ext }}" --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.file }}
+          if-no-files-found: error
+          retention-days: 30
+
+  checksums:
+    name: SHA256SUMS
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: archives
+          merge-multiple: true
+      - name: Compute SHA256SUMS
+        run: |
+          cd archives
+          sha256sum -- *.tar.gz *.zip | tee SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 6
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: SHA256SUMS
+          path: archives/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: GitHub Release
+    # Only a pushed cli-v* tag publishes. A manual run never creates a release.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/cli-v')
+    needs: [build, checksums]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: archives
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat > notes.md <<'EOF'
+          Prebuilt `engine-cli` and `engine-api` for Linux, macOS and Windows on x86-64 and
+          aarch64. Each archive holds both programs, the MIT licence and a short README.
+
+          **Verify before you run.** Download `SHA256SUMS` next to the archive and check it
+          (`sha256sum --check --ignore-missing SHA256SUMS`).
+
+          **These binaries are not signed.** The project has no code-signing certificate yet.
+          macOS Gatekeeper will block them after a browser download: once the checksum
+          matches, run `xattr -d com.apple.quarantine engine-cli engine-api` or open them once
+          with a right click. Windows SmartScreen will show an unknown-publisher warning:
+          choose More info, Run anyway, only after the checksum matches.
+
+          Support matrix, what CI verifies and known limits: `docs/PLATFORM-SUPPORT.md`.
+          EOF
+          cd archives
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Command-line tools $TAG" --notes-file ../notes.md \
+            *.tar.gz *.zip SHA256SUMS

@@ -8,12 +8,14 @@
 //! pass, the ODK expression parser, and the semantic three-way merge are implemented
 //! (stages 14–16 and 21).
 
+pub mod at_rest;
 pub mod database;
 pub mod expr;
 pub mod governance;
 pub mod integrity;
 pub mod log;
 pub mod materializer;
+pub mod merge_policy;
 pub mod ops;
 pub mod projection;
 pub mod repository;

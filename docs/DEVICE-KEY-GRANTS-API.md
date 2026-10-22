@@ -187,6 +187,73 @@ No row is written for a no-op (`changed:false`).
 5. The command line learns of a refusal only as `403`; tell the person to check this
    screen.
 
+## Key class and the agent scope (schema 42)
+
+A key is enrolled for a person (the default) or for an AI agent. The class is chosen once,
+at enrolment, and never changes (`device_key_class`, immutable). It decides which scopes the
+key may ever hold, so a signing key file cannot be re-purposed.
+
+- `POST /devices` accepts two more optional fields next to `project_access`: `class`
+  (`person` or `agent`) and `label` (1 to 80 characters, no control characters, shown in the
+  listing; never put a secret in it). A `label` without a `class`, an unknown class or a bad
+  label is 400. The response gains `class`. An exact retry returns the class the key has.
+- `GET /devices` gains `class` (`person` unless the key was enrolled as an agent key) and
+  `label` (null when none) on every key. The `scopes` list is unchanged: it names the scopes
+  of a person's key.
+- The agent scope is `content:read` (docs/AI-AGENT-PROTOCOL-SPEC.md section 14.2). It is
+  independent of the other scopes. `PUT /devices/{key}/projects/{project}` with `content:read`
+  on a person's key is 400, and with any other scope on an agent key is 400. Issuance
+  (`POST /projects/{id}/device-sessions`) gives the same mix the uniform 403.
+- The `all` mode never covers `content:read`: even an agent key in `all` mode needs an
+  active grant for the project, checked at issuance and on every request.
+- A session with `content:read` is accepted only by the agent routes
+  (`/projects/{id}/agent/...`, behind `AGENT_GATEWAY=on`); every other route refuses it, and
+  the agent routes refuse every other credential.
+- `device.enrolled` audit rows carry `class` when the enrolment named one.
+- Schema 43: a grant and a session are necessary but not sufficient. The agent routes also
+  need the project's agent policy to be enabled by an owner or manager (`PUT
+  /projects/{id}/agent-policy`); until then every request is the uniform `403`, whoever holds
+  the key. Creating a key or a grant, and opening a session, are not refused meanwhile. The
+  project's kill switch (`POST /projects/{id}/agent-policy/kill`) revokes every active grant of
+  an agent key for the project (one `device.grant.revoked` audit row each, detail `reason:
+  agent_killswitch`, actor the manager) and refuses every session not issued strictly after it,
+  so granting the key again does not revive them. An ordinary revocation (`DELETE`) does not cut sessions
+  off: granting again revives an unexpired session.
+
+## The write scopes and the agent identity (schema 44)
+
+An agent key may also hold `content:propose` and `content:submit` (docs/AI-AGENT-PROTOCOL-SPEC.md
+section 14.2). `content:propose` and `content:submit` imply neither each other nor
+`content:read`, and a `content:read` session cannot propose. But a write scope is held only
+beside `content:read`: a preview of a proposal shows the text it changes, and so do the answers
+to a bad ref, so a write scope alone would be a read scope under another name. A grant, a
+session challenge and the database (a CHECK on both scope arrays) refuse a set with
+`content:propose` or `content:submit` and no `content:read`: 400 with the reason
+"content:propose and content:submit need content:read: a preview shows the text it changes".
+
+- `PUT /devices/{key}/projects/{project}` accepts `content:read`, alone or with
+  `content:propose` and `content:submit` (the 4 valid sets: read; read and propose; read and
+  submit; all three) on an agent key (and none of them on a person's key,
+  which is 400). Issuance of a session with `content:propose` or `content:submit` additionally
+  needs a project role that may stage drafts (not a viewer): the uniform `403`. The `all` mode
+  never covers any of the three.
+- `POST /devices` accepts `client_kind` for an agent key: `claude`, `chatgpt`, `gemini`,
+  `copilot`, `cursor`, `codex`, `device` (the default) or `generic`. It names the AI product
+  the key is for and is fixed with the class; `GET /devices` shows it (null for a person's
+  key). It is a claim, never authority. A `client_kind` for a person's key, an unknown one or
+  one without a `class` is 400.
+- **The agent identity.** The first grant of a write scope to a key makes the person's agent
+  identity for that product ("Claude for Olivia"), in the same transaction (audit row
+  `agent.identity.created`). One live identity exists per person and product: further keys of
+  the same product share it, another product gets its own, and a read-only grant makes none.
+  It is an `identity` row that cannot sign in, receive mail or be a member or reviewer; it
+  records the drafts and edits the agent makes, and the person it acts for sees and can edit,
+  submit and withdraw them. Its authority is the person's, read again on every request. When
+  the person is disabled or erased it is revoked with their keys, and restoring the person
+  revives neither; a new key and a new write grant make a new one.
+- A write session is still necessary but not sufficient: the project's `write_mode` must not be
+  `none` (the default), and the kill switch sets it back to `none`.
+
 ## Not in this contract
 
 No per-grant expiry, no device names, no grant approval workflow for another
