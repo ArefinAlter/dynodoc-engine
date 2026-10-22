@@ -218,7 +218,6 @@ async fn expected_indexes_exist(pool: PgPool) -> sqlx::Result<()> {
         "node_parent_idx",
         "node_varname_idx",
         "node_fields_gin",
-        "event_document_seq_idx",
         "event_target_node_idx",
         "event_type_idx",
         "snapshot_latest_idx",
@@ -230,6 +229,88 @@ async fn expected_indexes_exist(pool: PgPool) -> sqlx::Result<()> {
             "missing index {expected}; have {names:?}"
         );
     }
+    assert!(!names.iter().any(|name| name == "event_document_seq_idx"));
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+async fn history_index_upgrade_preserves_rows_and_sequence_uniqueness(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let all = sqlx::migrate!("../../migrations");
+    let old = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            all.iter().filter(|m| m.version <= 44).cloned().collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    old.run(&pool).await?;
+    let s = seed(&pool).await?;
+    let snapshot_id: uuid::Uuid = sqlx::query_scalar(
+        "insert into snapshot (document_id, through_seq, state, merkle_root, event_chain_hash)
+         values ($1, 1, $2, $3, $4) returning id",
+    )
+    .bind(s.document_id)
+    .bind(serde_json::json!({"nodes": 1}))
+    .bind(&digest(0x33)[..])
+    .bind(&digest(0x22)[..])
+    .fetch_one(&pool)
+    .await?;
+    // Explicit snapshot fields also let this upgrade compose with the separately
+    // proposed additive event-root column in migration 0045.
+    let contents = "select jsonb_build_object(
+        'node', (select to_jsonb(n) from node n where id=$1),
+        'event', (select to_jsonb(e) from event e where id=$2),
+        'snapshot', (select jsonb_build_array(id,document_id,through_seq,state,
+             merkle_root,event_chain_hash,created_at) from snapshot where id=$3))";
+    let before: serde_json::Value = sqlx::query_scalar(contents)
+        .bind(&s.node_id)
+        .bind(&s.event_id)
+        .bind(snapshot_id)
+        .fetch_one(&pool)
+        .await?;
+    all.run(&pool).await?;
+    let after: serde_json::Value = sqlx::query_scalar(contents)
+        .bind(&s.node_id)
+        .bind(&s.event_id)
+        .bind(snapshot_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(before, after);
+
+    let duplicate_event = sqlx::query(
+        "insert into event (id,document_id,seq,type,actor_id,target_node_id,payload,
+             content_hash,prev_chain_hash,chain_hash)
+         select $1,document_id,seq,type,actor_id,target_node_id,payload,
+             content_hash,prev_chain_hash,$2 from event where id=$3",
+    )
+    .bind(ulid::Ulid::generate().to_string())
+    .bind(&digest(0x55)[..])
+    .bind(&s.event_id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        duplicate_event
+            .as_database_error()
+            .and_then(|e| e.constraint()),
+        Some("event_document_seq_unique")
+    );
+    let duplicate_snapshot = sqlx::query(
+        "insert into snapshot (document_id,through_seq,state,merkle_root,event_chain_hash)
+         select document_id,through_seq,state,merkle_root,event_chain_hash
+         from snapshot where id=$1",
+    )
+    .bind(snapshot_id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        duplicate_snapshot
+            .as_database_error()
+            .and_then(|e| e.constraint()),
+        Some("snapshot_document_seq_unique")
+    );
     Ok(())
 }
 
