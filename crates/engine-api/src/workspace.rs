@@ -895,7 +895,7 @@ pub(crate) async fn carry_into_draft(
     local: &mut DocumentState,
     target: &DocumentState,
 ) -> Result<(), ApiError> {
-    for op in engine_core::workspace_merge::diff(local, target) {
+    for op in engine_core::workspace_merge::diff(local, target)? {
         governance::authorize(Role::Author, &op, local)?;
         apply_payload(local, &op).map_err(|e| ApiError::Internal(e.to_string()))?;
         sqlx::query("insert into draft_edit(draft_id,payload,actor_id) values($1,$2,$3)")
@@ -962,7 +962,7 @@ async fn sync_draft(
     let changes = plan.ops.clone();
     if req.action.is_empty() || req.action == "preview" {
         // The draft's own changes relative to its ancestor let a rebase list what moves.
-        let own = engine_core::workspace_merge::diff(&base, &local);
+        let own = engine_core::workspace_merge::diff(&base, &local)?;
         return Ok(Json(
             json!({"conflicts":plan.conflicts,"ops":changes,"own":own,"team_seq":seq,"base_seq":row["base_seq"],"revision":revision,"excluded_nodes":row["excluded_nodes"]}),
         ));
@@ -1058,7 +1058,7 @@ async fn sync_draft(
     };
     carry_into_draft(&mut tx, draft, auth.identity_id, &mut local, &target).await?;
     let completed =
-        req.action == "share" && engine_core::workspace_merge::diff(&team, &local).is_empty();
+        req.action == "share" && engine_core::workspace_merge::diff(&team, &local)?.is_empty();
     let next_seq = events.last().map_or(seq, |e| e.seq);
     // Sharing every change of a submitted draft yourself also closes its review request.
     let stored =
@@ -1119,7 +1119,7 @@ async fn restore_version(
         .state;
     let target: DocumentState =
         serde_json::from_value(saved).map_err(|e| ApiError::Internal(e.to_string()))?;
-    let ops = engine_core::workspace_merge::diff(&current, &target);
+    let ops = engine_core::workspace_merge::diff(&current, &target)?;
     let mut events = Vec::new();
     for op in &ops {
         governance::authorize(role, op, &current)?;
@@ -1189,3 +1189,57 @@ async fn search(
     structure
 ))]
 pub struct WorkspaceApi;
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+    use engine_shared::NodeId;
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unsupported_target_cannot_partially_append_draft_edits(pool: sqlx::PgPool) {
+        let mut local = DocumentState::default();
+        apply_payload(
+            &mut local,
+            &EventPayload::NodeCreated {
+                node_id: NodeId("root".into()),
+                node_type: engine_shared::NodeType::Form,
+                parent_id: None,
+                pos: "a0".into(),
+                fields: json!({"label":"before"}),
+                var_name: None,
+            },
+        )
+        .unwrap();
+        let original = local.clone();
+        let mut target = local.clone();
+        target
+            .nodes
+            .get_mut(&NodeId("root".into()))
+            .unwrap()
+            .current_fields["label"] = json!("after");
+        let mut unsupported = target.nodes[&NodeId("root".into())].clone();
+        unsupported.id = NodeId("future".into());
+        unsupported.node_type = "future-widget".into();
+        unsupported.parent_id = Some(NodeId("root".into()));
+        target.nodes.insert(unsupported.id.clone(), unsupported);
+        let mut tx = pool.begin().await.unwrap();
+        let error = carry_into_draft(&mut tx, Uuid::nil(), Uuid::nil(), &mut local, &target)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Conflict { .. }));
+        assert_eq!(
+            local, original,
+            "even the supported first edit must not be applied"
+        );
+        let count: i64 = sqlx::query_scalar("select count(*) from draft_edit")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let count: i64 = sqlx::query_scalar("select count(*) from event")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+}
