@@ -318,14 +318,6 @@ accepts the class). Nothing was run against a real MCP client or a production-co
 rehearsed or released: it needs a schema-42 release by the usual routine. Vendor-specific plugin facts are marked unverified
 in the guide.
 
-## Source: event-prefix roots for new snapshots (21 October 2026)
-
-Engine source `13c4ced`. New snapshots store a separate event-prefix Merkle root, computed with a streaming frontier and checked against audit inclusion proofs. The existing node Merkle root keeps its meaning. New inline/shared receipts bind the event root as versions 3/4; historical versions 1/2 retain their exact envelope vectors.
-
-Validation: task lint, task test (1,289 passed, 0 failed, 4 existing ignored), task docs and regenerated OpenAPI pass on isolated PostgreSQL 16. Four new cases compare the frontier and HTTP proof algorithms, verify prefix bounds, preserve NULL legacy rows, and detect root tampering. All 19 snapshot integration cases pass; schema-27/28 upgrade fixtures explicitly construct historical envelopes.
-
-Compatibility and rollout: Migration 0045 adds the nullable column without updating old snapshots. Engine and application migration sources both ended at 0044, with no open 0045 allocation at the check; reserve/mirror 0045 and upgrade all readers before rollout. Older readers cannot verify receipt versions 3/4. Rust Snapshot literals need the optional field; historical JSON omits None. The legacy zero-padded event tree and v1 metadata exclusions are unchanged; this is not an independent witness. No deployment or application migration was performed.
-
 ## Source: horizon record specification and read-only planner, pruning P0 and P1 (20 October 2026)
 
 Phases P0 and P1 of [DESIGN-COMMIT-PRUNING.md](DESIGN-COMMIT-PRUNING.md) are built; **nothing deletes,
