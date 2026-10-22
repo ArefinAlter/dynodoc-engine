@@ -127,8 +127,31 @@ pub fn merge(
     draft: &DocumentState,
     resolutions: &BTreeMap<String, String>,
 ) -> MergePlan {
-    merge_with(base, team, draft, resolutions, &mut Direct)
+    merge_with(base, team, draft, resolutions, &mut Direct, false)
 }
+/// Opt-in workspace ordering experiment: keep interleaved insertion runs together.
+/// Default merges and signed strategies retain their existing position/id order.
+/// This preference does not identify an insertion's author or supply ancestry.
+pub fn merge_with_grouped_insertions(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    resolutions: &BTreeMap<String, String>,
+) -> MergePlan {
+    merge_with(base, team, draft, resolutions, &mut Direct, true)
+}
+
+/// Signed v1 same-file resolutions retain their original insertion positions.
+/// Grouping changes state addresses and cannot silently change their verifier.
+pub(crate) fn merge_for_signed_v1(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    resolutions: &BTreeMap<String, String>,
+) -> MergePlan {
+    merge(base, team, draft, resolutions)
+}
+
 /// The same merge, with the decision for each differing field taken by the default
 /// policy `dynodoc.default.v1`, which reproduces [`merge`] exactly, or by `policy`.
 /// The plan has the same fields; the evidence says which rule and strategy decided
@@ -156,7 +179,7 @@ pub fn merge_with_registry(
 ) -> (MergePlan, MergeEvidence) {
     let family = merge_policy::Family::of(&[base, team, draft]);
     let mut engine = merge_policy::engine::Engine::new(policy, registry, family);
-    let mut plan = merge_with(base, team, draft, resolutions, &mut engine);
+    let mut plan = merge_with(base, team, draft, resolutions, &mut engine, false);
     let mut evidence = engine.finish();
     merge_policy::invariants::apply(
         &mut plan,
@@ -173,6 +196,7 @@ fn merge_with<S: Selector>(
     draft: &DocumentState,
     resolutions: &BTreeMap<String, String>,
     selector: &mut S,
+    group_inserts: bool,
 ) -> MergePlan {
     let base = canonical(base);
     let team = canonical(team);
@@ -287,11 +311,103 @@ fn merge_with<S: Selector>(
     out.removed_choices
         .retain(|id| out.nodes.get(id).is_some_and(|n| n.deleted));
     validate_merged_tree(&base, &team, &draft, &mut out, &mut conflicts, resolutions);
+    if group_inserts && conflicts.is_empty() {
+        keep_runs_together(&base, &team, &mut out);
+    }
     let ops = diff(&team, &out);
     MergePlan {
         state: out,
         conflicts,
         ops,
+    }
+}
+/// Re-keying is an output-quality improvement, not a correctness requirement. Keep
+/// it bounded so repeated merges cannot grow fractional positions without limit.
+const MAX_MERGED_POS_BYTES: usize = 200;
+
+/// Blocks both sides place between the same two unchanged siblings interleave when
+/// their keys do, and `between()` gives both sides the same keys for one spot. So the
+/// draft's blocks there go behind the team's last one only when the sides actually
+/// alternate at least twice. Base locations remain separators even after deletion
+/// or movement; grouping must not fuse distinct original gaps.
+fn keep_runs_together(base: &DocumentState, team: &DocumentState, out: &mut DocumentState) {
+    let at = |s: &DocumentState, n: &MaterializedNode| {
+        s.nodes
+            .get(&n.id)
+            .is_some_and(|o| o.parent_id == n.parent_id && o.pos == n.pos)
+    };
+    // A virtual base entry closes its original gap even if it moved or was deleted.
+    // The boolean distinguishes these separators from actual merged nodes.
+    let mut children: BTreeMap<&Option<NodeId>, Vec<(&MaterializedNode, bool)>> = BTreeMap::new();
+    for n in out.nodes.values().filter(|n| !n.deleted) {
+        children
+            .entry(&n.parent_id)
+            .or_default()
+            .push((n, at(base, n)));
+    }
+    for n in base.nodes.values().filter(|n| !n.deleted) {
+        if out
+            .nodes
+            .get(&n.id)
+            .is_none_or(|merged| merged.deleted || !at(base, merged))
+        {
+            children.entry(&n.parent_id).or_default().push((n, true));
+        }
+    }
+    let mut moves = Vec::new();
+    for mut siblings in children.into_values() {
+        siblings.sort_by(|(a, _), (b, _)| (&a.pos, &a.id).cmp(&(&b.pos, &b.id)));
+        let (mut last, mut draft) = (None, Vec::new());
+        let (mut previous_side, mut switches) = (None, 0);
+        // An unchanged sibling, or the end, closes the gap before it.
+        for entry in siblings.into_iter().map(Some).chain([None]) {
+            match entry {
+                Some((n, false)) => {
+                    let is_team = at(team, n);
+                    if previous_side.is_some_and(|side| side != is_team) {
+                        switches += 1;
+                    }
+                    previous_side = Some(is_team);
+                    if is_team {
+                        last = Some(&n.pos);
+                    } else {
+                        draft.push(n);
+                    }
+                }
+                _ => {
+                    if let Some(last) = last.take().filter(|_| switches >= 2) {
+                        // Reject oversized candidates before formatting or copying them.
+                        if draft
+                            .iter()
+                            .any(|d| last.len().saturating_add(d.pos.len()) > MAX_MERGED_POS_BYTES)
+                        {
+                            draft.clear();
+                            previous_side = None;
+                            switches = 0;
+                            continue;
+                        }
+                        let keys: Vec<_> = draft
+                            .iter()
+                            .map(|d| (d.id.clone(), format!("{last}{}", d.pos)))
+                            .collect();
+                        if keys
+                            .iter()
+                            .all(|(_, key)| entry.is_none_or(|(n, _)| *key < n.pos))
+                        {
+                            moves.extend(keys);
+                        }
+                    }
+                    draft.clear();
+                    previous_side = None;
+                    switches = 0;
+                }
+            }
+        }
+    }
+    for (id, pos) in moves {
+        if let Some(n) = out.nodes.get_mut(&id) {
+            n.pos = pos;
+        }
     }
 }
 /// Merge for content that does not share history with the team version, such as a
@@ -304,6 +420,27 @@ pub fn merge_strict(
     team: &DocumentState,
     draft: &DocumentState,
     resolutions: &BTreeMap<String, String>,
+) -> MergePlan {
+    merge_strict_with_insert_ordering(base, team, draft, resolutions, false)
+}
+
+/// Explicit grouped-insertion variant of [`merge_strict`]. Strict block choices
+/// and whole-tree validation finish before any insertion positions are grouped.
+pub fn merge_strict_with_grouped_insertions(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    resolutions: &BTreeMap<String, String>,
+) -> MergePlan {
+    merge_strict_with_insert_ordering(base, team, draft, resolutions, true)
+}
+
+fn merge_strict_with_insert_ordering(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    resolutions: &BTreeMap<String, String>,
+    group_inserts: bool,
 ) -> MergePlan {
     let mut plan = merge(base, team, draft, resolutions);
     let canonical_team = canonical(team);
@@ -350,6 +487,9 @@ pub fn merge_strict(
         &mut plan.conflicts,
         resolutions,
     );
+    if group_inserts && plan.conflicts.is_empty() {
+        keep_runs_together(&canonical(base), &canonical_team, &mut plan.state);
+    }
     plan.ops = diff(team, &plan.state);
     plan
 }
@@ -1386,6 +1526,240 @@ mod tests {
         let plan = merge(&with(ps), &with(margin), &with(other), &BTreeMap::new());
         assert_eq!(plan.conflicts.len(), 1);
         assert_eq!(plan.conflicts[0].key, "root:page_setup");
+    }
+
+    #[test]
+    fn inserts_at_one_spot_keep_each_sides_run_together() {
+        let add = |s: &mut DocumentState, id: &str, pos: &str| {
+            let mut n = s.nodes[&NodeId("root".into())].clone();
+            n.id = NodeId(id.into());
+            n.parent_id = Some(NodeId("root".into()));
+            n.pos = pos.into();
+            s.nodes.insert(n.id.clone(), n);
+        };
+        let order = |next: &str| {
+            let mut base = state();
+            add(&mut base, "a", "a");
+            add(&mut base, "z", next);
+            let (mut team, mut draft) = (base.clone(), base.clone());
+            for (side, s) in [(&mut team, "t"), (&mut draft, "d")] {
+                add(side, &format!("{s}1"), "m");
+                add(side, &format!("{s}2"), "n");
+            }
+            let default = merge(&base, &team, &draft, &BTreeMap::new());
+            assert_eq!(default.state.nodes[&NodeId("d1".into())].pos, "m");
+            assert_eq!(
+                merge_strict(&base, &team, &draft, &BTreeMap::new()).state,
+                default.state
+            );
+            let plan = merge_with_grouped_insertions(&base, &team, &draft, &BTreeMap::new());
+            let mut blocks: Vec<_> = plan
+                .state
+                .nodes
+                .into_values()
+                .filter(|n| n.parent_id.is_some())
+                .collect();
+            blocks.sort_by(|a, b| (&a.pos, &a.id).cmp(&(&b.pos, &b.id)));
+            blocks.into_iter().map(|n| n.id.0).collect::<Vec<_>>()
+        };
+        assert_eq!(order("z"), ["a", "t1", "t2", "d1", "d2", "z"]);
+        // "nm" would pass "n0", so those keys stay.
+        assert_eq!(order("n0"), ["a", "d1", "t1", "d2", "t2", "z"]);
+    }
+
+    #[test]
+    fn grouping_never_grows_positions_past_its_bound() {
+        let add = |s: &mut DocumentState, id: &str, pos: String| {
+            let mut n = s.nodes[&NodeId("root".into())].clone();
+            n.id = NodeId(id.into());
+            n.parent_id = Some(NodeId("root".into()));
+            n.pos = pos;
+            s.nodes.insert(n.id.clone(), n);
+        };
+        let mut base = state();
+        add(&mut base, "a", "a".into());
+        add(&mut base, "z", "z".into());
+        let (mut team, mut draft) = (base.clone(), base.clone());
+        let draft_pos = "x".repeat(110);
+        add(&mut team, "t1", draft_pos.clone());
+        add(&mut team, "t2", "y".repeat(110));
+        add(&mut draft, "d1", draft_pos.clone());
+        add(&mut draft, "d2", "y".repeat(110));
+
+        let plan = merge_with_grouped_insertions(&base, &team, &draft, &BTreeMap::new());
+        assert_eq!(plan.state.nodes[&NodeId("d1".into())].pos, draft_pos);
+        assert!(plan
+            .state
+            .nodes
+            .values()
+            .all(|node| node.pos.len() <= MAX_MERGED_POS_BYTES));
+    }
+
+    #[test]
+    fn repeated_concurrent_inserts_keep_replayable_bounded_positions() {
+        use crate::{materializer::apply_payload, ops::validate_op};
+
+        let mut base = state();
+        let mut next = "m".to_owned();
+        let mut bounded_fallback = false;
+        for round in 0..12 {
+            let (mut team, mut draft) = (base.clone(), base.clone());
+            for (side, prefix) in [(&mut team, "t"), (&mut draft, "d")] {
+                for suffix in ['m', 'n'] {
+                    let mut node = base.nodes[&NodeId("root".into())].clone();
+                    node.id = NodeId(format!("{prefix}{round}{suffix}"));
+                    node.node_type = "item".into();
+                    node.parent_id = Some(NodeId("root".into()));
+                    node.pos = format!("{next}{suffix}");
+                    side.nodes.insert(node.id.clone(), node);
+                }
+            }
+            let plan = merge_with_grouped_insertions(&base, &team, &draft, &BTreeMap::new());
+            assert!(plan.conflicts.is_empty());
+            bounded_fallback |=
+                plan.state.nodes[&NodeId(format!("d{round}m"))].pos == format!("{next}m");
+            for op in &plan.ops {
+                validate_op(&team, op).unwrap();
+                apply_payload(&mut team, op).unwrap();
+            }
+            assert_eq!(team, plan.state);
+            assert!(plan
+                .state
+                .nodes
+                .values()
+                .all(|n| n.pos.len() <= MAX_MERGED_POS_BYTES));
+            // New positions append after the current last sibling on both sides.
+            next = plan
+                .state
+                .nodes
+                .values()
+                .map(|n| &n.pos)
+                .max()
+                .unwrap()
+                .clone();
+            if next.len() + 2 > MAX_MERGED_POS_BYTES {
+                break;
+            }
+            next.push('m');
+            base = plan.state;
+        }
+        assert!(bounded_fallback, "exercise the cap after repeated grouping");
+    }
+
+    #[test]
+    fn default_policy_and_signed_v1_never_enable_insertion_grouping() {
+        let base = state();
+        let (mut team, mut draft) = (base.clone(), base.clone());
+        for (side, prefix) in [(&mut team, "t"), (&mut draft, "d")] {
+            insert_at(side, &format!("{prefix}1"), "m");
+            insert_at(side, &format!("{prefix}2"), "n");
+        }
+        let choices = BTreeMap::new();
+        let plain = merge(&base, &team, &draft, &choices);
+        let (policy, _) = merge_with_policy(
+            &base,
+            &team,
+            &draft,
+            &choices,
+            crate::merge_policy::default::policy(),
+        );
+        let signed = merge_for_signed_v1(&base, &team, &draft, &choices);
+        let grouped = merge_with_grouped_insertions(&base, &team, &draft, &choices);
+        assert!(plain.conflicts.is_empty());
+        assert!(policy.conflicts.is_empty());
+        assert!(signed.conflicts.is_empty());
+        assert!(grouped.conflicts.is_empty());
+        assert_eq!(policy.state, plain.state);
+        assert_eq!(signed.state, plain.state);
+        assert_ne!(grouped.state, plain.state);
+    }
+
+    fn insert_at(state: &mut DocumentState, id: &str, pos: &str) {
+        let mut node = state.nodes[&NodeId("root".into())].clone();
+        node.id = NodeId(id.into());
+        node.node_type = "item".into();
+        node.parent_id = Some(NodeId("root".into()));
+        node.pos = pos.into();
+        state.nodes.insert(node.id.clone(), node);
+    }
+
+    #[test]
+    fn disjoint_runs_stay_in_order_across_repeated_pulls() {
+        let mut base = state();
+        insert_at(&mut base, "a", "a");
+        insert_at(&mut base, "z", "z");
+        let (mut team, mut draft) = (base.clone(), base.clone());
+        insert_at(&mut team, "team", "w");
+        insert_at(&mut draft, "draft", "d");
+        for round in 0..5 {
+            let plan = merge_with_grouped_insertions(&base, &team, &draft, &BTreeMap::new());
+            assert!(plan.conflicts.is_empty());
+            assert_eq!(plan.state.nodes[&NodeId("draft".into())].pos, "d");
+            assert_eq!(applied(&team, &plan), plan.state);
+            draft = plan.state;
+            insert_at(
+                &mut team,
+                &format!("later{round}"),
+                &format!("x{}", "x".repeat(round)),
+            );
+        }
+    }
+
+    #[test]
+    fn deleted_and_moved_base_siblings_keep_their_original_gaps_separate() {
+        for moved in [false, true] {
+            let mut base = state();
+            for (id, pos) in [("a", "a"), ("b", "m"), ("z", "z")] {
+                insert_at(&mut base, id, pos);
+            }
+            let (mut team, mut draft) = (base.clone(), base.clone());
+            let separator = team.nodes.get_mut(&NodeId("b".into())).unwrap();
+            if moved {
+                separator.pos = "w".into();
+            } else {
+                separator.deleted = true;
+            }
+            insert_at(&mut team, "t1", "p");
+            insert_at(&mut team, "t2", "v");
+            insert_at(&mut draft, "d1", "g");
+            insert_at(&mut draft, "d2", "t");
+            for merge in [
+                merge_with_grouped_insertions,
+                merge_strict_with_grouped_insertions,
+            ] {
+                let plan = merge(&base, &team, &draft, &BTreeMap::new());
+                assert!(plan.conflicts.is_empty());
+                assert_eq!(plan.state.nodes[&NodeId("d1".into())].pos, "g");
+                assert_eq!(
+                    plan.state.nodes[&NodeId("d2".into())].pos,
+                    if moved { "wt" } else { "vt" }
+                );
+                assert_eq!(applied(&team, &plan), plan.state);
+            }
+        }
+    }
+
+    #[test]
+    fn three_run_alternation_groups_only_the_interleaved_run() {
+        let mut base = state();
+        insert_at(&mut base, "a", "a");
+        insert_at(&mut base, "z", "z");
+        let (mut team, mut draft) = (base.clone(), base.clone());
+        insert_at(&mut team, "t1", "g");
+        insert_at(&mut team, "t2", "t");
+        insert_at(&mut draft, "draft", "m");
+        for merge in [
+            merge_with_grouped_insertions,
+            merge_strict_with_grouped_insertions,
+        ] {
+            let plan = merge(&base, &team, &draft, &BTreeMap::new());
+            assert!(plan.conflicts.is_empty());
+            assert_eq!(plan.state.nodes[&NodeId("draft".into())].pos, "tm");
+            assert_eq!(applied(&team, &plan), plan.state);
+            let again = merge(&base, &plan.state, &plan.state, &BTreeMap::new());
+            assert_eq!(again.state, plan.state);
+            assert!(again.ops.is_empty());
+        }
     }
 
     #[test]
