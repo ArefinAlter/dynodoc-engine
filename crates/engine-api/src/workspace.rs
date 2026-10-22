@@ -1136,19 +1136,22 @@ async fn restore_version(
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
+    project_id: Option<Uuid>,
+    #[serde(default)]
+    offset: i64,
 }
-#[utoipa::path(get, path="/search", tag="workspace", params(("q" = String, Query, description = "Literal search term, 2–200 characters")), responses((status=200, description="Success; requires document membership", body=Value),(status=401, description="Sign in required"),(status=403, description="Insufficient access"),(status=409, description="Review a concurrent change before retrying")))]
+#[utoipa::path(get, path="/search", tag="workspace", params(("q" = String, Query, description = "Literal search term, 2–200 UTF-8 bytes"), ("project_id" = Option<Uuid>, Query, description = "Search only this project and its folders; requires current project membership"), ("offset" = Option<i64>, Query, description = "Result offset, 0–1000000; 50 results per page")), responses((status=200, description="Success; requires document membership", body=Value),(status=401, description="Sign in required"),(status=403, description="Insufficient access"),(status=409, description="Review a concurrent change before retrying")))]
 async fn search(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<SearchQuery>,
     auth: AuthContext,
 ) -> Result<Json<Value>, ApiError> {
-    let term = query.q.trim();
-    if term.len() < 2 {
-        return Ok(Json(json!({"items":[]})));
+    if !(0..=1_000_000).contains(&query.offset) {
+        return Err(bad("Invalid page offset"));
     }
+    let term = query.q.trim();
     if term.len() > 200 {
-        return Err(bad("Search in 200 characters or fewer"));
+        return Err(bad("Search in 200 bytes or fewer"));
     }
     let _budget = state.workloads.enter(auth.identity_id, None)?;
     let mut tx = state.pool.begin().await?;
@@ -1157,9 +1160,27 @@ async fn search(
     sqlx::query("set local statement_timeout = '2s'")
         .execute(&mut *tx)
         .await?;
-    let items:Vec<Value>=sqlx::query_scalar("select jsonb_build_object('document_id',d.id,'title',d.title,'node_id',n.id,'text',left(n.current_fields::text,4000)) from document d left join node n on n.document_id=d.id and not n.deleted where effective_document_role(d.id,$1) is not null and d.status<>'archived' and (strpos(lower(d.title),lower($2))>0 or strpos(lower(n.current_fields::text),lower($2))>0) order by d.updated_at desc,n.pos limit 50").bind(auth.identity_id).bind(term).fetch_all(&mut *tx).await?;
+    if let Some(project) = query.project_id {
+        crate::projects::require(&mut tx, project, auth.identity_id).await?;
+    }
+    if term.len() < 2 {
+        return Ok(Json(
+            json!({"items":[], "more":false, "offset":query.offset}),
+        ));
+    }
+    let items: Vec<Value> = sqlx::query_scalar(
+        "select jsonb_build_object('document_id',d.id,'title',d.title,'node_id',n.id,'text',left(n.current_fields::text,4000))
+         from document d left join node n on n.document_id=d.id and not n.deleted
+         where effective_document_role(d.id,$1) is not null and d.status<>'archived' and d.deleted_at is null
+           and ($3::uuid is null or (document_project(d.id)=$3 and inherited_space_role($3,$1) is not null))
+           and (strpos(lower(d.title),lower($2))>0 or strpos(lower(n.current_fields::text),lower($2))>0)
+         order by d.updated_at desc,d.id,n.pos,n.id limit 51 offset $4"
+    ).bind(auth.identity_id).bind(term).bind(query.project_id).bind(query.offset).fetch_all(&mut *tx).await?;
     tx.commit().await?;
-    Ok(Json(json!({"items":items})))
+    let more = items.len() > 50;
+    Ok(Json(
+        json!({"items":items.into_iter().take(50).collect::<Vec<_>>(), "more":more, "offset":query.offset}),
+    ))
 }
 
 #[derive(utoipa::OpenApi)]
