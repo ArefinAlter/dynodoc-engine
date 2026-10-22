@@ -111,6 +111,10 @@ impl<S: AgentScope> Deref for AgentAuth<S> {
 
 impl<S: AgentScope> AgentAuth<S> {
     /// The key, project and session this request was authorised for.
+    #[allow(
+        clippy::expect_used,
+        reason = "an agent login always carries its device binding"
+    )]
     pub fn binding(&self) -> &DeviceBinding {
         self.0
             .device

@@ -12,6 +12,8 @@
 //! [`error::ApiError`], opaque cursor [`pagination`], Postgres-backed [`idempotency`],
 //! and a generated [`ApiDoc`] OpenAPI document.
 
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod access;
 pub mod admin;
 mod admin_controls;

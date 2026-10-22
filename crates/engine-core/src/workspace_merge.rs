@@ -208,6 +208,10 @@ fn merge_with_registry_mode(
     (plan, evidence)
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "the absent-base branch continued above; the absent-team branch continued above"
+)]
 fn merge_with<S: Selector>(
     base: &DocumentState,
     team: &DocumentState,
@@ -258,8 +262,8 @@ fn merge_with<S: Selector>(
             }
             continue;
         }
-        let b = b.unwrap();
-        let t = t.unwrap();
+        let b = b.expect("the absent-base branch continued above");
+        let t = t.expect("the absent-team branch continued above");
         let mut n = t.clone();
         let at = |field| At {
             id,
@@ -919,6 +923,10 @@ fn diff_for_merge(
 
 /// Build semantic operations without silently omitting unsupported new node types.
 /// Errors return no partial operation list. Historical readers are unchanged.
+#[allow(
+    clippy::expect_used,
+    reason = "the preceding branch handled an absent prior node"
+)]
 pub fn diff(from: &DocumentState, to: &DocumentState) -> Result<Vec<EventPayload>, DiffError> {
     let from = canonical(from);
     let to = canonical(to);
@@ -982,7 +990,7 @@ pub fn diff(from: &DocumentState, to: &DocumentState) -> Result<Vec<EventPayload
             }
             continue;
         }
-        let p = prior.unwrap();
+        let p = prior.expect("the preceding branch handled an absent prior node");
         if p.node_type != n.node_type {
             return Err(DiffError::NodeTypeChanged {
                 node_id: n.id.clone(),
