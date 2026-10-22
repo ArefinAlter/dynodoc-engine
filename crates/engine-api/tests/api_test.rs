@@ -2223,6 +2223,298 @@ fn auth_post_get(uri: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn assert_private_node_conflict(status: StatusCode, body: &Value, foreign: Uuid, node: &str) {
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let response = body.to_string();
+    assert!(!response.contains(&foreign.to_string()));
+    assert!(!response.contains(node));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn node_id_from_another_document_is_conflict(pool: PgPool) {
+    let runtime = common::RuntimeDatabase::new(pool).await;
+    let pool = runtime.pool.clone();
+    let router = app(test_state(pool.clone()));
+    let owner = bearer(seed_identity(&pool, "collision-owner@example.test").await);
+    let foreign = create_document(&router, &owner, "Synthetic foreign file").await;
+    let target = create_document(&router, &owner, "Synthetic target file").await;
+    let node = ulid::Ulid::generate().to_string();
+    let op = json!({"type":"NodeCreated","node_id":node,"node_type":"form","pos":"a0","fields":{}});
+    // A private draft saved before another file reserves the ID must still fail
+    // at the authoritative insert when it is shared later.
+    let (_, draft) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{target}/drafts"),
+            &owner,
+            &json!({"name":"Private before collision"}),
+        ),
+    )
+    .await;
+    let draft_uri = format!(
+        "/documents/{target}/drafts/{}",
+        draft["id"].as_str().unwrap()
+    );
+    let (status, result) = send(
+        &router,
+        auth_post(
+            &draft_uri,
+            &owner,
+            &json!({"revision":0,"ops":[op.clone()]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        send(
+            &router,
+            auth_post(
+                &format!("/documents/{foreign}/ops/node-create"),
+                &owner,
+                &op
+            )
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for (suffix, body) in [
+        ("ops/node-create", op.clone()),
+        ("batch", json!({"ops":[op]})),
+    ] {
+        let (status, body) = send(
+            &router,
+            auth_post(&format!("/documents/{target}/{suffix}"), &owner, &body),
+        )
+        .await;
+        assert_private_node_conflict(status, &body, foreign, &node);
+    }
+    let root = ulid::Ulid::generate().to_string();
+    let item = ulid::Ulid::generate().to_string();
+    let (status, body) = send(&router, auth_post(&format!("/documents/{target}/batch"), &owner,
+        &json!({"ops":[
+            {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}},
+            {"type":"NodeCreated","node_id":item,"node_type":"item","parent_id":root,"pos":"a0","fields":{"type":"select_one"}},
+            {"type":"ChoiceAdded","node_id":item,"choice_id":node,"fields":{"label":"One"}}
+        ]}))).await;
+    assert_private_node_conflict(status, &body, foreign, &node);
+    let sync = format!("{draft_uri}/sync");
+    let (_, preview) = send(
+        &router,
+        auth_post(&sync, &owner, &json!({"action":"preview"})),
+    )
+    .await;
+    let (status, body) = send(&router, auth_post(&sync, &owner,
+        &json!({"action":"share","team_seq":preview["team_seq"],"revision":preview["revision"],"included_nodes":[node],"override_rules":true}))).await;
+    assert_private_node_conflict(status, &body, foreign, &node);
+    let events: i64 = sqlx::query_scalar("select count(*) from event where document_id=$1")
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let nodes: i64 = sqlx::query_scalar("select count(*) from node where document_id=$1")
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!((events, nodes), (0, 0));
+    let actual: Uuid = sqlx::query_scalar("select document_id from node where id=$1")
+        .bind(node)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(actual, foreign);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn private_uploads_check_global_ids_before_storing_edits(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let token = bearer(seed_identity(&pool, "early-collision@example.test").await);
+    let foreign = create_document(&router, &token, "Synthetic source").await;
+    let target = create_document(&router, &token, "Synthetic destination").await;
+    let node = ulid::Ulid::generate().to_string();
+    let op = json!({"type":"NodeCreated","node_id":node,"node_type":"form","pos":"a0","fields":{}});
+    assert_eq!(
+        send(
+            &router,
+            auth_post(
+                &format!("/documents/{foreign}/ops/node-create"),
+                &token,
+                &op
+            )
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{target}/change-requests"),
+            &token,
+            &json!({"name":"Collision","base_seq":0,"ops":[op.clone()]}),
+        ),
+    )
+    .await;
+    assert_private_node_conflict(status, &body, foreign, &node);
+    let (_, draft) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{target}/drafts"),
+            &token,
+            &json!({"name":"Private"}),
+        ),
+    )
+    .await;
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!(
+                "/documents/{target}/drafts/{}",
+                draft["id"].as_str().unwrap()
+            ),
+            &token,
+            &json!({"revision":0,"ops":[op]}),
+        ),
+    )
+    .await;
+    assert_private_node_conflict(status, &body, foreign, &node);
+    let (count, revision): (i64, i64) =
+        sqlx::query_as("select count(*),max(revision) from workspace_draft where document_id=$1")
+            .bind(target)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((count, revision), (1, 0));
+    let edits: i64 = sqlx::query_scalar("select count(*) from draft_edit e join workspace_draft d on d.id=e.draft_id where d.document_id=$1")
+        .bind(target).fetch_one(&pool).await.unwrap();
+    assert_eq!(edits, 0);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_global_id_insert_returns_conflict_after_waiting(pool: PgPool) {
+    use engine_shared::{EventPayload, IdentityId, NodeId, NodeType};
+    let runtime = common::RuntimeDatabase::new(pool).await;
+    let pool = runtime.pool.clone();
+    let router = app(test_state(pool.clone()));
+    let actor = seed_identity(&pool, "id-race@example.test").await;
+    let token = bearer(actor);
+    let foreign = create_document(&router, &token, "Synthetic first writer").await;
+    let target = create_document(&router, &token, "Synthetic second writer").await;
+    let node = ulid::Ulid::generate().to_string();
+    let mut first = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("select pg_backend_pid()")
+        .fetch_one(&mut *first)
+        .await
+        .unwrap();
+    sqlx::query(
+        "insert into node(id,document_id,type,pos,current_fields) values($1,$2,'form','a0','{}')",
+    )
+    .bind(&node)
+    .bind(foreign)
+    .execute(&mut *first)
+    .await
+    .unwrap();
+    engine_core::log::append_in_tx(
+        &mut first,
+        DocumentId(foreign),
+        &EventPayload::NodeCreated {
+            node_id: NodeId(node.clone()),
+            node_type: NodeType::Form,
+            parent_id: None,
+            pos: "a0".into(),
+            fields: json!({}),
+            var_name: None,
+        },
+        IdentityId(actor),
+    )
+    .await
+    .unwrap();
+    let body = json!({"node_type":"form","node_id":node,"pos":"a0"});
+    let request = auth_post(
+        &format!("/documents/{target}/ops/node-create"),
+        &token,
+        &body,
+    );
+    let writer = tokio::spawn(async move { send(&router, request).await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "select exists(select 1 from pg_stat_activity where $1=any(pg_blocking_pids(pid)))",
+            )
+            .bind(pid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            assert!(
+                !writer.is_finished(),
+                "second writer did not wait for the primary key"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    first.commit().await.unwrap();
+    let (status, body) = writer.await.unwrap();
+    assert_private_node_conflict(status, &body, foreign, &node);
+    let count: i64 = sqlx::query_scalar("select count(*) from event where document_id=$1")
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_unique_constraint_keeps_its_existing_error_mapping(pool: PgPool) {
+    // This index exists only in this isolated fixture, to exercise a different
+    // SQLSTATE 23505 without changing production constraints.
+    sqlx::query(
+        "create unique index synthetic_other_unique on node(var_name) where var_name is not null",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let router = app(test_state(pool.clone()));
+    let token = bearer(seed_identity(&pool, "other-constraint@example.test").await);
+    let foreign = create_document(&router, &token, "Synthetic other index").await;
+    let target = create_document(&router, &token, "Synthetic failed insert").await;
+    let path = |id| format!("/documents/{id}/ops/node-create");
+    assert_eq!(
+        send(
+            &router,
+            auth_post(
+                &path(foreign),
+                &token,
+                &json!({"node_type":"form","pos":"a0","var_name":"shared_name"})
+            )
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &path(target),
+            &token,
+            &json!({"node_type":"form","pos":"a0","var_name":"shared_name"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let count: i64 = sqlx::query_scalar("select count(*) from event where document_id=$1")
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
 // --- audit ----------------------------------------------------------------------
 
 #[sqlx::test(migrations = "../../migrations")]

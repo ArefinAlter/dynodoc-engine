@@ -108,3 +108,19 @@ Operators must inventory legacy IDs before rollout: an old noncanonical node can
 still be read and edited by reference, but selecting it for these merge/recovery
 requests now returns 400. A canonical ULID alone does not reserve a global node ID;
 database uniqueness remains authoritative. No historical IDs or migrations change.
+
+## Global node ID conflicts
+
+Canonical node IDs are globally unique. A node-create, batch, draft share or
+new choice that collides with another document's ID returns HTTP 409 with a generic
+message containing neither the conflicting ID nor the other document. The entire
+transaction rolls back, including earlier operations in a batch. Only a PostgreSQL
+23505 violation of `node_pkey` receives this mapping; other database errors keep
+their existing handling.
+
+Change-request/connector uploads and private draft edits check new IDs after
+authorization and before storing new draft content. A connector bundle's existing
+idempotent receipt can still replay first. This is early feedback, not an ID
+reservation: another document can commit the ID later, and sharing still relies
+on the primary key. Existing historical identities and node references are not
+rewritten; this builds on the stricter new-ID wire contract.
