@@ -1,0 +1,118 @@
+# Container image of engine-api and engine-cli for linux/amd64 and linux/arm64.
+#
+# Each architecture is built NATIVELY on a runner of its own (no emulation): ubuntu-latest
+# for amd64, ubuntu-24.04-arm for arm64. Every run builds the image and proves it starts
+# on that processor (engine-cli --version, and engine-api refusing to start without
+# configuration). Nothing is published from a push, a pull request or a manual run.
+#
+# Publishing happens only for a pushed `image-v*` tag: each architecture is pushed to
+# ghcr.io/<owner>/dynodoc-engine as <tag>-amd64 / <tag>-arm64, then one multi-architecture
+# tag <tag> is created from the two. That path needs `packages: write` and has not been
+# run (see docs/PLATFORM-SUPPORT.md); the images are unsigned and carry no SBOM yet.
+
+name: containers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - crates/**
+      - migrations/**
+      - .github/workflows/containers.yml
+    tags: ["image-v*"]
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .github/workflows/containers.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-containers-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  image:
+    name: image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    # packages: write is used by the tag-only push step below and by nothing else.
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the image
+        run: docker build --pull --tag dynodoc-engine:${{ matrix.arch }} .
+      - name: Start it on this processor
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE=dynodoc-engine:${{ matrix.arch }}
+          docker image inspect "$IMAGE" --format 'architecture={{.Architecture}} os={{.Os}} size={{.Size}}'
+          test "$(docker image inspect "$IMAGE" --format '{{.Architecture}}')" = "${{ matrix.arch }}"
+          docker run --rm --entrypoint engine-cli "$IMAGE" --version
+          # engine-api has no --version: with no configuration it must refuse to start
+          # and say why, which proves the binary runs on this processor.
+          set +e
+          OUT="$(docker run --rm "$IMAGE" 2>&1)"; CODE=$?
+          set -e
+          echo "engine-api exit code $CODE"
+          echo "$OUT" | head -5
+          test "$CODE" -ne 0
+          echo "$OUT" | grep -q "DATABASE_URL is not set"
+      - name: The image does not run as root
+        run: |
+          test "$(docker run --rm --entrypoint id dynodoc-engine:${{ matrix.arch }} -u)" = "10001"
+      - name: Push this architecture (tags only)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/image-v')
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/dynodoc-engine"
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+          docker tag "dynodoc-engine:${{ matrix.arch }}" "$REPO:$TAG-${{ matrix.arch }}"
+          docker push "$REPO:$TAG-${{ matrix.arch }}"
+
+  manifest:
+    name: multi-architecture tag
+    # Only a pushed image-v* tag publishes. Nothing else creates a registry tag.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/image-v')
+    needs: [image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Combine the two architectures under one tag
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/dynodoc-engine"
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+          docker buildx imagetools create --tag "$REPO:$TAG" "$REPO:$TAG-amd64" "$REPO:$TAG-arm64"
+          docker buildx imagetools inspect "$REPO:$TAG"

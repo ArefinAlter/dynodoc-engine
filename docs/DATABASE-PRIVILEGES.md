@@ -1,5 +1,61 @@
 # Database runtime boundary
 
+Schema 44 adds two tables for the review-gated write path of AI agents. `agent_identity`
+joins the SELECT/INSERT/UPDATE class (no DELETE): the sidecar of an agent identity (the
+`identity` row under which an agent's drafts and audit rows are recorded), created once and
+moved only by one `revoked_at` transition; a trigger refuses every other change and every
+delete, for every login. `agent_proposal_receipt` joins the SELECT/INSERT history class (no
+UPDATE, no DELETE): one append-only row per `propose` call that stored edits and per `submit`
+or `withdraw` that changed state (counts, the stale refs, the agent's own reasons, the request
+digest; no document text). It refuses UPDATE by trigger and DELETE except as the cascade of an
+audited whole-document erasure or of the erasure of the person the agent acted for
+(`agent_proposal_receipt_erasure_guard`, which checks the same-transaction receipt and the
+trigger depth). Triggers also keep the agent identity out of `document_access`, `space_member`,
+`change_request_review`, `connector_grant` and `device_signing_key`
+(`refuse_agent_identity`), keep the reserved `agents.invalid` address domain for agent
+identities alone (`agent_identity_domain_guard`, a deferred constraint trigger on `identity`),
+refuse to enable or erase an agent identity as an account, and revoke a person's agent
+identities when the person is disabled or erased (`revoke_removed_account_agents`, beside
+`revoke_removed_account_devices` of schema 33). `erase_agent_children` is a second
+`SECURITY DEFINER` trigger entry point, like `erased_identity_guard`: it deletes the drafts of
+the erased person's agent identities in the erasure transaction, after that guard has accepted
+the erasure receipt; `document_erasure_child_guard` is replaced (one clause added) so that it
+lets those `draft_edit` rows go. The runtime login has no EXECUTE on any of these functions.
+The migration also widens the scope checks with `content:propose` and `content:submit` (each
+needs `content:read` in the same array; a CHECK on both scope arrays says so),
+`agent_call.tool` with `propose` and `submit` (added `NOT VALID`: the new set only adds
+values, so the exclusive lock does not wait for a scan of the ledger), adds `client_kind` to `device_key_class` and
+the write fields to `project_agent_policy`. The startup check counts both new tables;
+re-run `grant-runtime`, then `check-runtime`, after migrating. See
+[AI agent connectors](AI-AGENT-CONNECTORS.md).
+
+Schema 43 adds two tables to the SELECT/INSERT/UPDATE class (no DELETE for the runtime login):
+`project_agent_policy`, the current agent policy of a project (no row means agents are
+disabled; `enabled` defaults to false), and `file_agent_policy`, the per-file override. They
+hold the current value only, edited in place; the history of every change is its
+`operation_audit` row, written in the same transaction (the audit table is append-only). A
+trigger lets the policy revision move by exactly one per update, never change the project and
+never move `sessions_valid_after` (the kill-switch cut-off) back or clear it; another keeps the
+file override's document fixed. A CHECK keeps `kinds` to one to three distinct known values. Both tables are removed only by the cascade of their project or
+document (whole-document erasure removes the file override; the audit row stays). The
+migration also adds a covering index on `agent_call(key_id, project_id, at)` for the per-grant
+budgets (built inside the migration, not concurrently; the API refuses a newer schema, so a
+rollback restores the dump). The startup check counts both tables; re-run `grant-runtime`, then `check-runtime`,
+after migrating. See [AI agent connectors](AI-AGENT-CONNECTORS.md).
+
+Schema 42 adds two tables to the SELECT/INSERT history class (no UPDATE, no DELETE for the
+runtime login): `device_key_class`, one immutable row per signing key enrolled with a class
+(`person` or `agent`; no row means a person's key), and `agent_call`, the append-only
+metadata ledger of AI-agent reads (credential, project, file, tool, revision, request digest,
+byte counts, outcome; never document text). Both refuse UPDATE by trigger for every login;
+`device_key_class` refuses DELETE too, and an `agent_call` row can only be deleted by the
+cascade of an audited whole-document erasure (`agent_call_erasure_guard`, which checks the
+same-transaction erasure receipt and the trigger depth, because the document row is already
+gone when the cascade runs). The startup check counts both tables, so a missing table or a
+wrong privilege fails closed. The migration also widens the scope checks of `device_session`
+and `device_key_project_grant` with `content:read`. Re-run `grant-runtime`, then
+`check-runtime`, after migrating. See [AI agent connectors](AI-AGENT-CONNECTORS.md).
+
 Schema 41 adds two SELECT-only tables, `project_ref_authority_epoch` (receipt
 authority epochs with their stored signed statements) and
 `project_ref_authority_revocation` (immutable revocation markers). They join the
@@ -89,6 +145,14 @@ drafts, derived indexes and administration. Migration metadata and the convenien
 view are SELECT-only. Two identity sequences permit usage but not `setval`.
 Seven read-only access helpers are executable; new tables/functions need an explicit
 allowlist and schema update. Effective column and PUBLIC grants are checked as well.
+
+The API retention loop (`crates/engine-api/src/retention.rs`) depends on the grants
+that already exist: SELECT, UPDATE (for `FOR UPDATE SKIP LOCKED`) and DELETE on the mutable
+tables `magic_link`, `refresh_token`, `auth_request_window`, `device_enrollment_challenge`,
+`web_metric` and `idempotency_key`, and nothing on history. It needs no migration and no
+grant change; moving one of these six tables out of the mutable class would stop the
+loop (a failed pass is logged and counted, never fatal), and its test asserts the
+privileges.
 
 Migration 0029 revokes PUBLIC privileges on application relations/functions and
 database CREATE/TEMP, plus public-schema CREATE. It also removes automatic PUBLIC
