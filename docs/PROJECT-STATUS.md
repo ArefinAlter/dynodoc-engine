@@ -467,20 +467,6 @@ is complete. Not implemented: markdown cell-format annotations on ranges. Owner 
 zero-width characters may ever be stripped, whether reading a cell should cover only its first text
 container, and the spec's diff for sheets and decks (left undefined; the crate extends it).
 
-## Source proposal: column-ID spreadsheet matching (18 October 2026)
-
-Engine source `eec1006` (base `d675538`) reads row `cell_<id>` fields in the
-parent sheet's optional `column_ids` array order. Without that array, numeric
-`cell_N` behavior stays unchanged. Undeclared cells are excluded when the array
-is present. Fingerprint version 2 requests background reindexing; fingerprint
-normalization and hashes for legacy inputs are unchanged. App/editor adoption of
-this optional metadata is separate; no sheet or historical event is migrated.
-
-Checks: complete serial workspace suite on disposable PostgreSQL 16: **639 passed,
-0 failed, 2 existing measurement/large-tree tests ignored**. Task is unavailable;
-the equivalent Cargo fmt, all-target Clippy, warning-denying rustdoc and generated
-OpenAPI comparison passed. No schema/API format change or deployment.
-
 ## Source: transparency log core and verifier library (18 October 2026)
 
 Phases W0, W1 (core only) and W2 (verifier library only) of
