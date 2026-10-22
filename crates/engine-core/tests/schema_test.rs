@@ -233,6 +233,59 @@ async fn expected_indexes_exist(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn retained_indexes_support_json_containment_and_mixed_snapshot_ordering(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let s = seed(&pool).await?;
+    let other: uuid::Uuid = sqlx::query_scalar(
+        "insert into document(title,created_by) values('Other snapshots',$1) returning id",
+    )
+    .bind(s.identity_id)
+    .fetch_one(&pool)
+    .await?;
+    let mut expected = vec![
+        (s.document_id, 1_i64),
+        (s.document_id, 3),
+        (other, 2),
+        (other, 4),
+    ];
+    for (document, seq) in &expected {
+        sqlx::query("insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash) values($1,$2,'{}'::jsonb,$3,$4)")
+            .bind(document).bind(seq).bind(&digest(0x33)[..]).bind(&digest(0x22)[..])
+            .execute(&pool).await?;
+    }
+    let mut tx = pool.begin().await?;
+    // Check access-path capability independently of small-fixture cost choices.
+    sqlx::query("set local enable_seqscan=off")
+        .execute(&mut *tx)
+        .await?;
+    let containment = "select id from node where current_fields @> '{\"label\":{\"en\":\"How many hours outdoors?\"}}'::jsonb";
+    let matching: Vec<String> = sqlx::query_scalar(containment).fetch_all(&mut *tx).await?;
+    assert_eq!(matching, vec![s.node_id]);
+    let plan: serde_json::Value =
+        sqlx::query_scalar(&format!("explain (format json) {containment}"))
+            .fetch_one(&mut *tx)
+            .await?;
+    assert!(plan.to_string().contains("node_fields_gin"), "{plan}");
+
+    let ordered =
+        "select document_id,through_seq from snapshot order by document_id asc,through_seq desc";
+    let actual: Vec<(uuid::Uuid, i64)> = sqlx::query_as(ordered).fetch_all(&mut *tx).await?;
+    expected.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    assert_eq!(actual, expected);
+    let plan: serde_json::Value = sqlx::query_scalar(&format!("explain (format json) {ordered}"))
+        .fetch_one(&mut *tx)
+        .await?;
+    assert!(plan.to_string().contains("snapshot_latest_idx"), "{plan}");
+    assert!(
+        !plan.to_string().contains("\"Node Type\":\"Sort\""),
+        "{plan}"
+    );
+    tx.rollback().await?;
+    Ok(())
+}
+
 #[sqlx::test(migrations = false)]
 async fn history_index_upgrade_preserves_rows_and_sequence_uniqueness(
     pool: PgPool,
