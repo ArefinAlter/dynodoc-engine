@@ -100,6 +100,7 @@ pub fn validate_op(state: &DocumentState, op: &EventPayload) -> Result<(), OpErr
             field,
             value,
         } => {
+            require_not_removed(state, node_id)?;
             if field == "var_name" || field == "varName" {
                 // A deleted block may take the name it comes back with; the restore
                 // checks it.
@@ -167,6 +168,7 @@ pub fn validate_op(state: &DocumentState, op: &EventPayload) -> Result<(), OpErr
             if choice.parent_id.as_ref() != Some(node_id) {
                 return Err(OpError::ChoiceNotFound(choice_id.0.clone()));
             }
+            require_live(state, choice_id)?;
             Ok(())
         }
 
@@ -301,6 +303,7 @@ fn validate_node_moved(
     new_parent_id: Option<&NodeId>,
 ) -> Result<(), OpError> {
     // A deleted block may move to where it comes back; the restore checks the parent.
+    require_not_removed(state, node_id)?;
     let node = require_present(state, node_id)?;
     let Some(new_parent_id) = new_parent_id else {
         // Moving to the root: legal only for a root-eligible type.
@@ -376,10 +379,17 @@ fn require_live<'a>(
     node_id: &NodeId,
 ) -> Result<&'a MaterializedNode, OpError> {
     let node = require_present(state, node_id)?;
-    if node.deleted {
+    if node.deleted || state.removed_choices.contains(node_id) {
         return Err(OpError::NodeDeleted(node_id.0.clone()));
     }
     Ok(node)
+}
+
+fn require_not_removed(state: &DocumentState, node_id: &NodeId) -> Result<(), OpError> {
+    if state.removed_choices.contains(node_id) {
+        return Err(OpError::NodeDeleted(node_id.0.clone()));
+    }
+    Ok(())
 }
 
 fn require_choice_bearing(node: &MaterializedNode) -> Result<(), OpError> {

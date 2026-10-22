@@ -1235,38 +1235,163 @@ async fn node_rows_follow_restored_choices_and_report_missing_rows(pool: PgPool)
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn removed_choices_stay_consistent_when_edited_deleted_and_restored(pool: PgPool) {
-    use engine_core::projection::{verify_projection, KNOWN_REMOVED_CHOICE};
-    let router = app(test_state(pool.clone()));
+async fn removed_choices_reject_new_writes_atomically_until_restored(pool: PgPool) {
+    use engine_core::{
+        projection::verify_projection,
+        snapshot::{merkle_root, SnapshotEngine},
+    };
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let router = app(test_state(runtime.pool.clone()));
     let token = bearer(seed_identity(&pool, "choices@example.test").await);
     let doc = create_document(&router, &token, "Choices").await;
     let [root, question, choice] = std::array::from_fn(|_| ulid::Ulid::generate().to_string());
     let uri = format!("/documents/{doc}/batch");
-    for (step, op) in [
-        json!({"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}}),
-        json!({"type":"NodeCreated","node_id":question,"node_type":"item","parent_id":root,"pos":"a0","fields":{"label":"Q"}}),
-        json!({"type":"ChoiceAdded","node_id":question,"choice_id":choice,"fields":{"label":"C"}}),
+    let before = json!({"type":"paragraph","content":[{"type":"text","text":"Original"}]});
+    let after = json!({"type":"paragraph","content":[{"type":"text","text":"Changed"}]});
+    let (status, body) = send(&router, auth_post(&uri, &token, &json!({"ops":[
+        {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}},
+        {"type":"NodeCreated","node_id":question,"node_type":"item","parent_id":root,"pos":"a0","fields":{"label":"Q"}},
+        {"type":"ChoiceAdded","node_id":question,"choice_id":choice,"fields":{"label":"C","content":before}}
+    ]}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let snapshots = SnapshotEngine::new(runtime.pool.clone());
+    let live = snapshots.read_current_state(DocumentId(doc)).await.unwrap();
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &uri,
+            &token,
+            &json!({"ops":[
+                {"type":"ChoiceRemoved","node_id":question,"choice_id":choice}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let removed = snapshots.read_current_state(DocumentId(doc)).await.unwrap();
+    assert_ne!(live, removed);
+    // V1 hashes nodes, not the removed-choice set. Keep historical roots readable.
+    assert_eq!(merkle_root(&live).unwrap(), merkle_root(&removed).unwrap());
+    let patch = engine_core::richtext::make_patch(&before, &after).unwrap();
+    for op in [
+        json!({"type":"FieldEdited","node_id":choice,"field":"label","value":"Changed"}),
+        json!({"type":"FieldEdited","node_id":choice,"field":"var_name","value":"renamed"}),
+        json!({"type":"RichTextPatched","node_id":choice,"patch":patch}),
+        json!({"type":"NodeMoved","node_id":choice,"new_parent_id":question,"new_pos":"b0"}),
         json!({"type":"ChoiceRemoved","node_id":question,"choice_id":choice}),
-        json!({"type":"FieldEdited","node_id":choice,"field":"label","value":"Edited after removal"}),
         json!({"type":"NodeDeleted","node_id":choice}),
-        json!({"type":"NodeRestored","node_id":choice}),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let (status, body) = send(&router, auth_post(&uri, &token, &json!({ "ops": [op] }))).await;
-        assert_eq!(status, StatusCode::OK, "step {step}: {body}");
-        // The table may differ from replay only by the known removed-choice marker.
-        let report = verify_projection(&pool, DocumentId(doc)).await.unwrap();
-        assert!(
-            report
-                .differences
-                .iter()
-                .all(|d| d.known == Some(KNOWN_REMOVED_CHOICE)),
-            "step {step}: {:?}",
-            report.differences
+    ] {
+        let (status, body) = send(&router, auth_post(&uri, &token, &json!({"ops":[
+            {"type":"FieldEdited","node_id":question,"field":"label","value":"Must roll back"}, op
+        ]}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let seq: i64 = sqlx::query_scalar("select max(seq) from event where document_id=$1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(seq, 4);
+        assert_eq!(
+            snapshots.read_current_state(DocumentId(doc)).await.unwrap(),
+            removed
         );
+        let label: Value =
+            sqlx::query_scalar("select current_fields->'label' from node where id=$1")
+                .bind(&question)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(label, "Q");
     }
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &uri,
+            &token,
+            &json!({"ops":[
+                {"type":"NodeRestored","node_id":choice},
+                {"type":"FieldEdited","node_id":choice,"field":"label","value":"Restored"},
+                {"type":"NodeMoved","node_id":choice,"new_parent_id":question,"new_pos":"b0"}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(verify_projection(&runtime.pool, DocumentId(doc))
+        .await
+        .unwrap()
+        .differences
+        .is_empty());
+    runtime.close().await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reused_node_and_choice_ids_conflict_even_after_deletion_or_removal(pool: PgPool) {
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let router = app(test_state(runtime.pool.clone()));
+    let token = bearer(seed_identity(&runtime.pool, "reuse@example.test").await);
+    let doc = create_document(&router, &token, "Stable identity regression").await;
+    let [root, question, choice] = std::array::from_fn(|_| ulid::Ulid::generate().to_string());
+    let uri = format!("/documents/{doc}/batch");
+    let (status, body) = send(&router, auth_post(&uri, &token, &json!({"ops":[
+        {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{"label":"Original"}},
+        {"type":"NodeCreated","node_id":question,"node_type":"item","parent_id":root,"pos":"a0","fields":{"label":"Question"}},
+        {"type":"ChoiceAdded","node_id":question,"choice_id":choice,"fields":{"label":"Choice"}}
+    ]}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for (stage, expected_seq) in [3_i64, 4, 6].into_iter().enumerate() {
+        let transition = match stage {
+            0 => vec![],
+            1 => vec![json!({"type":"NodeDeleted","node_id":choice})],
+            _ => vec![
+                json!({"type":"NodeRestored","node_id":choice}),
+                json!({"type":"ChoiceRemoved","node_id":question,"choice_id":choice}),
+            ],
+        };
+        if !transition.is_empty() {
+            let (status, body) =
+                send(&router, auth_post(&uri, &token, &json!({"ops":transition}))).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        for existing in [&root, &question, &choice] {
+            for collision in [
+                json!({"type":"NodeCreated","node_id":existing,"node_type":"form","pos":"new","fields":{}}),
+                json!({"type":"ChoiceAdded","node_id":question,"choice_id":existing,"fields":{"label":"Replacement"}}),
+            ] {
+                let (status, body) = send(&router, auth_post(&uri, &token, &json!({"ops":[
+                    {"type":"FieldEdited","node_id":root,"field":"label","value":"Must roll back"},
+                    collision
+                ]}))).await;
+                assert_eq!(status, StatusCode::CONFLICT, "stage {stage}: {body}");
+                let seq: i64 =
+                    sqlx::query_scalar("select max(seq) from event where document_id=$1")
+                        .bind(doc)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(seq, expected_seq, "ID reuse must append no event");
+                let fields: Value =
+                    sqlx::query_scalar("select current_fields from node where id=$1")
+                        .bind(&root)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(fields["label"], "Original", "earlier writes must roll back");
+            }
+        }
+    }
+    let report = engine_core::projection::verify_projection(&runtime.pool, DocumentId(doc))
+        .await
+        .unwrap();
+    assert!(
+        report
+            .differences
+            .iter()
+            .all(|d| d.known == Some(engine_core::projection::KNOWN_REMOVED_CHOICE)),
+        "{:?}",
+        report.differences
+    );
+    runtime.close().await;
 }
 
 fn test_state(pool: PgPool) -> AppState {
