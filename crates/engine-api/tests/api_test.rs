@@ -1385,6 +1385,85 @@ async fn anonymous_read_requires_auth(pool: PgPool) {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn event_proofs_match_the_stored_snapshot_prefix_root(pool: PgPool) {
+    use engine_core::snapshot::{SnapshotEngine, SnapshotReason};
+    use engine_shared::{EventPayload, IdentityId};
+    let router = app(test_state(pool.clone()));
+    let identity = seed_identity(&pool, "prefix-root@example.test").await;
+    let token = bearer(identity);
+    let document = create_document(&router, &token, "Synthetic snapshot prefix").await;
+    let mut events = Vec::new();
+    for i in 0..3 {
+        events.push(
+            engine_core::log::append(
+                &pool,
+                DocumentId(document),
+                &EventPayload::CommentAdded {
+                    node_id: None,
+                    body: format!("Synthetic {i}"),
+                },
+                IdentityId(identity),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let snapshot = SnapshotEngine::new(pool.clone())
+        .take(DocumentId(document), SnapshotReason::Periodic)
+        .await
+        .unwrap();
+    let root = snapshot.event_merkle_root.as_ref().unwrap();
+    let root_hex: String = root.iter().map(|byte| format!("{byte:02x}")).collect();
+    let later = engine_core::log::append(
+        &pool,
+        DocumentId(document),
+        &EventPayload::CommentAdded {
+            node_id: None,
+            body: "Outside prefix".into(),
+        },
+        IdentityId(identity),
+    )
+    .await
+    .unwrap();
+    for event in &events {
+        let (status, proof) = send(
+            &router,
+            auth_post_get(
+                &format!("/documents/{document}/merkle-proof/{}", event.id.0),
+                &token,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{proof}");
+        assert_eq!(proof["root"], root_hex);
+        assert_eq!(proof["through_seq"], 3);
+        assert_eq!(proof["seq"], event.seq);
+    }
+    assert_eq!(
+        send(
+            &router,
+            auth_post_get(
+                &format!("/documents/{document}/merkle-proof/{}", later.id.0),
+                &token
+            )
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, wire) = send(
+        &router,
+        auth_post_get(
+            &format!("/documents/{document}/snapshot/{}", snapshot.id.0),
+            &token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(wire["event_merkle_root"], json!(root));
+}
+
 // --- write path + governance ----------------------------------------------------
 
 #[sqlx::test(migrations = "../../migrations")]

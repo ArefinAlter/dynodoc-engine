@@ -1644,7 +1644,7 @@ paths:
           type: string
       responses:
         '200':
-          description: Inclusion proof
+          description: Inclusion proof checked against the snapshot event root when present
           content:
             application/json:
               schema: {}
@@ -2202,7 +2202,7 @@ paths:
           format: uuid
       responses:
         '200':
-          description: The snapshot
+          description: The snapshot; new snapshots include a separate event_merkle_root
           content:
             application/json:
               schema: {}

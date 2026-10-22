@@ -33,12 +33,19 @@ fn invalid(snapshot: &Snapshot, detail: &str) -> SnapshotError {
     }
 }
 
-fn receipt_version(snapshot: &Snapshot) -> i16 {
-    if snapshot.state.get("$dynodoc_state").is_some() {
-        2
-    } else {
-        1
+fn receipt_format(snapshot: &Snapshot) -> (i16, &'static str) {
+    match (
+        snapshot.state.get("$dynodoc_state").is_some(),
+        snapshot.event_merkle_root.is_some(),
+    ) {
+        (false, false) => (1, "dynodoc.legacy-snapshot.v1"),
+        (true, false) => (2, "dynodoc.shared-snapshot.v2"),
+        (false, true) => (3, "dynodoc.legacy-snapshot.v3"),
+        (true, true) => (4, "dynodoc.shared-snapshot.v4"),
     }
+}
+fn receipt_version(snapshot: &Snapshot) -> i16 {
+    receipt_format(snapshot).0
 }
 
 /// Strict reference recognition; a malformed/new version never falls back to JSON.
@@ -75,7 +82,7 @@ async fn materialize(
 }
 
 /// Verify the stored envelope before decoding its graph. Never fingerprint the
-/// hydrated response: v2 attests the immutable reference and v1 the inline state.
+/// hydrated response: v2/v4 attest the immutable reference, v1/v3 the inline state.
 pub(crate) async fn read_verified_state(
     connection: &mut PgConnection,
     snapshot: &Snapshot,
@@ -107,23 +114,21 @@ fn fingerprint(snapshot: &Snapshot) -> Result<Vec<u8>, serde_json::Error> {
     let mut writer = HashWriter(Context::new(&SHA256));
     // Versioned, ordered envelope. JSON objects in state are recursively sorted;
     // arrays retain their stored order, including the legacy removed-choice set.
-    serde_json::to_writer(
-        &mut writer,
-        &(
-            if receipt_version(snapshot) == 1 {
-                "dynodoc.legacy-snapshot.v1"
-            } else {
-                "dynodoc.shared-snapshot.v2"
-            },
-            snapshot.id,
-            snapshot.document_id,
-            snapshot.through_seq,
-            &snapshot.merkle_root,
-            &snapshot.event_chain_hash,
-            snapshot.created_at,
-            CanonicalValue(&snapshot.state),
-        ),
-    )?;
+    let envelope = (
+        receipt_format(snapshot).1,
+        snapshot.id,
+        snapshot.document_id,
+        snapshot.through_seq,
+        &snapshot.merkle_root,
+        &snapshot.event_chain_hash,
+        snapshot.created_at,
+        CanonicalValue(&snapshot.state),
+    );
+    if let Some(root) = &snapshot.event_merkle_root {
+        serde_json::to_writer(&mut writer, &(envelope, root))?;
+    } else {
+        serde_json::to_writer(&mut writer, &envelope)?;
+    }
     Ok(writer.0.finish().as_ref().to_vec())
 }
 
@@ -174,7 +179,7 @@ pub async fn load(
     if let Some(ref mut snapshot) = snapshot {
         let state = read_verified_state(connection, snapshot).await?;
         // Preserve legacy JSON exactly, including optional fields and set order.
-        if receipt_version(snapshot) == 2 {
+        if snapshot.state.get("$dynodoc_state").is_some() {
             snapshot.state = serde_json::to_value(state)?;
         }
     }
@@ -186,6 +191,7 @@ async fn compare(
     snapshot: &Snapshot,
     state: &DocumentState,
     chain: &[u8],
+    event_root: &[u8],
 ) -> Result<(), SnapshotError> {
     // Serde normally ignores unknown struct fields. Reject them at this trust
     // boundary: otherwise backfill could attest bytes that replay never produced
@@ -246,6 +252,16 @@ async fn compare(
     }
     if snapshot.merkle_root != merkle_root(state)? {
         return Err(invalid(snapshot, "node Merkle root differs from replay"));
+    }
+    if snapshot
+        .event_merkle_root
+        .as_deref()
+        .is_some_and(|root| root != event_root)
+    {
+        return Err(invalid(
+            snapshot,
+            "event Merkle root differs from canonical replay",
+        ));
     }
     if snapshot.event_chain_hash != chain {
         return Err(invalid(
@@ -329,6 +345,8 @@ pub async fn take_with_storage_in_connection(
         .await?
         .state;
     let chain = chain_at(connection, document, through_seq).await?;
+    let event_root =
+        crate::event_merkle::root_in_connection(connection, document, through_seq).await?;
     let encoded = match storage {
         NamedStorage::Legacy => serde_json::to_value(&state)?,
         NamedStorage::SharedV2 => {
@@ -344,14 +362,15 @@ pub async fn take_with_storage_in_connection(
         }
     };
     sqlx::query(
-        "insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash)
-        values($1,$2,$3,$4,$5) on conflict(document_id,through_seq) do nothing",
+        "insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash,event_merkle_root)
+        values($1,$2,$3,$4,$5,$6) on conflict(document_id,through_seq) do nothing",
     )
     .bind(document.0)
     .bind(through_seq)
     .bind(encoded)
     .bind(merkle_root(&state)?.as_slice())
     .bind(&chain)
+    .bind(event_root.as_slice())
     .execute(&mut *connection)
     .await?;
     let mut snapshot: Snapshot =
@@ -360,9 +379,9 @@ pub async fn take_with_storage_in_connection(
             .bind(through_seq)
             .fetch_one(&mut *connection)
             .await?;
-    compare(connection, &snapshot, &state, &chain).await?;
+    compare(connection, &snapshot, &state, &chain, &event_root).await?;
     record(connection, &snapshot).await?;
-    if receipt_version(&snapshot) == 2 {
+    if snapshot.state.get("$dynodoc_state").is_some() {
         snapshot.state = serde_json::to_value(state)?;
     }
     Ok(snapshot)
@@ -402,6 +421,7 @@ pub async fn verify_document(
     let mut state = DocumentState::default();
     let mut seq = 0;
     let mut chain = ZERO_HASH.to_vec();
+    let mut event_tree = crate::event_merkle::Accumulator::default();
     let mut last_snapshot: Option<i64> = None;
     let mut count = 0;
     loop {
@@ -431,6 +451,7 @@ pub async fn verify_document(
                 Materializer::fold_into(&mut state, std::slice::from_ref(&event))
                     .map_err(|source| SnapshotError::Replay { document, source })?;
                 seq = event.seq;
+                event_tree.push(&event.content_hash);
                 chain = event.chain_hash;
             }
         }
@@ -440,7 +461,7 @@ pub async fn verify_document(
         let Some(snapshot) = next else {
             break;
         };
-        compare(&mut tx, &snapshot, &state, &chain).await?;
+        compare(&mut tx, &snapshot, &state, &chain, &event_tree.root()).await?;
         if backfill {
             record(&mut tx, &snapshot).await?;
         } else {
@@ -480,6 +501,7 @@ mod tests {
             state: serde_json::json!({"nodes":{},"comments":[],"suggestions":{},"removed_choices":[]}),
             merkle_root: vec![0; 32],
             event_chain_hash: vec![0; 32],
+            event_merkle_root: None,
             created_at: "2026-10-11T00:00:00Z".parse().unwrap(),
         };
         // Independently encoded with sorted JSON keys and SHA-256.
@@ -503,6 +525,7 @@ mod tests {
             state: serde_json::json!({"$dynodoc_state":2,"root":"0123456789abcdef".repeat(4)}),
             merkle_root: vec![0; 32],
             event_chain_hash: vec![0; 32],
+            event_merkle_root: None,
             created_at: "2026-10-11T00:00:00Z".parse().unwrap(),
         };
         // Independent Python JSON/SHA-256 envelope, not the engine encoder.
@@ -515,5 +538,89 @@ mod tests {
             hex,
             "3108937000f9ea2d5fef24341ac085f2886808ba24f9197613ea603e23ff3d76"
         );
+    }
+    async fn event_fixture(
+        pool: &PgPool,
+    ) -> anyhow::Result<(DocumentId, engine_shared::IdentityId)> {
+        let actor=engine_shared::IdentityId(sqlx::query_scalar("insert into identity(email,display_name) values('event-root@example.test','Synthetic root author') returning id").fetch_one(pool).await?);
+        let doc=DocumentId(sqlx::query_scalar("insert into document(title,created_by) values('Synthetic event root',$1) returning id").bind(actor.0).fetch_one(pool).await?);
+        let mut tx = pool.begin().await?;
+        log::append_in_tx(
+            &mut tx,
+            doc,
+            &engine_shared::EventPayload::CommentAdded {
+                node_id: None,
+                body: "Synthetic".into(),
+            },
+            actor,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok((doc, actor))
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn old_null_roots_stay_null_while_new_snapshots_bind_event_roots(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let (doc, actor) = event_fixture(&pool).await?;
+        let mut tx = pool.begin().await?;
+        let (state, seq) = crate::snapshot::read_current_state(&mut tx, doc).await?;
+        let chain = chain_at(&mut tx, doc, seq).await?;
+        sqlx::query("insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash) values($1,$2,$3,$4,$5)")
+            .bind(doc.0).bind(seq).bind(serde_json::to_value(&state)?).bind(merkle_root(&state)?).bind(chain)
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        verify_document(&pool, doc, true).await?;
+        let old = crate::snapshot::SnapshotEngine::new(pool.clone())
+            .take(doc, crate::snapshot::SnapshotReason::Periodic)
+            .await?;
+        assert!(old.event_merkle_root.is_none());
+        assert!(serde_json::to_value(&old)?
+            .get("event_merkle_root")
+            .is_none());
+        let mut tx = pool.begin().await?;
+        log::append_in_tx(
+            &mut tx,
+            doc,
+            &engine_shared::EventPayload::CommentAdded {
+                node_id: None,
+                body: "Next".into(),
+            },
+            actor,
+        )
+        .await?;
+        tx.commit().await?;
+        let new = crate::snapshot::SnapshotEngine::new(pool.clone())
+            .take(doc, crate::snapshot::SnapshotReason::Periodic)
+            .await?;
+        let mut conn = pool.acquire().await?;
+        let expected = crate::event_merkle::root_in_connection(&mut conn, doc, 2).await?;
+        assert_eq!(new.event_merkle_root.as_deref(), Some(expected.as_slice()));
+        assert_eq!(receipt_version(&new), 3);
+        let old_root: Option<Vec<u8>> =
+            sqlx::query_scalar("select event_merkle_root from snapshot where id=$1")
+                .bind(old.id.0)
+                .fetch_one(&pool)
+                .await?;
+        assert!(old_root.is_none());
+        drop(conn);
+        verify_document(&pool, doc, false).await?;
+        // A privileged change to the new root cannot be hidden behind its receipt.
+        sqlx::raw_sql("alter table snapshot disable trigger snapshot_no_update")
+            .execute(&pool)
+            .await?;
+        sqlx::query("update snapshot set event_merkle_root=$2 where id=$1")
+            .bind(new.id.0)
+            .bind(vec![9u8; 32])
+            .execute(&pool)
+            .await?;
+        sqlx::raw_sql("alter table snapshot enable trigger snapshot_no_update")
+            .execute(&pool)
+            .await?;
+        assert!(verify_document(&pool, doc, false).await.is_err());
+        let mut conn = pool.acquire().await?;
+        assert!(load(&mut conn, doc, new.id.0).await.is_err());
+        Ok(())
     }
 }
