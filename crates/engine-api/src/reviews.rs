@@ -339,6 +339,7 @@ pub(crate) async fn create(
     auth: AuthContext,
     Json(req): Json<CreateRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::ops::pos::validate_operations_pos(&req.ops)?;
     if req.name.trim().is_empty() || req.name.len() > 200 {
         return Err(bad("Name this change in 1–200 characters"));
     }

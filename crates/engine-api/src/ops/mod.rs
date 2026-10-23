@@ -8,6 +8,7 @@
 //! handle idempotency.
 
 pub mod apply;
+pub mod pos;
 pub mod routes;
 
 pub use routes::router;
