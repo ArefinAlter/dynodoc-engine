@@ -1100,6 +1100,77 @@ async fn rich_text_history_replays_compact_edits_and_rejects_stale_patches(pool:
     assert_eq!(send(&router, request).await.0, StatusCode::FORBIDDEN);
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn restore_rejects_live_nodes_atomically_and_restores_removed_choices(pool: PgPool) {
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let router = app(test_state(runtime.pool.clone()));
+    let token = bearer(seed_identity(&runtime.pool, "restore@example.test").await);
+    let doc = create_document(&router, &token, "Restore preconditions").await;
+    let [root, item, choice] = std::array::from_fn(|_| ulid::Ulid::generate().to_string());
+    let uri = format!("/documents/{doc}/batch");
+    let setup = json!({"ops":[
+        {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{"label":"Original"}},
+        {"type":"NodeCreated","node_id":item,"node_type":"item","parent_id":root,"pos":"a0","fields":{}},
+        {"type":"ChoiceAdded","node_id":item,"choice_id":choice,"fields":{"label":"Option"}}
+    ]});
+    let (status, body) = send(&router, auth_post(&uri, &token, &setup)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for id in [&root, &item, &choice] {
+        let (status, body) = send(
+            &router,
+            auth_post(
+                &uri,
+                &token,
+                &json!({"ops":[
+                    {"type":"FieldEdited","node_id":root,"field":"label","value":"Must roll back"},
+                    {"type":"NodeRestored","node_id":id}
+                ]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains("already live"), "{body}");
+        let seq: i64 = sqlx::query_scalar("select max(seq) from event where document_id=$1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(seq, 3, "rejected restore must roll back the whole batch");
+        let fields: Value = sqlx::query_scalar("select current_fields from node where id=$1")
+            .bind(&root)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(fields["label"], "Original");
+    }
+    for op in [
+        json!({"type":"ChoiceRemoved","node_id":item,"choice_id":choice}),
+        json!({"type":"NodeRestored","node_id":choice}),
+        json!({"type":"NodeDeleted","node_id":choice}),
+        json!({"type":"NodeRestored","node_id":choice}),
+    ] {
+        let (status, body) = send(&router, auth_post(&uri, &token, &json!({"ops":[op]}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &uri,
+            &token,
+            &json!({"ops":[
+                {"type":"NodeRestored","node_id":choice}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = send(&router, auth_post_get(&format!("/documents/{doc}"), &token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"]["nodes"][&choice]["id"], choice);
+    assert_eq!(body["state"]["nodes"][&choice]["deleted"], false);
+    runtime.close().await;
+}
+
 /// Every node-table write path, checked as the runtime login: only the removed-choice
 /// encoding differs. Rows written now follow the fold, so null fields match replay.
 #[sqlx::test(migrations = "../../migrations")]
