@@ -1039,6 +1039,62 @@ async fn admin_account_erasure_preserves_shared_chain_and_clears_private_drafts(
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn image_attr_edits_persist_full_embedded_source_payloads(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let owner = bearer(seed_identity(&pool, "image-size@example.test").await);
+    let doc = create_document(&router, &owner, "Embedded image").await;
+    let root = ulid::Ulid::generate().to_string();
+    let image = ulid::Ulid::generate().to_string();
+    let src = format!("data:image/png;base64,{}", "A".repeat(375_000));
+    let mut content = json!({"type":"image","attrs":{"src":src,"alt":"Original","width":100}});
+    let (status, result) = send(&router, auth_post(&format!("/documents/{doc}/batch"), &owner,
+        &json!({"base_seq":0,"ops":[
+            {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}},
+            {"type":"NodeCreated","node_id":image,"node_type":"item","parent_id":root,"pos":"a0","fields":{"content":content}}
+        ]}))).await;
+    assert_eq!(status, StatusCode::OK, "{status}");
+    assert_eq!(result["events"].as_array().unwrap().len(), 2);
+    let mut seq = 2_i64;
+    for (attribute, value) in [
+        ("alt", json!("Revised alternative text")),
+        ("width", json!(640)),
+    ] {
+        content["attrs"][attribute] = value;
+        let (status, result) = send(&router, auth_post(&format!("/documents/{doc}/batch"), &owner,
+            &json!({"base_seq":seq,"ops":[{"type":"FieldEdited","node_id":image,"field":"content","value":content}]}))).await;
+        assert_eq!(status, StatusCode::OK, "image {attribute}: {status}");
+        assert_eq!(result["events"].as_array().unwrap().len(), 1);
+        seq += 1;
+        let (bytes, payload): (i32, Value) = sqlx::query_as(
+            "select octet_length(payload::text),payload from event where document_id=$1 and seq=$2",
+        )
+        .bind(doc)
+        .bind(seq)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        eprintln!("stored image {attribute} edit: {bytes} JSONB payload bytes");
+        assert!(bytes > 375_000, "V1 still repeats the image: {bytes}");
+        assert!(bytes < 376_024, "unexpected JSONB overhead: {bytes}");
+        assert_eq!(payload["type"], "FieldEdited");
+        assert_eq!(payload["value"], content);
+        assert_eq!(payload["value"]["attrs"]["src"], src);
+    }
+    let (_, node) = send(
+        &router,
+        auth_post_get(&format!("/documents/{doc}/node/{image}"), &owner),
+    )
+    .await;
+    assert_eq!(node["current_fields"]["content"], content);
+    let (_, verification) = send(
+        &router,
+        auth_post_get(&format!("/documents/{doc}/verify"), &owner),
+    )
+    .await;
+    assert_eq!(verification["ok"], true);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn rich_text_history_replays_compact_edits_and_rejects_stale_patches(pool: PgPool) {
     let router = app(test_state(pool.clone()));
     let owner = seed_identity(&pool, "richtext@example.test").await;
