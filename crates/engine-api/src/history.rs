@@ -90,12 +90,6 @@ async fn recover(
                     "Select 1-5000 blocks, or omit the selection for all content",
                 ));
             }
-            if ids
-                .iter()
-                .any(|id| !engine_shared::ids::is_canonical_ulid(id))
-            {
-                return Err(bad("Selected node IDs must be canonical uppercase ULIDs"));
-            }
             let unique: BTreeSet<_> = ids.iter().cloned().collect();
             if unique.len() != ids.len() || ids.iter().any(|id| id.is_empty() || id.len() > 128) {
                 return Err(bad("Block IDs must be nonempty and unique"));

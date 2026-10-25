@@ -1831,7 +1831,8 @@ async fn selection_ids_and_new_choice_ids_are_validated_without_partial_writes(p
     let draft = draft["id"].as_str().unwrap();
     for field in ["included_nodes", "dropped_nodes"] {
         for ids in [
-            json!(["bad"]),
+            json!([""]),
+            json!(["X".repeat(129)]),
             json!(vec![ulid::Ulid::generate().to_string(); 20_001]),
         ] {
             let mut body = json!({"action":"preview"});
@@ -1847,18 +1848,21 @@ async fn selection_ids_and_new_choice_ids_are_validated_without_partial_writes(p
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {result}");
         }
-        let mut body = json!({"action":"preview"});
-        body[field] = json!([ulid::Ulid::generate().to_string()]);
-        let (status, result) = send(
-            &router,
-            auth_post(
-                &format!("/documents/{doc}/drafts/{draft}/sync"),
-                &token,
-                &body,
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{result}");
+        // A selection names nodes that already exist, so a historical spelling is accepted.
+        for id in [ulid::Ulid::generate().to_string(), "01NODE00000000".into()] {
+            let mut body = json!({"action":"preview"});
+            body[field] = json!([id]);
+            let (status, result) = send(
+                &router,
+                auth_post(
+                    &format!("/documents/{doc}/drafts/{draft}/sync"),
+                    &token,
+                    &body,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+        }
     }
     let root = ulid::Ulid::generate().to_string();
     let question = ulid::Ulid::generate().to_string();
@@ -1896,16 +1900,16 @@ async fn selection_ids_and_new_choice_ids_are_validated_without_partial_writes(p
     .await;
     assert_eq!(status, StatusCode::OK, "{review}");
     let review = review["id"].as_str().unwrap();
-    for ids in [
-        json!(["bad"]),
-        json!(vec![review_id.clone(); 20_001]),
-        json!([review_id]),
+    for (ids, expected) in [
+        (json!([""]), StatusCode::BAD_REQUEST),
+        (json!(["X".repeat(129)]), StatusCode::BAD_REQUEST),
+        (
+            json!(vec![review_id.clone(); 20_001]),
+            StatusCode::BAD_REQUEST,
+        ),
+        // A historical spelling in the selection is accepted next to a canonical one.
+        (json!([review_id, "01NODE00000000"]), StatusCode::OK),
     ] {
-        let expected = if ids.as_array().unwrap().len() == 1 && ids[0] != "bad" {
-            StatusCode::OK
-        } else {
-            StatusCode::BAD_REQUEST
-        };
         let (status, result) = send(
             &router,
             auth_post(

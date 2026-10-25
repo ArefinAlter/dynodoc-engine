@@ -98,15 +98,15 @@ suggestion operations use the same check. Malformed values return HTTP 400 befor
 any operation is applied. Missing node-create IDs still use server-generated ULIDs.
 
 Sync included/dropped selections and change-request merge selections accept at most
-20,000 IDs and validate each ID. History recovery retains its existing 5,000-ID
-limit and also validates selections. Error messages never include supplied IDs.
+20,000 IDs of 1 to 128 bytes each (history recovery keeps its 5,000-ID limit and the
+same per-ID bound). A selection names nodes that already exist, so it is not required to
+be canonical: an old node with a non-canonical ID can still be shared, merged or
+recovered. Error messages never include supplied IDs.
 
-This is a write-boundary change. Historical event readers, `NodeId` deserialization,
-server-generated history recovery operations and references to existing nodes keep
-legacy ID compatibility. Existing successful idempotency responses can still replay.
-Operators must inventory legacy IDs before rollout: an old noncanonical node can
-still be read and edited by reference, but selecting it for these merge/recovery
-requests now returns 400. A canonical ULID alone does not reserve a global node ID;
+This is a write-boundary change for new identities only. Historical event readers,
+`NodeId` deserialization, server-generated history recovery operations and references
+to existing nodes keep legacy ID compatibility. Existing successful idempotency
+responses can still replay. A canonical ULID alone does not reserve a global node ID;
 database uniqueness remains authoritative. No historical IDs or migrations change.
 
 ## Global node ID conflicts
