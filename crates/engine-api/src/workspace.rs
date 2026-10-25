@@ -607,6 +607,7 @@ async fn edit_draft(
             reason: "This draft changed in another tab. Reopen it before saving.".into(),
         });
     }
+    apply::ensure_new_node_ids_available(&mut tx, &req.ops).await?;
     let base:Value=sqlx::query_scalar(&format!("select base_state from workspace_draft where id=$1 and document_id=$2 and {owned} and merged_at is null for update")).bind(draft).bind(id).bind(auth.identity_id).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
     let mut current = crate::draft_storage::decode(&mut tx, DocumentId(id), &base).await?;
     let prior: Vec<Value> =
