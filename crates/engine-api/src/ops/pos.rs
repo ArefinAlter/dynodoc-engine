@@ -6,7 +6,10 @@ use engine_shared::{ids::is_valid_pos_key, EventPayload};
 
 fn invalid_pos() -> ApiError {
     ApiError::BadRequest {
-        reason: "Position key must be non-empty printable ASCII without trailing spaces (max 1024 bytes)".into(),
+        reason: format!(
+            "Position key must be non-empty printable ASCII without trailing spaces (max {} bytes)",
+            engine_shared::ids::MAX_POS_KEY_BYTES
+        ),
     }
 }
 

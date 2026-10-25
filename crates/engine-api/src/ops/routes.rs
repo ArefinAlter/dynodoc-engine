@@ -53,6 +53,7 @@ pub struct NodeCreateRequest {
     pub node_type: NodeType,
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Position key among siblings: 1 to 8,192 bytes of printable ASCII, not ending in a space.
     pub pos: String,
     #[serde(default)]
     pub fields: Value,

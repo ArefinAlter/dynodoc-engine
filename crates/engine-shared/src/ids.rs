@@ -90,16 +90,24 @@ mod canonical_tests {
     }
 }
 
+/// Longest position key a new write may carry.
+///
+/// The web editor's `between()` grows a key by one character per insert once it passes 200
+/// characters (see `engine-agent/src/pos.rs`): appending 3,000 rows or pasting 5,000 blocks
+/// one after another reaches 1,700 to 3,600 characters, and the editors have no limit of
+/// their own. The limit only has to stop abuse, not to shape what the editors write.
+pub const MAX_POS_KEY_BYTES: usize = 8192;
+
 /// Validate position keys on new writes.
 ///
 /// Position keys must be non-empty, printable ASCII (32..=126),
-/// have no trailing spaces, and not exceed 1024 bytes.
+/// have no trailing spaces, and not exceed [`MAX_POS_KEY_BYTES`] bytes.
 ///
 /// ChoiceAdded uses the choice ID as pos, so ULIDs must pass.
 pub fn is_valid_pos_key(key: &str) -> bool {
     let bytes = key.as_bytes();
     !bytes.is_empty()
-        && bytes.len() <= 1024
+        && bytes.len() <= MAX_POS_KEY_BYTES
         && bytes.last() != Some(&b' ')
         && bytes.iter().all(|b| (32..=126).contains(b))
 }
@@ -110,15 +118,24 @@ mod tests {
 
     #[test]
     fn new_pos_keys_are_validated() {
-        // Rejected: empty, newline, emoji, trailing space, over 1024 bytes
-        for invalid in ["", "\n", "\r", "\t", "🦀", "m ", " ", &"a".repeat(1025)] {
+        // Rejected: empty, newline, emoji, trailing space, over the limit
+        for invalid in [
+            "",
+            "\n",
+            "\r",
+            "\t",
+            "🦀",
+            "m ",
+            " ",
+            &"a".repeat(MAX_POS_KEY_BYTES + 1),
+        ] {
             assert!(
                 !is_valid_pos_key(invalid),
                 "expected {invalid:?} to be rejected"
             );
         }
 
-        // Passed: pending, 000000, ULID, standard fractional indices, exactly 1024 bytes
+        // Passed: pending, 000000, ULID, standard fractional indices, exactly the limit
         let ulid = ulid::Ulid::generate().to_string();
         for valid in [
             "pending",
@@ -127,7 +144,7 @@ mod tests {
             "a0",
             "a0V",
             "V",
-            &"a".repeat(1024),
+            &"a".repeat(MAX_POS_KEY_BYTES),
         ] {
             assert!(is_valid_pos_key(valid), "expected {valid:?} to be accepted");
         }
