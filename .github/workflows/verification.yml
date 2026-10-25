@@ -20,6 +20,9 @@ concurrency:
 
 jobs:
   disposable-verification:
+    # Only the upstream repository runs the daily schedule; forks that enable
+    # scheduled workflows would otherwise spend their owners' minutes on it.
+    if: github.event_name != 'schedule' || github.repository == 'ArefinAlter/dynodoc-engine'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -50,4 +53,4 @@ jobs:
         run: cargo test --locked -p engine-cli --test verify_cli_test -- --test-threads=1
       - name: Mark an actionable failure
         if: failure()
-        run: echo '::error::Scheduled verification failed. The repository owner must investigate this run. Enable failed-workflow notifications as documented in docs/SCHEDULED-VERIFICATION.md.'
+        run: echo '::error::Scheduled verification failed. Investigate this run; see "The GitHub Actions run" in docs/SCHEDULED-VERIFICATION.md.'
