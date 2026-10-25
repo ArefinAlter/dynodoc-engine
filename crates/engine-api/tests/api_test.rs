@@ -2652,6 +2652,89 @@ fn assert_private_node_conflict(status: StatusCode, body: &Value, foreign: Uuid,
     assert!(!response.contains(node));
 }
 
+/// A person who cannot read the other document learns no more from the conflict than one who
+/// can: the answer is the same status and body, and names neither the document, its title,
+/// its owner nor its text. (That the ID is taken is unavoidable: IDs are global and random.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn node_id_conflict_is_identical_for_readable_and_unreadable_documents(pool: PgPool) {
+    let runtime = common::RuntimeDatabase::new(pool).await;
+    let pool = runtime.pool.clone();
+    let router = app(test_state(pool.clone()));
+    let owner = bearer(seed_identity(&pool, "private-owner@example.test").await);
+    let outsider = bearer(seed_identity(&pool, "private-outsider@example.test").await);
+    let private = create_document(&router, &owner, "Confidential board minutes").await;
+    let readable = create_document(&router, &outsider, "Outsider reference file").await;
+    let target = create_document(&router, &outsider, "Outsider working file").await;
+    let secret = ulid::Ulid::generate().to_string();
+    let open = ulid::Ulid::generate().to_string();
+    let create = |id: &str, text: &str| json!({"type":"NodeCreated","node_id":id,"node_type":"form","pos":"a0","fields":{"label":text}});
+    for (doc, token, id, text) in [
+        (private, &owner, &secret, "Confidential board text"),
+        (readable, &outsider, &open, "Outsider text"),
+    ] {
+        let (status, body) = send(
+            &router,
+            auth_post(
+                &format!("/documents/{doc}/batch"),
+                token,
+                &json!({"ops":[create(id, text)]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    // The outsider really cannot read the private file.
+    let (status, _) = send(
+        &router,
+        auth_post_get(&format!("/documents/{private}/node/{secret}"), &outsider),
+    )
+    .await;
+    assert!(matches!(
+        status,
+        StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+    ));
+    let mut answers = Vec::new();
+    for id in [&secret, &open] {
+        for (suffix, body) in [
+            ("ops/node-create", create(id, "Reused")),
+            ("batch", json!({"ops":[create(id, "Reused")]})),
+            (
+                "change-requests",
+                json!({"name":"Reuse","base_seq":0,"ops":[create(id, "Reused")]}),
+            ),
+        ] {
+            let (status, body) = send(
+                &router,
+                auth_post(&format!("/documents/{target}/{suffix}"), &outsider, &body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{suffix}: {body}");
+            let text = body.to_string();
+            for leak in [
+                private.to_string(),
+                readable.to_string(),
+                secret.clone(),
+                open.clone(),
+                "Confidential".into(),
+                "private-owner".into(),
+            ] {
+                assert!(!text.contains(&leak), "{suffix} leaks {leak}: {text}");
+            }
+            answers.push((suffix, body));
+        }
+    }
+    for pair in answers.chunks(3).collect::<Vec<_>>().windows(2) {
+        assert_eq!(pair[0], pair[1], "conflict answers differ by readability");
+    }
+    let events: i64 = sqlx::query_scalar("select count(*) from event where document_id=$1")
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(events, 0);
+    runtime.close().await;
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn node_id_from_another_document_is_conflict(pool: PgPool) {
     let runtime = common::RuntimeDatabase::new(pool).await;
