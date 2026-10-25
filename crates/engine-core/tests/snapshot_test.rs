@@ -552,6 +552,9 @@ async fn schema_27_upgrade_requires_replay_without_rewriting_old_snapshots(
         .execute(&pool)
         .await?;
     all.run(&pool).await?;
+    let opts = (*pool.connect_options()).clone();
+    pool.close().await;
+    let pool = PgPool::connect_with(opts).await?;
     let mut connection = pool.acquire().await?;
     assert!(matches!(
         snapshot_verification::load(&mut connection, doc, snapshot.id.0).await,

@@ -434,3 +434,60 @@ async fn content_hash_is_not_null(pool: PgPool) -> sqlx::Result<()> {
     );
     Ok(())
 }
+
+/// (l) Pos column and ID columns use "C" collation so SQL ordering matches Rust byte-order string comparisons.
+#[sqlx::test(migrations = "../../migrations")]
+async fn sql_pos_order_matches_byte_order(pool: PgPool) -> anyhow::Result<()> {
+    let s = seed(&pool).await?;
+
+    let positions = vec![
+        " ", "!", "0", "1", "A", "Z", "a", "a0", "a0!", "a1", "b", "z", "~",
+    ];
+
+    for pos in &positions {
+        let node_id = ulid::Ulid::generate().to_string();
+        sqlx::query(
+            "insert into node (id, document_id, parent_id, type, pos, current_fields)
+             values ($1, $2, null, 'item', $3, '{}'::jsonb)",
+        )
+        .bind(&node_id)
+        .bind(s.document_id)
+        .bind(pos)
+        .execute(&pool)
+        .await?;
+    }
+
+    let fetched: Vec<String> =
+        sqlx::query_scalar("select pos from node where document_id = $1 order by pos asc")
+            .bind(s.document_id)
+            .fetch_all(&pool)
+            .await?;
+
+    // Also include the seed row's pos ("a0")
+    let mut expected = positions.clone();
+    expected.push("a0");
+    expected.sort();
+
+    assert_eq!(fetched, expected);
+
+    // Verify collation on columns
+    let collations: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "select table_name::text, column_name::text, collation_name::text
+         from information_schema.columns
+         where table_name in ('node', 'event')
+           and column_name in ('id', 'parent_id', 'pos', 'target_node_id')
+         order by table_name, column_name",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    for (table, col, coll) in &collations {
+        assert_eq!(
+            coll.as_deref(),
+            Some("C"),
+            "expected column {table}.{col} to have collation 'C', got {coll:?}"
+        );
+    }
+
+    Ok(())
+}
