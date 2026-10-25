@@ -121,7 +121,7 @@ pub async fn verify(
         ("snapshot_id" = Uuid, Path, description = "Snapshot id")
     ),
     responses(
-        (status = 200, description = "The snapshot", body = serde_json::Value),
+        (status = 200, description = "The snapshot; new snapshots include a separate event_merkle_root", body = serde_json::Value),
         (status = 404, description = "No such snapshot for this document")
     ),
     tag = "audit"
@@ -178,7 +178,7 @@ pub struct ProofStep {
         ("event_id" = String, Path, description = "Event id (ULID)")
     ),
     responses(
-        (status = 200, description = "Inclusion proof", body = serde_json::Value),
+        (status = 200, description = "Inclusion proof checked against the snapshot event root when present", body = serde_json::Value),
         (status = 404, description = "No snapshot, or event not in range")
     ),
     tag = "audit"
@@ -231,6 +231,15 @@ pub async fn merkle_proof(
 
     let leaves: Vec<[u8; 32]> = rows.iter().map(|(_, _, ch)| leaf_hash(ch)).collect();
     let (root, path) = inclusion_path(&leaves, target);
+    if snapshot
+        .event_merkle_root
+        .as_deref()
+        .is_some_and(|stored| stored != root)
+    {
+        return Err(ApiError::Internal(
+            "snapshot event Merkle root differs from proof".into(),
+        ));
+    }
 
     Ok(Json(MerkleProof {
         event_id,
@@ -338,5 +347,22 @@ mod tests {
             *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod event_root_tests {
+    #[test]
+    fn stored_frontier_matches_the_existing_proof_tree() {
+        let mut tree = engine_core::event_merkle::Accumulator::default();
+        let mut leaves = Vec::new();
+        for i in 0u64..65 {
+            let content = i.to_be_bytes();
+            tree.push(&content);
+            leaves.push(super::leaf_hash(&content));
+            for target in 0..leaves.len() {
+                assert_eq!(tree.root(), super::inclusion_path(&leaves, target).0);
+            }
+        }
     }
 }

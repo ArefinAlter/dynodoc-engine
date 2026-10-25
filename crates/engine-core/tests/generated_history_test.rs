@@ -33,6 +33,7 @@ proptest! {
                 state: serde_json::to_value(&base).unwrap(),
                 merkle_root: vec![0; 32],
                 event_chain_hash: vec![0; 32],
+            event_merkle_root: None,
                 created_at: chrono::Utc::now(),
             };
             let from_snapshot = Materializer::from_snapshot(&snapshot, &events[cut..]).unwrap();

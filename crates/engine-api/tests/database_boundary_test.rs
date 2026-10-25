@@ -227,10 +227,39 @@ async fn schema_28_upgrade_preserves_history_and_requires_a_new_runtime_login(po
     old.run(&pool).await.unwrap();
     let (doc, actor) = seed(&pool).await;
     comment(&pool, doc, actor).await;
-    let snapshot = SnapshotEngine::new(pool.clone())
-        .take(doc, SnapshotReason::Periodic)
+    // Reproduce the historical envelope on schema 28; the current writer requires
+    // schema 49 and must not be used to fabricate a pre-upgrade snapshot.
+    let mut tx = pool.begin().await.unwrap();
+    let (state, seq) = engine_core::snapshot::read_current_state(&mut tx, doc)
         .await
         .unwrap();
+    let state = serde_json::to_value(state).unwrap();
+    let root = engine_core::snapshot::merkle_root(&serde_json::from_value(state.clone()).unwrap())
+        .unwrap();
+    let chain: Vec<u8> =
+        sqlx::query_scalar("select chain_hash from event where document_id=$1 and seq=$2")
+            .bind(doc.0)
+            .bind(seq)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    let snapshot: engine_shared::Snapshot = sqlx::query_as("insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash) values($1,$2,$3,$4,$5) returning *,null::bytea as event_merkle_root")
+        .bind(doc.0).bind(seq).bind(state).bind(root.as_slice()).bind(chain).fetch_one(&mut *tx).await.unwrap();
+    let envelope = serde_json::to_vec(&(
+        "dynodoc.legacy-snapshot.v1",
+        snapshot.id,
+        snapshot.document_id,
+        snapshot.through_seq,
+        &snapshot.merkle_root,
+        &snapshot.event_chain_hash,
+        snapshot.created_at,
+        &snapshot.state,
+    ))
+    .unwrap();
+    let fingerprint = ring::digest::digest(&ring::digest::SHA256, &envelope);
+    sqlx::query("insert into snapshot_verification(snapshot_id,document_id,through_seq,version,fingerprint) values($1,$2,$3,1,$4)")
+        .bind(snapshot.id.0).bind(doc.0).bind(seq).bind(fingerprint.as_ref()).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
     assert!(database::check_schema(&pool).await.is_err());
     database::MIGRATOR.run(&pool).await.unwrap();
     let runtime = RuntimeDatabase::new(pool).await;
