@@ -8,6 +8,8 @@
 //! pass, the ODK expression parser, and the semantic three-way merge are implemented
 //! (stages 14–16 and 21).
 
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod at_rest;
 pub mod database;
 pub mod expr;

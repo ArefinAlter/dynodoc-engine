@@ -631,6 +631,7 @@ impl MergePolicy {
     }
 
     /// The canonical JSON value: see the module documentation.
+    #[allow(clippy::expect_used, reason = "a policy is plain JSON data")]
     pub fn canonical_value(&self) -> Value {
         let mut policy = self.clone();
         for rule in &mut policy.rules {

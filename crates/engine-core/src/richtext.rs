@@ -64,8 +64,10 @@ struct Styles {
     lookup: BTreeMap<String, usize>,
 }
 impl Styles {
+    #[allow(clippy::expect_used, reason = "canonical JSON is valid UTF-8")]
     fn intern(&mut self, value: Value) -> usize {
-        let key = String::from_utf8(crate::log::canonical_json(&value)).unwrap();
+        let key = String::from_utf8(crate::log::canonical_json(&value))
+            .expect("canonical JSON is valid UTF-8");
         if let Some(i) = self.lookup.get(&key) {
             return *i;
         }
@@ -242,6 +244,10 @@ fn delta(a: &[Scalar], b: &[Scalar]) -> Vec<TextOp> {
     }
     out
 }
+#[allow(
+    clippy::expect_used,
+    reason = "the enclosing branch checked props(b) is present"
+)]
 fn build(
     a: &Value,
     b: &Value,
@@ -258,7 +264,7 @@ fn build(
             if props(a) != props(b) {
                 edits.push(RichTextEdit::Props {
                     path: path.clone(),
-                    value: props(b).unwrap(),
+                    value: props(b).expect("the enclosing branch checked props(b) is present"),
                 });
             }
             edits.push(RichTextEdit::Text {
@@ -272,7 +278,7 @@ fn build(
                 if props(a) != props(b) {
                     edits.push(RichTextEdit::Props {
                         path: path.clone(),
-                        value: props(b).unwrap(),
+                        value: props(b).expect("the enclosing branch checked props(b) is present"),
                     });
                 }
                 for (i, (x, y)) in x.iter().zip(y).enumerate() {
@@ -418,6 +424,7 @@ pub fn apply_patch(before: &Value, patch: &RichTextPatch) -> Result<Value, Patch
 
 /// Existing clients may send whole fields; canonical history automatically stores
 /// a checked delta only when it is smaller. Old events always remain replayable.
+#[allow(clippy::expect_used, reason = "owned event fields serialize to JSON")]
 pub fn compact_event(state: &DocumentState, op: &EventPayload) -> EventPayload {
     if let EventPayload::FieldEdited {
         node_id,
@@ -436,8 +443,12 @@ pub fn compact_event(state: &DocumentState, op: &EventPayload) -> EventPayload {
                         node_id: node_id.clone(),
                         patch,
                     };
-                    if serde_json::to_vec(&compact).unwrap().len()
-                        < serde_json::to_vec(op).unwrap().len()
+                    if serde_json::to_vec(&compact)
+                        .expect("owned event fields serialize to JSON")
+                        .len()
+                        < serde_json::to_vec(op)
+                            .expect("owned event fields serialize to JSON")
+                            .len()
                     {
                         return compact;
                     }

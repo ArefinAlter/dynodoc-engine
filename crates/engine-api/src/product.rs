@@ -605,13 +605,21 @@ fn reference_ids(content: &Value, out: &mut Vec<String>) {
 
 /// A ULID-shaped stand-in for a block id: the first 128 bits of its HMAC, labelled so the
 /// same key could never produce a tag that means something else.
+#[allow(
+    clippy::expect_used,
+    reason = "the configured SHA-256 HMAC has 32 bytes"
+)]
 fn pseudonym(key: &ring::hmac::Key, id: &str) -> String {
     const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     let tag = ring::hmac::sign(
         key,
         &[b"dynodoc.public-node-id\0v1\0".as_slice(), id.as_bytes()].concat(),
     );
-    let bits = u128::from_be_bytes(tag.as_ref()[..16].try_into().unwrap());
+    let bits = u128::from_be_bytes(
+        tag.as_ref()[..16]
+            .try_into()
+            .expect("the configured SHA-256 HMAC has 32 bytes"),
+    );
     (0..26)
         .rev()
         .map(|i| CROCKFORD[((bits >> (5 * i)) & 31) as usize] as char)

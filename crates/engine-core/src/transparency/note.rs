@@ -57,6 +57,10 @@ pub fn valid_key_name(name: &str) -> bool {
         && !name.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "the digest prefix or checked signature prefix contains four bytes"
+)]
 fn key_id(name: &str, kind: KeyKind, public: &[u8; 32]) -> [u8; 4] {
     let mut input = Vec::with_capacity(name.len() + 34);
     input.extend_from_slice(name.as_bytes());
@@ -64,7 +68,9 @@ fn key_id(name: &str, kind: KeyKind, public: &[u8; 32]) -> [u8; 4] {
     input.push(kind.type_byte());
     input.extend_from_slice(public);
     let sum = digest(&SHA256, &input);
-    sum.as_ref()[..4].try_into().expect("four bytes")
+    sum.as_ref()[..4]
+        .try_into()
+        .expect("the digest prefix or checked signature prefix contains four bytes")
 }
 
 /// A log identity: `<host>/dynodoc/v1/transparency`, a schema-less URL (design 4.2).
@@ -201,13 +207,17 @@ impl Signer {
         })
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "Ed25519 public keys contain exactly 32 bytes"
+    )]
     pub fn verifier_key(&self) -> VerifierKey {
         let public = self
             .pair
             .public_key()
             .as_ref()
             .try_into()
-            .expect("32 bytes");
+            .expect("Ed25519 public keys contain exactly 32 bytes");
         VerifierKey {
             name: self.name.clone(),
             kind: self.kind,
@@ -281,6 +291,10 @@ impl NoteSignature {
         format!("{DASH}{} {}\n", self.name, b64(&raw))
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the digest prefix or checked signature prefix contains four bytes"
+    )]
     fn parse(line: &str) -> Result<Self, Error> {
         let rest = line.strip_prefix(DASH).ok_or(Error::MalformedNote(
             "signature line must start with an em dash and a space",
@@ -299,7 +313,9 @@ impl NoteSignature {
         }
         Ok(Self {
             name: name.to_string(),
-            key_id: raw[..4].try_into().expect("four bytes"),
+            key_id: raw[..4]
+                .try_into()
+                .expect("the digest prefix or checked signature prefix contains four bytes"),
             body: raw[4..].to_vec(),
         })
     }

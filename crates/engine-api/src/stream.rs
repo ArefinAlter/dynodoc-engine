@@ -69,7 +69,10 @@ impl Subscriptions {
 
     /// Get (or lazily create) the broadcast sender for a document.
     fn sender(&self, document_id: DocumentId) -> broadcast::Sender<Arc<Event>> {
-        let mut map = self.inner.lock().expect("subscriptions mutex poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(document_id.0)
             .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
             .clone()
@@ -87,7 +90,10 @@ impl Subscriptions {
     /// Check and subscribe under the same lock so concurrent requests cannot
     /// oversubscribe between a receiver-count check and acquiring the receiver.
     fn subscribe(&self, document_id: DocumentId) -> Option<broadcast::Receiver<Arc<Event>>> {
-        let mut map = self.inner.lock().expect("subscriptions mutex poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let sender = map
             .entry(document_id.0)
             .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0);
@@ -267,4 +273,33 @@ fn to_sse_event(event: Event) -> Result<SseEvent, Infallible> {
         .json_data(&event)
         .unwrap_or_else(|_| SseEvent::default().comment("serialization error"));
     Ok(frame)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscriptions_recover_after_a_poisoned_lock() {
+        let subscriptions = Subscriptions::default();
+        let inner = subscriptions.inner.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = inner.lock().unwrap();
+            panic!("synthetic subscriber failure");
+        })
+        .join()
+        .is_err());
+        let id = DocumentId(Uuid::new_v4());
+        let receiver = subscriptions.subscribe(id).expect("recovered subscription");
+        let sender = subscriptions.sender(id);
+        assert_eq!(sender.receiver_count(), 1);
+        drop(receiver);
+        // Keep every receiver alive to exercise the same limit after recovery.
+        let receivers: Vec<_> = (0..MAX_SUBSCRIBERS_PER_DOCUMENT)
+            .map(|_| subscriptions.subscribe(id).unwrap())
+            .collect();
+        assert!(subscriptions.subscribe(id).is_none());
+        drop(receivers);
+        assert!(subscriptions.subscribe(id).is_some());
+    }
 }
