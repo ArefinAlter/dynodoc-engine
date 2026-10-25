@@ -21,6 +21,14 @@ use engine_core::snapshot::SnapshotError;
 
 use crate::auth::AuthError;
 
+impl From<engine_core::workspace_merge::DiffError> for ApiError {
+    fn from(error: engine_core::workspace_merge::DiffError) -> Self {
+        Self::Conflict {
+            reason: error.to_string(),
+        }
+    }
+}
+
 /// The error code of a response, for counting ([`crate::counters`]).
 #[derive(Clone, Copy)]
 pub struct ErrorCode(pub &'static str);
@@ -293,5 +301,26 @@ impl From<engine_core::shared_checkpoint::Error> for ApiError {
             engine_core::shared_checkpoint::Error::History(e) => e.into(),
             other => ApiError::Internal(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsupported_diff_is_an_explicit_conflict_response() {
+        let error = engine_core::workspace_merge::DiffError::UnsupportedNodeType {
+            node_id: engine_shared::NodeId("unsupported-node".into()),
+            node_type: "future-widget".into(),
+        };
+        let response = ApiError::from(error).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "conflict");
+        assert!(body["error"].as_str().unwrap().contains("unsupported-node"));
     }
 }

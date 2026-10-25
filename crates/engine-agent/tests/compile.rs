@@ -92,7 +92,8 @@ fn assert_applies(fx: &Fixture, c: &Compiled) {
 /// No phantom ops: diffing the states gives ops that rebuild `after` from `before` and touch
 /// nothing the compiled ops did not touch.
 fn assert_round_trip(fx: &Fixture, c: &Compiled) {
-    let d = workspace_merge::diff(&fx.state, &c.after);
+    let d = workspace_merge::diff(&fx.state, &c.after)
+        .expect("compiled states have representable node kinds");
     let mut replay = fx.state.clone();
     for op in &d {
         authorize(Role::Author, op, &replay).unwrap_or_else(|e| panic!("{e}: {op:?}"));

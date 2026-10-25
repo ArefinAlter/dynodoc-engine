@@ -198,7 +198,7 @@ async fn recover(
     } else {
         historical
     };
-    let own = workspace_merge::diff(&base, &target);
+    let own = workspace_merge::diff(&base, &target)?;
     if own.len() > 20_000 {
         return Err(bad(
             "Recover at most 20,000 changes at a time; select fewer blocks",
