@@ -1399,6 +1399,15 @@ async fn removed_choices_reject_new_writes_atomically_until_restored(pool: PgPoo
     assert_ne!(live, removed);
     // V1 hashes nodes, not the removed-choice set. Keep historical roots readable.
     assert_eq!(merkle_root(&live).unwrap(), merkle_root(&removed).unwrap());
+    // The table marks the removed choice deleted; replay lists it as removed. Nothing else differs.
+    let report = verify_projection(&runtime.pool, DocumentId(doc))
+        .await
+        .unwrap();
+    assert_eq!(report.differences.len(), 1, "{:?}", report.differences);
+    assert_eq!(
+        report.differences[0].known,
+        Some(engine_core::projection::KNOWN_REMOVED_CHOICE)
+    );
     let patch = engine_core::richtext::make_patch(&before, &after).unwrap();
     for op in [
         json!({"type":"FieldEdited","node_id":choice,"field":"label","value":"Changed"}),
@@ -1406,7 +1415,6 @@ async fn removed_choices_reject_new_writes_atomically_until_restored(pool: PgPoo
         json!({"type":"RichTextPatched","node_id":choice,"patch":patch}),
         json!({"type":"NodeMoved","node_id":choice,"new_parent_id":question,"new_pos":"b0"}),
         json!({"type":"ChoiceRemoved","node_id":question,"choice_id":choice}),
-        json!({"type":"NodeDeleted","node_id":choice}),
     ] {
         let (status, body) = send(&router, auth_post(&uri, &token, &json!({"ops":[
             {"type":"FieldEdited","node_id":question,"field":"label","value":"Must roll back"}, op
@@ -1449,6 +1457,111 @@ async fn removed_choices_reject_new_writes_atomically_until_restored(pool: PgPoo
         .unwrap()
         .differences
         .is_empty());
+    runtime.close().await;
+}
+
+/// The editors delete a question's whole subtree, removed choices included (state diffs and
+/// the questionnaire editor list every child that is not tombstoned). Rejecting that would make
+/// a question with a removed choice undeletable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_question_with_a_removed_choice_can_still_be_deleted(pool: PgPool) {
+    use engine_core::projection::{verify_projection, KNOWN_REMOVED_CHOICE};
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let router = app(test_state(runtime.pool.clone()));
+    let token = bearer(seed_identity(&runtime.pool, "delete-choices@example.test").await);
+    let doc = create_document(&router, &token, "Delete with removed choice").await;
+    let [root, question, kept, removed] =
+        std::array::from_fn(|_| ulid::Ulid::generate().to_string());
+    let uri = format!("/documents/{doc}/batch");
+    let (status, body) = send(&router, auth_post(&uri, &token, &json!({"ops":[
+        {"type":"NodeCreated","node_id":root,"node_type":"form","pos":"a0","fields":{}},
+        {"type":"NodeCreated","node_id":question,"node_type":"item","parent_id":root,"pos":"a0","fields":{"label":"Q"}},
+        {"type":"ChoiceAdded","node_id":question,"choice_id":kept,"fields":{"label":"Kept"}},
+        {"type":"ChoiceAdded","node_id":question,"choice_id":removed,"fields":{"label":"Removed"}},
+        {"type":"ChoiceRemoved","node_id":question,"choice_id":removed}
+    ]}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Children first, as the editor orders them: both choices, then the question.
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &uri,
+            &token,
+            &json!({"ops":[
+                {"type":"NodeDeleted","node_id":removed},
+                {"type":"NodeDeleted","node_id":kept},
+                {"type":"NodeDeleted","node_id":question}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let deleted: Vec<(String, bool)> =
+        sqlx::query_as("select id, deleted from node where document_id=$1 order by id")
+            .bind(doc)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        deleted
+            .iter()
+            .filter(|(id, _)| [&removed, &kept, &question].contains(&id))
+            .all(|(_, deleted)| *deleted),
+        "{deleted:?}"
+    );
+    // Tombstoning twice is still refused, and the refusal appends nothing.
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &uri,
+            &token,
+            &json!({"ops":[{"type":"NodeDeleted","node_id":removed}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let seq: i64 = sqlx::query_scalar("select max(seq) from event where document_id=$1")
+        .bind(doc)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(seq, 8);
+    let report = verify_projection(&runtime.pool, DocumentId(doc))
+        .await
+        .unwrap();
+    assert!(
+        report
+            .differences
+            .iter()
+            .all(|d| d.known == Some(KNOWN_REMOVED_CHOICE)),
+        "{:?}",
+        report.differences
+    );
+    // Bringing the choice back is still one explicit restore, parent first.
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &uri,
+            &token,
+            &json!({"ops":[
+                {"type":"NodeRestored","node_id":question},
+                {"type":"NodeRestored","node_id":removed}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let report = verify_projection(&runtime.pool, DocumentId(doc))
+        .await
+        .unwrap();
+    assert!(
+        report
+            .differences
+            .iter()
+            .all(|d| d.known == Some(KNOWN_REMOVED_CHOICE)),
+        "{:?}",
+        report.differences
+    );
     runtime.close().await;
 }
 

@@ -149,8 +149,12 @@ pub fn validate_op(state: &DocumentState, op: &EventPayload) -> Result<(), OpErr
             }) {
                 return Err(OpError::NodeHasChildren(node_id.0.clone()));
             }
-            // Deleting an already-deleted node is a no-op error; require it live.
-            require_live(state, node_id)?;
+            // Deleting an already-deleted node is a no-op error. A removed choice may
+            // still be tombstoned: the editors delete a question's whole subtree, removed
+            // choices included, and the removal already hides the choice.
+            if require_present(state, node_id)?.deleted {
+                return Err(OpError::NodeDeleted(node_id.0.clone()));
+            }
             Ok(())
         }
 
@@ -528,6 +532,43 @@ mod tests {
         ));
         crate::materializer::apply_payload(&mut s, &op).unwrap();
         assert_eq!(s, before);
+    }
+
+    #[test]
+    fn a_removed_choice_can_be_tombstoned_but_not_edited_or_moved() {
+        let mut s = state(vec![
+            n("root", NodeType::Form, None, None),
+            n("item", NodeType::Item, Some("root"), None),
+            n("choice", NodeType::Choice, Some("item"), None),
+        ]);
+        s.removed_choices.insert(NodeId("choice".into()));
+        let id = NodeId("choice".into());
+        validate_op(
+            &s,
+            &EventPayload::NodeDeleted {
+                node_id: id.clone(),
+            },
+        )
+        .unwrap();
+        for op in [
+            EventPayload::FieldEdited {
+                node_id: id.clone(),
+                field: "label".into(),
+                value: json!("x"),
+            },
+            EventPayload::NodeMoved {
+                node_id: id.clone(),
+                new_parent_id: Some(NodeId("item".into())),
+                new_pos: "b0".into(),
+            },
+        ] {
+            assert!(matches!(validate_op(&s, &op), Err(OpError::NodeDeleted(_))));
+        }
+        s.nodes.get_mut(&id).unwrap().deleted = true;
+        assert!(matches!(
+            validate_op(&s, &EventPayload::NodeDeleted { node_id: id }),
+            Err(OpError::NodeDeleted(_))
+        ));
     }
 
     fn created(id: &str, ty: NodeType, parent: Option<&str>, var: Option<&str>) -> EventPayload {
