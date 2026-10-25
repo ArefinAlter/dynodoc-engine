@@ -124,3 +124,20 @@ idempotent receipt can still replay first. This is early feedback, not an ID
 reservation: another document can commit the ID later, and sharing still relies
 on the primary key. Existing historical identities and node references are not
 rewritten; this builds on the stricter new-ID wire contract.
+
+## Restores, removed choices and position keys
+
+These are write-boundary rules for new operations. Replay of stored events, snapshots and
+the materialized fold are unchanged, so existing histories keep their meaning and hashes.
+Each violation returns HTTP 400 (HTTP 409 for an ID collision) before anything is appended,
+and a batch that contains one is rolled back as a whole.
+
+- `NodeRestored` applies only to a node that is deleted or to a removed choice. Restoring
+  a node that is already live returns 400 ("already live").
+- A removed choice (after `ChoiceRemoved`) accepts no `FieldEdited`, `RichTextPatched`,
+  `NodeMoved` or second `ChoiceRemoved`; restore it first with `NodeRestored`. It can still
+  be tombstoned with `NodeDeleted`, as an editor does when it deletes the whole question.
+- `NodeCreated.pos` and `NodeMoved.new_pos` (also inside a proposed suggestion) must be
+  1 to 8,192 bytes of printable ASCII (space to `~`) and must not end in a space. Every key
+  the web editor's `between()` and the agent compiler's port of it produce satisfies this;
+  server-generated operations and stored keys are not checked.
