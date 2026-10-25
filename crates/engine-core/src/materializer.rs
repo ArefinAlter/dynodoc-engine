@@ -371,6 +371,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn historical_restore_of_a_live_node_still_folds_identically() {
+        let created = event(
+            1,
+            EventPayload::NodeCreated {
+                node_id: NodeId("legacy-node".into()),
+                node_type: engine_shared::NodeType::Form,
+                parent_id: None,
+                pos: "legacy-pos".into(),
+                fields: json!({"title":"Historical"}),
+                var_name: None,
+            },
+        );
+        let before = Materializer::fold(std::slice::from_ref(&created)).unwrap();
+        let restored = event(
+            2,
+            EventPayload::NodeRestored {
+                node_id: NodeId("legacy-node".into()),
+            },
+        );
+        assert_eq!(Materializer::fold(&[created, restored]).unwrap(), before);
+    }
+
     // Materialization correctness at scale: a 1000-node snapshot + 500-event tail
     // folds to the right state. The wall-clock perf target (<10 ms, release build) is
     // the deferred `criterion` bench — a hard timing assert in a debug `cargo test`
