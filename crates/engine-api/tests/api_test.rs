@@ -4663,3 +4663,100 @@ async fn new_pos_keys_are_validated_at_write_boundaries(pool: PgPool) {
         "expected 400 for newline new_pos: {body}"
     );
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn one_root_per_document_enforced_at_api_boundary(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let actor = seed_identity(&pool, "one-root@example.test").await;
+    let owner = bearer(actor);
+    let doc = create_document(&router, &owner, "Single Root Document").await;
+
+    // 1. First root node created -> 200 OK
+    let (status, created) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_type":"form","pos":"a0","fields":{"label":"Root 1"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first root must succeed: {created}");
+
+    // 2. Second root node creation -> 400 Bad Request
+    let (status, err) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_type":"form","pos":"a1","fields":{"label":"Root 2"}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "second root must be rejected: {err}"
+    );
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap()
+            .contains("document already has a live root"),
+        "error message must mention live root: {err}"
+    );
+
+    // 3. Permissive historical fold: A document with multiple historical roots folds cleanly without error.
+    let historical_events = vec![
+        engine_shared::Event {
+            id: engine_shared::EventId("01HIST00000000000000000001".into()),
+            document_id: engine_shared::DocumentId(doc),
+            seq: 1,
+            event_type: "NodeCreated".into(),
+            actor_id: engine_shared::IdentityId(actor),
+            target_node_id: Some(engine_shared::NodeId("01ROOT1".into())),
+            payload: serde_json::to_value(engine_shared::EventPayload::NodeCreated {
+                node_id: engine_shared::NodeId("01ROOT1".into()),
+                node_type: engine_shared::NodeType::Form,
+                parent_id: None,
+                pos: "a0".into(),
+                fields: json!({"label": "Root 1"}),
+                var_name: None,
+            })
+            .unwrap(),
+            content_hash: vec![0; 32],
+            prev_chain_hash: vec![0; 32],
+            chain_hash: vec![0; 32],
+            created_at: chrono::Utc::now(),
+        },
+        engine_shared::Event {
+            id: engine_shared::EventId("01HIST00000000000000000002".into()),
+            document_id: engine_shared::DocumentId(doc),
+            seq: 2,
+            event_type: "NodeCreated".into(),
+            actor_id: engine_shared::IdentityId(actor),
+            target_node_id: Some(engine_shared::NodeId("01ROOT2".into())),
+            payload: serde_json::to_value(engine_shared::EventPayload::NodeCreated {
+                node_id: engine_shared::NodeId("01ROOT2".into()),
+                node_type: engine_shared::NodeType::Form,
+                parent_id: None,
+                pos: "a1".into(),
+                fields: json!({"label": "Root 2"}),
+                var_name: None,
+            })
+            .unwrap(),
+            content_hash: vec![0; 32],
+            prev_chain_hash: vec![0; 32],
+            chain_hash: vec![0; 32],
+            created_at: chrono::Utc::now(),
+        },
+    ];
+
+    let folded = engine_core::materializer::Materializer::fold(&historical_events);
+    assert!(
+        folded.is_ok(),
+        "historical replay must fold multiple roots permissively"
+    );
+    let state = folded.unwrap();
+    assert_eq!(state.nodes.len(), 2);
+}

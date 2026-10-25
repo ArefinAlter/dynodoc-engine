@@ -44,6 +44,9 @@ pub enum OpError {
     /// A non-root node had no parent, or a root node had the wrong type.
     #[error("invalid root: a {0} node cannot be a document root")]
     InvalidRoot(String),
+    /// A document may have at most one live root.
+    #[error("document already has a live root: {0}")]
+    OneRootViolation(String),
     /// The `var_name` is already used by another live node in this document.
     #[error("var_name {0:?} is already used by another node")]
     DuplicateVarName(String),
@@ -133,6 +136,8 @@ pub fn validate_op(state: &DocumentState, op: &EventPayload) -> Result<(), OpErr
             }
             if let Some(parent) = &node.parent_id {
                 require_live(state, parent)?;
+            } else if let Some(existing_root) = find_live_root(state, Some(node_id)) {
+                return Err(OpError::OneRootViolation(existing_root.0));
             }
             if let Some(name) = node.var_name.as_deref().filter(|n| !n.is_empty()) {
                 if var_name_taken(state, name, Some(node_id)) {
@@ -297,7 +302,11 @@ fn validate_node_created(
         None if !is_root_type(node_type) => {
             return Err(OpError::InvalidRoot(node_type.as_str().to_string()));
         }
-        None => {}
+        None => {
+            if let Some(existing_root) = find_live_root(state, None) {
+                return Err(OpError::OneRootViolation(existing_root.0));
+            }
+        }
     }
     if let Some(var_name) = var_name.filter(|v| !v.is_empty()) {
         if var_name_taken(state, var_name, None) {
@@ -320,6 +329,9 @@ fn validate_node_moved(
         let node_type = parse_node_type(&node.node_type);
         if node_type.is_some_and(|t| !is_root_type(t)) {
             return Err(OpError::InvalidRoot(node.node_type.clone()));
+        }
+        if let Some(existing_root) = find_live_root(state, Some(node_id)) {
+            return Err(OpError::OneRootViolation(existing_root.0));
         }
         return Ok(());
     };
@@ -452,6 +464,20 @@ pub(crate) fn can_contain(parent: NodeType, child: NodeType) -> bool {
 /// Document-root-eligible node types (a parentless node must be one of these).
 pub(crate) fn is_root_type(node_type: NodeType) -> bool {
     matches!(node_type, NodeType::Form | NodeType::Clause)
+}
+
+/// Find an existing live root node in `state`, optionally excluding `exclude`.
+pub(crate) fn find_live_root(state: &DocumentState, exclude: Option<&NodeId>) -> Option<NodeId> {
+    state.nodes.values().find_map(|node| {
+        if exclude == Some(&node.id) {
+            return None;
+        }
+        if node.parent_id.is_none() && !node.deleted && !state.removed_choices.contains(&node.id) {
+            Some(node.id.clone())
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(test)]
@@ -946,5 +972,73 @@ mod tests {
                 "failed on {legacy_pos:?}"
             );
         }
+    }
+
+    #[test]
+    fn one_live_root_per_document_enforced() {
+        // 1. Initial creation of a root is OK.
+        let empty = state(vec![]);
+        assert!(validate_op(&empty, &created("01F1", NodeType::Form, None, None)).is_ok());
+
+        // 2. Creating a second root when one exists fails with OneRootViolation.
+        let with_root = state(vec![n("01F1", NodeType::Form, None, None)]);
+        assert!(matches!(
+            validate_op(&with_root, &created("01F2", NodeType::Form, None, None)),
+            Err(OpError::OneRootViolation(root)) if root == "01F1"
+        ));
+
+        // 3. If the existing root is deleted, creating a new root is allowed.
+        let mut with_deleted_root = with_root.clone();
+        with_deleted_root
+            .nodes
+            .get_mut(&NodeId("01F1".into()))
+            .unwrap()
+            .deleted = true;
+        assert!(validate_op(
+            &with_deleted_root,
+            &created("01F2", NodeType::Form, None, None)
+        )
+        .is_ok());
+
+        // 4. Moving a node to root (new_parent_id: None) when a live root exists fails.
+        let tree = state(vec![
+            n("01F1", NodeType::Form, None, None),
+            n("01C1", NodeType::Clause, Some("01F1"), None),
+        ]);
+        let mv_to_root = EventPayload::NodeMoved {
+            node_id: NodeId("01C1".into()),
+            new_parent_id: None,
+            new_pos: "a0".into(),
+        };
+        assert!(matches!(
+            validate_op(&tree, &mv_to_root),
+            Err(OpError::OneRootViolation(root)) if root == "01F1"
+        ));
+
+        // 5. Moving an existing root node with new_parent_id: None (e.g. pos update) is allowed.
+        let mv_root_self = EventPayload::NodeMoved {
+            node_id: NodeId("01F1".into()),
+            new_parent_id: None,
+            new_pos: "b0".into(),
+        };
+        assert!(validate_op(&tree, &mv_root_self).is_ok());
+
+        // 6. Restoring a root node when another live root already exists fails.
+        let mut two_roots_one_deleted = state(vec![
+            n("01F2", NodeType::Form, None, None),
+            n("01F1", NodeType::Form, None, None),
+        ]);
+        two_roots_one_deleted
+            .nodes
+            .get_mut(&NodeId("01F1".into()))
+            .unwrap()
+            .deleted = true;
+        let restore_f1 = EventPayload::NodeRestored {
+            node_id: NodeId("01F1".into()),
+        };
+        assert!(matches!(
+            validate_op(&two_roots_one_deleted, &restore_f1),
+            Err(OpError::OneRootViolation(root)) if root == "01F2"
+        ));
     }
 }
