@@ -228,7 +228,7 @@ async fn schema_28_upgrade_preserves_history_and_requires_a_new_runtime_login(po
     let (doc, actor) = seed(&pool).await;
     comment(&pool, doc, actor).await;
     // Reproduce the historical envelope on schema 28; the current writer requires
-    // schema 45 and must not be used to fabricate a pre-upgrade snapshot.
+    // schema 49 and must not be used to fabricate a pre-upgrade snapshot.
     let mut tx = pool.begin().await.unwrap();
     let (state, seq) = engine_core::snapshot::read_current_state(&mut tx, doc)
         .await
