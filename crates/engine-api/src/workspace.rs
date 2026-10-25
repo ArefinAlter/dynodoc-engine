@@ -73,6 +73,7 @@ async fn batch(
     Json(mut req): Json<BatchRequest>,
 ) -> Result<Json<Value>, ApiError> {
     crate::ops::ids::operations(&req.ops)?;
+    crate::ops::pos::validate_operations_pos(&req.ops)?;
     if req.ops.is_empty() || req.ops.len() > 20_000 {
         return Err(bad(
             "A batch must contain 1–5000 changes, or up to 20,000 initial import nodes",
@@ -592,6 +593,7 @@ async fn edit_draft(
     Json(req): Json<BatchRequest>,
 ) -> Result<Json<Value>, ApiError> {
     crate::ops::ids::operations(&req.ops)?;
+    crate::ops::pos::validate_operations_pos(&req.ops)?;
     if req.ops.is_empty() || req.ops.len() > 5000 {
         return Err(bad("A draft save must contain 1–5000 changes"));
     }

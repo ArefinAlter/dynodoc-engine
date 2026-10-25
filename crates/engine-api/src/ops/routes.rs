@@ -319,6 +319,7 @@ async fn write(
     path: &str,
     op: EventPayload,
 ) -> Result<Json<Value>, ApiError> {
+    super::pos::validate_operation_pos(&op)?;
     let actor = IdentityId(auth.identity_id);
     with_idempotency(state, headers, actor, path, document_id, || async {
         super::ids::new_identities(&op)?;

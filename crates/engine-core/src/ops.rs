@@ -872,4 +872,38 @@ mod tests {
             OpError::SuggestionNotFound(_)
         ));
     }
+
+    #[test]
+    fn historical_replay_retains_arbitrary_pos_keys() {
+        let s = state(vec![n("01F", NodeType::Form, None, None)]);
+        // Historical logs may contain unusual or legacy position keys.
+        // validate_op is total and permissive over pos during historical replay.
+        for legacy_pos in ["", "\n", "\t", "m ", "🦀", "any legacy string"] {
+            let create = EventPayload::NodeCreated {
+                node_id: NodeId("01NEW".into()),
+                node_type: NodeType::Item,
+                parent_id: Some(NodeId("01F".into())),
+                pos: legacy_pos.into(),
+                fields: json!({}),
+                var_name: None,
+            };
+            assert!(validate_op(&s, &create).is_ok(), "failed on {legacy_pos:?}");
+        }
+
+        let with_item = state(vec![
+            n("01F", NodeType::Form, None, None),
+            n("01I", NodeType::Item, Some("01F"), None),
+        ]);
+        for legacy_pos in ["", "\n", "\t", "m ", "🦀"] {
+            let mv = EventPayload::NodeMoved {
+                node_id: NodeId("01I".into()),
+                new_parent_id: Some(NodeId("01F".into())),
+                new_pos: legacy_pos.into(),
+            };
+            assert!(
+                validate_op(&with_item, &mv).is_ok(),
+                "failed on {legacy_pos:?}"
+            );
+        }
+    }
 }
