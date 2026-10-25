@@ -1479,7 +1479,7 @@ async fn non_participant_is_forbidden(pool: PgPool) {
 // --- proposal lifecycle ---------------------------------------------------------
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn accepted_suggestion_records_acceptor_as_actor(pool: PgPool) {
+async fn suggest_then_accept_applies_the_wrapped_op(pool: PgPool) {
     let router = app(test_state(pool.clone()));
     let author = seed_identity(&pool, "author@dynodoc.local").await;
     let reviewer = seed_identity(&pool, "reviewer@dynodoc.local").await;
@@ -1632,7 +1632,7 @@ async fn conflicts_list_groups_two_pending_edits_on_one_field(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn conflict_resolution_records_resolver_as_actor(pool: PgPool) {
+async fn resolve_accept_makes_chosen_value_canonical_and_rejects_others(pool: PgPool) {
     let router = app(test_state(pool.clone()));
     let (doc_id, node_id, token, reviewer) = seed_conflict(&pool, &router).await;
 
