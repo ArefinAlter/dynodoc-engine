@@ -9,7 +9,7 @@ mod corpus;
 
 use engine_core::{
     log::append_in_tx,
-    snapshot::{read_current_state, SnapshotEngine, SnapshotReason},
+    snapshot::{cache::CurrentStateCache, read_current_state, SnapshotEngine, SnapshotReason},
 };
 use engine_shared::{DocumentId, EventPayload, IdentityId};
 use serde_json::json;
@@ -90,15 +90,69 @@ async fn main() -> anyhow::Result<()> {
             runs.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         runs.sort_by(f64::total_cmp);
-        results.push(json!({"blocks": blocks, "tail_events": TAIL, "snapshot_json_bytes": snapshot_bytes, "read_current_state_ms": runs[4]}));
+        let cache = CurrentStateCache::default();
+        let mut tx = pool.begin().await?;
+        sqlx::query("select id from document where id=$1 for no key update")
+            .bind(doc.0)
+            .execute(&mut *tx)
+            .await?;
+        cache.read(&mut tx, doc).await?;
+        let mut warm = Vec::new();
+        for _ in 0..9 {
+            let start = Instant::now();
+            std::hint::black_box(cache.read(&mut tx, doc).await?);
+            warm.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        tx.rollback().await?;
+        let (mut incremental, mut reference) = (Vec::new(), Vec::new());
+        for i in 0..9 {
+            let mut write = pool.begin().await?;
+            append_in_tx(
+                &mut write,
+                doc,
+                &EventPayload::FieldEdited {
+                    node_id: ids[i * 397 % blocks].clone(),
+                    field: "label".into(),
+                    value: json!(format!("Incremental {i}")),
+                },
+                actor,
+            )
+            .await?;
+            write.commit().await?;
+            let mut tx = pool.begin().await?;
+            sqlx::query("select id from document where id=$1 for no key update")
+                .bind(doc.0)
+                .execute(&mut *tx)
+                .await?;
+            let start = Instant::now();
+            let cached = cache.read(&mut tx, doc).await?;
+            incremental.push(start.elapsed().as_secs_f64() * 1000.0);
+            let start = Instant::now();
+            let uncached = read_current_state(&mut tx, doc).await?;
+            reference.push(start.elapsed().as_secs_f64() * 1000.0);
+            anyhow::ensure!(cached == uncached, "cached and checked states differ");
+            tx.rollback().await?;
+        }
+        warm.sort_by(f64::total_cmp);
+        incremental.sort_by(f64::total_cmp);
+        reference.sort_by(f64::total_cmp);
+        let stats = cache.stats();
+        anyhow::ensure!(
+            stats.hits == 18 && stats.entries == 1,
+            "cache was not exercised: {stats:?}"
+        );
+        results.push(json!({"blocks":blocks,"tail_events":TAIL,"snapshot_json_bytes":snapshot_bytes,
+            "read_current_state_ms":runs[4],"cached_warm_ms":warm[4],
+            "cached_incremental_ms":incremental[4],"checked_incremental_ms":reference[4],
+            "cache_hits":stats.hits,"cache_misses":stats.misses,"cache_serialized_bytes":stats.serialized_bytes}));
     }
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
             "date": chrono::Utc::now().date_naive().to_string(),
-            "platform": format!("{} {}; release build; single-thread Tokio runtime; local PostgreSQL", std::env::consts::OS, std::env::consts::ARCH),
-            "measurement": "Median of 9 warm snapshot::read_current_state calls on one connection: latest sequence, checked legacy snapshot read and JSON parse, and a fold of the event tail",
-            "limitations": "One disposable local database, sequential reads, no concurrent writers, no lock wait; the document lock and role check that begin_write also takes are excluded.",
+            "platform": format!("{} {}; {} build; single-thread Tokio runtime; local PostgreSQL", std::env::consts::OS, std::env::consts::ARCH, if cfg!(debug_assertions) { "debug" } else { "release" }),
+            "measurement": "Medians of 9 warm checked reads, warm cache reads, and incremental cached/checked reads after each new committed edit",
+            "limitations": "One disposable local database; sequential warm and incremental reads, no concurrent writers or lock wait. Incremental reads follow one committed edit and compare with the checked reader. Cache reads hold the document lock; lock acquisition and role checks are excluded from timings.",
             "results": results,
         }))?
     );

@@ -86,6 +86,8 @@ pub struct AppState {
     pub agent_gateway: bool,
     /// Bounded cache of verified document states for the agent routes.
     pub agent_cache: agent::StateCache,
+    /// Opt-in checked write cache; authorization always precedes lookup.
+    pub write_cache: Option<engine_core::snapshot::cache::CurrentStateCache>,
     /// The immutable installation ID, read once for device-session challenges.
     device_authority: std::sync::Arc<tokio::sync::OnceCell<uuid::Uuid>>,
 }
@@ -114,6 +116,8 @@ impl AppState {
             },
             agent_gateway: std::env::var("AGENT_GATEWAY").as_deref() == Ok("on"),
             agent_cache: Default::default(),
+            write_cache: (std::env::var("DYNODOC_WRITE_STATE_CACHE").as_deref() == Ok("on"))
+                .then(engine_core::snapshot::cache::CurrentStateCache::default),
             device_authority: Default::default(),
         }
     }
