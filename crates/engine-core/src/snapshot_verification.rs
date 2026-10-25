@@ -82,7 +82,16 @@ pub(crate) async fn read_verified_state(
 ) -> Result<DocumentState, SnapshotError> {
     check_receipt(connection, snapshot).await?;
     let state = materialize(connection, snapshot).await?;
-    if snapshot.merkle_root != merkle_root(&state)? {
+    let is_legacy = state
+        .removed_choices
+        .iter()
+        .any(|id| state.nodes.get(id).is_some_and(|n| !n.deleted));
+    let expected_merkle = if is_legacy {
+        crate::snapshot::merkle_root_v1(&state)?
+    } else {
+        merkle_root(&state)?
+    };
+    if snapshot.merkle_root != expected_merkle {
         return Err(invalid(
             snapshot,
             "node Merkle root differs from stored state",
@@ -238,13 +247,25 @@ async fn compare(
         ));
     }
     let stored = materialize(connection, snapshot).await?;
-    if &stored != state {
+    let is_legacy = stored
+        .removed_choices
+        .iter()
+        .any(|id| stored.nodes.get(id).is_some_and(|n| !n.deleted));
+    let (expected_state, expected_merkle) = if is_legacy {
+        (
+            state.to_legacy_v1(),
+            crate::snapshot::merkle_root_v1(state)?,
+        )
+    } else {
+        (state.clone(), merkle_root(state)?)
+    };
+    if stored != expected_state {
         return Err(invalid(
             snapshot,
             "state differs from canonical event replay",
         ));
     }
-    if snapshot.merkle_root != merkle_root(state)? {
+    if snapshot.merkle_root != expected_merkle {
         return Err(invalid(snapshot, "node Merkle root differs from replay"));
     }
     if snapshot.event_chain_hash != chain {

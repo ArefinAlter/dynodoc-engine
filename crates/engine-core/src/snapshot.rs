@@ -456,6 +456,11 @@ pub fn merkle_root(state: &DocumentState) -> Result<[u8; 32], SnapshotError> {
     Ok(layer[0])
 }
 
+/// Compute Merkle root under legacy v1 rules where removed choices had `deleted = false`.
+pub fn merkle_root_v1(state: &DocumentState) -> Result<[u8; 32], SnapshotError> {
+    merkle_root(&state.to_legacy_v1())
+}
+
 fn hash_node(node: &MaterializedNode) -> Result<[u8; 32], serde_json::Error> {
     let value = serde_json::to_value(node)?;
     let canonical = log::canonical_json(&value);

@@ -50,6 +50,19 @@ pub struct DocumentState {
     pub removed_choices: BTreeSet<NodeId>,
 }
 
+impl DocumentState {
+    /// Convert state to the legacy v1 representation where removed choices have `deleted = false`.
+    pub fn to_legacy_v1(&self) -> Self {
+        let mut legacy = self.clone();
+        for id in &legacy.removed_choices {
+            if let Some(node) = legacy.nodes.get_mut(id) {
+                node.deleted = false;
+            }
+        }
+        legacy
+    }
+}
+
 /// Errors while folding or restoring materialized state.
 #[derive(Debug, thiserror::Error)]
 pub enum MaterializeError {
@@ -223,6 +236,9 @@ pub fn apply_payload(state: &mut DocumentState, payload: &EventPayload) -> Resul
             state.removed_choices.remove(choice_id);
         }
         EventPayload::ChoiceRemoved { choice_id, .. } => {
+            if let Some(choice) = state.nodes.get_mut(choice_id) {
+                choice.deleted = true;
+            }
             state.removed_choices.insert(choice_id.clone());
         }
         // Thread topology and lifecycle are projected from canonical event IDs.
@@ -283,6 +299,18 @@ impl Materializer {
     pub fn fold(events: &[Event]) -> Result<DocumentState, MaterializeError> {
         let mut state = DocumentState::default();
         Self::fold_into(&mut state, events)?;
+        Ok(state)
+    }
+
+    /// Build legacy v1 state from genesis by folding the event stream, preserving the
+    /// legacy `deleted = false` representation for removed choices.
+    pub fn fold_v1(events: &[Event]) -> Result<DocumentState, MaterializeError> {
+        let mut state = Self::fold(events)?;
+        for id in &state.removed_choices {
+            if let Some(node) = state.nodes.get_mut(id) {
+                node.deleted = false;
+            }
+        }
         Ok(state)
     }
 
@@ -468,7 +496,7 @@ mod tests {
             state
         );
         assert!(state.removed_choices.contains(&choice));
-        assert!(!state.nodes[&choice].deleted);
+        assert!(state.nodes[&choice].deleted);
         assert_eq!(state.nodes[&choice].current_fields["label"], "New");
         assert_eq!(state.nodes[&choice].current_fields["content"], after);
         assert_eq!(state.nodes[&choice].pos, "b0");

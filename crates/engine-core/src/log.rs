@@ -647,12 +647,12 @@ mod tests {
         }
         assert_eq!(types.len(), 15, "the fixture covers every v1 event type");
 
-        let state = crate::materializer::Materializer::fold(&events).unwrap();
+        let state = crate::materializer::Materializer::fold_v1(&events).unwrap();
         let pinned: crate::materializer::DocumentState =
             serde_json::from_value(fixture["final_state"].clone()).unwrap();
         assert_eq!(state, pinned);
         assert_eq!(
-            snapshot::merkle_root(&state).unwrap().to_vec(),
+            snapshot::merkle_root_v1(&state).unwrap().to_vec(),
             hex(fixture["merkle_root"].as_str().unwrap())
         );
     }

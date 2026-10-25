@@ -877,3 +877,71 @@ async fn concurrent_mixed_snapshot_writers_keep_one_format_and_receipt(
     assert_eq!(verify_document(&pool, doc, false).await?.snapshots, 1);
     Ok(())
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn removed_choices_unify_deleted_state_and_preserve_legacy_verification(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, doc, node) = seed(&pool).await?;
+    let choice_id = NodeId(ulid::Ulid::generate().to_string());
+
+    // 1. Add choice, then remove it
+    append(
+        &pool,
+        doc,
+        &EventPayload::ChoiceAdded {
+            node_id: node.clone(),
+            choice_id: choice_id.clone(),
+            fields: json!({"label": "Option A"}),
+        },
+        actor,
+    )
+    .await?;
+    append(
+        &pool,
+        doc,
+        &EventPayload::ChoiceRemoved {
+            node_id: node.clone(),
+            choice_id: choice_id.clone(),
+        },
+        actor,
+    )
+    .await?;
+
+    // 2. Newly taken snapshot reflects unified deleted = true in replay state
+    let snap = SnapshotEngine::new(pool.clone())
+        .take(doc, SnapshotReason::Periodic)
+        .await?;
+    let mut conn = pool.acquire().await?;
+    let _loaded = snapshot_verification::load(&mut conn, doc, snap.id.0)
+        .await?
+        .expect("snapshot exists");
+
+    let current = SnapshotEngine::new(pool.clone())
+        .read_current_state(doc)
+        .await?;
+    assert!(current.removed_choices.contains(&choice_id));
+    assert!(
+        current.nodes.get(&choice_id).unwrap().deleted,
+        "removed choice must have deleted = true in unified state"
+    );
+
+    // 3. Stored row verification passes
+    let verify = verify_document(&pool, doc, false).await?;
+    assert_eq!(verify.snapshots, 1);
+
+    // 4. Legacy representation helper creates deleted = false for removed choices
+    let legacy_state = current.to_legacy_v1();
+    assert!(
+        !legacy_state.nodes.get(&choice_id).unwrap().deleted,
+        "legacy representation has deleted = false"
+    );
+    let legacy_merkle = engine_core::snapshot::merkle_root_v1(&current)?;
+    assert_ne!(
+        legacy_merkle,
+        snap.merkle_root[..],
+        "legacy and unified merkle roots are distinct"
+    );
+
+    Ok(())
+}
