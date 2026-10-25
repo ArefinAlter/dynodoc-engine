@@ -88,3 +88,56 @@ require immutable verification receipts. CLI `verify-snapshots DOCUMENT_UUID` or
 without writing receipts. An existing database must complete this backfill before
 traffic is restored. An old API that ignores receipts is not safe rollback. Read
 [the release gate and limitations](VERIFIED-SNAPSHOTS.md).
+
+## New write identities and selection IDs
+
+Caller-created `NodeCreated.node_id` and `ChoiceAdded.choice_id` must be canonical
+uppercase ULIDs: exactly 26 ASCII Crockford base32 characters, with first character
+`0`–`7`. Node-create, batch, draft edit, change-request creation and proposed
+suggestion operations use the same check. Malformed values return HTTP 400 before
+any operation is applied. Missing node-create IDs still use server-generated ULIDs.
+
+Sync included/dropped selections and change-request merge selections accept at most
+20,000 IDs of 1 to 128 bytes each (history recovery keeps its 5,000-ID limit and the
+same per-ID bound). A selection names nodes that already exist, so it is not required to
+be canonical: an old node with a non-canonical ID can still be shared, merged or
+recovered. Error messages never include supplied IDs.
+
+This is a write-boundary change for new identities only. Historical event readers,
+`NodeId` deserialization, server-generated history recovery operations and references
+to existing nodes keep legacy ID compatibility. Existing successful idempotency
+responses can still replay. A canonical ULID alone does not reserve a global node ID;
+database uniqueness remains authoritative. No historical IDs or migrations change.
+
+## Global node ID conflicts
+
+Canonical node IDs are globally unique. A node-create, batch, draft share or
+new choice that collides with another document's ID returns HTTP 409 with a generic
+message containing neither the conflicting ID nor the other document. The entire
+transaction rolls back, including earlier operations in a batch. Only a PostgreSQL
+23505 violation of `node_pkey` receives this mapping; other database errors keep
+their existing handling.
+
+Change-request/connector uploads and private draft edits check new IDs after
+authorization and before storing new draft content. A connector bundle's existing
+idempotent receipt can still replay first. This is early feedback, not an ID
+reservation: another document can commit the ID later, and sharing still relies
+on the primary key. Existing historical identities and node references are not
+rewritten; this builds on the stricter new-ID wire contract.
+
+## Restores, removed choices and position keys
+
+These are write-boundary rules for new operations. Replay of stored events, snapshots and
+the materialized fold are unchanged, so existing histories keep their meaning and hashes.
+Each violation returns HTTP 400 (HTTP 409 for an ID collision) before anything is appended,
+and a batch that contains one is rolled back as a whole.
+
+- `NodeRestored` applies only to a node that is deleted or to a removed choice. Restoring
+  a node that is already live returns 400 ("already live").
+- A removed choice (after `ChoiceRemoved`) accepts no `FieldEdited`, `RichTextPatched`,
+  `NodeMoved` or second `ChoiceRemoved`; restore it first with `NodeRestored`. It can still
+  be tombstoned with `NodeDeleted`, as an editor does when it deletes the whole question.
+- `NodeCreated.pos` and `NodeMoved.new_pos` (also inside a proposed suggestion) must be
+  1 to 8,192 bytes of printable ASCII (space to `~`) and must not end in a space. Every key
+  the web editor's `between()` and the agent compiler's port of it produce satisfies this;
+  server-generated operations and stored keys are not checked.
