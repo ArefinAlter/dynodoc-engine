@@ -20,6 +20,7 @@ impl Registry {
 
     /// Every strategy that is built: the three that delegate to the existing
     /// merge logic and the element-wise collection strategy.
+    #[allow(clippy::expect_used, reason = "built-in strategy ids are unique")]
     pub fn builtin() -> Self {
         let mut registry = Self::empty();
         for strategy in super::default::strategies() {

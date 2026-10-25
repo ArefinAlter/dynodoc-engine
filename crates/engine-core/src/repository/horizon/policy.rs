@@ -850,6 +850,7 @@ impl Policy {
     }
 
     /// Canonical bytes of the normalized policy.
+    #[allow(clippy::expect_used, reason = "a policy value always encodes")]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         canonical_bytes(&self.to_value()).expect("a policy value always encodes")
     }

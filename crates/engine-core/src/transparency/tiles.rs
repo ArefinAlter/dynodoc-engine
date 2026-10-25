@@ -381,6 +381,10 @@ impl<S: TileStore> HashSource for TileLog<S> {
         self.size
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "chunks_exact(32) yields only 32-byte slices"
+    )]
     fn node(&self, level: u8, index: u64) -> Result<Hash, Error> {
         let missing = Error::MissingNode { level, index };
         if level >= 64 {
@@ -399,7 +403,11 @@ impl<S: TileStore> HashSource for TileLog<S> {
         let offset = (first % TILE_WIDTH) as usize;
         let mut nodes: Vec<Hash> = bytes[offset * 32..(offset + (1 << sub)) * 32]
             .chunks_exact(32)
-            .map(|chunk| chunk.try_into().expect("chunks are 32 bytes"))
+            .map(|chunk| {
+                chunk
+                    .try_into()
+                    .expect("chunks_exact(32) yields only 32-byte slices")
+            })
             .collect();
         while nodes.len() > 1 {
             nodes = nodes

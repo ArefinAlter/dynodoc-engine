@@ -294,6 +294,10 @@ fn summary(raw: &Raw) -> Option<String> {
 }
 
 #[utoipa::path(get, path="/projects/{id}/activity", params(("id"=Uuid,Path),("limit"=Option<i64>,Query,description="Items per page, 1-100 (default 50)"),("before"=Option<String>,Query,description="Opaque cursor from the previous page's next value")), security(("paseto"=[]),("device_session"=["project:read"])), responses((status=200,description="Newest-first project activity: items and an opaque next cursor",body=Value),(status=400,description="Invalid cursor"),(status=403,description="Project membership required"),(status=429,description="Too many activity reads"),(status=504,description="Deadline exceeded")))]
+#[allow(
+    clippy::expect_used,
+    reason = "the folds guard checked the last group is present"
+)]
 async fn project_activity_feed(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -366,7 +370,9 @@ async fn project_activity_feed(
                     && last.actor == row.actor
             });
         if folds {
-            let last = items.last_mut().expect("checked above");
+            let last = items
+                .last_mut()
+                .expect("the folds guard checked the last group is present");
             last.count += 1;
             last.seq = last.seq.max(row.seq);
             if last.kind == "edit" {
