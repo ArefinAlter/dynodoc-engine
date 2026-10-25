@@ -22,8 +22,10 @@
 //! platforms, so stored fingerprints stay comparable: changing a constant or the
 //! normalisation requires re-indexing (bump [`VERSION`]).
 use crate::materializer::DocumentState;
+use engine_shared::NodeId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// Stored fingerprints with a different version are recomputed.
 pub const VERSION: i16 = 2;
@@ -503,6 +505,9 @@ fn field_text(value: &Value) -> Option<String> {
 /// supported. Undeclared ID cells are not guessed into an arbitrary order.
 pub fn block_texts(state: &DocumentState) -> Vec<String> {
     let mut out = Vec::new();
+    // Declared column positions per sheet, built once so wide sheets with many rows
+    // do not rescan the ID list for every cell. A repeated ID keeps its first position.
+    let mut positions: HashMap<&NodeId, Option<HashMap<&str, usize>>> = HashMap::new();
     for node in state.nodes.values() {
         if node.deleted || node.parent_id.is_none() || state.removed_choices.contains(&node.id) {
             continue;
@@ -515,13 +520,25 @@ pub fn block_texts(state: &DocumentState) -> Vec<String> {
                 .map(crate::richtext::plain_text)
                 .filter(|t| !t.trim().is_empty())
         });
-        let column_ids = node
-            .parent_id
-            .as_ref()
-            .and_then(|id| state.nodes.get(id))
-            .filter(|parent| !parent.deleted && !state.removed_choices.contains(&parent.id))
-            .and_then(|parent| parent.current_fields.get("column_ids"))
-            .and_then(Value::as_array);
+        let column_ids = node.parent_id.as_ref().and_then(|id| {
+            positions
+                .entry(id)
+                .or_insert_with(|| {
+                    let parent = state.nodes.get(id)?;
+                    if parent.deleted || state.removed_choices.contains(&parent.id) {
+                        return None;
+                    }
+                    let ids = parent.current_fields.get("column_ids")?.as_array()?;
+                    let mut map = HashMap::new();
+                    for (position, id) in ids.iter().enumerate() {
+                        if let Some(id) = id.as_str() {
+                            map.entry(id).or_insert(position);
+                        }
+                    }
+                    Some(map)
+                })
+                .as_ref()
+        });
         let mut cells: Vec<(usize, String)> = fields
             .as_object()
             .into_iter()
@@ -529,7 +546,7 @@ pub fn block_texts(state: &DocumentState) -> Vec<String> {
             .filter_map(|(key, value)| {
                 let suffix = key.strip_prefix("cell_")?;
                 let column = if let Some(ids) = column_ids {
-                    ids.iter().position(|id| id.as_str() == Some(suffix))?
+                    *ids.get(suffix)?
                 } else {
                     suffix.parse::<usize>().ok()?
                 };
