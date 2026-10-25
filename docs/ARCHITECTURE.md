@@ -72,6 +72,36 @@ The `engine-api` adapter retains the original product schema so migrations and
 recorded histories remain compatible. Further extraction of product-specific
 adapters is a future change with explicit compatibility tests.
 
+## V1 hash and snapshot errata
+
+The applied SQL migrations are immutable compatibility artifacts. Their comments have
+three historical inaccuracies; the implementation and fixed v1 vectors are authoritative:
+
+- `0002_events.sql:9` reverses the operands. The actual chain hash is
+  `SHA-256(content_hash || prev_chain_hash)`, with 32 zero predecessor bytes at genesis.
+- `0002_events.sql:47` says sequence participates in that hash. V1 content hashing binds
+  the event type, target node ID, canonical JSON payload and actor UUID, each length-framed;
+  the chain binds that content hash and its predecessor. It does not bind `seq`,
+  `document_id`, `event.id` or `created_at`.
+- `0003_snapshots.sql:1`, `:5–7` and `:16` describe an event Merkle root. The stored
+  `snapshot.merkle_root` is over the materialized **nodes**, not the covered events.
+  An event-proof root from the audit endpoint is a separate commitment.
+
+The verifier checks the event document ID in the requested stream, sequence continuity and
+predecessors separately. These checks do not give excluded fields a cryptographic binding:
+a privileged writer can change timestamps/event IDs or copy an entire chain to another
+document while preserving its v1 hashes. A comment thread uses its `CommentAdded` event ID,
+so that identity is also outside the v1 commitment. Database `now()` is shared by events in
+one transaction and is neither an authenticated observation nor an external timestamp.
+A trusted retained head is needed to detect complete history replacement; copying a chain
+can preserve that same head, so v1 alone cannot prove its document identity.
+
+Fixing these limitations requires a versioned event/hash contract and compatible readers
+(evolution part 6), not edits to applied migrations or old hash inputs. Existing portable
+signed commit and receipt formats have their own bindings and do not retroactively change
+v1 document events. Executable exclusions are in `event_log_test.rs`; the fixed v1 vectors
+remain unchanged.
+
 ## Current collaboration adapters
 
 `workspace_merge::merge_strict` adds explicit existing-block choices for unrelated
