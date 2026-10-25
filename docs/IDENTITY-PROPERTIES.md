@@ -1,9 +1,8 @@
 # Engine node identity properties
 
 Two reproducible properties run 1,000 generated examples each with the fixed
-`IDENTITY` seed. They depend on the structural diagnostic checker submitted in
-[the structural checker PR](https://github.com/ArefinAlter/dynodoc-engine/pull/42),
-which is included in this branch until that dependency lands.
+`IDENTITY` seed. They use the read-only structural diagnostic checker
+`integrity::check_invariants` (`crates/engine-core/src/integrity/invariants.rs`).
 
 Independent generated draft histories fork a generated base. Both merge
 orientations must keep map keys equal to node IDs, retain base identities and
