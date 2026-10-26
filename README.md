@@ -8,7 +8,7 @@ Semantic version control for documents edited in existing tools. Rust libraries,
 a PostgreSQL HTTP service adapter, SQLite local repositories and an operator CLI
 provide stable node identity, append-only operations, review and synchronization
 building blocks. This MIT engine is the open-source core of Dynodoc, a product of
-Verne Systems (Dhaka, Bangladesh). The Dynodoc workspace, website and editor
+Verne Ltd. (Dhaka, Bangladesh). The Dynodoc workspace, website and editor
 connectors are developed in a separate private repository and are not published
 as open source; this repository carries the engine, HTTP API and command-line tools.
 
