@@ -5,3 +5,26 @@
 *.rs.bk
 .DS_Store
 /data/
+
+# Audit baseline: local credentials, state, logs and build products
+.env*
+!.env.example
+!.env.*.example
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+*.log.*
+node_modules/
+target/
+credentials/
+*.token
+*.pem
+*.key
+id_ed25519
+.id_ed25519
+id_rsa
