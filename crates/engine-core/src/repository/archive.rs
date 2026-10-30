@@ -10,14 +10,15 @@
 //! 4. Footer frame (object count, commit count, bytes before footer, running SHA-256)
 #![allow(clippy::manual_is_multiple_of)]
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 use engine_shared::DocumentId;
 use ring::digest;
 use serde::{Deserialize, Serialize};
 
-use super::local::{LocalRepository, ObjectKey};
+use super::local::{LocalRepository, ObjectKey, ObjectPacket};
 use crate::repository::{SignedCommit, MAX_COMMIT_BYTES};
 use crate::shared_checkpoint::{Address, MAX_OBJECT_BYTES};
 use crate::transparency::encoding::{b64, hex, unb64};
@@ -795,4 +796,334 @@ pub async fn export_archive<W: Write>(
     }
 
     writer.finish()
+}
+
+/// Bounded private temporary directory for archive staging.
+/// Permissions are 0700 on Unix. Recursively cleaned up on drop.
+pub struct PrivateTempDir {
+    path: PathBuf,
+}
+
+impl PrivateTempDir {
+    pub fn new() -> io::Result<Self> {
+        let path =
+            std::env::temp_dir().join(format!("dynodoc-archive-staging-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(Self { path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A staged object entry verified and saved to bounded temporary disk storage.
+#[derive(Debug, Clone)]
+pub struct StagedObjectEntry {
+    pub document: DocumentId,
+    pub address: Address,
+    pub path: PathBuf,
+    pub size: usize,
+}
+
+/// A fully verified archive staged on temporary disk, ready for atomic target import.
+pub struct StagedArchive {
+    pub summary: ArchiveSummary,
+    pub objects: Vec<StagedObjectEntry>,
+    pub commits: Vec<SignedCommit>,
+    pub staging_dir: Option<PrivateTempDir>,
+}
+
+/// Summary emitted when an archive import completes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveImportSummary {
+    pub head: Address,
+    pub objects_imported: usize,
+    pub commits_imported: usize,
+    pub total_objects: usize,
+    pub total_commits: usize,
+}
+
+/// Errors returned during archive import.
+#[derive(Debug, thiserror::Error)]
+pub enum ArchiveImportError {
+    #[error("archive validation failed: {0}")]
+    Validation(#[from] ArchiveError),
+    #[error("target copy failed after importing {objects_imported} objects and {commits_imported} commits: {source}")]
+    TargetCopy {
+        objects_imported: usize,
+        commits_imported: usize,
+        #[source]
+        source: crate::repository::Error,
+    },
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// Validate an archive stream and stage its objects into a fresh private temporary directory.
+///
+/// Verifies magic, frames, hashes, signatures, counts, dependency closure and object graph.
+/// All objects and commits must belong to the selected head closure (no extra or missing data).
+pub fn validate_and_stage_archive<R: Read>(
+    reader: R,
+    limits: ArchiveLimits,
+    expected_head: Option<&Address>,
+    expected_project: Option<DocumentId>,
+) -> Result<StagedArchive, ArchiveError> {
+    let staging_dir = PrivateTempDir::new()?;
+    validate_and_stage_archive_in(reader, limits, expected_head, expected_project, staging_dir)
+}
+
+/// Validate and stage an archive into the given private temporary directory.
+pub fn validate_and_stage_archive_in<R: Read>(
+    reader: R,
+    limits: ArchiveLimits,
+    expected_head: Option<&Address>,
+    expected_project: Option<DocumentId>,
+    staging_dir: PrivateTempDir,
+) -> Result<StagedArchive, ArchiveError> {
+    let mut archive_reader = ArchiveReader::new(reader, limits);
+    let objects_dir = staging_dir.path().join("objects");
+    std::fs::create_dir_all(&objects_dir)?;
+
+    let mut staged_objects: Vec<StagedObjectEntry> = Vec::new();
+    let mut staged_commits: Vec<SignedCommit> = Vec::new();
+    let mut staged_objects_map: HashMap<(DocumentId, Address), usize> = HashMap::new();
+    let mut staged_commits_map: HashMap<Address, usize> = HashMap::new();
+    let mut total_staged_bytes: u64 = 0;
+    let mut footer_summary = None;
+
+    while let Some(entry) = archive_reader.next_entry()? {
+        match entry {
+            ArchiveEntry::Header {
+                version: _,
+                project,
+                head,
+            } => {
+                if let Some(exp_proj) = expected_project {
+                    if project != exp_proj {
+                        return Err(ArchiveError::InvalidFrame(
+                            "archive header project mismatch with expected project",
+                        ));
+                    }
+                }
+                if let Some(exp_head) = expected_head {
+                    if &head != exp_head {
+                        return Err(ArchiveError::InvalidFrame(
+                            "archive header head mismatch with expected head",
+                        ));
+                    }
+                }
+            }
+            ArchiveEntry::Object {
+                document,
+                address,
+                bytes,
+            } => {
+                total_staged_bytes = total_staged_bytes
+                    .checked_add(bytes.len() as u64)
+                    .ok_or(ArchiveError::Limit("total archive bytes overflow"))?;
+                if total_staged_bytes > limits.max_total_bytes {
+                    return Err(ArchiveError::Limit("archive exceeds total bytes limit"));
+                }
+                if staged_objects.len() >= limits.max_objects {
+                    return Err(ArchiveError::Limit("maximum object count exceeded"));
+                }
+                let obj_file = objects_dir.join(format!("{}.bin", staged_objects.len()));
+                std::fs::write(&obj_file, &bytes)?;
+                staged_objects_map.insert((document, address.clone()), staged_objects.len());
+                staged_objects.push(StagedObjectEntry {
+                    document,
+                    address,
+                    path: obj_file,
+                    size: bytes.len(),
+                });
+            }
+            ArchiveEntry::Commit {
+                address,
+                signed,
+                raw_envelope: _,
+            } => {
+                if staged_commits.len() >= limits.max_commits {
+                    return Err(ArchiveError::Limit("maximum commit count exceeded"));
+                }
+                staged_commits_map.insert(address, staged_commits.len());
+                staged_commits.push(signed);
+            }
+            ArchiveEntry::Footer(summary) => {
+                footer_summary = Some(summary);
+            }
+        }
+    }
+
+    let summary = footer_summary.ok_or(ArchiveError::UnexpectedEof)?;
+
+    if let Some(exp_head) = expected_head {
+        if &summary.head != exp_head {
+            return Err(ArchiveError::InvalidFrame(
+                "archive footer head mismatch with expected head",
+            ));
+        }
+    }
+    if let Some(exp_proj) = expected_project {
+        if summary.project != exp_proj {
+            return Err(ArchiveError::InvalidFrame(
+                "archive footer project mismatch with expected project",
+            ));
+        }
+    }
+
+    // 1. Commit closure verification
+    let mut reachable_commits = HashSet::new();
+    let mut commit_stack = vec![summary.head.clone()];
+    while let Some(addr) = commit_stack.pop() {
+        if reachable_commits.insert(addr.clone()) {
+            let idx = staged_commits_map.get(&addr).ok_or_else(|| {
+                ArchiveError::MissingDependency("commit".into(), addr.as_str().into())
+            })?;
+            let signed = &staged_commits[*idx];
+            for dep in signed.commit.dependencies() {
+                if !reachable_commits.contains(&dep) {
+                    commit_stack.push(dep);
+                }
+            }
+        }
+    }
+
+    if reachable_commits.len() != staged_commits.len() {
+        return Err(ArchiveError::InvalidFrame(
+            "archive contains extra commits outside the selected dependency closure",
+        ));
+    }
+
+    // 2. Object graph closure verification
+    let mut file_roots: HashMap<DocumentId, HashSet<Address>> = HashMap::new();
+    for signed in &staged_commits {
+        for file_entry in signed.commit.files.values() {
+            file_roots
+                .entry(file_entry.document)
+                .or_default()
+                .insert(file_entry.state.clone());
+        }
+    }
+
+    let mut reachable_objects: HashSet<(DocumentId, Address)> = HashSet::new();
+    for (doc_id, roots) in file_roots {
+        let mut obj_stack: Vec<Address> = roots.into_iter().collect();
+        while let Some(addr) = obj_stack.pop() {
+            if reachable_objects.insert((doc_id, addr.clone())) {
+                let idx = staged_objects_map.get(&(doc_id, addr.clone())).ok_or(
+                    ArchiveError::InvalidFrame(
+                        "object referenced in file graph is missing from archive",
+                    ),
+                )?;
+                let raw_bytes = std::fs::read(&staged_objects[*idx].path)?;
+                let children = crate::shared_checkpoint::references(&addr, &raw_bytes)
+                    .map_err(|_| ArchiveError::InvalidFrame("malformed object references"))?;
+                for child in children {
+                    if !reachable_objects.contains(&(doc_id, child.clone())) {
+                        obj_stack.push(child);
+                    }
+                }
+            }
+        }
+    }
+
+    if reachable_objects.len() != staged_objects.len() {
+        return Err(ArchiveError::InvalidFrame(
+            "archive contains extra objects outside the selected object closure",
+        ));
+    }
+
+    Ok(StagedArchive {
+        summary,
+        objects: staged_objects,
+        commits: staged_commits,
+        staging_dir: Some(staging_dir),
+    })
+}
+
+/// Import a verified and staged archive into a local target repository.
+///
+/// Copies objects in bounded batches and verified commits in dependency-first order.
+/// Branches and quotas are never modified.
+pub async fn import_archive(
+    repo: &LocalRepository,
+    staged: &StagedArchive,
+) -> Result<ArchiveImportSummary, ArchiveImportError> {
+    if staged.summary.project != DocumentId(repo.project()) {
+        return Err(ArchiveImportError::Validation(ArchiveError::InvalidFrame(
+            "archive project mismatch with target repository",
+        )));
+    }
+
+    let mut objects_imported = 0usize;
+    let mut batch_packets: Vec<ObjectPacket> = Vec::new();
+    let mut batch_bytes = 0usize;
+
+    for entry in &staged.objects {
+        let bytes = std::fs::read(&entry.path)?;
+        if batch_packets.len() >= 64 || batch_bytes + bytes.len() > 800 * 1024 {
+            repo.import_objects(&batch_packets).await.map_err(|e| {
+                ArchiveImportError::TargetCopy {
+                    objects_imported,
+                    commits_imported: 0,
+                    source: e,
+                }
+            })?;
+            objects_imported += batch_packets.len();
+            batch_packets.clear();
+            batch_bytes = 0;
+        }
+        batch_bytes += bytes.len();
+        batch_packets.push(ObjectPacket {
+            key: ObjectKey {
+                document: entry.document,
+                address: entry.address.clone(),
+            },
+            bytes,
+        });
+    }
+
+    if !batch_packets.is_empty() {
+        repo.import_objects(&batch_packets)
+            .await
+            .map_err(|e| ArchiveImportError::TargetCopy {
+                objects_imported,
+                commits_imported: 0,
+                source: e,
+            })?;
+        objects_imported += batch_packets.len();
+    }
+
+    let mut commits_imported = 0usize;
+    for signed in &staged.commits {
+        repo.import_commit(signed)
+            .await
+            .map_err(|e| ArchiveImportError::TargetCopy {
+                objects_imported,
+                commits_imported,
+                source: e,
+            })?;
+        commits_imported += 1;
+    }
+
+    Ok(ArchiveImportSummary {
+        head: staged.summary.head.clone(),
+        objects_imported,
+        commits_imported,
+        total_objects: staged.objects.len(),
+        total_commits: staged.commits.len(),
+    })
 }
