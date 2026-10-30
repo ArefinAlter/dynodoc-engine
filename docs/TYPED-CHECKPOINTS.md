@@ -55,3 +55,29 @@ Current validation and remaining adoption work are recorded in
 [the handoff](ENGINE-EVOLUTION-HANDOFF.md). [Shared draft bases](SHARED-DRAFT-BASES.md)
 now use this codec through a separate opt-in at schema 31. Shared named versions,
 incremental changed-node publication and physical packing remain separate work.
+
+## Compact checkpoints v3
+
+V3 typed checkpoints introduce lossless node ID and label compaction while
+preserving canonical JSON, 32 KiB typed-object limits and existing chunked-content
+rules. V1/V2 bytes, roots and serializers are unchanged.
+
+### Object contract
+
+V3 objects begin with `DYNOTYP\0` followed by byte `3`, then canonical UTF-8 JSON.
+The SHA-256 domain is `dynodoc.typed-checkpoint\0v3\0`. The null scalar vector is
+`24a4c5329aad519af2cf28e2500cf9eb75c5f372f4ebd366e382e236fd6713d1`.
+
+Node identity comes from its state-map key in the radix map, omitting the redundant
+`id` field from the node body. Two explicit booleans govern field reconstruction:
+- `restore_block_id`: when `true`, reconstructs `current_fields["blockId"]` as a
+  string equal to the node map key. Omission is mandatory when `blockId == id`;
+  redundant inclusion with `restore_block_id == false` is rejected.
+- `restore_label`: when `true`, reconstructs `current_fields["label"]` as
+  `richtext::plain_text(content)`, requiring a non-null `content` field. Omission is
+  mandatory when `label == plain_text(content)`; redundant inclusion with
+  `restore_label == false` is rejected.
+
+Conflicting flags, existing reconstructed keys, unknown fields and noncanonical
+encodings fail closed. V2 readers reject V3 roots with `Error::Invalid("typed header/version")`,
+and V3 readers similarly reject V2 roots.
