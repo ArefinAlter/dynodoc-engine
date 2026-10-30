@@ -1,5 +1,11 @@
 use super::*;
-use axum::{routing::get, Json, Router};
+use axum::{
+    extract::Query,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Json, Router,
+};
 use engine_api::{
     app,
     auth::{store, token, AuthConfig},
@@ -15,6 +21,8 @@ use engine_core::{
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use sqlx::PgPool;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 #[path = "../../../engine-api/tests/common/mod.rs"]
 mod common;
@@ -1831,4 +1839,504 @@ async fn revocation_refuses_clients_and_only_an_explicit_repin_crosses_the_recor
         remove(path).await;
     }
     runtime.close().await;
+}
+
+#[tokio::test]
+async fn remote_compare_multi_page_success_and_local_state_unchanged() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let (repo_path, repo) = repo(project).await;
+    let (pin_path, journal) = journal().await;
+    let scope = Scope {
+        project,
+        authority,
+        branch: "main".into(),
+    };
+    let initial_heads = repo.head("main").await.unwrap();
+    let initial_pin = journal.pin(&scope).await.unwrap();
+
+    let from = Address::try_from("1".repeat(64)).unwrap();
+    let to = Address::try_from("2".repeat(64)).unwrap();
+    let doc1 = Uuid::new_v4();
+    let doc2 = Uuid::new_v4();
+    let doc3 = Uuid::new_v4();
+    let a1 = Address::try_from("a".repeat(64)).unwrap();
+    let a2 = Address::try_from("b".repeat(64)).unwrap();
+
+    let served_project = project;
+    let served_from = from.clone();
+    let served_to = to.clone();
+
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/compare",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let p = served_project;
+                let f = served_from.clone();
+                let t = served_to.clone();
+                let a1 = a1.clone();
+                let a2 = a2.clone();
+                async move {
+                    assert_eq!(params.get("from").unwrap(), f.as_str());
+                    assert_eq!(params.get("to").unwrap(), t.as_str());
+                    let cursor = params.get("cursor").cloned();
+                    if cursor.is_none() {
+                        Json(json!({
+                            "project": p,
+                            "from": f,
+                            "to": t,
+                            "totals": {
+                                "added": 1,
+                                "removed": 1,
+                                "modified": 1,
+                                "unchanged": 0,
+                                "total_changes": 3
+                            },
+                            "changes": [
+                                {
+                                    "path": "a.txt",
+                                    "kind": "added",
+                                    "to": { "document": doc1, "state": a1 }
+                                },
+                                {
+                                    "path": "b.txt",
+                                    "kind": "modified",
+                                    "from": { "document": doc2, "state": a1 },
+                                    "to": { "document": doc2, "state": a2 }
+                                }
+                            ],
+                            "next_cursor": "cursor_page2",
+                            "more": true
+                        }))
+                    } else if cursor.as_deref() == Some("cursor_page2") {
+                        Json(json!({
+                            "project": p,
+                            "from": f,
+                            "to": t,
+                            "totals": {
+                                "added": 1,
+                                "removed": 1,
+                                "modified": 1,
+                                "unchanged": 0,
+                                "total_changes": 3
+                            },
+                            "changes": [
+                                {
+                                    "path": "c.txt",
+                                    "kind": "removed",
+                                    "from": { "document": doc3, "state": a1 }
+                                }
+                            ],
+                            "next_cursor": null,
+                            "more": false
+                        }))
+                    } else {
+                        panic!("unexpected cursor: {:?}", cursor);
+                    }
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "synthetic", true).unwrap();
+
+    let report = compare(&client, &from, &to).await.unwrap();
+    assert_eq!(report.project, project);
+    assert_eq!(report.from, from);
+    assert_eq!(report.to, to);
+    assert_eq!(report.totals.total_changes, 3);
+    assert_eq!(report.changes.len(), 3);
+    assert_eq!(report.changes[0].path, "a.txt");
+    assert_eq!(report.changes[1].path, "b.txt");
+    assert_eq!(report.changes[2].path, "c.txt");
+
+    let text = format_compare_text(&report);
+    assert!(text.contains("Server-produced metadata (unverified by receipt journal)"));
+    assert!(text.contains("+ a.txt"));
+    assert!(text.contains("~ b.txt"));
+    assert!(text.contains("- c.txt"));
+    assert!(text.contains("Totals:  3 change(s) (1 added, 1 removed, 1 modified, 0 unchanged)"));
+
+    let json_val = format_compare_json(&report).unwrap();
+    assert_eq!(json_val["server_metadata"], true);
+    assert!(json_val["disclaimer"]
+        .as_str()
+        .unwrap()
+        .contains("Server-produced metadata"));
+
+    // Verify local repository and receipt journal are untouched
+    assert_eq!(repo.head("main").await.unwrap(), initial_heads);
+    assert_eq!(journal.pin(&scope).await.unwrap(), initial_pin);
+
+    server.abort();
+    let _ = server.await;
+    repo.close().await;
+    journal.close().await;
+    remove(repo_path).await;
+    remove(pin_path).await;
+}
+
+#[tokio::test]
+async fn remote_compare_mid_run_401_with_one_allowed_refresh() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let from = Address::try_from("1".repeat(64)).unwrap();
+    let to = Address::try_from("2".repeat(64)).unwrap();
+    let doc1 = Uuid::new_v4();
+    let doc2 = Uuid::new_v4();
+    let a1 = Address::try_from("a".repeat(64)).unwrap();
+
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_calls_clone = refresh_calls.clone();
+
+    let f_served = from.clone();
+    let t_served = to.clone();
+    let router = Router::new()
+        .route(
+            "/auth/refresh",
+            axum::routing::post(move |Json(body): Json<Value>| {
+                let calls = refresh_calls_clone.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(body["refresh_token"], "1111111111222222222233333333334444444444555555555566666666667777");
+                    Json(json!({
+                        "access_token": "token_renewed",
+                        "refresh_token": "8888888888999999999900000000001111111111222222222233333333334444",
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/compare",
+            get(move |headers: HeaderMap, Query(params): Query<HashMap<String, String>>| {
+                let f = f_served.clone();
+                let t = t_served.clone();
+                let a1 = a1.clone();
+                async move {
+                    let auth = headers.get("authorization").and_then(|h| h.to_str().ok()).unwrap_or("");
+                    let cursor = params.get("cursor").cloned();
+                    if cursor.is_none() {
+                        // First page succeeds with initial token
+                        assert_eq!(auth, "Bearer token_initial");
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "project": project,
+                                "from": f,
+                                "to": t,
+                                "totals": { "added": 2, "removed": 0, "modified": 0, "unchanged": 0, "total_changes": 2 },
+                                "changes": [
+                                    { "path": "1.txt", "kind": "added", "to": { "document": doc1, "state": a1 } }
+                                ],
+                                "next_cursor": "p2",
+                                "more": true
+                            })),
+                        ).into_response()
+                    } else if auth == "Bearer token_initial" {
+                        // Page 2 fails with 401 when using initial token
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "error": "token expired" })),
+                        ).into_response()
+                    } else if auth == "Bearer token_renewed" && cursor.as_deref() == Some("p2") {
+                        // Page 2 succeeds with renewed token
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "project": project,
+                                "from": f,
+                                "to": t,
+                                "totals": { "added": 2, "removed": 0, "modified": 0, "unchanged": 0, "total_changes": 2 },
+                                "changes": [
+                                    { "path": "2.txt", "kind": "added", "to": { "document": doc2, "state": a1 } }
+                                ],
+                                "next_cursor": null,
+                                "more": false
+                            })),
+                        ).into_response()
+                    } else {
+                        (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid state"}))).into_response()
+                    }
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+
+    let refresh_file = std::env::temp_dir().join(format!("dynodoc-ref-{}.txt", Uuid::new_v4()));
+    let access_file = std::env::temp_dir().join(format!("dynodoc-acc-{}.txt", Uuid::new_v4()));
+    crate::private_file::write_private_test(
+        &refresh_file,
+        b"1111111111222222222233333333334444444444555555555566666666667777\n",
+    )
+    .unwrap();
+    crate::private_file::write_private_test(&access_file, b"token_initial\n").unwrap();
+
+    let client = Client::with_credential(
+        remote(url, authority),
+        project,
+        Credential::Refresh {
+            refresh_file: refresh_file.clone(),
+            access_file: Some(access_file.clone()),
+        },
+        Some("token_initial"),
+        true,
+    )
+    .unwrap();
+
+    let report = compare(&client, &from, &to).await.unwrap();
+    assert_eq!(report.changes.len(), 2);
+    assert_eq!(refresh_calls.load(Ordering::Relaxed), 1);
+
+    server.abort();
+    let _ = server.await;
+    let _ = std::fs::remove_file(refresh_file);
+    let _ = std::fs::remove_file(access_file);
+}
+
+#[tokio::test]
+async fn remote_compare_mid_run_403_and_unauthorized_loss() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let from = Address::try_from("1".repeat(64)).unwrap();
+    let to = Address::try_from("2".repeat(64)).unwrap();
+
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/compare",
+            get(|| async { (StatusCode::FORBIDDEN, Json(json!({"error": "denied"}))) }),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(
+        remote(url, authority),
+        project,
+        "my_secret_token_12345",
+        true,
+    )
+    .unwrap();
+
+    let err = compare(&client, &from, &to).await.unwrap_err().to_string();
+    assert!(err.contains("403"));
+    assert!(
+        !err.contains("my_secret_token_12345"),
+        "must never log bearer token"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn remote_compare_integrity_checks_and_error_handling() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let from = Address::try_from("1".repeat(64)).unwrap();
+    let to = Address::try_from("2".repeat(64)).unwrap();
+
+    // 1. Cursor loop
+    let f1 = from.clone();
+    let t1 = to.clone();
+    let loop_calls = Arc::new(AtomicUsize::new(0));
+    let lc = loop_calls.clone();
+    let router = Router::new()
+        .route("/projects/{id}/history/authority", get(move || async move { Json(epoch_one(authority)) }))
+        .route("/projects/{id}/history/compare", get(move || {
+            let f = f1.clone();
+            let t = t1.clone();
+            let lc = lc.clone();
+            async move {
+                let call = lc.fetch_add(1, Ordering::Relaxed);
+                let path = if call == 0 { "a.txt" } else { "b.txt" };
+                Json(json!({
+                    "project": project,
+                    "from": f,
+                    "to": t,
+                    "totals": { "added": 2, "removed": 0, "modified": 0, "unchanged": 0, "total_changes": 2 },
+                    "changes": [{ "path": path, "kind": "added" }],
+                    "next_cursor": "loop_cursor",
+                    "more": true
+                }))
+            }
+        }));
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+    let err = compare(&client, &from, &to).await.unwrap_err().to_string();
+    assert!(
+        err.contains("cursor loop"),
+        "expected cursor loop error, got: {err}"
+    );
+    server.abort();
+    let _ = server.await;
+
+    // 2. Out of order changes
+    let f2 = from.clone();
+    let t2 = to.clone();
+    let router = Router::new()
+        .route("/projects/{id}/history/authority", get(move || async move { Json(epoch_one(authority)) }))
+        .route("/projects/{id}/history/compare", get(move || {
+            let f = f2.clone();
+            let t = t2.clone();
+            async move {
+                Json(json!({
+                    "project": project,
+                    "from": f,
+                    "to": t,
+                    "totals": { "added": 2, "removed": 0, "modified": 0, "unchanged": 0, "total_changes": 2 },
+                    "changes": [
+                        { "path": "z.txt", "kind": "added" },
+                        { "path": "a.txt", "kind": "added" }
+                    ],
+                    "next_cursor": null,
+                    "more": false
+                }))
+            }
+        }));
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+    let err = compare(&client, &from, &to).await.unwrap_err().to_string();
+    assert!(
+        err.contains("out of order"),
+        "expected out of order error, got: {err}"
+    );
+    server.abort();
+    let _ = server.await;
+
+    // 3. Foreign address / mismatch
+    let foreign = Address::try_from("9".repeat(64)).unwrap();
+    let t3 = to.clone();
+    let router = Router::new()
+        .route("/projects/{id}/history/authority", get(move || async move { Json(epoch_one(authority)) }))
+        .route("/projects/{id}/history/compare", get(move || {
+            let f = foreign.clone();
+            let t = t3.clone();
+            async move {
+                Json(json!({
+                    "project": project,
+                    "from": f,
+                    "to": t,
+                    "totals": { "added": 1, "removed": 0, "modified": 0, "unchanged": 0, "total_changes": 1 },
+                    "changes": [{ "path": "a.txt", "kind": "added" }],
+                    "next_cursor": null,
+                    "more": false
+                }))
+            }
+        }));
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+    let err = compare(&client, &from, &to).await.unwrap_err().to_string();
+    assert!(
+        err.contains("from-address mismatch"),
+        "expected from-address mismatch, got: {err}"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn remote_compare_cli_options_execution() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let (repo_path, repo) = repo(project).await;
+    let (pin_path, journal) = journal().await;
+    let from = Address::try_from("1".repeat(64)).unwrap();
+    let to = Address::try_from("2".repeat(64)).unwrap();
+
+    let from_served = from.clone();
+    let to_served = to.clone();
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/compare",
+            get(move || {
+                let f = from_served.clone();
+                let t = to_served.clone();
+                async move {
+                    Json(json!({
+                        "project": project,
+                        "from": f,
+                        "to": t,
+                        "totals": { "added": 1, "removed": 0, "modified": 0, "unchanged": 0, "total_changes": 1 },
+                        "changes": [{ "path": "doc.txt", "kind": "added" }],
+                        "next_cursor": null,
+                        "more": false
+                    }))
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+    let remote_file = std::env::temp_dir().join(format!("dynodoc-remote-{}.json", Uuid::new_v4()));
+    let token_file = std::env::temp_dir().join(format!("dynodoc-tok-{}.txt", Uuid::new_v4()));
+    std::fs::write(
+        &remote_file,
+        serde_json::to_vec(&remote(url, authority)).unwrap(),
+    )
+    .unwrap();
+    crate::private_file::write_private_test(&token_file, b"token_test\n").unwrap();
+
+    // Run with json: true
+    let options_json = Options {
+        repository: repo_path.clone(),
+        project,
+        remote: remote_file.clone(),
+        token_file: Some(token_file.clone()),
+        refresh_token_file: None,
+        device_key: None,
+        journal: pin_path.clone(),
+        branch: "main".into(),
+        allow_loopback_http: true,
+        accept_authority_break: None,
+        action: Action::Compare {
+            from: from.clone(),
+            to: to.clone(),
+            json: true,
+        },
+    };
+    run(options_json).await.unwrap();
+
+    // Run with json: false (text)
+    let options_text = Options {
+        repository: repo_path.clone(),
+        project,
+        remote: remote_file.clone(),
+        token_file: Some(token_file.clone()),
+        refresh_token_file: None,
+        device_key: None,
+        journal: pin_path.clone(),
+        branch: "main".into(),
+        allow_loopback_http: true,
+        accept_authority_break: None,
+        action: Action::Compare {
+            from: from.clone(),
+            to: to.clone(),
+            json: false,
+        },
+    };
+    run(options_text).await.unwrap();
+
+    server.abort();
+    let _ = server.await;
+    repo.close().await;
+    journal.close().await;
+    remove(repo_path).await;
+    remove(pin_path).await;
+    let _ = std::fs::remove_file(remote_file);
+    let _ = std::fs::remove_file(token_file);
 }

@@ -524,6 +524,27 @@ impl Client {
         }
         Ok(result)
     }
+    pub async fn compare_page(
+        &self,
+        from: &Address,
+        to: &Address,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+    ) -> anyhow::Result<engine_core::repository::compare::ProjectDiffReport> {
+        let mut query = vec![
+            ("from", from.as_str().to_string()),
+            ("to", to.as_str().to_string()),
+        ];
+        let limit_str;
+        if let Some(limit) = limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str));
+        }
+        if let Some(cursor) = cursor {
+            query.push(("cursor", cursor.to_string()));
+        }
+        self.get("history/compare", &query, 512 * 1024).await
+    }
     pub async fn post(&self, path: &str, body: Value) -> anyhow::Result<Value> {
         Ok(self
             .request(Method::POST, path, &[], Some(&body), 64 * 1024, false)
