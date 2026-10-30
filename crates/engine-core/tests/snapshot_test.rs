@@ -877,3 +877,84 @@ async fn concurrent_mixed_snapshot_writers_keep_one_format_and_receipt(
     assert_eq!(verify_document(&pool, doc, false).await?.snapshots, 1);
     Ok(())
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn snapshot_reconstruction_preserves_multi_root_forest(pool: PgPool) -> anyhow::Result<()> {
+    let (author, doc, root1) = seed(&pool).await?;
+
+    // Create a second root (Clause) at top level
+    let root2 = NodeId(ulid::Ulid::generate().to_string());
+    sqlx::query(
+        "insert into node (id, document_id, parent_id, type, pos, current_fields, var_name)
+         values ($1, $2, null, 'clause', 'a1', '{}'::jsonb, null)",
+    )
+    .bind(&root2.0)
+    .bind(doc.0)
+    .execute(&pool)
+    .await?;
+
+    append(
+        &pool,
+        doc,
+        &EventPayload::NodeCreated {
+            node_id: root2.clone(),
+            node_type: engine_shared::NodeType::Clause,
+            parent_id: None,
+            pos: "a1".into(),
+            fields: json!({ "title": "Second Root Clause" }),
+            var_name: None,
+        },
+        author,
+    )
+    .await?;
+
+    // Create a child node under root2
+    let child = NodeId(ulid::Ulid::generate().to_string());
+    sqlx::query(
+        "insert into node (id, document_id, parent_id, type, pos, current_fields, var_name)
+         values ($1, $2, $3, 'item', 'a0', '{}'::jsonb, null)",
+    )
+    .bind(&child.0)
+    .bind(doc.0)
+    .bind(&root2.0)
+    .execute(&pool)
+    .await?;
+
+    append(
+        &pool,
+        doc,
+        &EventPayload::NodeCreated {
+            node_id: child.clone(),
+            node_type: engine_shared::NodeType::Item,
+            parent_id: Some(root2.clone()),
+            pos: "a0".into(),
+            fields: json!({ "label": "Child of root 2" }),
+            var_name: None,
+        },
+        author,
+    )
+    .await?;
+
+    // Take snapshot of multi-root document
+    let engine = SnapshotEngine::new(pool.clone());
+    let _snapshot = engine.take(doc, SnapshotReason::Periodic).await?;
+
+    // Read state from snapshot
+    let mut conn = pool.acquire().await?;
+    let hist = read_state_at(&mut conn, doc, 3).await?;
+    let state = hist.state;
+    assert_eq!(state.nodes.len(), 3);
+    assert!(state.nodes.contains_key(&root1));
+    assert!(state.nodes.contains_key(&root2));
+    assert!(state.nodes.contains_key(&child));
+    assert_eq!(state.nodes[&root1].parent_id, None);
+    assert_eq!(state.nodes[&root2].parent_id, None);
+    assert_eq!(state.nodes[&child].parent_id, Some(root2.clone()));
+
+    // Verify snapshot verification passes
+    let record = verify_document(&pool, doc, false).await?;
+    assert_eq!(record.snapshots, 1);
+    assert_eq!(record.through_seq, 3);
+
+    Ok(())
+}
