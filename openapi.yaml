@@ -4428,6 +4428,66 @@ paths:
       - paseto: []
       - device_session:
         - history:read
+  /projects/{id}/history/compare:
+    get:
+      tags:
+      - project history
+      operationId: project_history_compare
+      parameters:
+      - name: id
+        in: path
+        description: Project ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: from
+        in: query
+        description: Starting commit address
+        required: true
+        schema:
+          type: string
+      - name: to
+        in: query
+        description: Ending commit address
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Maximum number of changed paths to return (1-100, default 50)
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: cursor
+        in: query
+        description: Opaque continuation cursor
+        required: false
+        schema:
+          type: string
+      - name: include_unchanged
+        in: query
+        description: Whether to include unchanged paths
+        required: false
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: Bounded two-commit diff report
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid commit address, cursor or query parameters
+        '403':
+          description: Project membership or document scope permission denied
+        '404':
+          description: One or both commits not published in this project
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
   /projects/{id}/history/receipts:
     get:
       tags:
