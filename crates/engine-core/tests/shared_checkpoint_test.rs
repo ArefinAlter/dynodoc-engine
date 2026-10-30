@@ -1105,3 +1105,271 @@ async fn forged_metadata_and_corrupt_stored_objects_fail_closed(
     ));
     Ok(())
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_publication_duplicate_and_reordered_retries(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    let node2 = NodeId(ulid::Ulid::generate().to_string());
+    sqlx::query(
+        "insert into node(id,document_id,type,pos,current_fields) values($1,$2,'section','a1','{}')",
+    )
+    .bind(&node2.0)
+    .bind(document.0)
+    .execute(&pool)
+    .await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::NodeCreated {
+            node_id: node2.clone(),
+            node_type: NodeType::Section,
+            parent_id: Some(node.clone()),
+            pos: "a1".into(),
+            fields: json!({"text": "Child node"}),
+            var_name: None,
+        },
+        actor,
+    )
+    .await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node2.clone(),
+            field: "text".into(),
+            value: json!("Edited text"),
+        },
+        actor,
+    )
+    .await?;
+
+    // Initial incremental publication at rev 1: no base exists -> fallback_ran is true
+    let p1 = postgres::take_incremental(&pool, document, 1, Limits::default()).await?;
+    assert_eq!(p1.through_seq, 1);
+    assert!(p1.fallback_ran);
+    assert_eq!(p1.base_seq, None);
+
+    // Incremental publication at rev 2: uses rev 1 as base -> fallback_ran is false
+    let p2 = postgres::take_incremental(&pool, document, 2, Limits::default()).await?;
+    assert_eq!(p2.through_seq, 2);
+    assert!(!p2.fallback_ran);
+    assert_eq!(p2.base_seq, Some(1));
+    assert!(p2.stats.new_objects > 0);
+
+    // Duplicate retry at rev 2: same root, 0 new objects
+    let p2_retry = postgres::take_incremental(&pool, document, 2, Limits::default()).await?;
+    assert_eq!(p2_retry.root, p2.root);
+    assert_eq!(p2_retry.stats.new_objects, 0);
+
+    // Incremental publication at rev 3: uses rev 2 as base
+    let p3 = postgres::take_incremental(&pool, document, 3, Limits::default()).await?;
+    assert_eq!(p3.through_seq, 3);
+    assert!(!p3.fallback_ran);
+    assert_eq!(p3.base_seq, Some(2));
+
+    // Reordered retry at rev 2: returns p2.root
+    let p2_reordered = postgres::take_incremental(&pool, document, 2, Limits::default()).await?;
+    assert_eq!(p2_reordered.root, p2.root);
+
+    // Reordered retry at rev 1: returns p1.root
+    let p1_reordered = postgres::take_incremental(&pool, document, 1, Limits::default()).await?;
+    assert_eq!(p1_reordered.root, p1.root);
+
+    // All 3 match history
+    for seq in 1..=3 {
+        let loaded = postgres::load(&pool, document, seq, Limits::default()).await?;
+        let events: Vec<Event> =
+            sqlx::query_as("select * from event where document_id=$1 and seq <= $2 order by seq")
+                .bind(document.0)
+                .bind(seq)
+                .fetch_all(&pool)
+                .await?;
+        let expected = Materializer::fold(&events)?;
+        assert_eq!(loaded, expected);
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_publication_concurrent_same_revision(pool: PgPool) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node,
+            field: "label".into(),
+            value: json!("Concurrent update"),
+        },
+        actor,
+    )
+    .await?;
+
+    // Seed base checkpoint at rev 1
+    let p1 = postgres::take_incremental(&pool, document, 1, Limits::default()).await?;
+    assert!(p1.fallback_ran);
+
+    // Two concurrent tasks publishing rev 2
+    let pool1 = pool.clone();
+    let pool2 = pool.clone();
+    let t1 = tokio::spawn(async move {
+        postgres::take_incremental(&pool1, document, 2, Limits::default()).await
+    });
+    let t2 = tokio::spawn(async move {
+        postgres::take_incremental(&pool2, document, 2, Limits::default()).await
+    });
+
+    let (res1, res2) = tokio::try_join!(t1, t2)?;
+    let p2_a = res1?;
+    let p2_b = res2?;
+    assert_eq!(p2_a.root, p2_b.root);
+    assert_eq!(p2_a.through_seq, 2);
+    assert_eq!(p2_b.through_seq, 2);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_publication_missing_base_and_fallback(pool: PgPool) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+
+    // Auto-selection with no earlier base: falls back to full typed write
+    let p1 = postgres::take_incremental(&pool, document, 1, Limits::default()).await?;
+    assert!(p1.fallback_ran);
+    assert_eq!(p1.base_seq, None);
+
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node,
+            field: "label".into(),
+            value: json!("rev 2 edit"),
+        },
+        actor,
+    )
+    .await?;
+
+    // Explicit base requested that does not exist: fails with Error::Invalid
+    let err =
+        postgres::take_incremental_with_base(&pool, document, 2, Some(999), Limits::default())
+            .await
+            .unwrap_err();
+    assert!(matches!(err, Error::Invalid("base checkpoint not found")));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_publication_quota_failure_rolls_back_atomically(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node,
+            field: "label".into(),
+            value: json!("New label"),
+        },
+        actor,
+    )
+    .await?;
+
+    // Establish base at rev 1
+    postgres::take_incremental(&pool, document, 1, Limits::default()).await?;
+    let initial_count = object_count(&pool, document).await;
+
+    // Call take_incremental with impossible quota limits
+    let impossible = Limits {
+        max_objects: 1,
+        max_bytes: 10,
+    };
+    let err = postgres::take_incremental(&pool, document, 2, impossible)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Limit(_)));
+
+    // Quotas and writes must roll back completely
+    assert_eq!(object_count(&pool, document).await, initial_count);
+    let checkpoints_at_2: i64 = sqlx::query_scalar(
+        "select count(*) from shared_checkpoint where document_id=$1 and through_seq=2",
+    )
+    .bind(document.0)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(checkpoints_at_2, 0);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_publication_corrupted_reused_objects_fails_closed(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node,
+            field: "label".into(),
+            value: json!("Edit for rev 2"),
+        },
+        actor,
+    )
+    .await?;
+
+    // Simulate pre-existing corrupt base checkpoint at rev 1
+    let dummy_root = "c".repeat(64);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(document.0)
+        .bind(&dummy_root)
+        .bind(b"corrupted_bytes".as_slice())
+        .execute(&pool)
+        .await?;
+    let chain = postgres::chain_at(&mut *pool.acquire().await?, document, 1).await?;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,1,2,$2,$3)",
+    )
+    .bind(document.0)
+    .bind(&dummy_root)
+    .bind(&chain)
+    .execute(&pool)
+    .await?;
+
+    // Publishing rev 2 incrementally should attempt to use rev 1 base, detect corruption, and fail closed
+    let err = postgres::take_incremental(&pool, document, 2, Limits::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Invalid(_) | Error::HashMismatch));
+
+    // Revision 2 must NOT have been published
+    let count_2: i64 = sqlx::query_scalar(
+        "select count(*) from shared_checkpoint where document_id=$1 and through_seq=2",
+    )
+    .bind(document.0)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count_2, 0);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_publication_erasure_races_rejected(pool: PgPool) -> anyhow::Result<()> {
+    let (_, document, _) = seed(&pool).await?;
+    sqlx::query("update document set deleted_at=now() where id=$1")
+        .bind(document.0)
+        .execute(&pool)
+        .await?;
+
+    let err = postgres::take_incremental(&pool, document, 1, Limits::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Invalid("document missing or in trash")
+    ));
+    Ok(())
+}
