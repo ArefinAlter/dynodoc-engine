@@ -7,6 +7,8 @@
 use anyhow::{bail, Context};
 use sqlx::{PgConnection, PgPool};
 
+pub mod ordering;
+
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 const HISTORY: &[&str] = &[
