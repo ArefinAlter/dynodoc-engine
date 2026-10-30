@@ -11,6 +11,7 @@ use ring::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod archive;
 pub mod attestation;
 pub mod authority_epoch;
 pub mod compare;
@@ -220,7 +221,7 @@ impl Commit {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedCommit {
     pub commit: Commit,
