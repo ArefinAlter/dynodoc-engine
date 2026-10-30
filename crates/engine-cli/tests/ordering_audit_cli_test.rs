@@ -44,14 +44,91 @@ fn stderr_of(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+async fn unmigrate_collations(pool: &PgPool) {
+    sqlx::query("ALTER TABLE event DROP CONSTRAINT IF EXISTS event_target_node_id_fkey")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE node DROP CONSTRAINT IF EXISTS node_parent_id_fkey")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE node ALTER COLUMN id TYPE text COLLATE \"default\"")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE node ALTER COLUMN parent_id TYPE text COLLATE \"default\"")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE node ALTER COLUMN pos TYPE text COLLATE \"default\"")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE event ALTER COLUMN target_node_id TYPE text COLLATE \"default\"")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE change_request_review ALTER COLUMN node_id TYPE text COLLATE \"default\"",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE node ADD CONSTRAINT node_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES node(id) ON DELETE CASCADE")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE event ADD CONSTRAINT event_target_node_id_fkey FOREIGN KEY (target_node_id) REFERENCES node(id)")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 #[sqlx::test(migrations = "../../migrations")]
-async fn default_en_us_catalog_reports_mismatch_and_exits_2(pool: PgPool) {
+async fn migrated_catalog_reports_ok_and_exits_0(pool: PgPool) {
     let url = db_url(&pool);
     let output = run_cli(Some(&url), &["check-ordering"]);
     let stdout = stdout_of(&output);
     let stderr = stderr_of(&output);
 
-    // The command must exit with documented exit code 2 on ordering mismatch.
+    // The command must exit with 0 on fully migrated schema.
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "expected exit 0 on clean schema; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // Human-readable output checks
+    assert!(
+        stdout.contains("Column Collation Inventory"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("[OK] node.id"), "stdout:\n{stdout}");
+    assert!(stdout.contains("[OK] node.pos"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("[OK] event.target_node_id"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Synthetic Ordering Parity Checks"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("[OK] upper_lower"), "stdout:\n{stdout}");
+    assert!(stdout.contains("[OK] pos_keys"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Result: OK"), "stdout:\n{stdout}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmigrated_catalog_reports_mismatch_and_exits_2(pool: PgPool) {
+    unmigrate_collations(&pool).await;
+
+    let url = db_url(&pool);
+    let output = run_cli(Some(&url), &["check-ordering"]);
+    let stdout = stdout_of(&output);
+    let stderr = stderr_of(&output);
+
+    // On standard non-C database, unmigrated columns must exit with code 2.
     assert_eq!(
         output.status.code(),
         Some(2),
@@ -90,23 +167,44 @@ async fn default_en_us_catalog_reports_mismatch_and_exits_2(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn json_output_mode_contains_structured_diagnostics(pool: PgPool) {
     let url = db_url(&pool);
+
+    // 1. Fully-migrated state
     let output = run_cli(Some(&url), &["check-ordering", "--json"]);
     let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0));
 
-    assert_eq!(output.status.code(), Some(2));
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("invalid JSON output: {e}\n{stdout}"));
 
-    assert_eq!(parsed["compatible"], false);
-    assert_eq!(parsed["database"]["is_byte_order_default"], false);
-    assert!(parsed["incompatible_columns"].as_array().unwrap().len() >= 4);
-    assert!(parsed["ordering_mismatches"].as_i64().unwrap() > 0);
+    assert_eq!(parsed["compatible"], true);
+    assert_eq!(parsed["incompatible_columns"].as_array().unwrap().len(), 0);
+    assert_eq!(parsed["ordering_mismatches"], 0);
 
     let columns = parsed["columns"].as_array().expect("columns array");
-    let has_node_pos = columns
+    let node_pos = columns
         .iter()
-        .any(|c| c["table_name"] == "node" && c["column_name"] == "pos");
-    assert!(has_node_pos, "expected node.pos in column inventory");
+        .find(|c| c["table_name"] == "node" && c["column_name"] == "pos")
+        .expect("node.pos in inventory");
+    assert_eq!(node_pos["is_byte_order"], true);
+    assert_eq!(node_pos["explicit_collation"], "C");
+
+    // 2. Unmigrated state
+    unmigrate_collations(&pool).await;
+    let output_unmig = run_cli(Some(&url), &["check-ordering", "--json"]);
+    let stdout_unmig = stdout_of(&output_unmig);
+    assert_eq!(output_unmig.status.code(), Some(2));
+
+    let parsed_unmig: serde_json::Value = serde_json::from_str(&stdout_unmig)
+        .unwrap_or_else(|e| panic!("invalid JSON output: {e}\n{stdout_unmig}"));
+    assert_eq!(parsed_unmig["compatible"], false);
+    assert!(
+        parsed_unmig["incompatible_columns"]
+            .as_array()
+            .unwrap()
+            .len()
+            >= 4
+    );
+    assert!(parsed_unmig["ordering_mismatches"].as_i64().unwrap() > 0);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -198,8 +296,8 @@ async fn runtime_login_has_sufficient_privileges_for_audit(pool: PgPool) {
 
     assert_eq!(
         output.status.code(),
-        Some(2),
-        "expected exit 2 from runtime check; stdout:\n{stdout}\nstderr:\n{stderr}"
+        Some(0),
+        "expected exit 0 from runtime check on migrated schema; stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         !stderr.contains("permission denied"),
