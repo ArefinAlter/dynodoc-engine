@@ -2306,6 +2306,7 @@ async fn remote_compare_cli_options_execution() {
         action: Action::Compare {
             from: from.clone(),
             to: to.clone(),
+            path: None,
             json: true,
         },
     };
@@ -2326,6 +2327,754 @@ async fn remote_compare_cli_options_execution() {
         action: Action::Compare {
             from: from.clone(),
             to: to.clone(),
+            path: None,
+            json: false,
+        },
+    };
+    run(options_text).await.unwrap();
+
+    server.abort();
+    let _ = server.await;
+    repo.close().await;
+    journal.close().await;
+    remove(repo_path).await;
+    remove(pin_path).await;
+    let _ = std::fs::remove_file(remote_file);
+    let _ = std::fs::remove_file(token_file);
+}
+
+#[tokio::test]
+async fn remote_file_compare_multi_page_success_and_local_state_unchanged() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let (repo_path, repo) = repo(project).await;
+    let (pin_path, journal) = journal().await;
+    let from = Address::try_from("1".repeat(64)).unwrap();
+    let to = Address::try_from("2".repeat(64)).unwrap();
+    let root1 = Address::try_from("a".repeat(64)).unwrap();
+    let root2 = Address::try_from("b".repeat(64)).unwrap();
+    let doc_id = Uuid::new_v4();
+
+    let served_project = project;
+    let served_from = from.clone();
+    let served_to = to.clone();
+    let r1 = root1.clone();
+    let r2 = root2.clone();
+
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/compare/file",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let p = served_project;
+                let f = served_from.clone();
+                let t = served_to.clone();
+                let r1 = r1.clone();
+                let r2 = r2.clone();
+                async move {
+                    assert_eq!(params.get("from").unwrap(), f.as_str());
+                    assert_eq!(params.get("to").unwrap(), t.as_str());
+                    assert_eq!(params.get("path").unwrap(), "doc.txt");
+                    let cursor = params.get("cursor").cloned();
+                    if cursor.is_none() {
+                        Json(json!({
+                            "project": p,
+                            "from": f,
+                            "to": t,
+                            "path": "doc.txt",
+                            "kind": "modified",
+                            "from_file": { "document": doc_id, "state": r1 },
+                            "to_file": { "document": doc_id, "state": r2 },
+                            "document_replaced": false,
+                            "node_diff": {
+                                "document_id": doc_id,
+                                "from_root": r1,
+                                "to_root": r2,
+                                "whole_state_identical": false,
+                                "totals": { "added": 1, "removed": 1, "modified": 1, "unchanged": 0, "total_changes": 3 },
+                                "components": {
+                                    "comments_changed": true,
+                                    "comments_from_count": 0,
+                                    "comments_to_count": 2,
+                                    "suggestions_changed": false,
+                                    "suggestions_from_count": 0,
+                                    "suggestions_to_count": 0,
+                                    "removed_choices_changed": false,
+                                    "removed_choices_from_count": 0,
+                                    "removed_choices_to_count": 0
+                                },
+                                "changes": [
+                                    {
+                                        "node_id": "node_01",
+                                        "kind": "modified",
+                                        "from": { "id": "node_01", "node_type": "paragraph", "pos": "a0", "deleted": false },
+                                        "to": { "id": "node_01", "node_type": "paragraph", "pos": "a0", "deleted": false },
+                                        "field_changes": [
+                                            {
+                                                "field": "content",
+                                                "from": { "omitted": true, "bytes": 10000, "sha256": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" },
+                                                "to": "small"
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        "node_id": "node_02",
+                                        "kind": "removed",
+                                        "from": { "id": "node_02", "node_type": "paragraph", "pos": "a1", "deleted": false },
+                                        "to": null,
+                                        "field_changes": []
+                                    }
+                                ],
+                                "next_cursor": "page2",
+                                "more": true,
+                                "limits": "finite limits"
+                            },
+                            "next_cursor": "page2",
+                            "more": true
+                        }))
+                    } else if cursor.as_deref() == Some("page2") {
+                        Json(json!({
+                            "project": p,
+                            "from": f,
+                            "to": t,
+                            "path": "doc.txt",
+                            "kind": "modified",
+                            "from_file": { "document": doc_id, "state": r1 },
+                            "to_file": { "document": doc_id, "state": r2 },
+                            "document_replaced": false,
+                            "node_diff": {
+                                "document_id": doc_id,
+                                "from_root": r1,
+                                "to_root": r2,
+                                "whole_state_identical": false,
+                                "totals": { "added": 1, "removed": 1, "modified": 1, "unchanged": 0, "total_changes": 3 },
+                                "components": {
+                                    "comments_changed": true,
+                                    "comments_from_count": 0,
+                                    "comments_to_count": 2,
+                                    "suggestions_changed": false,
+                                    "suggestions_from_count": 0,
+                                    "suggestions_to_count": 0,
+                                    "removed_choices_changed": false,
+                                    "removed_choices_from_count": 0,
+                                    "removed_choices_to_count": 0
+                                },
+                                "changes": [
+                                    {
+                                        "node_id": "node_03",
+                                        "kind": "added",
+                                        "from": null,
+                                        "to": { "id": "node_03", "node_type": "paragraph", "pos": "a2", "deleted": false },
+                                        "field_changes": [
+                                            {
+                                                "field": "content",
+                                                "from": null,
+                                                "to": "new node"
+                                            }
+                                        ]
+                                    }
+                                ],
+                                "next_cursor": null,
+                                "more": false,
+                                "limits": "finite limits"
+                            },
+                            "next_cursor": null,
+                            "more": false
+                        }))
+                    } else {
+                        panic!("unexpected cursor: {:?}", cursor);
+                    }
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+
+    let report = compare_file(&client, &from, &to, "doc.txt").await.unwrap();
+    assert_eq!(report.project, project);
+    assert_eq!(report.from, from);
+    assert_eq!(report.to, to);
+    assert_eq!(report.path, "doc.txt");
+    assert_eq!(report.kind, DiffKind::Modified);
+    assert!(!report.document_replaced);
+
+    let nd = report.node_diff.as_ref().unwrap();
+    assert_eq!(nd.changes.len(), 3);
+    assert_eq!(nd.changes[0].node_id.0, "node_01");
+    assert_eq!(nd.changes[1].node_id.0, "node_02");
+    assert_eq!(nd.changes[2].node_id.0, "node_03");
+
+    // Text output verification
+    let text = format_file_compare_text(&report);
+    assert!(text.contains("Server-produced metadata"));
+    assert!(text.contains("doc.txt"));
+    assert!(text.contains("[omitted: 10000 bytes"));
+    assert!(text.contains("comments (from: 0, to: 2, changed: true)"));
+
+    // JSON output verification
+    let json_val = format_file_compare_json(&report).unwrap();
+    assert_eq!(json_val["server_metadata"], true);
+    assert!(json_val["disclaimer"].is_string());
+
+    server.abort();
+    let _ = server.await;
+    repo.close().await;
+    journal.close().await;
+    remove(repo_path).await;
+    remove(pin_path).await;
+}
+
+#[tokio::test]
+async fn remote_file_compare_replaced_and_added_and_removed() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let from = Address::try_from("1".repeat(64)).unwrap();
+    let to = Address::try_from("2".repeat(64)).unwrap();
+    let doc1 = Uuid::new_v4();
+    let doc2 = Uuid::new_v4();
+    let root1 = Address::try_from("a".repeat(64)).unwrap();
+    let root2 = Address::try_from("b".repeat(64)).unwrap();
+
+    let p_c = project;
+    let f_c = from.clone();
+    let t_c = to.clone();
+    let r1 = root1.clone();
+    let r2 = root2.clone();
+
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/compare/file",
+            get(move |Query(params): Query<HashMap<String, String>>| {
+                let p = p_c;
+                let f = f_c.clone();
+                let t = t_c.clone();
+                let r1 = r1.clone();
+                let r2 = r2.clone();
+                async move {
+                    let path = params.get("path").unwrap().as_str();
+                    match path {
+                        "replaced.txt" => Json(json!({
+                            "project": p,
+                            "from": f,
+                            "to": t,
+                            "path": "replaced.txt",
+                            "kind": "modified",
+                            "from_file": { "document": doc1, "state": r1 },
+                            "to_file": { "document": doc2, "state": r2 },
+                            "document_replaced": true,
+                            "node_diff": null,
+                            "next_cursor": null,
+                            "more": false
+                        })),
+                        "added.txt" => Json(json!({
+                            "project": p,
+                            "from": f,
+                            "to": t,
+                            "path": "added.txt",
+                            "kind": "added",
+                            "from_file": null,
+                            "to_file": { "document": doc1, "state": r1 },
+                            "document_replaced": false,
+                            "node_diff": null,
+                            "next_cursor": null,
+                            "more": false
+                        })),
+                        "removed.txt" => Json(json!({
+                            "project": p,
+                            "from": f,
+                            "to": t,
+                            "path": "removed.txt",
+                            "kind": "removed",
+                            "from_file": { "document": doc1, "state": r1 },
+                            "to_file": null,
+                            "document_replaced": false,
+                            "node_diff": null,
+                            "next_cursor": null,
+                            "more": false
+                        })),
+                        other => panic!("unexpected path: {other}"),
+                    }
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+
+    let rep_replaced = compare_file(&client, &from, &to, "replaced.txt")
+        .await
+        .unwrap();
+    assert_eq!(rep_replaced.kind, DiffKind::Modified);
+    assert!(rep_replaced.document_replaced);
+    assert!(format_file_compare_text(&rep_replaced).contains("Document: replaced"));
+
+    let rep_added = compare_file(&client, &from, &to, "added.txt")
+        .await
+        .unwrap();
+    assert_eq!(rep_added.kind, DiffKind::Added);
+    assert!(!rep_added.document_replaced);
+
+    let rep_removed = compare_file(&client, &from, &to, "removed.txt")
+        .await
+        .unwrap();
+    assert_eq!(rep_removed.kind, DiffKind::Removed);
+    assert!(!rep_removed.document_replaced);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn remote_file_compare_mid_run_401_with_one_allowed_refresh() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let from = Address::try_from("1".repeat(64)).unwrap();
+    let to = Address::try_from("2".repeat(64)).unwrap();
+    let doc = Uuid::new_v4();
+    let r1 = Address::try_from("a".repeat(64)).unwrap();
+    let r2 = Address::try_from("b".repeat(64)).unwrap();
+
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_calls_clone = refresh_calls.clone();
+
+    let f_served = from.clone();
+    let t_served = to.clone();
+    let router = Router::new()
+        .route(
+            "/auth/refresh",
+            axum::routing::post(move |Json(body): Json<Value>| {
+                let calls = refresh_calls_clone.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(body["refresh_token"], "1111111111222222222233333333334444444444555555555566666666667777");
+                    Json(json!({
+                        "access_token": "token_renewed",
+                        "refresh_token": "8888888888999999999900000000001111111111222222222233333333334444",
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/compare/file",
+            get(move |headers: HeaderMap, Query(params): Query<HashMap<String, String>>| {
+                let f = f_served.clone();
+                let t = t_served.clone();
+                let r1 = r1.clone();
+                let r2 = r2.clone();
+                async move {
+                    let cursor = params.get("cursor").cloned();
+                    let auth = headers.get("authorization").and_then(|h| h.to_str().ok());
+
+                    if cursor.is_none() {
+                        assert_eq!(auth, Some("Bearer token_initial"));
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "project": project,
+                                "from": f,
+                                "to": t,
+                                "path": "doc.txt",
+                                "kind": "modified",
+                                "from_file": { "document": doc, "state": r1 },
+                                "to_file": { "document": doc, "state": r2 },
+                                "document_replaced": false,
+                                "node_diff": {
+                                    "document_id": doc,
+                                    "from_root": r1,
+                                    "to_root": r2,
+                                    "whole_state_identical": false,
+                                    "totals": { "added": 2, "removed": 0, "modified": 0, "unchanged": 0, "total_changes": 2 },
+                                    "components": {
+                                        "comments_changed": false,
+                                        "comments_from_count": 0,
+                                        "comments_to_count": 0,
+                                        "suggestions_changed": false,
+                                        "suggestions_from_count": 0,
+                                        "suggestions_to_count": 0,
+                                        "removed_choices_changed": false,
+                                        "removed_choices_from_count": 0,
+                                        "removed_choices_to_count": 0
+                                    },
+                                    "changes": [{ "node_id": "node_01", "kind": "added" }],
+                                    "next_cursor": "page2",
+                                    "more": true,
+                                    "limits": "limits"
+                                },
+                                "next_cursor": "page2",
+                                "more": true
+                            })),
+                        )
+                    } else if cursor.as_deref() == Some("page2") {
+                        if auth == Some("Bearer token_initial") {
+                            (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({"code": "unauthorized", "details": {"reason": "expired"}})),
+                            )
+                        } else if auth == Some("Bearer token_renewed") {
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "project": project,
+                                    "from": f,
+                                    "to": t,
+                                    "path": "doc.txt",
+                                    "kind": "modified",
+                                    "from_file": { "document": doc, "state": r1 },
+                                    "to_file": { "document": doc, "state": r2 },
+                                    "document_replaced": false,
+                                    "node_diff": {
+                                        "document_id": doc,
+                                        "from_root": r1,
+                                        "to_root": r2,
+                                        "whole_state_identical": false,
+                                        "totals": { "added": 2, "removed": 0, "modified": 0, "unchanged": 0, "total_changes": 2 },
+                                        "components": {
+                                            "comments_changed": false,
+                                            "comments_from_count": 0,
+                                            "comments_to_count": 0,
+                                            "suggestions_changed": false,
+                                            "suggestions_from_count": 0,
+                                            "suggestions_to_count": 0,
+                                            "removed_choices_changed": false,
+                                            "removed_choices_from_count": 0,
+                                            "removed_choices_to_count": 0
+                                        },
+                                        "changes": [{ "node_id": "node_02", "kind": "added" }],
+                                        "next_cursor": null,
+                                        "more": false,
+                                        "limits": "limits"
+                                    },
+                                    "next_cursor": null,
+                                    "more": false
+                                })),
+                            )
+                        } else {
+                            panic!("unexpected auth header: {:?}", auth);
+                        }
+                    } else {
+                        panic!("unexpected cursor: {:?}", cursor);
+                    }
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+    let refresh_file = std::env::temp_dir().join(format!("dynodoc-ref-{}.txt", Uuid::new_v4()));
+    let access_file = std::env::temp_dir().join(format!("dynodoc-acc-{}.txt", Uuid::new_v4()));
+    crate::private_file::write_private_test(
+        &refresh_file,
+        b"1111111111222222222233333333334444444444555555555566666666667777\n",
+    )
+    .unwrap();
+    crate::private_file::write_private_test(&access_file, b"token_initial\n").unwrap();
+
+    let client = Client::with_credential(
+        remote(url, authority),
+        project,
+        Credential::Refresh {
+            refresh_file: refresh_file.clone(),
+            access_file: Some(access_file.clone()),
+        },
+        Some("token_initial"),
+        true,
+    )
+    .unwrap();
+
+    let report = compare_file(&client, &from, &to, "doc.txt").await.unwrap();
+    assert_eq!(report.node_diff.unwrap().changes.len(), 2);
+    assert_eq!(refresh_calls.load(Ordering::Relaxed), 1);
+
+    server.abort();
+    let _ = server.await;
+    let _ = std::fs::remove_file(refresh_file);
+    let _ = std::fs::remove_file(access_file);
+}
+
+#[tokio::test]
+async fn remote_file_compare_integrity_checks_and_error_handling() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let from = Address::try_from("1".repeat(64)).unwrap();
+    let to = Address::try_from("2".repeat(64)).unwrap();
+    let doc = Uuid::new_v4();
+    let r1 = Address::try_from("a".repeat(64)).unwrap();
+    let r2 = Address::try_from("b".repeat(64)).unwrap();
+
+    // 1. Cursor loop
+    let f1 = from.clone();
+    let t1 = to.clone();
+    let r1_c = r1.clone();
+    let r2_c = r2.clone();
+    let loop_calls = Arc::new(AtomicUsize::new(0));
+    let lc = loop_calls.clone();
+    let router = Router::new()
+        .route("/projects/{id}/history/authority", get(move || async move { Json(epoch_one(authority)) }))
+        .route("/projects/{id}/history/compare/file", get(move || {
+            let f = f1.clone();
+            let t = t1.clone();
+            let r1 = r1_c.clone();
+            let r2 = r2_c.clone();
+            let lc = lc.clone();
+            async move {
+                let call = lc.fetch_add(1, Ordering::Relaxed);
+                let node_id = if call == 0 { "node_01" } else { "node_02" };
+                Json(json!({
+                    "project": project,
+                    "from": f,
+                    "to": t,
+                    "path": "doc.txt",
+                    "kind": "modified",
+                    "from_file": { "document": doc, "state": r1 },
+                    "to_file": { "document": doc, "state": r2 },
+                    "document_replaced": false,
+                    "node_diff": {
+                        "document_id": doc,
+                        "from_root": r1,
+                        "to_root": r2,
+                        "whole_state_identical": false,
+                        "totals": { "added": 2, "removed": 0, "modified": 0, "unchanged": 0, "total_changes": 2 },
+                        "components": {
+                            "comments_changed": false,
+                            "comments_from_count": 0,
+                            "comments_to_count": 0,
+                            "suggestions_changed": false,
+                            "suggestions_from_count": 0,
+                            "suggestions_to_count": 0,
+                            "removed_choices_changed": false,
+                            "removed_choices_from_count": 0,
+                            "removed_choices_to_count": 0
+                        },
+                        "changes": [{ "node_id": node_id, "kind": "added" }],
+                        "next_cursor": "loop_cursor",
+                        "more": true,
+                        "limits": "limits"
+                    },
+                    "next_cursor": "loop_cursor",
+                    "more": true
+                }))
+            }
+        }));
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+    let err = compare_file(&client, &from, &to, "doc.txt")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("cursor loop"),
+        "expected cursor loop error, got: {err}"
+    );
+    server.abort();
+    let _ = server.await;
+
+    // 2. Out of order node IDs
+    let f2 = from.clone();
+    let t2 = to.clone();
+    let r1_c = r1.clone();
+    let r2_c = r2.clone();
+    let router = Router::new()
+        .route("/projects/{id}/history/authority", get(move || async move { Json(epoch_one(authority)) }))
+        .route("/projects/{id}/history/compare/file", get(move || {
+            let f = f2.clone();
+            let t = t2.clone();
+            let r1 = r1_c.clone();
+            let r2 = r2_c.clone();
+            async move {
+                Json(json!({
+                    "project": project,
+                    "from": f,
+                    "to": t,
+                    "path": "doc.txt",
+                    "kind": "modified",
+                    "from_file": { "document": doc, "state": r1 },
+                    "to_file": { "document": doc, "state": r2 },
+                    "document_replaced": false,
+                    "node_diff": {
+                        "document_id": doc,
+                        "from_root": r1,
+                        "to_root": r2,
+                        "whole_state_identical": false,
+                        "totals": { "added": 2, "removed": 0, "modified": 0, "unchanged": 0, "total_changes": 2 },
+                        "components": {
+                            "comments_changed": false,
+                            "comments_from_count": 0,
+                            "comments_to_count": 0,
+                            "suggestions_changed": false,
+                            "suggestions_from_count": 0,
+                            "suggestions_to_count": 0,
+                            "removed_choices_changed": false,
+                            "removed_choices_from_count": 0,
+                            "removed_choices_to_count": 0
+                        },
+                        "changes": [
+                            { "node_id": "node_z", "kind": "added" },
+                            { "node_id": "node_a", "kind": "added" }
+                        ],
+                        "next_cursor": null,
+                        "more": false,
+                        "limits": "limits"
+                    },
+                    "next_cursor": null,
+                    "more": false
+                }))
+            }
+        }));
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+    let err = compare_file(&client, &from, &to, "doc.txt")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("node changes out of order"),
+        "expected out of order error, got: {err}"
+    );
+    server.abort();
+    let _ = server.await;
+
+    // 3. Path mismatch
+    let f3 = from.clone();
+    let t3 = to.clone();
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/compare/file",
+            get(move || {
+                let f = f3.clone();
+                let t = t3.clone();
+                async move {
+                    Json(json!({
+                        "project": project,
+                        "from": f,
+                        "to": t,
+                        "path": "different.txt",
+                        "kind": "added",
+                        "from_file": null,
+                        "to_file": null,
+                        "document_replaced": false,
+                        "node_diff": null,
+                        "next_cursor": null,
+                        "more": false
+                    }))
+                }
+            }),
+        );
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+    let err = compare_file(&client, &from, &to, "doc.txt")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("path mismatch"),
+        "expected path mismatch, got: {err}"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn remote_file_compare_cli_options_execution() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let (repo_path, repo) = repo(project).await;
+    let (pin_path, journal) = journal().await;
+    let from = Address::try_from("1".repeat(64)).unwrap();
+    let to = Address::try_from("2".repeat(64)).unwrap();
+
+    let from_served = from.clone();
+    let to_served = to.clone();
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/compare/file",
+            get(move || {
+                let f = from_served.clone();
+                let t = to_served.clone();
+                async move {
+                    Json(json!({
+                        "project": project,
+                        "from": f,
+                        "to": t,
+                        "path": "doc.txt",
+                        "kind": "added",
+                        "from_file": null,
+                        "to_file": null,
+                        "document_replaced": false,
+                        "node_diff": null,
+                        "next_cursor": null,
+                        "more": false
+                    }))
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+    let remote_file = std::env::temp_dir().join(format!("dynodoc-remote-{}.json", Uuid::new_v4()));
+    let token_file = std::env::temp_dir().join(format!("dynodoc-tok-{}.txt", Uuid::new_v4()));
+    std::fs::write(
+        &remote_file,
+        serde_json::to_vec(&remote(url, authority)).unwrap(),
+    )
+    .unwrap();
+    crate::private_file::write_private_test(&token_file, b"token_test\n").unwrap();
+
+    // Run with json: true
+    let options_json = Options {
+        repository: repo_path.clone(),
+        project,
+        remote: remote_file.clone(),
+        token_file: Some(token_file.clone()),
+        refresh_token_file: None,
+        device_key: None,
+        journal: pin_path.clone(),
+        branch: "main".into(),
+        allow_loopback_http: true,
+        accept_authority_break: None,
+        action: Action::Compare {
+            from: from.clone(),
+            to: to.clone(),
+            path: Some("doc.txt".into()),
+            json: true,
+        },
+    };
+    run(options_json).await.unwrap();
+
+    // Run with json: false (text)
+    let options_text = Options {
+        repository: repo_path.clone(),
+        project,
+        remote: remote_file.clone(),
+        token_file: Some(token_file.clone()),
+        refresh_token_file: None,
+        device_key: None,
+        journal: pin_path.clone(),
+        branch: "main".into(),
+        allow_loopback_http: true,
+        accept_authority_break: None,
+        action: Action::Compare {
+            from: from.clone(),
+            to: to.clone(),
+            path: Some("doc.txt".into()),
             json: false,
         },
     };
