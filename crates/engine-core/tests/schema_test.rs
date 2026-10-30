@@ -302,3 +302,259 @@ async fn content_hash_is_not_null(pool: PgPool) -> sqlx::Result<()> {
     );
     Ok(())
 }
+
+/// (e) High-volume JSONB columns use LZ4 compression (migration 0050).
+#[sqlx::test(migrations = "../../migrations")]
+async fn high_volume_jsonb_columns_use_lz4_compression(pool: PgPool) -> sqlx::Result<()> {
+    // 1. Verify pg_attribute attcompression column setting
+    let rows: Vec<(String, String, Option<i8>)> = sqlx::query_as(
+        "select c.relname::text, a.attname::text, a.attcompression
+         from pg_attribute a
+         join pg_class c on a.attrelid = c.oid
+         where c.relname in ('event', 'snapshot', 'node')
+           and a.attname in ('payload', 'state', 'current_fields')
+         order by c.relname, a.attname",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    assert_eq!(rows.len(), 3, "expected 3 configured columns; got {rows:?}");
+    for (relname, attname, compression) in rows {
+        // 'l' in ASCII is 108 (lz4)
+        assert_eq!(
+            compression,
+            Some(b'l' as i8),
+            "expected lz4 compression ('l') for {relname}.{attname}, got {compression:?}"
+        );
+    }
+
+    // 2. Insert new rows with large enough JSON to trigger TOAST compression and verify pg_column_compression
+    let s = seed(&pool).await?;
+
+    // Create a repetitive JSON payload that exceeds the TOAST threshold (typically 2KB)
+    let large_payload = serde_json::json!({
+        "type": "BatchImported",
+        "description": "Repetitive structured JSON payload testing LZ4 compression on event.payload. ".repeat(60),
+        "nested": {
+            "runs": (0..40).map(|i| serde_json::json!({ "id": i, "bold": true, "font": "Inter" })).collect::<Vec<_>>()
+        }
+    });
+
+    let event_id = ulid::Ulid::generate().to_string();
+    sqlx::query(
+        "insert into event
+           (id, document_id, seq, type, actor_id, target_node_id, payload,
+            content_hash, prev_chain_hash, chain_hash)
+         values ($1, $2, 2, 'FieldEdited', $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(&event_id)
+    .bind(s.document_id)
+    .bind(s.identity_id)
+    .bind(&s.node_id)
+    .bind(&large_payload)
+    .bind(&digest(0x12)[..])
+    .bind(&digest(0x22)[..])
+    .bind(&digest(0x32)[..])
+    .execute(&pool)
+    .await?;
+
+    let comp_method: Option<String> =
+        sqlx::query_scalar("select pg_column_compression(payload) from event where id = $1")
+            .bind(&event_id)
+            .fetch_one(&pool)
+            .await?;
+
+    assert_eq!(
+        comp_method.as_deref(),
+        Some("lz4"),
+        "event.payload must be compressed with lz4"
+    );
+
+    // 3. Verify decoded equality
+    let ev: Event = sqlx::query_as("select * from event where id = $1")
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        ev.payload, large_payload,
+        "decoded payload must match exactly"
+    );
+
+    // 4. Verify snapshot state LZ4 compression and decoded equality
+    let large_state = serde_json::json!({
+        "document_id": s.document_id,
+        "nodes": (0..50).map(|i| serde_json::json!({
+            "id": format!("node_{i}"),
+            "pos": format!("a{i:03}"),
+            "fields": { "title": format!("Clause {i}"), "body": "Historical record with verifiable hash proofs. ".repeat(10) }
+        })).collect::<Vec<_>>()
+    });
+
+    let snap_id: uuid::Uuid = sqlx::query_scalar(
+        "insert into snapshot (document_id, through_seq, state, merkle_root, event_chain_hash)
+         values ($1, 2, $2, $3, $4) returning id",
+    )
+    .bind(s.document_id)
+    .bind(&large_state)
+    .bind(&digest(0x44)[..])
+    .bind(&digest(0x32)[..])
+    .fetch_one(&pool)
+    .await?;
+
+    let snap_comp: Option<String> =
+        sqlx::query_scalar("select pg_column_compression(state) from snapshot where id = $1")
+            .bind(snap_id)
+            .fetch_one(&pool)
+            .await?;
+
+    assert_eq!(
+        snap_comp.as_deref(),
+        Some("lz4"),
+        "snapshot.state must be compressed with lz4"
+    );
+
+    let snap: Snapshot = sqlx::query_as("select * from snapshot where id = $1")
+        .bind(snap_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        snap.state, large_state,
+        "decoded snapshot state must match exactly"
+    );
+
+    Ok(())
+}
+
+/// Old-to-new schema upgrade: existing historical rows retain pglz/uncompressed data
+/// and hashes intact, while newly written rows use LZ4 compression.
+#[sqlx::test(migrations = "../../migrations")]
+async fn schema_upgrade_preserves_historical_rows_and_compresses_new_rows(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let s = seed(&pool).await?;
+
+    // 1. Simulate an existing pre-0050 historical row by explicitly writing with pglz compression.
+    sqlx::query("alter table event alter column payload set compression pglz")
+        .execute(&pool)
+        .await?;
+
+    let old_payload = serde_json::json!({
+        "type": "FieldEdited",
+        "historical_note": "Created prior to migration 0050 with legacy pglz compression. ".repeat(60),
+        "revision": 2
+    });
+    let old_event_id = ulid::Ulid::generate().to_string();
+    let old_content_hash = digest(0x71);
+    let old_chain_hash = digest(0x72);
+
+    sqlx::query(
+        "insert into event
+           (id, document_id, seq, type, actor_id, target_node_id, payload,
+            content_hash, prev_chain_hash, chain_hash)
+         values ($1, $2, 2, 'FieldEdited', $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(&old_event_id)
+    .bind(s.document_id)
+    .bind(s.identity_id)
+    .bind(&s.node_id)
+    .bind(&old_payload)
+    .bind(&old_content_hash[..])
+    .bind(&digest(0x22)[..])
+    .bind(&old_chain_hash[..])
+    .execute(&pool)
+    .await?;
+
+    let old_comp: Option<String> =
+        sqlx::query_scalar("select pg_column_compression(payload) from event where id = $1")
+            .bind(&old_event_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        old_comp.as_deref(),
+        Some("pglz"),
+        "historical pre-upgrade row should be pglz"
+    );
+
+    // 2. Apply migration 0050 alteration to set column compression to LZ4
+    sqlx::query("alter table event alter column payload set compression lz4")
+        .execute(&pool)
+        .await?;
+
+    // 3. Historical row must be completely unchanged (same payload, hashes, and pglz compression)
+    let old_comp_after: Option<String> =
+        sqlx::query_scalar("select pg_column_compression(payload) from event where id = $1")
+            .bind(&old_event_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        old_comp_after.as_deref(),
+        Some("pglz"),
+        "migration must never rewrite or recompress historical row"
+    );
+
+    let read_old: Event = sqlx::query_as("select * from event where id = $1")
+        .bind(&old_event_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(read_old.payload, old_payload);
+    assert_eq!(read_old.content_hash, old_content_hash);
+    assert_eq!(read_old.chain_hash, old_chain_hash);
+
+    // 4. Newly written row after upgrade uses LZ4 compression
+    let new_payload = serde_json::json!({
+        "type": "FieldEdited",
+        "upgrade_note": "Created after migration 0050 with new LZ4 compression. ".repeat(60),
+        "revision": 3
+    });
+    let new_event_id = ulid::Ulid::generate().to_string();
+    let new_content_hash = digest(0x81);
+    let new_chain_hash = digest(0x82);
+
+    sqlx::query(
+        "insert into event
+           (id, document_id, seq, type, actor_id, target_node_id, payload,
+            content_hash, prev_chain_hash, chain_hash)
+         values ($1, $2, 3, 'FieldEdited', $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(&new_event_id)
+    .bind(s.document_id)
+    .bind(s.identity_id)
+    .bind(&s.node_id)
+    .bind(&new_payload)
+    .bind(&new_content_hash[..])
+    .bind(&old_chain_hash[..])
+    .bind(&new_chain_hash[..])
+    .execute(&pool)
+    .await?;
+
+    let new_comp: Option<String> =
+        sqlx::query_scalar("select pg_column_compression(payload) from event where id = $1")
+            .bind(&new_event_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        new_comp.as_deref(),
+        Some("lz4"),
+        "newly written row after upgrade must use lz4"
+    );
+
+    let read_new: Event = sqlx::query_as("select * from event where id = $1")
+        .bind(&new_event_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(read_new.payload, new_payload);
+    assert_eq!(read_new.content_hash, new_content_hash);
+    assert_eq!(read_new.chain_hash, new_chain_hash);
+
+    // 5. Reading both in a single query works seamlessly
+    let all_events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id = $1 order by seq asc")
+            .bind(s.document_id)
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(all_events.len(), 3);
+    assert_eq!(all_events[1].id.0, old_event_id);
+    assert_eq!(all_events[2].id.0, new_event_id);
+
+    Ok(())
+}
