@@ -134,6 +134,18 @@ pub enum Action {
         #[arg(long)]
         expect_head: String,
     },
+    /// Export a local historical file as a normalized-state JSON envelope.
+    ExportFile {
+        /// Commit address containing the file.
+        #[arg(long)]
+        commit: String,
+        /// Path of the file within the commit.
+        #[arg(long)]
+        path: String,
+        /// Output file path for the normalized state (refuses overwrite).
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Import a private staging upload JSON batch, without moving any branch.
     ImportObjects { input: PathBuf },
     /// Read-only retention plan: what no branch head or recovery source reaches.
@@ -546,13 +558,14 @@ fn today_start_ms() -> anyhow::Result<i64> {
 }
 
 pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::Result<()> {
-    // The retention, horizon plans and archive export/verify must not create, upgrade or write the database.
+    // The retention, horizon plans, archive export/verify, and export-file must not create, upgrade or write the database.
     let repo = if matches!(
         action,
         Action::GcPlan { .. }
             | Action::HorizonPlan { .. }
             | Action::ArchiveExport { .. }
             | Action::ArchiveVerify { .. }
+            | Action::ExportFile { .. }
     ) {
         LocalRepository::open_read_only(&path, project).await?
     } else {
@@ -740,6 +753,82 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                 "bytes_before_footer": summary.bytes_before_footer,
                 "total_bytes": summary.total_bytes,
                 "sha256": summary.sha256,
+            })
+        }
+        Action::ExportFile {
+            commit,
+            path: file_path,
+            out,
+        } => {
+            let commit_addr = address(commit)?;
+            anyhow::ensure!(
+                !out.exists(),
+                "output file {} already exists; refusing overwrite",
+                out.display()
+            );
+
+            let signed = repo.commit(&commit_addr).await.with_context(|| {
+                format!("commit {} not found in repository", commit_addr.as_str())
+            })?;
+
+            let verified_addr = signed.verify().with_context(|| {
+                format!(
+                    "commit {} signature verification failed",
+                    commit_addr.as_str()
+                )
+            })?;
+            anyhow::ensure!(
+                verified_addr == commit_addr,
+                "commit address mismatch: expected {}, verified {}",
+                commit_addr.as_str(),
+                verified_addr.as_str()
+            );
+
+            anyhow::ensure!(
+                signed.commit.project == project,
+                "commit project {} does not match repository project {project}",
+                signed.commit.project
+            );
+
+            let file_entry = signed
+                .commit
+                .files
+                .get(&file_path)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "path {file_path:?} not found in commit {}",
+                        commit_addr.as_str()
+                    )
+                })?;
+
+            let state = repo
+                .read_state(file_entry.document, &file_entry.state)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to reconstruct state root {} for document {}",
+                        file_entry.state.as_str(),
+                        file_entry.document.0
+                    )
+                })?;
+
+            let envelope = engine_core::repository::state_export::StateExportEnvelope::new(
+                file_path.clone(),
+                signed,
+                state,
+            );
+
+            envelope.write_to_path(&out)?;
+
+            serde_json::json!({
+                "out": out.display().to_string(),
+                "commit": commit_addr,
+                "path": file_path,
+                "document": file_entry.document.0,
+                "state_root": file_entry.state,
+                "format": engine_core::repository::state_export::STATE_EXPORT_FORMAT,
+                "version": engine_core::repository::state_export::STATE_EXPORT_VERSION,
             })
         }
         Action::ImportObjects { input } => {
@@ -2991,5 +3080,245 @@ mod tests {
         let _ = std::fs::remove_file(&archive_trunc);
 
         f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn export_file_retained_old_commit_after_later_edits_and_deletion() {
+        use engine_core::repository::state_export::StateExportEnvelope;
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+
+        // c1: Report.docx v1
+        let f1 = f.file(doc1, &[(0, "Report v1")]).await;
+        let c1 = f.commit(&[], vec![("Report.docx", f1)], "Genesis").await;
+
+        // c2: Report.docx v2
+        let f2 = f.file(doc1, &[(0, "Report v2")]).await;
+        let c2 = f
+            .commit(&[&c1], vec![("Report.docx", f2)], "Edit report")
+            .await;
+
+        // c3: Delete Report.docx and add Report-Renamed.docx
+        let f3 = f.file(doc1, &[(0, "Report Renamed")]).await;
+        let c3 = f
+            .commit(&[&c2], vec![("Report-Renamed.docx", f3)], "Rename report")
+            .await;
+
+        let export_out =
+            std::env::temp_dir().join(format!("test-export-v1-{}.json", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&export_out);
+
+        // Export Report.docx from retained old commit c1
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ExportFile {
+                commit: c1.as_str().to_string(),
+                path: "Report.docx".to_string(),
+                out: export_out.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(export_out.is_file());
+
+        // Verify exported envelope JSON
+        let envelope_bytes = std::fs::read(&export_out).unwrap();
+        let envelope: StateExportEnvelope = serde_json::from_slice(&envelope_bytes).unwrap();
+        assert_eq!(envelope.format, "dynodoc.state-export");
+        assert_eq!(envelope.version, 1);
+        assert_eq!(envelope.path, "Report.docx");
+        assert_eq!(envelope.commit.verify().unwrap(), c1);
+        assert_eq!(envelope.state, paragraphs(&[(0, "Report v1")]));
+
+        // Attempting to export Report.docx at c3 must fail (file was deleted)
+        let export_fail_deleted = std::env::temp_dir().join(format!(
+            "test-export-fail-del-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let err_del = run(
+            f.path.clone(),
+            f.project,
+            Action::ExportFile {
+                commit: c3.as_str().to_string(),
+                path: "Report.docx".to_string(),
+                out: export_fail_deleted.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err_del.to_string().contains("not found in commit"));
+        assert!(!export_fail_deleted.exists());
+
+        // Attempting to export Report-Renamed.docx at c1 must fail (never guess a rename)
+        let export_fail_rename = std::env::temp_dir().join(format!(
+            "test-export-fail-ren-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let err_ren = run(
+            f.path.clone(),
+            f.project,
+            Action::ExportFile {
+                commit: c1.as_str().to_string(),
+                path: "Report-Renamed.docx".to_string(),
+                out: export_fail_rename.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err_ren.to_string().contains("not found in commit"));
+        assert!(!export_fail_rename.exists());
+
+        // Repository refs/pins remain untouched
+        assert_eq!(f.repo.head("main").await.unwrap(), None);
+
+        let _ = std::fs::remove_file(&export_out);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn export_file_refuses_overwrite_and_sets_private_permissions() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Content")]).await;
+        let c1 = f.commit(&[], vec![("doc.docx", f1)], "Genesis").await;
+
+        let export_out =
+            std::env::temp_dir().join(format!("test-export-perm-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&export_out, b"pre-existing content").unwrap();
+
+        // Refuses overwrite
+        let err = run(
+            f.path.clone(),
+            f.project,
+            Action::ExportFile {
+                commit: c1.as_str().to_string(),
+                path: "doc.docx".to_string(),
+                out: export_out.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("already exists; refusing overwrite"));
+        assert_eq!(std::fs::read(&export_out).unwrap(), b"pre-existing content");
+
+        let _ = std::fs::remove_file(&export_out);
+
+        // Successful export sets 0600 permissions on Unix
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ExportFile {
+                commit: c1.as_str().to_string(),
+                path: "doc.docx".to_string(),
+                out: export_out.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&export_out).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+
+        let _ = std::fs::remove_file(&export_out);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn export_file_corrupt_object_cleans_up_incomplete_output() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Content")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        // Tamper object in SQLite
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", f.path.display()))
+            .await
+            .unwrap();
+        sqlx::query("drop trigger if exists objects_no_update")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("update objects set bytes = x'deadbeef' where document = ? and address = ?")
+            .bind(doc1.0.to_string())
+            .bind(f1.state.as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let export_out =
+            std::env::temp_dir().join(format!("test-export-corrupt-{}.json", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&export_out);
+
+        let err = run(
+            f.path.clone(),
+            f.project,
+            Action::ExportFile {
+                commit: c1.as_str().to_string(),
+                path: "doc.docx".to_string(),
+                out: export_out.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("failed to reconstruct")
+                || err.to_string().contains("HashMismatch")
+        );
+        assert!(
+            !export_out.exists(),
+            "incomplete export file must be removed on failure"
+        );
+
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn export_file_project_mismatch_fails() {
+        let f1 = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1_v1 = f1.file(doc1, &[(0, "Content")]).await;
+        let c1 = f1.commit(&[], vec![("doc.docx", f1_v1)], "Genesis").await;
+
+        let export_out = std::env::temp_dir().join(format!(
+            "test-export-mismatch-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&export_out);
+
+        let f2 = Fixture::new().await; // different project UUID
+        let err = run(
+            f1.path.clone(),
+            f2.project, // pass wrong project to run()
+            Action::ExportFile {
+                commit: c1.as_str().to_string(),
+                path: "doc.docx".to_string(),
+                out: export_out.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("does not match repository project")
+                || err.to_string().contains("local schema/project")
+        );
+        assert!(!export_out.exists());
+
+        f1.finish().await;
+        f2.finish().await;
     }
 }
