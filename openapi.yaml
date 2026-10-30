@@ -4488,6 +4488,72 @@ paths:
       - paseto: []
       - device_session:
         - history:read
+  /projects/{id}/history/compare/file:
+    get:
+      tags:
+      - project history
+      operationId: project_history_compare_file
+      parameters:
+      - name: id
+        in: path
+        description: Project ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: from
+        in: query
+        description: Starting commit address
+        required: true
+        schema:
+          type: string
+      - name: to
+        in: query
+        description: Ending commit address
+        required: true
+        schema:
+          type: string
+      - name: path
+        in: query
+        description: Exact file path within project
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Maximum number of changed nodes to return (1-100, default 50)
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: cursor
+        in: query
+        description: Opaque continuation cursor
+        required: false
+        schema:
+          type: string
+      - name: include_unchanged
+        in: query
+        description: Whether to include unchanged nodes
+        required: false
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: Bounded file and node comparison report
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid commit address, path, cursor or query parameters
+        '403':
+          description: Project membership or document scope permission denied
+        '404':
+          description: One or both commits not published, or file not found in either commit
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
   /projects/{id}/history/receipts:
     get:
       tags:

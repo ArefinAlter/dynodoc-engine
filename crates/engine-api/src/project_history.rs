@@ -24,10 +24,12 @@ use engine_core::{
     repository::{
         attestation::{Receipt, Scope, SignedReceipt},
         authority_epoch::{MAX_CHAIN_PAGE, MAX_EPOCH},
+        compare::{self, DiffKind, FileCompareReport, MAX_NODE_DIFF_LIMIT},
         server_authority, valid_branch, Head, SignedCommit,
     },
-    shared_checkpoint::{self, typed, Address},
+    shared_checkpoint::{self, typed, Address, ObjectStore},
 };
+use engine_shared::DocumentId;
 use ring::signature::KeyPair;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -68,6 +70,7 @@ pub fn router() -> Router<AppState> {
             get(object),
         )
         .route("/projects/{id}/history/compare", get(compare))
+        .route("/projects/{id}/history/compare/file", get(compare_file))
         .route("/projects/{id}/history/refs", get(refs).post(advance))
         .route("/projects/{id}/history/reviews", get(reviews).post(review))
         .route("/projects/{id}/history/storage", get(storage))
@@ -295,6 +298,308 @@ async fn compare(
         },
     )
     .map_err(history_error)?;
+
+    Ok(Json(json!(report)))
+}
+
+struct PublishedStore<'a> {
+    db: &'a mut PgConnection,
+    project: Uuid,
+    state_root: Address,
+    budget: shared_checkpoint::Limits,
+    prefetched: BTreeMap<(Uuid, Address), Vec<u8>>,
+}
+
+impl ObjectStore for PublishedStore<'_> {
+    async fn prefetch(
+        &mut self,
+        document: DocumentId,
+        addresses: &[Address],
+    ) -> Result<(), shared_checkpoint::Error> {
+        self.prefetched.clear();
+        if addresses.len() > shared_checkpoint::READ_BATCH_OBJECTS {
+            return Err(shared_checkpoint::Error::Limit("read batch objects"));
+        }
+        if addresses.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<_> = addresses.iter().map(Address::as_str).collect();
+        let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "select o.address,o.bytes from project_published_object p join checkpoint_object o using(document_id,address) where p.project_id=$1 and p.state_root=$2 and p.document_id=$3 and p.address=any($4)"
+        )
+        .bind(self.project)
+        .bind(self.state_root.as_str())
+        .bind(document.0)
+        .bind(&keys)
+        .fetch_all(&mut *self.db)
+        .await?;
+        for (address, bytes) in rows {
+            self.prefetched
+                .insert((document.0, Address::try_from(address)?), bytes);
+        }
+        Ok(())
+    }
+
+    async fn put(
+        &mut self,
+        _: DocumentId,
+        _: &Address,
+        _: &[u8],
+    ) -> Result<bool, shared_checkpoint::Error> {
+        Err(shared_checkpoint::Error::Invalid(
+            "read-only published store",
+        ))
+    }
+
+    async fn get(
+        &mut self,
+        document: DocumentId,
+        address: &Address,
+    ) -> Result<Vec<u8>, shared_checkpoint::Error> {
+        if self.budget.max_objects == 0 {
+            return Err(shared_checkpoint::Error::Limit("objects"));
+        }
+        let bytes = if let Some(bytes) = self.prefetched.get(&(document.0, address.clone())) {
+            bytes.clone()
+        } else {
+            sqlx::query_scalar::<_, Vec<u8>>(
+                "select o.bytes from project_published_object p join checkpoint_object o using(document_id,address) where p.project_id=$1 and p.state_root=$2 and p.document_id=$3 and p.address=$4"
+            )
+            .bind(self.project)
+            .bind(self.state_root.as_str())
+            .bind(document.0)
+            .bind(address.as_str())
+            .fetch_optional(&mut *self.db)
+            .await?
+            .ok_or_else(|| shared_checkpoint::Error::Missing(address.as_str().into()))?
+        };
+        self.budget.max_objects = self
+            .budget
+            .max_objects
+            .checked_sub(1)
+            .ok_or(shared_checkpoint::Error::Limit("objects"))?;
+        self.budget.max_bytes = self
+            .budget
+            .max_bytes
+            .checked_sub(bytes.len())
+            .ok_or(shared_checkpoint::Error::Limit("bytes"))?;
+        shared_checkpoint::validate_stored(address, &bytes)?;
+        Ok(bytes)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompareFileQuery {
+    from: Address,
+    to: Address,
+    path: String,
+    limit: Option<usize>,
+    cursor: Option<String>,
+    #[serde(default)]
+    include_unchanged: bool,
+}
+
+#[utoipa::path(
+    operation_id = "project_history_compare_file",
+    get,
+    path = "/projects/{id}/history/compare/file",
+    tag = "project history",
+    params(
+        ("id" = Uuid, Path, description = "Project ID"),
+        ("from" = String, Query, description = "Starting commit address"),
+        ("to" = String, Query, description = "Ending commit address"),
+        ("path" = String, Query, description = "Exact file path within project"),
+        ("limit" = Option<usize>, Query, description = "Maximum number of changed nodes to return (1-100, default 50)"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation cursor"),
+        ("include_unchanged" = Option<bool>, Query, description = "Whether to include unchanged nodes")
+    ),
+    security(("paseto" = []), ("device_session" = ["history:read"])),
+    responses(
+        (status = 200, description = "Bounded file and node comparison report", body = Value),
+        (status = 400, description = "Invalid commit address, path, cursor or query parameters"),
+        (status = 403, description = "Project membership or document scope permission denied"),
+        (status = 404, description = "One or both commits not published, or file not found in either commit")
+    )
+)]
+async fn compare_file(
+    State(state): State<AppState>,
+    auth: ProjectAuth<HistoryRead>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<CompareFileQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !engine_core::repository::valid_path(&query.path) {
+        return Err(bad("Invalid file path"));
+    }
+    if let Some(limit) = query.limit {
+        if !(1..=MAX_NODE_DIFF_LIMIT).contains(&limit) {
+            return Err(bad("Page size must be 1 to 100"));
+        }
+    }
+
+    let _permit = state.workloads.enter(auth.identity_id, Some(id))?;
+
+    let mut tx = start(&state, &auth).await?;
+    member(&mut tx, &auth, id).await?;
+
+    let from_stored = load(&mut tx, id, &query.from).await?;
+    let to_stored = load(&mut tx, id, &query.to).await?;
+
+    let mut combined_scope: BTreeSet<Uuid> = from_stored.scope.into_iter().collect();
+    combined_scope.extend(to_stored.scope);
+    let union_scope: Vec<Uuid> = combined_scope.into_iter().collect();
+
+    authorize(&mut tx, &auth, id, &union_scope, false).await?;
+
+    let from_file = from_stored.signed.commit.files.get(&query.path).cloned();
+    let to_file = to_stored.signed.commit.files.get(&query.path).cloned();
+
+    if from_file.is_none() && to_file.is_none() {
+        return Err(ApiError::NotFound);
+    }
+
+    if from_file.is_none() {
+        if query.cursor.is_some() {
+            return Err(bad("Cursor cannot be used for added file"));
+        }
+        tx.commit().await?;
+        let report = FileCompareReport {
+            project: id,
+            from: query.from,
+            to: query.to,
+            path: query.path,
+            kind: DiffKind::Added,
+            from_file: None,
+            to_file,
+            document_replaced: false,
+            node_diff: None,
+            next_cursor: None,
+            more: false,
+        };
+        return Ok(Json(json!(report)));
+    }
+
+    if to_file.is_none() {
+        if query.cursor.is_some() {
+            return Err(bad("Cursor cannot be used for removed file"));
+        }
+        tx.commit().await?;
+        let report = FileCompareReport {
+            project: id,
+            from: query.from,
+            to: query.to,
+            path: query.path,
+            kind: DiffKind::Removed,
+            from_file,
+            to_file: None,
+            document_replaced: false,
+            node_diff: None,
+            next_cursor: None,
+            more: false,
+        };
+        return Ok(Json(json!(report)));
+    }
+
+    let from_entry = from_file.unwrap();
+    let to_entry = to_file.unwrap();
+
+    if from_entry.document != to_entry.document {
+        if query.cursor.is_some() {
+            return Err(bad("Cursor cannot be used for replaced document"));
+        }
+        tx.commit().await?;
+        let report = FileCompareReport {
+            project: id,
+            from: query.from,
+            to: query.to,
+            path: query.path,
+            kind: DiffKind::Modified,
+            from_file: Some(from_entry),
+            to_file: Some(to_entry),
+            document_replaced: true,
+            node_diff: None,
+            next_cursor: None,
+            more: false,
+        };
+        return Ok(Json(json!(report)));
+    }
+
+    let doc_id = from_entry.document;
+    let from_root = from_entry.state.clone();
+    let to_root = to_entry.state.clone();
+
+    let mut from_store = PublishedStore {
+        db: &mut tx,
+        project: id,
+        state_root: from_root.clone(),
+        budget: READ_LIMIT,
+        prefetched: BTreeMap::new(),
+    };
+    let from_state = typed::read_state(
+        &mut from_store,
+        doc_id,
+        &from_root,
+        READ_LIMIT,
+        Default::default(),
+    )
+    .await
+    .map_err(content_error)?;
+
+    let mut to_store = PublishedStore {
+        db: &mut tx,
+        project: id,
+        state_root: to_root.clone(),
+        budget: READ_LIMIT,
+        prefetched: BTreeMap::new(),
+    };
+    let to_state = typed::read_state(
+        &mut to_store,
+        doc_id,
+        &to_root,
+        READ_LIMIT,
+        Default::default(),
+    )
+    .await
+    .map_err(content_error)?;
+
+    tx.commit().await?;
+
+    let node_diff = compare::compare_nodes(
+        doc_id,
+        &from_root,
+        &to_root,
+        &from_state,
+        &to_state,
+        compare::NodeDiffOptions {
+            limit: query.limit,
+            cursor: query.cursor.as_deref(),
+            include_unchanged: query.include_unchanged,
+        },
+    )
+    .map_err(history_error)?;
+
+    let kind = if from_root == to_root && node_diff.whole_state_identical {
+        DiffKind::Unchanged
+    } else {
+        DiffKind::Modified
+    };
+
+    let next_cursor = node_diff.next_cursor.clone();
+    let more = node_diff.more;
+
+    let report = FileCompareReport {
+        project: id,
+        from: query.from,
+        to: query.to,
+        path: query.path,
+        kind,
+        from_file: Some(from_entry),
+        to_file: Some(to_entry),
+        document_replaced: false,
+        next_cursor,
+        more,
+        node_diff: Some(node_diff),
+    };
 
     Ok(Json(json!(report)))
 }
@@ -1099,6 +1404,7 @@ async fn receipts(
     rotations,
     receipts,
     acknowledge,
-    compare
+    compare,
+    compare_file
 ))]
 pub struct ProjectHistoryApi;
