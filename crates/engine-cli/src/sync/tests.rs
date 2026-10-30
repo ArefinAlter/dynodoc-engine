@@ -1,5 +1,5 @@
 use super::*;
-use axum::{routing::get, Json, Router};
+use axum::{response::IntoResponse, routing::get, Json, Router};
 use engine_api::{
     app,
     auth::{store, token, AuthConfig},
@@ -1891,7 +1891,9 @@ async fn remote_history_log_single_page_default_and_formatting() {
     let (url, server) = serve(router).await;
     let client = Client::new(remote(url, authority), project, "token", true).unwrap();
 
-    let result = log(&client, Some(&a1), None, None, false).await.unwrap();
+    let result = log(&client, Some(&a1), None, None, false, false, None)
+        .await
+        .unwrap();
     assert_eq!(result.project, project);
     assert_eq!(result.head, a1);
     assert_eq!(result.entries.len(), 2);
@@ -2007,14 +2009,16 @@ async fn remote_history_log_multi_page_all_and_cursor_continuation() {
     let client = Client::new(remote(url, authority), project, "token", true).unwrap();
 
     // 1. Single page without --all stops after page 1 with next_cursor
-    let page1 = log(&client, Some(&a2), None, None, false).await.unwrap();
+    let page1 = log(&client, Some(&a2), None, None, false, false, None)
+        .await
+        .unwrap();
     assert_eq!(page1.entries.len(), 1);
     assert_eq!(page1.entries[0].address, a2);
     assert!(page1.more);
     assert_eq!(page1.next_cursor.as_deref(), Some("cursor_p2"));
 
     // 2. Fetch page 2 directly using cursor
-    let page2 = log(&client, None, None, Some("cursor_p2"), false)
+    let page2 = log(&client, None, None, Some("cursor_p2"), false, false, None)
         .await
         .unwrap();
     assert_eq!(page2.head, a2);
@@ -2025,7 +2029,9 @@ async fn remote_history_log_multi_page_all_and_cursor_continuation() {
     assert_eq!(page2.next_cursor, None);
 
     // 3. Multi-page fetch using --all
-    let all = log(&client, Some(&a2), None, None, true).await.unwrap();
+    let all = log(&client, Some(&a2), None, None, true, false, None)
+        .await
+        .unwrap();
     assert_eq!(all.head, a2);
     assert_eq!(all.entries.len(), 3);
     assert_eq!(all.entries[0].address, a2);
@@ -2090,7 +2096,7 @@ async fn remote_history_log_merge_commit_and_omitted_message() {
     let (url, server) = serve(router).await;
     let client = Client::new(remote(url, authority), project, "token", true).unwrap();
 
-    let result = log(&client, Some(&a_merge), None, None, false)
+    let result = log(&client, Some(&a_merge), None, None, false, false, None)
         .await
         .unwrap();
     assert_eq!(result.entries.len(), 1);
@@ -2151,7 +2157,9 @@ async fn remote_history_log_cursor_loop_rejection() {
     let (url, server) = serve(router).await;
     let client = Client::new(remote(url, authority), project, "token", true).unwrap();
 
-    let err = log(&client, Some(&a0), None, None, true).await.unwrap_err();
+    let err = log(&client, Some(&a0), None, None, true, false, None)
+        .await
+        .unwrap_err();
     assert!(err
         .to_string()
         .contains("cursor loop detected in remote history log"));
@@ -2195,7 +2203,7 @@ async fn remote_history_log_mismatch_rejections() {
         );
     let (url_proj, server_proj) = serve(router_proj).await;
     let client_proj = Client::new(remote(url_proj, authority), project, "token", true).unwrap();
-    let err_proj = log(&client_proj, Some(&a0), None, None, false)
+    let err_proj = log(&client_proj, Some(&a0), None, None, false, false, None)
         .await
         .unwrap_err();
     assert!(err_proj
@@ -2227,7 +2235,7 @@ async fn remote_history_log_mismatch_rejections() {
         );
     let (url_head, server_head) = serve(router_head).await;
     let client_head = Client::new(remote(url_head, authority), project, "token", true).unwrap();
-    let err_head = log(&client_head, Some(&a0), None, None, false)
+    let err_head = log(&client_head, Some(&a0), None, None, false, false, None)
         .await
         .unwrap_err();
     assert!(err_head.to_string().contains("remote report head mismatch"));
@@ -2264,7 +2272,7 @@ async fn remote_history_log_mismatch_rejections() {
         }));
     let (url_dup, server_dup) = serve(router_dup).await;
     let client_dup = Client::new(remote(url_dup, authority), project, "token", true).unwrap();
-    let err_dup = log(&client_dup, Some(&a1), None, None, true)
+    let err_dup = log(&client_dup, Some(&a1), None, None, true, false, None)
         .await
         .unwrap_err();
     assert!(err_dup
@@ -2292,7 +2300,7 @@ async fn remote_history_log_permission_loss_403() {
     let (url, server) = serve(router).await;
     let client = Client::new(remote(url, authority), project, "token", true).unwrap();
 
-    let err = log(&client, Some(&a0), None, None, false)
+    let err = log(&client, Some(&a0), None, None, false, false, None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("403"));
@@ -2369,6 +2377,8 @@ async fn remote_history_log_cli_options_execution_and_local_state_untouched() {
             limit: None,
             cursor: None,
             all: false,
+            verify: false,
+            expect_tip: None,
             json: true,
         },
     };
@@ -2390,6 +2400,938 @@ async fn remote_history_log_cli_options_execution_and_local_state_untouched() {
             limit: None,
             cursor: None,
             all: false,
+            verify: false,
+            expect_tip: None,
+            json: false,
+        },
+    };
+    run(options_text).await.unwrap();
+
+    // Verify local repository branches and journal pins were not touched
+    let head = repo.head("main").await.unwrap();
+    assert!(
+        head.is_none(),
+        "local repository branches must remain untouched"
+    );
+
+    let scope = Scope {
+        authority,
+        project,
+        branch: "main".into(),
+    };
+    let pin = journal.pin(&scope).await.unwrap();
+    assert!(pin.is_none(), "journal pin must remain untouched");
+
+    server.abort();
+    let _ = server.await;
+    repo.close().await;
+    journal.close().await;
+    remove(repo_path).await;
+    remove(pin_path).await;
+    let _ = std::fs::remove_file(remote_file);
+    let _ = std::fs::remove_file(token_file);
+}
+
+fn make_test_commit(
+    project: Uuid,
+    parents: Vec<Address>,
+    message: &str,
+    authored_at_ms: i64,
+    signer: &Ed25519KeyPair,
+) -> SignedCommit {
+    SignedCommit::sign(
+        engine_core::repository::Commit {
+            version: 1,
+            project,
+            parents,
+            files: BTreeMap::new(),
+            author_key: String::new(),
+            authored_at_ms,
+            message: message.to_string(),
+            recovery: None,
+            same_file_resolutions: Vec::new(),
+        },
+        signer,
+    )
+    .unwrap()
+}
+
+fn commit_to_log_entry(signed: &SignedCommit) -> serde_json::Value {
+    let address = signed.verify().unwrap();
+    let msg = match engine_core::repository::log::BoundedMessage::new(&signed.commit.message) {
+        engine_core::repository::log::BoundedMessage::Value(v) => json!(v),
+        engine_core::repository::log::BoundedMessage::Omitted(o) => json!(o),
+    };
+    json!({
+        "address": address,
+        "parents": signed.commit.parents,
+        "author_key": signed.commit.author_key,
+        "authored_at_ms": signed.commit.authored_at_ms,
+        "message": msg,
+    })
+}
+
+#[tokio::test]
+async fn verify_remote_history_valid_multi_page_and_merge() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+
+    let c0 = make_test_commit(project, vec![], "genesis", 1000, &key(1));
+    let a0 = c0.verify().unwrap();
+    let c1 = make_test_commit(project, vec![a0.clone()], "feature 1", 2000, &key(2));
+    let a1 = c1.verify().unwrap();
+    let c_side = make_test_commit(project, vec![a0.clone()], "side work", 2500, &key(3));
+    let a_side = c_side.verify().unwrap();
+    let c2 = make_test_commit(
+        project,
+        vec![a1.clone(), a_side.clone()],
+        "merge feature",
+        3000,
+        &key(4),
+    );
+    let a2 = c2.verify().unwrap();
+
+    let mut commit_map = std::collections::HashMap::new();
+    commit_map.insert(a0.clone(), c0.clone());
+    commit_map.insert(a1.clone(), c1.clone());
+    commit_map.insert(a_side.clone(), c_side.clone());
+    commit_map.insert(a2.clone(), c2.clone());
+    let commits = Arc::new(commit_map);
+
+    let store = Arc::clone(&commits);
+    let e0 = commit_to_log_entry(&c0);
+    let e1 = commit_to_log_entry(&c1);
+    let e2 = commit_to_log_entry(&c2);
+
+    let p_a2 = a2.clone();
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(
+                move |axum::extract::Path((_id, address)): axum::extract::Path<(Uuid, String)>| {
+                    let s = Arc::clone(&store);
+                    async move {
+                        if let Ok(addr) = Address::try_from(address) {
+                            if let Some(signed) = s.get(&addr) {
+                                return (axum::http::StatusCode::OK, Json(json!(signed)))
+                                    .into_response();
+                            }
+                        }
+                        (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                    }
+                },
+            ),
+        )
+        .route(
+            "/projects/{id}/history/log",
+            get(
+                move |axum::extract::Query(params): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| {
+                    let head = p_a2.clone();
+                    let entry2 = e2.clone();
+                    let entry1 = e1.clone();
+                    let entry0 = e0.clone();
+                    async move {
+                        if !params.contains_key("cursor") {
+                            Json(json!({
+                                "project": project,
+                                "head": head,
+                                "entries": [entry2],
+                                "next_cursor": "page2",
+                                "more": true
+                            }))
+                        } else if params.get("cursor").map(|s| s.as_str()) == Some("page2") {
+                            Json(json!({
+                                "project": project,
+                                "head": head,
+                                "entries": [entry1, entry0],
+                                "next_cursor": null,
+                                "more": false
+                            }))
+                        } else {
+                            Json(json!({
+                                "project": project,
+                                "head": head,
+                                "entries": [],
+                                "next_cursor": null,
+                                "more": false
+                            }))
+                        }
+                    }
+                },
+            ),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+
+    // 1. Single page verification
+    let single_page = log(&client, Some(&a2), None, None, false, true, Some(&a2))
+        .await
+        .unwrap();
+    assert!(single_page.verified);
+    assert_eq!(single_page.verified_tip.as_ref(), Some(&a2));
+    assert_eq!(single_page.entries.len(), 1);
+    assert_eq!(single_page.entries[0].address, a2);
+    assert!(single_page.more);
+    assert_eq!(single_page.next_cursor.as_deref(), Some("page2"));
+
+    // 2. Multi page complete verification across pages
+    let all_pages = log(&client, Some(&a2), None, None, true, true, Some(&a2))
+        .await
+        .unwrap();
+    assert!(all_pages.verified);
+    assert_eq!(all_pages.verified_tip.as_ref(), Some(&a2));
+    assert_eq!(all_pages.entries.len(), 3);
+    assert_eq!(all_pages.entries[0].address, a2);
+    assert_eq!(all_pages.entries[1].address, a1);
+    assert_eq!(all_pages.entries[2].address, a0);
+    assert!(!all_pages.more);
+    assert_eq!(all_pages.next_cursor, None);
+
+    // 3. Output formatting verification
+    let text = format_log_text(&all_pages);
+    assert!(text.contains(&format!("verified against expected tip {}", a2.as_str())));
+    assert!(text.contains("Notice: Verified against signed commit envelopes. Proves consistency with selected first-parent tip; does not prove human authorship, independent timestamps, all second-parent work, or server freshness."));
+
+    let json_val = format_log_json(&all_pages).unwrap();
+    assert_eq!(json_val["verified"], true);
+    assert_eq!(json_val["verified_tip"], a2.as_str());
+    assert!(json_val["verification_notice"]
+        .as_str()
+        .unwrap()
+        .contains("Verified against signed commit envelopes"));
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn verify_remote_history_wrong_tip_rejected() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+
+    let c0 = make_test_commit(project, vec![], "genesis", 1000, &key(1));
+    let a0 = c0.verify().unwrap();
+    let c1 = make_test_commit(project, vec![a0.clone()], "feature 1", 2000, &key(2));
+    let a1 = c1.verify().unwrap();
+
+    let mut commit_map = std::collections::HashMap::new();
+    commit_map.insert(a0.clone(), c0.clone());
+    commit_map.insert(a1.clone(), c1.clone());
+    let store = Arc::new(commit_map);
+
+    let e1 = commit_to_log_entry(&c1);
+    let p_a1 = a1.clone();
+    let store_c1 = Arc::clone(&store);
+    let e1_c1 = e1.clone();
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(
+                move |axum::extract::Path((_id, address)): axum::extract::Path<(Uuid, String)>| {
+                    let s = Arc::clone(&store_c1);
+                    async move {
+                        if let Ok(addr) = Address::try_from(address) {
+                            if let Some(signed) = s.get(&addr) {
+                                return (axum::http::StatusCode::OK, Json(json!(signed)))
+                                    .into_response();
+                            }
+                        }
+                        (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                    }
+                },
+            ),
+        )
+        .route(
+            "/projects/{id}/history/log",
+            get(move || {
+                let head = p_a1.clone();
+                let entry1 = e1_c1.clone();
+                async move {
+                    Json(json!({
+                        "project": project,
+                        "head": head,
+                        "entries": [entry1],
+                        "next_cursor": null,
+                        "more": false
+                    }))
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+
+    // Caller expects a0, but server returned a1 as first commit
+    let err = log(&client, Some(&a1), None, None, false, true, Some(&a0))
+        .await
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("--head and --expect-tip must match"));
+
+    // Head omitted, expect_tip a0; server reports head a1
+    let err2 = log(&client, None, None, None, false, true, Some(&a0))
+        .await
+        .unwrap_err();
+    assert!(err2.to_string().contains("remote report head mismatch"));
+
+    // Server reports head a0, but entries[0] has a1 (discontinuity)
+    let p_a0 = a0.clone();
+    let entry_a1 = e1.clone();
+    let store_c2 = Arc::clone(&store);
+    let router_disc = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(
+                move |axum::extract::Path((_id, address)): axum::extract::Path<(Uuid, String)>| {
+                    let s = Arc::clone(&store_c2);
+                    async move {
+                        if let Ok(addr) = Address::try_from(address) {
+                            if let Some(signed) = s.get(&addr) {
+                                return (axum::http::StatusCode::OK, Json(json!(signed)))
+                                    .into_response();
+                            }
+                        }
+                        (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                    }
+                },
+            ),
+        )
+        .route(
+            "/projects/{id}/history/log",
+            get(move || {
+                let head = p_a0.clone();
+                let ent = entry_a1.clone();
+                async move {
+                    Json(json!({
+                        "project": project,
+                        "head": head,
+                        "entries": [ent],
+                        "next_cursor": null,
+                        "more": false
+                    }))
+                }
+            }),
+        );
+    let (url_disc, server_disc) = serve(router_disc).await;
+    let client_disc = Client::new(remote(url_disc, authority), project, "token", true).unwrap();
+    let err_disc = log(&client_disc, None, None, None, false, true, Some(&a0))
+        .await
+        .unwrap_err();
+    assert!(err_disc
+        .to_string()
+        .contains("history chain discontinuity: expected commit"));
+    server_disc.abort();
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn verify_remote_history_skipped_or_reordered_commit_rejected() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+
+    let c0 = make_test_commit(project, vec![], "genesis", 1000, &key(1));
+    let a0 = c0.verify().unwrap();
+    let c1 = make_test_commit(project, vec![a0.clone()], "feature 1", 2000, &key(2));
+    let a1 = c1.verify().unwrap();
+    let c2 = make_test_commit(project, vec![a1.clone()], "feature 2", 3000, &key(3));
+    let a2 = c2.verify().unwrap();
+
+    let mut commit_map = std::collections::HashMap::new();
+    commit_map.insert(a0.clone(), c0.clone());
+    commit_map.insert(a1.clone(), c1.clone());
+    commit_map.insert(a2.clone(), c2.clone());
+    let store = Arc::new(commit_map);
+
+    let e0 = commit_to_log_entry(&c0);
+    let e1 = commit_to_log_entry(&c1);
+    let e2 = commit_to_log_entry(&c2);
+
+    // Case 1: Skipped commit (c2 then c0 directly, skipping c1)
+    let s1 = Arc::clone(&store);
+    let p_a2 = a2.clone();
+    let e2_skip = e2.clone();
+    let e0_skip = e0.clone();
+    let router_skip = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(
+                move |axum::extract::Path((_id, address)): axum::extract::Path<(Uuid, String)>| {
+                    let s = Arc::clone(&s1);
+                    async move {
+                        if let Ok(addr) = Address::try_from(address) {
+                            if let Some(signed) = s.get(&addr) {
+                                return (axum::http::StatusCode::OK, Json(json!(signed)))
+                                    .into_response();
+                            }
+                        }
+                        (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                    }
+                },
+            ),
+        )
+        .route(
+            "/projects/{id}/history/log",
+            get(move || {
+                let head = p_a2.clone();
+                let entry2 = e2_skip.clone();
+                let entry0 = e0_skip.clone();
+                async move {
+                    Json(json!({
+                        "project": project,
+                        "head": head,
+                        "entries": [entry2, entry0],
+                        "next_cursor": null,
+                        "more": false
+                    }))
+                }
+            }),
+        );
+    let (url_skip, server_skip) = serve(router_skip).await;
+    let client_skip = Client::new(remote(url_skip, authority), project, "token", true).unwrap();
+    let err_skip = log(&client_skip, Some(&a2), None, None, false, true, Some(&a2))
+        .await
+        .unwrap_err();
+    assert!(err_skip
+        .to_string()
+        .contains("history chain discontinuity: expected commit"));
+    server_skip.abort();
+
+    // Case 2: Reordered commits (c2, c0, c1)
+    let s2 = Arc::clone(&store);
+    let p_a2_ro = a2.clone();
+    let e2_ro = e2.clone();
+    let e1_ro = e1.clone();
+    let e0_ro = e0.clone();
+    let router_ro = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(
+                move |axum::extract::Path((_id, address)): axum::extract::Path<(Uuid, String)>| {
+                    let s = Arc::clone(&s2);
+                    async move {
+                        if let Ok(addr) = Address::try_from(address) {
+                            if let Some(signed) = s.get(&addr) {
+                                return (axum::http::StatusCode::OK, Json(json!(signed)))
+                                    .into_response();
+                            }
+                        }
+                        (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                    }
+                },
+            ),
+        )
+        .route(
+            "/projects/{id}/history/log",
+            get(move || {
+                let head = p_a2_ro.clone();
+                let entry2 = e2_ro.clone();
+                let entry1 = e1_ro.clone();
+                let entry0 = e0_ro.clone();
+                async move {
+                    Json(json!({
+                        "project": project,
+                        "head": head,
+                        "entries": [entry2, entry0, entry1],
+                        "next_cursor": null,
+                        "more": false
+                    }))
+                }
+            }),
+        );
+    let (url_ro, server_ro) = serve(router_ro).await;
+    let client_ro = Client::new(remote(url_ro, authority), project, "token", true).unwrap();
+    let err_ro = log(&client_ro, Some(&a2), None, None, false, true, Some(&a2))
+        .await
+        .unwrap_err();
+    assert!(err_ro
+        .to_string()
+        .contains("history chain discontinuity: expected commit"));
+    server_ro.abort();
+}
+
+#[tokio::test]
+async fn verify_remote_history_tampered_envelope_or_signature_rejected() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+
+    let c0 = make_test_commit(project, vec![], "genesis", 1000, &key(1));
+    let a0 = c0.verify().unwrap();
+    let mut c1_tampered = make_test_commit(project, vec![a0.clone()], "feature 1", 2000, &key(2));
+    let a1 = c1_tampered.verify().unwrap();
+    c1_tampered.signature = "00".repeat(64);
+
+    let e0 = commit_to_log_entry(&c0);
+    let e1 = json!({
+        "address": a1,
+        "parents": [a0],
+        "author_key": c1_tampered.commit.author_key,
+        "authored_at_ms": 2000,
+        "message": "feature 1",
+    });
+
+    let a0_route = a0.clone();
+    let a1_route = a1.clone();
+    let a1_log = a1.clone();
+    let head = a1.clone();
+
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(
+                move |axum::extract::Path((_id, address)): axum::extract::Path<(Uuid, String)>| {
+                    let c0_clone = c0.clone();
+                    let c1_t = c1_tampered.clone();
+                    let a0_c = a0_route.clone();
+                    let a1_c = a1_route.clone();
+                    async move {
+                        if address == a0_c.as_str() {
+                            (axum::http::StatusCode::OK, Json(json!(c0_clone))).into_response()
+                        } else if address == a1_c.as_str() {
+                            (axum::http::StatusCode::OK, Json(json!(c1_t))).into_response()
+                        } else {
+                            (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                        }
+                    }
+                },
+            ),
+        )
+        .route(
+            "/projects/{id}/history/log",
+            get(move || {
+                let h = a1_log.clone();
+                let entry1 = e1.clone();
+                let entry0 = e0.clone();
+                async move {
+                    Json(json!({
+                        "project": project,
+                        "head": h,
+                        "entries": [entry1, entry0],
+                        "next_cursor": null,
+                        "more": false
+                    }))
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+    let err = log(&client, Some(&head), None, None, false, true, Some(&head))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("invalid signature")
+            || err.to_string().contains("commit signature")
+            || err.to_string().contains("invalid signed commit envelope")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn verify_remote_history_cross_project_envelope_rejected() {
+    let project = Uuid::new_v4();
+    let other_project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+
+    let c0_other = make_test_commit(other_project, vec![], "genesis", 1000, &key(1));
+    let a0 = c0_other.verify().unwrap();
+    let c1 = make_test_commit(project, vec![a0.clone()], "feature 1", 2000, &key(2));
+    let a1 = c1.verify().unwrap();
+
+    let e0 = commit_to_log_entry(&c0_other);
+    let e1 = commit_to_log_entry(&c1);
+
+    let a0_route = a0.clone();
+    let a1_route = a1.clone();
+    let a1_log = a1.clone();
+    let head = a1.clone();
+
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(
+                move |axum::extract::Path((_id, address)): axum::extract::Path<(Uuid, String)>| {
+                    let c0_c = c0_other.clone();
+                    let c1_c = c1.clone();
+                    let a0_c = a0_route.clone();
+                    let a1_c = a1_route.clone();
+                    async move {
+                        if address == a0_c.as_str() {
+                            (axum::http::StatusCode::OK, Json(json!(c0_c))).into_response()
+                        } else if address == a1_c.as_str() {
+                            (axum::http::StatusCode::OK, Json(json!(c1_c))).into_response()
+                        } else {
+                            (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                        }
+                    }
+                },
+            ),
+        )
+        .route(
+            "/projects/{id}/history/log",
+            get(move || {
+                let h = a1_log.clone();
+                let entry1 = e1.clone();
+                let entry0 = e0.clone();
+                async move {
+                    Json(json!({
+                        "project": project,
+                        "head": h,
+                        "entries": [entry1, entry0],
+                        "next_cursor": null,
+                        "more": false
+                    }))
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+    let err = log(&client, Some(&head), None, None, false, true, Some(&head))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("remote commit address/project mismatch")
+            || err.to_string().contains("signed commit project mismatch")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn verify_remote_history_claimed_end_without_genesis_rejected() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+
+    let c0 = make_test_commit(project, vec![], "genesis", 1000, &key(1));
+    let a0 = c0.verify().unwrap();
+    let c1 = make_test_commit(project, vec![a0.clone()], "feature 1", 2000, &key(2));
+    let a1 = c1.verify().unwrap();
+
+    let e1 = commit_to_log_entry(&c1);
+
+    let a1_route = a1.clone();
+    let a1_log = a1.clone();
+    let head = a1.clone();
+
+    // Server claims log ends at c1 (more: false, next_cursor: null), but c1 has parent a0
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(
+                move |axum::extract::Path((_id, address)): axum::extract::Path<(Uuid, String)>| {
+                    let c1_c = c1.clone();
+                    let a1_c = a1_route.clone();
+                    async move {
+                        if address == a1_c.as_str() {
+                            (axum::http::StatusCode::OK, Json(json!(c1_c))).into_response()
+                        } else {
+                            (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                        }
+                    }
+                },
+            ),
+        )
+        .route(
+            "/projects/{id}/history/log",
+            get(move || {
+                let h = a1_log.clone();
+                let entry1 = e1.clone();
+                async move {
+                    Json(json!({
+                        "project": project,
+                        "head": h,
+                        "entries": [entry1],
+                        "next_cursor": null,
+                        "more": false
+                    }))
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+
+    // 1. Single page: claims end without genesis
+    let err_single = log(&client, Some(&head), None, None, false, true, Some(&head))
+        .await
+        .unwrap_err();
+    assert!(err_single
+        .to_string()
+        .contains("log claims to have reached genesis (end of history), but last commit"));
+
+    // 2. Multi page: claims end without genesis
+    let err_all = log(&client, Some(&head), None, None, true, true, Some(&head))
+        .await
+        .unwrap_err();
+    assert!(err_all
+        .to_string()
+        .contains("log claims to have reached genesis (end of history), but last commit"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn verify_remote_history_untrusted_metadata_mismatch_rejected() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+
+    let c0 = make_test_commit(project, vec![], "genesis", 1000, &key(1));
+    let a0 = c0.verify().unwrap();
+
+    // Server tampers with message in log page
+    let mut e0_tampered = commit_to_log_entry(&c0);
+    e0_tampered["message"] = json!("malicious modified message");
+
+    let a0_route = a0.clone();
+    let a0_log = a0.clone();
+    let head = a0.clone();
+
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(
+                move |axum::extract::Path((_id, address)): axum::extract::Path<(Uuid, String)>| {
+                    let c0_c = c0.clone();
+                    let a0_c = a0_route.clone();
+                    async move {
+                        if address == a0_c.as_str() {
+                            (axum::http::StatusCode::OK, Json(json!(c0_c))).into_response()
+                        } else {
+                            (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                        }
+                    }
+                },
+            ),
+        )
+        .route(
+            "/projects/{id}/history/log",
+            get(move || {
+                let h = a0_log.clone();
+                let entry0 = e0_tampered.clone();
+                async move {
+                    Json(json!({
+                        "project": project,
+                        "head": h,
+                        "entries": [entry0],
+                        "next_cursor": null,
+                        "more": false
+                    }))
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+    let err = log(&client, Some(&head), None, None, false, true, Some(&head))
+        .await
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("untrusted metadata message mismatch"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn verify_remote_history_missing_envelope_rejected() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+
+    let c0 = make_test_commit(project, vec![], "genesis", 1000, &key(1));
+    let a0 = c0.verify().unwrap();
+    let e0 = commit_to_log_entry(&c0);
+
+    let a0_log = a0.clone();
+    let head = a0.clone();
+
+    // Server returns 404 for commits/{address}
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(|| async { (axum::http::StatusCode::NOT_FOUND, "missing").into_response() }),
+        )
+        .route(
+            "/projects/{id}/history/log",
+            get(move || {
+                let h = a0_log.clone();
+                let entry0 = e0.clone();
+                async move {
+                    Json(json!({
+                        "project": project,
+                        "head": h,
+                        "entries": [entry0],
+                        "next_cursor": null,
+                        "more": false
+                    }))
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url, authority), project, "token", true).unwrap();
+    let err = log(&client, Some(&head), None, None, false, true, Some(&head))
+        .await
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("missing signed commit envelope for"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn verify_remote_history_cli_options_execution_and_local_state_untouched() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let (repo_path, repo) = repo(project).await;
+    let (pin_path, journal) = journal().await;
+
+    let c0 = make_test_commit(project, vec![], "genesis commit", 1000, &key(1));
+    let a0 = c0.verify().unwrap();
+    let e0 = commit_to_log_entry(&c0);
+
+    let served_project = project;
+    let served_a0 = a0.clone();
+    let c0_for_server = c0.clone();
+
+    let a0_route = served_a0.clone();
+    let a0_log = served_a0.clone();
+
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(
+                move |axum::extract::Path((_id, address)): axum::extract::Path<(Uuid, String)>| {
+                    let c = c0_for_server.clone();
+                    let a = a0_route.clone();
+                    async move {
+                        if address == a.as_str() {
+                            (axum::http::StatusCode::OK, Json(json!(c))).into_response()
+                        } else {
+                            (axum::http::StatusCode::NOT_FOUND, "not found").into_response()
+                        }
+                    }
+                },
+            ),
+        )
+        .route(
+            "/projects/{id}/history/log",
+            get(move || {
+                let p = served_project;
+                let c0_addr = a0_log.clone();
+                let entry0 = e0.clone();
+                async move {
+                    Json(json!({
+                        "project": p,
+                        "head": c0_addr,
+                        "entries": [entry0],
+                        "next_cursor": null,
+                        "more": false
+                    }))
+                }
+            }),
+        );
+
+    let (url, server) = serve(router).await;
+
+    let remote_file = std::env::temp_dir().join(format!("remote-{}.json", Uuid::new_v4()));
+    std::fs::write(
+        &remote_file,
+        serde_json::to_vec(&remote(url, authority)).unwrap(),
+    )
+    .unwrap();
+    let token_file = std::env::temp_dir().join(format!("token-{}.txt", Uuid::new_v4()));
+    std::fs::write(&token_file, "valid-token").unwrap();
+
+    let options_json = Options {
+        repository: repo_path.clone(),
+        project,
+        remote: remote_file.clone(),
+        token_file: Some(token_file.clone()),
+        refresh_token_file: None,
+        device_key: None,
+        journal: pin_path.clone(),
+        branch: "main".into(),
+        allow_loopback_http: true,
+        accept_authority_break: None,
+        action: Action::Log {
+            head: None,
+            limit: None,
+            cursor: None,
+            all: false,
+            verify: true,
+            expect_tip: Some(served_a0.clone()),
+            json: true,
+        },
+    };
+    run(options_json).await.unwrap();
+
+    let options_text = Options {
+        repository: repo_path.clone(),
+        project,
+        remote: remote_file.clone(),
+        token_file: Some(token_file.clone()),
+        refresh_token_file: None,
+        device_key: None,
+        journal: pin_path.clone(),
+        branch: "main".into(),
+        allow_loopback_http: true,
+        accept_authority_break: None,
+        action: Action::Log {
+            head: Some(served_a0.clone()),
+            limit: None,
+            cursor: None,
+            all: false,
+            verify: true,
+            expect_tip: Some(served_a0.clone()),
             json: false,
         },
     };
