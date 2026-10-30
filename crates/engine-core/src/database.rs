@@ -30,6 +30,7 @@ const HISTORY: &[&str] = &[
     "project_history_review",
     "project_ref_event",
     "project_issue_comment",
+    "project_release",
     "device_key_class",
     "agent_call",
     "agent_proposal_receipt",
