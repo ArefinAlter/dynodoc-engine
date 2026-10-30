@@ -68,6 +68,11 @@ pub fn router() -> Router<AppState> {
             get(object),
         )
         .route("/projects/{id}/history/refs", get(refs).post(advance))
+        .route(
+            "/projects/{id}/history/releases",
+            get(releases).post(create_release),
+        )
+        .route("/projects/{id}/history/releases/{name}", get(release))
         .route("/projects/{id}/history/reviews", get(reviews).post(review))
         .route("/projects/{id}/history/storage", get(storage))
         .route("/projects/{id}/history/authority", get(authority))
@@ -1011,6 +1016,252 @@ async fn receipts(
         json!({"next_generation":items.last().map(|r|r.receipt.head.generation),"items":items,"epoch":active.epoch,"revocation":active.revocation,"rotations":bridge.iter().map(epoch_item).collect::<Vec<_>>()}),
     ))
 }
+
+#[derive(Deserialize)]
+struct ReleaseCreate {
+    name: String,
+    commit: Option<String>,
+}
+
+fn valid_release_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 100 {
+        return false;
+    }
+    let first = bytes[0];
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+#[utoipa::path(
+    operation_id = "project_history_create_release",
+    post,
+    path = "/projects/{id}/history/releases",
+    tag = "project history",
+    params(("id" = Uuid, Path)),
+    request_body = Value,
+    security(("paseto" = []), ("device_session" = ["history:write"])),
+    responses(
+        (status = 200, description = "Pin accepted protected main head as an immutable named release; current project and file merge authority required", body = Value),
+        (status = 400, description = "Invalid release name or commit does not equal accepted main head"),
+        (status = 403, description = "Current project/file merge authority required"),
+        (status = 409, description = "Release name already exists with a different commit, or storage quota exceeded")
+    )
+)]
+async fn create_release(
+    State(state): State<AppState>,
+    auth: ProjectAuth<HistoryWrite>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ReleaseCreate>,
+) -> Result<Json<Value>, ApiError> {
+    if !valid_release_name(&body.name) {
+        return Err(bad(
+            "Invalid release name; must be 1-100 characters starting with alphanumeric and containing only alphanumeric, dot, underscore, or hyphen",
+        ));
+    }
+    let mut tx = start(&state, &auth).await?;
+    member(&mut tx, &auth, id).await?;
+    serial(&mut tx, id).await?;
+    let _permit = state.workloads.enter(auth.identity_id, Some(id))?;
+
+    let main_head = head(&mut tx, id, "main")
+        .await?
+        .ok_or_else(|| bad("Project main branch has no published commits"))?;
+
+    if let Some(ref target_commit) = body.commit {
+        if target_commit != main_head.commit.as_str() {
+            return Err(bad(
+                "Release target commit must equal the accepted protected main head",
+            ));
+        }
+    }
+
+    let candidate = load(&mut tx, id, &main_head.commit).await?;
+    let policy = rules(&mut tx, id, &candidate.scope).await?;
+    if !policy.can_merge(role(&mut tx, id, auth.identity_id).await?) {
+        return Err(ApiError::Forbidden);
+    }
+    for doc in &candidate.scope {
+        if !policy.can_merge(access::governance_role(&mut tx, *doc, auth.identity_id).await?) {
+            return Err(ApiError::Forbidden);
+        }
+    }
+    authorize(&mut tx, &auth, id, &candidate.scope, false).await?;
+
+    let existing: Option<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "select commit_address, created_at from project_release where project_id=$1 and name=$2",
+    )
+    .bind(id)
+    .bind(&body.name)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((existing_commit, created_at)) = existing {
+        if existing_commit == main_head.commit.as_str() {
+            return Ok(Json(json!({
+                "project_id": id,
+                "name": body.name,
+                "commit": existing_commit,
+                "created_at": created_at
+            })));
+        } else {
+            return Err(ApiError::Conflict {
+                reason: "Release name already exists with a different commit".into(),
+            });
+        }
+    }
+
+    let created_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "insert into project_release (project_id, name, commit_address, actor)
+         values ($1, $2, $3, $4)
+         returning created_at",
+    )
+    .bind(id)
+    .bind(&body.name)
+    .bind(main_head.commit.as_str())
+    .bind(auth.identity_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    audit(
+        &mut tx,
+        auth.identity_id,
+        "project.release.create",
+        id,
+        json!({"name": body.name, "commit": main_head.commit.as_str()}),
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok(Json(json!({
+        "project_id": id,
+        "name": body.name,
+        "commit": main_head.commit.as_str(),
+        "created_at": created_at
+    })))
+}
+
+#[derive(Deserialize)]
+struct ReleasePage {
+    after: Option<String>,
+    limit: Option<i64>,
+}
+
+#[utoipa::path(
+    operation_id = "project_history_releases",
+    get,
+    path = "/projects/{id}/history/releases",
+    tag = "project history",
+    params(
+        ("id" = Uuid, Path),
+        ("after" = Option<String>, Query),
+        ("limit" = Option<i64>, Query)
+    ),
+    security(("paseto" = []), ("device_session" = ["history:read"])),
+    responses(
+        (status = 200, description = "Keyset page of project releases; requires current access to every historical file in release scopes", body = Value)
+    )
+)]
+async fn releases(
+    State(state): State<AppState>,
+    auth: ProjectAuth<HistoryRead>,
+    Path(id): Path<Uuid>,
+    Query(page): Query<ReleasePage>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = page_limit(page.limit)?;
+    let mut tx = start(&state, &auth).await?;
+    authorize(&mut tx, &auth, id, &[], false).await?;
+
+    let rows: Vec<(String, String, Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "select name, commit_address, actor, created_at from project_release
+         where project_id=$1 and name > $2
+         order by name asc limit $3",
+    )
+    .bind(id)
+    .bind(page.after.unwrap_or_default())
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut scope = BTreeSet::new();
+    let mut items = Vec::new();
+    for (name, commit_address, actor, created_at) in rows {
+        let addr = Address::try_from(commit_address.clone()).map_err(content_error)?;
+        let commit = load(&mut tx, id, &addr).await.map_err(|e| match e {
+            ApiError::NotFound => ApiError::Conflict {
+                reason: "A release commit is unavailable after erasure".into(),
+            },
+            other => other,
+        })?;
+        scope.extend(commit.scope);
+        items.push(json!({
+            "name": name,
+            "commit": commit_address,
+            "actor": actor,
+            "created_at": created_at
+        }));
+    }
+
+    let scope_vec: Vec<Uuid> = scope.into_iter().collect();
+    authorize(&mut tx, &auth, id, &scope_vec, false).await?;
+
+    Ok(Json(json!({
+        "items": items,
+        "next_cursor": items.last().and_then(|i| i["name"].as_str())
+    })))
+}
+
+#[utoipa::path(
+    operation_id = "project_history_release",
+    get,
+    path = "/projects/{id}/history/releases/{name}",
+    tag = "project history",
+    params(
+        ("id" = Uuid, Path),
+        ("name" = String, Path)
+    ),
+    security(("paseto" = []), ("device_session" = ["history:read"])),
+    responses(
+        (status = 200, description = "Single project release details with file scope verification", body = Value),
+        (status = 404, description = "Release not found or unavailable after erasure")
+    )
+)]
+async fn release(
+    State(state): State<AppState>,
+    auth: ProjectAuth<HistoryRead>,
+    Path((id, name)): Path<(Uuid, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let mut tx = start(&state, &auth).await?;
+    authorize(&mut tx, &auth, id, &[], false).await?;
+
+    let row: (String, Uuid, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "select commit_address, actor, created_at from project_release
+         where project_id=$1 and name=$2",
+    )
+    .bind(id)
+    .bind(&name)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+
+    let addr = Address::try_from(row.0.clone()).map_err(content_error)?;
+    let commit = load(&mut tx, id, &addr).await?;
+    authorize(&mut tx, &auth, id, &commit.scope, false).await?;
+
+    Ok(Json(json!({
+        "project_id": id,
+        "name": name,
+        "commit": row.0,
+        "actor": row.1,
+        "created_at": row.2,
+        "scope": commit.scope
+    })))
+}
+
 #[derive(utoipa::OpenApi)]
 #[openapi(paths(
     publish,
@@ -1019,6 +1270,9 @@ async fn receipts(
     object,
     advance,
     refs,
+    create_release,
+    releases,
+    release,
     review,
     reviews,
     storage,
