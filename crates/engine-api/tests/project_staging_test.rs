@@ -2199,3 +2199,204 @@ async fn shared_receipts_are_atomic_fail_closed_and_verify_in_the_client_pin(poo
     .is_err());
     runtime.close().await;
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn project_history_log_paged_traversal_continuation_and_authorization(pool: PgPool) {
+    install_receipts(&pool).await;
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let (app, actor, login, project, doc, key) = setup(&runtime.pool).await;
+
+    let (root, objects) = graph(doc).await;
+    upload(&app, &login, project, doc, &objects).await;
+
+    // Publish commit 0 (genesis)
+    let c0 = signed(
+        project,
+        doc,
+        root.clone(),
+        &key,
+        vec![],
+        "Commit 0: genesis",
+    );
+    let a0 = c0.verify().unwrap();
+    publish_commit(&app, &login, project, &c0).await;
+
+    // Publish commit 1
+    let c1 = signed(
+        project,
+        doc,
+        root.clone(),
+        &key,
+        vec![a0.clone()],
+        "Commit 1",
+    );
+    let a1 = c1.verify().unwrap();
+    publish_commit(&app, &login, project, &c1).await;
+
+    // Publish commit 2
+    let c2 = signed(
+        project,
+        doc,
+        root.clone(),
+        &key,
+        vec![a1.clone()],
+        "Commit 2: head",
+    );
+    let a2 = c2.verify().unwrap();
+    publish_commit(&app, &login, project, &c2).await;
+
+    // 1. Missing head parameter
+    let (st, res) = request(
+        &app,
+        "GET",
+        &format!("/projects/{project}/history/log"),
+        &login,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(res["error"]
+        .as_str()
+        .unwrap()
+        .contains("head parameter is required"));
+
+    // 2. Page 1 with limit 2: returns C2, C1
+    let p1 = ok(
+        &app,
+        "GET",
+        &format!(
+            "/projects/{project}/history/log?head={a2}&limit=2",
+            a2 = a2.as_str()
+        ),
+        &login,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(p1["project"], project.to_string());
+    assert_eq!(p1["head"], a2.as_str());
+    assert_eq!(p1["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(p1["entries"][0]["address"], a2.as_str());
+    assert_eq!(p1["entries"][1]["address"], a1.as_str());
+    assert!(p1["more"].as_bool().unwrap());
+    let cursor = p1["next_cursor"].as_str().unwrap();
+
+    // 3. Continuation via cursor: returns C0
+    let p2 = ok(
+        &app,
+        "GET",
+        &format!("/projects/{project}/history/log?cursor={cursor}"),
+        &login,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(p2["project"], project.to_string());
+    assert_eq!(p2["head"], a2.as_str()); // head is preserved!
+    assert_eq!(p2["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(p2["entries"][0]["address"], a0.as_str());
+    assert!(!p2["more"].as_bool().unwrap());
+    assert!(p2["next_cursor"].is_null());
+
+    // 4. Cursor cannot authenticate as account bearer token
+    let (st_cur, _) = request(&app, "GET", "/projects", cursor, Value::Null).await;
+    assert_eq!(st_cur, StatusCode::UNAUTHORIZED);
+
+    // 5. Tampered cursor rejected
+    let mut tampered = cursor.to_string();
+    tampered.replace_range(10..12, "xy");
+    let (st_tamp, res_tamp) = request(
+        &app,
+        "GET",
+        &format!("/projects/{project}/history/log?cursor={tampered}"),
+        &login,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_tamp, StatusCode::BAD_REQUEST);
+    assert!(res_tamp["error"].as_str().unwrap().contains("cursor"));
+
+    // 6. Another member's cursor reuse rejected (wrong principal)
+    let (other_id, other_login) = member(&runtime.pool, project, "other_member", "viewer").await;
+    let (st_other, _) = request(
+        &app,
+        "GET",
+        &format!("/projects/{project}/history/log?cursor={cursor}"),
+        &other_login,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_other, StatusCode::FORBIDDEN);
+
+    // 7. Inaccessible historical file: create commit a3 referencing doc2, then mark doc2 inaccessible
+    let doc2: Uuid = sqlx::query_scalar(
+        "insert into document(title,created_by,space_id) values('Restricted',$1,$2) returning id",
+    )
+    .bind(actor)
+    .bind(project)
+    .fetch_one(&runtime.pool)
+    .await
+    .unwrap();
+    let (root2, objects2) = graph(doc2).await;
+    upload(&app, &login, project, doc2, &objects2).await;
+    let mut c3 = signed(
+        project,
+        doc,
+        root.clone(),
+        &key,
+        vec![a2.clone()],
+        "Commit 3 with restricted file",
+    );
+    c3.commit.files.insert(
+        "restricted.txt".into(),
+        FileEntry {
+            document: DocumentId(doc2),
+            state: root2,
+        },
+    );
+    let c3_signed = SignedCommit::sign(c3.commit, &key).unwrap();
+    let a3 = c3_signed.verify().unwrap();
+    publish_commit(&app, &login, project, &c3_signed).await;
+
+    // Mark doc2 as inaccessible (deleted_at = now())
+    sqlx::query("update document set deleted_at=now() where id=$1")
+        .bind(doc2)
+        .execute(&runtime.pool)
+        .await
+        .unwrap();
+
+    // Querying log for a3 fails atomically with 403, 0 entries leaked!
+    let (st_inaccessible, _) = request(
+        &app,
+        "GET",
+        &format!(
+            "/projects/{project}/history/log?head={a3}",
+            a3 = a3.as_str()
+        ),
+        &login,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_inaccessible, StatusCode::FORBIDDEN);
+
+    // 8. Revocation: remove other_member's membership from project
+    sqlx::query("delete from space_member where identity_id=$1 and space_id=$2")
+        .bind(other_id)
+        .bind(project)
+        .execute(&runtime.pool)
+        .await
+        .unwrap();
+
+    let (st_revoked, _) = request(
+        &app,
+        "GET",
+        &format!(
+            "/projects/{project}/history/log?head={a2}",
+            a2 = a2.as_str()
+        ),
+        &other_login,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st_revoked, StatusCode::FORBIDDEN);
+
+    runtime.close().await;
+}

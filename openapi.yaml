@@ -4428,6 +4428,57 @@ paths:
       - paseto: []
       - device_session:
         - history:read
+  /projects/{id}/history/log:
+    get:
+      tags:
+      - project history
+      operationId: project_history_log
+      parameters:
+      - name: id
+        in: path
+        description: Project ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: head
+        in: query
+        description: Explicit starting commit address
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page limit (1..=50, default 20)
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: cursor
+        in: query
+        description: Opaque authenticated continuation cursor
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Authorized paged first-parent commit log
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectHistoryLogView'
+        '400':
+          description: Bad request, missing head, or invalid/tampered cursor
+        '401':
+          description: Authentication required
+        '403':
+          description: Membership or commit scope access denied
+        '404':
+          description: Project or starting commit not found
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
   /projects/{id}/history/receipts:
     get:
       tags:
@@ -7002,6 +7053,27 @@ components:
           type:
           - string
           - 'null'
+    CommitLogEntryView:
+      type: object
+      required:
+      - address
+      - parents
+      - author_key
+      - authored_at_ms
+      - message
+      properties:
+        address:
+          type: string
+        author_key:
+          type: string
+        authored_at_ms:
+          type: integer
+          format: int64
+        message: {}
+        parents:
+          type: array
+          items:
+            type: string
     ConflictOption:
       type: object
       description: |-
@@ -7855,6 +7927,29 @@ components:
             What agents may write: `none` (the default: they only read), `draft` (they stage
             drafts that a person submits) or `change_request` (they may submit, unless
             `submit_requires_person`). The kill switch sets it back to `none`.
+    ProjectHistoryLogView:
+      type: object
+      required:
+      - project
+      - head
+      - entries
+      - more
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/CommitLogEntryView'
+        head:
+          type: string
+        more:
+          type: boolean
+        next_cursor:
+          type:
+          - string
+          - 'null'
+        project:
+          type: string
+          format: uuid
     RecoveryRequest:
       type: object
       required:

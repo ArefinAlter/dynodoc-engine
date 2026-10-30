@@ -4,6 +4,10 @@ use crate::{
     access::{self, MemberRole, Policy},
     auth::{
         device::{HistoryRead, HistoryReview, HistoryWrite, ProjectAuth},
+        token::{
+            mint_history_cursor, verify_history_cursor, HistoryCursorClaims,
+            HISTORY_CURSOR_TTL_SECONDS,
+        },
         AuthContext,
     },
     devices,
@@ -24,12 +28,16 @@ use engine_core::{
     repository::{
         attestation::{Receipt, Scope, SignedReceipt},
         authority_epoch::{MAX_CHAIN_PAGE, MAX_EPOCH},
+        log::{
+            first_parent_log, CommitLoader, FirstParentLogOptions, LoadedEnvelope,
+            DEFAULT_LOG_PAGE_LIMIT,
+        },
         server_authority, valid_branch, Head, SignedCommit,
     },
     shared_checkpoint::{self, typed, Address},
 };
 use ring::signature::KeyPair;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgConnection;
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,6 +75,7 @@ pub fn router() -> Router<AppState> {
             "/projects/{id}/history/commits/{address}/objects/{document}/{object}",
             get(object),
         )
+        .route("/projects/{id}/history/log", get(log))
         .route("/projects/{id}/history/refs", get(refs).post(advance))
         .route("/projects/{id}/history/reviews", get(reviews).post(review))
         .route("/projects/{id}/history/storage", get(storage))
@@ -224,6 +233,192 @@ async fn commit(
     authorize(&mut tx, &auth, id, &stored.scope, false).await?;
     tx.commit().await?;
     Ok(Json(json!(stored.signed)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogQuery {
+    pub head: Option<Address>,
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct CommitLogEntryView {
+    pub address: String,
+    pub parents: Vec<String>,
+    pub author_key: String,
+    pub authored_at_ms: i64,
+    pub message: Value,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct ProjectHistoryLogView {
+    pub project: Uuid,
+    pub head: String,
+    pub entries: Vec<CommitLogEntryView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub more: bool,
+}
+
+#[utoipa::path(
+    operation_id = "project_history_log",
+    get,
+    path = "/projects/{id}/history/log",
+    tag = "project history",
+    params(
+        ("id" = Uuid, Path, description = "Project ID"),
+        ("head" = Option<String>, Query, description = "Explicit starting commit address"),
+        ("limit" = Option<usize>, Query, description = "Page limit (1..=50, default 20)"),
+        ("cursor" = Option<String>, Query, description = "Opaque authenticated continuation cursor")
+    ),
+    security(
+        ("paseto" = []),
+        ("device_session" = ["history:read"])
+    ),
+    responses(
+        (status = 200, description = "Authorized paged first-parent commit log", body = ProjectHistoryLogView),
+        (status = 400, description = "Bad request, missing head, or invalid/tampered cursor"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Membership or commit scope access denied"),
+        (status = 404, description = "Project or starting commit not found")
+    )
+)]
+async fn log(
+    State(state): State<AppState>,
+    auth: ProjectAuth<HistoryRead>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<LogQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let mut tx = start(&state, &auth).await?;
+    member(&mut tx, &auth, id).await?;
+
+    let (start_address, requested_head, effective_limit) = if let Some(cursor_str) = &query.cursor {
+        let claims = verify_history_cursor(&state.auth.paseto_key, cursor_str)
+            .map_err(|_| bad("invalid, tampered or expired continuation cursor"))?;
+        if claims.project != id {
+            return Err(bad("cursor project mismatch"));
+        }
+        if claims.principal != auth.identity_id {
+            return Err(ApiError::Forbidden);
+        }
+        if let Some(ref q_head) = query.head {
+            if q_head != &claims.head {
+                return Err(bad("cursor head mismatch"));
+            }
+        }
+        if claims.next_address == claims.head {
+            return Err(bad("cursor loop detected"));
+        }
+        let limit = query.limit.unwrap_or(claims.limit);
+        (claims.next_address, claims.head, limit)
+    } else {
+        let head = query
+            .head
+            .ok_or_else(|| bad("head parameter is required"))?;
+        let limit = query.limit.unwrap_or(DEFAULT_LOG_PAGE_LIMIT);
+        (head.clone(), head, limit)
+    };
+
+    struct PublishedCommitLoader<'a, 'b> {
+        tx: &'a mut sqlx::Transaction<'b, sqlx::Postgres>,
+        auth: &'a AuthContext,
+        project: Uuid,
+    }
+
+    impl<'a, 'b> CommitLoader for PublishedCommitLoader<'a, 'b> {
+        async fn load(
+            &mut self,
+            address: &Address,
+        ) -> Result<LoadedEnvelope, engine_core::repository::Error> {
+            let row: Option<(Vec<u8>, Vec<Uuid>, i64)> = sqlx::query_as(
+                "select body, scope, height from project_published_commit where project_id=$1 and address=$2",
+            )
+            .bind(self.project)
+            .bind(address.as_str())
+            .fetch_optional(&mut **self.tx)
+            .await
+            .map_err(|_| engine_core::repository::Error::Invalid("database read error"))?;
+
+            let (body, scope, _height) =
+                row.ok_or_else(|| engine_core::repository::Error::Missing(address.clone()))?;
+
+            authorize(self.tx, self.auth, self.project, &scope, false)
+                .await
+                .map_err(|_| {
+                    engine_core::repository::Error::Invalid("unauthorized commit scope")
+                })?;
+
+            let signed: SignedCommit = serde_json::from_slice(&body)
+                .map_err(|_| engine_core::repository::Error::Invalid("stored commit encoding"))?;
+
+            Ok(LoadedEnvelope::new(signed, body.len()))
+        }
+    }
+
+    let page = {
+        let mut loader = PublishedCommitLoader {
+            tx: &mut tx,
+            auth: &auth,
+            project: id,
+        };
+        first_parent_log(
+            &mut loader,
+            id,
+            &start_address,
+            FirstParentLogOptions {
+                limit: Some(effective_limit),
+            },
+        )
+        .await
+    };
+
+    let page = match page {
+        Ok(p) => p,
+        Err(engine_core::repository::Error::Invalid("unauthorized commit scope")) => {
+            return Err(ApiError::Forbidden);
+        }
+        Err(engine_core::repository::Error::Missing(_)) => {
+            return Err(ApiError::NotFound);
+        }
+        Err(engine_core::repository::Error::Limit(msg)) => {
+            return Err(bad(msg));
+        }
+        Err(engine_core::repository::Error::Invalid(msg)) => {
+            return Err(bad(msg));
+        }
+        Err(other) => return Err(chain_error(other)),
+    };
+
+    let next_cursor = match page.next_address {
+        Some(next_addr) => Some(
+            mint_history_cursor(
+                &state.auth.paseto_key,
+                &HistoryCursorClaims {
+                    version: 1,
+                    project: id,
+                    principal: auth.identity_id,
+                    head: requested_head.clone(),
+                    next_address: next_addr,
+                    limit: effective_limit,
+                },
+                HISTORY_CURSOR_TTL_SECONDS,
+            )
+            .map_err(|e| ApiError::Internal(e.to_string()))?,
+        ),
+        None => None,
+    };
+
+    tx.commit().await?;
+
+    Ok(Json(json!({
+        "project": id,
+        "head": requested_head,
+        "entries": page.entries,
+        "next_cursor": next_cursor,
+        "more": page.more,
+    })))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1012,19 +1207,23 @@ async fn receipts(
     ))
 }
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(
-    publish,
-    commit,
-    inventory,
-    object,
-    advance,
-    refs,
-    review,
-    reviews,
-    storage,
-    authority,
-    rotations,
-    receipts,
-    acknowledge
-))]
+#[openapi(
+    paths(
+        publish,
+        commit,
+        inventory,
+        object,
+        advance,
+        refs,
+        review,
+        reviews,
+        storage,
+        authority,
+        rotations,
+        receipts,
+        acknowledge,
+        log
+    ),
+    components(schemas(CommitLogEntryView, ProjectHistoryLogView))
+)]
 pub struct ProjectHistoryApi;
