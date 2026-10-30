@@ -20,6 +20,7 @@ use uuid::Uuid;
 mod auth;
 mod authority;
 mod device;
+mod export_token;
 mod keyfile;
 mod keystore;
 mod mcp;
@@ -52,6 +53,9 @@ struct Cli {
 enum Command {
     /// Selected-history transfer. Remote heads are pinned separately from local branches.
     Sync(sync::Options),
+    /// Private export-carrier actions (mint, status, resolve, revoke).
+    #[command(alias = "export-tokens", alias = "export")]
+    ExportToken(export_token::Options),
     /// Read-only MCP server for AI agents over standard input and output (Claude Code,
     /// Claude Desktop). Launched by the client, not run by hand.
     Mcp(mcp::Options),
@@ -206,6 +210,7 @@ async fn run() -> anyhow::Result<()> {
     private_file::allow_insecure(cli.allow_insecure_key_file);
     passphrase::set_file(cli.passphrase_file);
     match cli.command {
+        Command::ExportToken(options) => export_token::run(options).await,
         Command::Sync(options) => sync::run(options).await,
         Command::Mcp(options) => mcp::run(options).await,
         Command::Device { action } => device::run(action),
