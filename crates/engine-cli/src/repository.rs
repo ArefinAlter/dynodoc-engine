@@ -110,6 +110,14 @@ pub enum Action {
         document: uuid::Uuid,
         address: String,
     },
+    /// Export selected dependency closure and object graph as a history archive.
+    ArchiveExport {
+        /// Head commit address to export.
+        head: String,
+        /// File path for the output archive (refuses overwrite).
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Import a private staging upload JSON batch, without moving any branch.
     ImportObjects { input: PathBuf },
     /// Read-only retention plan: what no branch head or recovery source reaches.
@@ -522,8 +530,11 @@ fn today_start_ms() -> anyhow::Result<i64> {
 }
 
 pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::Result<()> {
-    // The retention and horizon plans must not create, upgrade or write the database.
-    let repo = if matches!(action, Action::GcPlan { .. } | Action::HorizonPlan { .. }) {
+    // The retention, horizon plans and archive export must not create, upgrade or write the database.
+    let repo = if matches!(
+        action,
+        Action::GcPlan { .. } | Action::HorizonPlan { .. } | Action::ArchiveExport { .. }
+    ) {
         LocalRepository::open_read_only(&path, project).await?
     } else {
         // A destructive command never creates the database it would collect.
@@ -604,6 +615,51 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                 })
                 .await?;
             serde_json::json!({"address":packet.key.address,"bytes":STANDARD.encode(packet.bytes)})
+        }
+        Action::ArchiveExport { head, out } => {
+            let head_addr = address(head)?;
+            anyhow::ensure!(
+                !out.exists(),
+                "output file {} already exists; refusing overwrite",
+                out.display()
+            );
+
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out)
+                .with_context(|| format!("creating output archive at {}", out.display()))?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600));
+            }
+
+            let summary = match engine_core::repository::archive::export_archive(
+                &repo,
+                &head_addr,
+                file,
+                engine_core::repository::archive::ArchiveLimits::default(),
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&out);
+                    return Err(e).context("archive export failed");
+                }
+            };
+
+            serde_json::json!({
+                "out": out.display().to_string(),
+                "head": summary.head,
+                "objects": summary.objects,
+                "commits": summary.commits,
+                "bytes": summary.total_bytes,
+                "bytes_before_footer": summary.bytes_before_footer,
+                "sha256": summary.sha256,
+            })
         }
         Action::ImportObjects { input } => {
             let batch: TransferBatch = read_json(&input, 1_500_000)?;
@@ -1924,5 +1980,226 @@ mod tests {
             .clone()
             .try_get_matches_from(["gc-plan", "--format", "xml"])
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn archive_export_selected_closure_excludes_unrelated_private_branch() {
+        use engine_core::repository::archive::{
+            verify_archive_stream, ArchiveEntry, ArchiveLimits, ArchiveReader,
+        };
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1_v1 = f.file(doc1, &[(0, "File 1 v1")]).await;
+        let c1 = f.commit(&[], vec![("doc1.docx", f1_v1)], "Genesis").await;
+
+        let f1_v2 = f.file(doc1, &[(0, "File 1 v2")]).await;
+        let c2 = f
+            .commit(&[&c1], vec![("doc1.docx", f1_v2)], "Mainline edit")
+            .await;
+
+        // Unrelated private branch
+        let doc2 = DocumentId(uuid::Uuid::new_v4());
+        let f2 = f.file(doc2, &[(0, "Private file")]).await;
+        let _c3 = f
+            .commit(&[&c1], vec![("private.docx", f2.clone())], "Private branch")
+            .await;
+
+        let archive_path =
+            std::env::temp_dir().join(format!("test-archive-{}.dynoarc", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&archive_path);
+
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(archive_path.is_file());
+
+        // Verify stream with verify_archive_stream
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let summary = verify_archive_stream(
+            file,
+            ArchiveLimits::default(),
+            Some(&c2),
+            Some(DocumentId(f.project)),
+        )
+        .unwrap();
+        assert_eq!(summary.head, c2);
+        assert_eq!(summary.commits, 2); // c1 and c2 only, NOT c3
+
+        // Inspect frame by frame
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let mut reader = ArchiveReader::new(file, ArchiveLimits::default());
+        let mut seen_commits = Vec::new();
+        let mut seen_documents = std::collections::HashSet::new();
+
+        while let Some(entry) = reader.next_entry().unwrap() {
+            match entry {
+                ArchiveEntry::Object { document, .. } => {
+                    seen_documents.insert(document);
+                }
+                ArchiveEntry::Commit { address, .. } => {
+                    seen_commits.push(address);
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(seen_commits, vec![c1, c2]);
+        assert!(seen_documents.contains(&doc1));
+        assert!(
+            !seen_documents.contains(&doc2),
+            "unrelated private document must NOT be in archive"
+        );
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_export_refuses_overwrite() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Text")]).await;
+        let c1 = f.commit(&[], vec![("doc.docx", f1)], "Genesis").await;
+
+        let archive_path =
+            std::env::temp_dir().join(format!("test-overwrite-{}.dynoarc", uuid::Uuid::new_v4()));
+        std::fs::write(&archive_path, b"existing content").unwrap();
+
+        let err = run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("already exists; refusing overwrite"));
+        assert_eq!(std::fs::read(&archive_path).unwrap(), b"existing content");
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_export_tampered_storage_fails_closed_and_removes_incomplete_output() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Text")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        // Tamper object in database (drop immutable trigger first to simulate disk corruption)
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", f.path.display()))
+            .await
+            .unwrap();
+        sqlx::query("drop trigger if exists objects_no_update")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("update objects set bytes = x'deadbeef' where document = ? and address = ?")
+            .bind(doc1.0.to_string())
+            .bind(f1.state.as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let archive_path =
+            std::env::temp_dir().join(format!("test-tamper-{}.dynoarc", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&archive_path);
+
+        let err = run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("archive export failed"));
+        assert!(
+            !archive_path.exists(),
+            "incomplete archive output must be removed on failure"
+        );
+
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_export_merge_and_recovery_history() {
+        use engine_core::repository::archive::{verify_archive_stream, ArchiveLimits};
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+
+        // Base commit c1
+        let f1 = f.file(doc1, &[(0, "Base")]).await;
+        let c1 = f.commit(&[], vec![("doc1.docx", f1)], "Base").await;
+
+        // Left branch c2
+        let f2 = f.file(doc1, &[(0, "Left branch")]).await;
+        let c2 = f
+            .commit(&[&c1], vec![("doc1.docx", f2)], "Left branch")
+            .await;
+
+        // Right branch c3
+        let f3 = f.file(doc1, &[(0, "Right branch")]).await;
+        let c3 = f
+            .commit(&[&c1], vec![("doc1.docx", f3.clone())], "Right branch")
+            .await;
+
+        // Merge commit c4
+        let c4 = f
+            .commit(&[&c2, &c3], vec![("doc1.docx", f3)], "Merge left and right")
+            .await;
+
+        let archive_path =
+            std::env::temp_dir().join(format!("test-merge-{}.dynoarc", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&archive_path);
+
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c4.as_str().to_string(),
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(archive_path.is_file());
+
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let summary = verify_archive_stream(
+            file,
+            ArchiveLimits::default(),
+            Some(&c4),
+            Some(DocumentId(f.project)),
+        )
+        .unwrap();
+        assert_eq!(summary.head, c4);
+        assert_eq!(summary.commits, 4); // c1, c2, c3, c4
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
     }
 }
