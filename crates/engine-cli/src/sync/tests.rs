@@ -1832,3 +1832,464 @@ async fn revocation_refuses_clients_and_only_an_explicit_repin_crosses_the_recor
     }
     runtime.close().await;
 }
+
+#[tokio::test]
+async fn export_file_equivalence_with_local_export_and_leaves_local_repo_unmodified() {
+    use engine_core::repository::state_export::StateExportEnvelope;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let (p1, r1) = repo(project).await;
+    let doc = Uuid::new_v4();
+    let signed = commit(
+        &r1,
+        doc,
+        &key(7),
+        vec![],
+        "Equivalence verification content",
+    )
+    .await;
+    let commit_addr = signed.verify().unwrap();
+
+    let local_out = std::env::temp_dir().join(format!("test-local-export-{}.json", Uuid::new_v4()));
+    let local_state = r1
+        .read_state(DocumentId(doc), &signed.commit.files["Report.docx"].state)
+        .await
+        .unwrap();
+    let local_envelope =
+        StateExportEnvelope::new("Report.docx".into(), signed.clone(), local_state);
+    local_envelope.write_to_path(&local_out).unwrap();
+
+    let source = r1.clone();
+    let signed_commit = signed.clone();
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(move || {
+                let c = signed_commit.clone();
+                async move { Json(json!(c)) }
+            }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{commit}/objects/{doc}/{address}",
+            get(
+                move |axum::extract::Path((_id, _commit, _doc, object)): axum::extract::Path<(
+                    String,
+                    String,
+                    String,
+                    String,
+                )>| {
+                    let source = source.clone();
+                    async move {
+                        let bytes = source
+                            .object(&ObjectKey {
+                                document: DocumentId(doc),
+                                address: Address::try_from(object.clone()).unwrap(),
+                            })
+                            .await
+                            .unwrap()
+                            .bytes;
+                        Json(json!({"address": object, "bytes": STANDARD.encode(bytes)}))
+                    }
+                },
+            ),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url.clone(), authority), project, "synthetic", true).unwrap();
+
+    // 1. Direct transfer::export_file check
+    let remote_out =
+        std::env::temp_dir().join(format!("test-remote-export-{}.json", Uuid::new_v4()));
+    transfer::export_file(&client, project, &commit_addr, "Report.docx", &remote_out)
+        .await
+        .unwrap();
+
+    assert!(remote_out.exists());
+    #[cfg(unix)]
+    {
+        let perms = std::fs::metadata(&remote_out).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
+    }
+
+    let remote_bytes = std::fs::read(&remote_out).unwrap();
+    let remote_envelope: StateExportEnvelope = serde_json::from_slice(&remote_bytes).unwrap();
+    assert_eq!(local_envelope, remote_envelope);
+
+    // 2. CLI options integration test: verify sync run works and leaves repo/journal untouched
+    let (p2, r2) = repo(project).await;
+    let (j2, journal2) = journal().await;
+    let remote_json_path = std::env::temp_dir().join(format!("remote-{}.json", Uuid::new_v4()));
+    std::fs::write(
+        &remote_json_path,
+        serde_json::to_vec(&remote(url.clone(), authority)).unwrap(),
+    )
+    .unwrap();
+    let token_path = std::env::temp_dir().join(format!("token-{}.txt", Uuid::new_v4()));
+    std::fs::write(&token_path, "synthetic").unwrap();
+
+    let cli_out = std::env::temp_dir().join(format!("test-cli-export-{}.json", Uuid::new_v4()));
+    let opts = Options {
+        repository: p2.clone(),
+        project,
+        remote: remote_json_path.clone(),
+        token_file: Some(token_path.clone()),
+        refresh_token_file: None,
+        device_key: None,
+        journal: j2.clone(),
+        branch: "main".into(),
+        allow_loopback_http: true,
+        accept_authority_break: None,
+        action: Action::ExportFile {
+            commit: commit_addr.as_str().to_string(),
+            path: "Report.docx".into(),
+            out: cli_out.clone(),
+        },
+    };
+
+    run(opts).await.unwrap();
+    assert!(cli_out.exists());
+    let cli_bytes = std::fs::read(&cli_out).unwrap();
+    let cli_envelope: StateExportEnvelope = serde_json::from_slice(&cli_bytes).unwrap();
+    assert_eq!(local_envelope, cli_envelope);
+
+    // Assert r2 and journal2 remain completely empty (no commits, no objects, no pins)
+    assert!(r2.commit(&commit_addr).await.is_err());
+    assert!(r2.head("main").await.unwrap().is_none());
+    assert!(journal2
+        .pin(&Scope {
+            authority,
+            project,
+            branch: "main".into(),
+        })
+        .await
+        .unwrap()
+        .is_none());
+
+    server.abort();
+    let _ = server.await;
+    r1.close().await;
+    r2.close().await;
+    journal2.close().await;
+    let _ = std::fs::remove_file(&local_out);
+    let _ = std::fs::remove_file(&remote_out);
+    let _ = std::fs::remove_file(&cli_out);
+    let _ = std::fs::remove_file(&remote_json_path);
+    let _ = std::fs::remove_file(&token_path);
+    remove(p1).await;
+    remove(p2).await;
+    remove(j2).await;
+}
+
+#[tokio::test]
+async fn export_file_malicious_object_or_address_fails_and_cleans_up() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let (p1, r1) = repo(project).await;
+    let doc = Uuid::new_v4();
+    let signed = commit(&r1, doc, &key(7), vec![], "Malicious response test").await;
+    let commit_addr = signed.verify().unwrap();
+
+    let signed_commit = signed.clone();
+    // Mode 1: address mismatch in object response
+    // Mode 2: hash mismatch (corrupt bytes) in object response
+    use std::sync::atomic::{AtomicU8, Ordering};
+    let mode = Arc::new(AtomicU8::new(1));
+    let mode_clone = mode.clone();
+
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/authority",
+            get(move || async move { Json(epoch_one(authority)) }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(move || {
+                let c = signed_commit.clone();
+                async move { Json(json!(c)) }
+            }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{commit}/objects/{doc}/{address}",
+            get(
+                move |axum::extract::Path((_id, _commit, _doc, object)): axum::extract::Path<(
+                    String,
+                    String,
+                    String,
+                    String,
+                )>| {
+                    let m = mode_clone.load(Ordering::Relaxed);
+                    async move {
+                        if m == 1 {
+                            // Mismatched address in packet
+                            let fake_address = "f".repeat(64);
+                            Json(json!({"address": fake_address, "bytes": STANDARD.encode(b"some content")}))
+                        } else {
+                            // Corrupt bytes (hash mismatch)
+                            Json(json!({"address": object, "bytes": STANDARD.encode(b"completely corrupted bytes")}))
+                        }
+                    }
+                },
+            ),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url.clone(), authority), project, "synthetic", true).unwrap();
+
+    // Mode 1: address mismatch
+    mode.store(1, Ordering::Relaxed);
+    let out1 = std::env::temp_dir().join(format!("test-out-malicious-1-{}.json", Uuid::new_v4()));
+    let err1 = transfer::export_file(&client, project, &commit_addr, "Report.docx", &out1)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err1.contains("object response address mismatch"),
+        "expected address mismatch, got: {err1}"
+    );
+    assert!(!out1.exists(), "output file should not exist after failure");
+
+    // Mode 2: corrupt hash
+    mode.store(2, Ordering::Relaxed);
+    let out2 = std::env::temp_dir().join(format!("test-out-malicious-2-{}.json", Uuid::new_v4()));
+    let _err2 = transfer::export_file(&client, project, &commit_addr, "Report.docx", &out2)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !out2.exists(),
+        "output file should not exist after corruption failure"
+    );
+
+    server.abort();
+    let _ = server.await;
+    r1.close().await;
+    remove(p1).await;
+}
+
+#[tokio::test]
+async fn export_file_cross_project_redirect_and_scope_denial_fail() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let (p1, r1) = repo(project).await;
+    let doc = Uuid::new_v4();
+    let _signed = commit(&r1, doc, &key(7), vec![], "Cross-project test").await;
+
+    // 1. Cross-project commit response: commit has different project
+    let other_project = Uuid::new_v4();
+    let (p_other, r_other) = repo(other_project).await;
+    let signed_other = commit(&r_other, doc, &key(7), vec![], "Other project").await;
+    let commit_other_addr = signed_other.verify().unwrap();
+
+    let router = Router::new()
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(move || {
+                let c = signed_other.clone();
+                async move { Json(json!(c)) }
+            }),
+        )
+        .route(
+            "/projects/{id}/redirect",
+            get(|| async { axum::response::Redirect::temporary("/other-project") }),
+        )
+        .route(
+            "/projects/{id}/denied",
+            get(|| async { (axum::http::StatusCode::FORBIDDEN, "scope denial") }),
+        );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url.clone(), authority), project, "synthetic", true).unwrap();
+
+    // Cross-project mismatch
+    let out = std::env::temp_dir().join(format!("test-out-crossproj-{}.json", Uuid::new_v4()));
+    let err = transfer::export_file(&client, project, &commit_other_addr, "Report.docx", &out)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("project mismatch") || err.contains("commit does not match requested project"),
+        "got: {err}"
+    );
+    assert!(!out.exists());
+
+    // Redirect rejected
+    let redirect_client =
+        Client::new(remote(url.clone(), authority), project, "synthetic", true).unwrap();
+    let err_red = redirect_client
+        .get::<Value>("redirect", &[], 1024)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err_red.contains("307"),
+        "expected 307 redirect error, got: {err_red}"
+    );
+
+    // Scope denial (403)
+    let err_denied = redirect_client
+        .get::<Value>("denied", &[], 1024)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err_denied.contains("403"));
+
+    server.abort();
+    let _ = server.await;
+    r1.close().await;
+    r_other.close().await;
+    remove(p1).await;
+    remove(p_other).await;
+}
+
+#[tokio::test]
+async fn export_file_missing_path_absent_commit_and_overwrite_refusal_fail() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let (p1, r1) = repo(project).await;
+    let doc = Uuid::new_v4();
+    let signed = commit(&r1, doc, &key(7), vec![], "Missing path test").await;
+    let commit_addr = signed.verify().unwrap();
+
+    let signed_commit = signed.clone();
+    let router = Router::new().route(
+        "/projects/{id}/history/commits/{address}",
+        get(
+            move |axum::extract::Path((_id, address)): axum::extract::Path<(String, String)>| {
+                let signed = signed_commit.clone();
+                async move {
+                    if address == signed.verify().unwrap().as_str() {
+                        (axum::http::StatusCode::OK, Json(json!(signed)))
+                    } else {
+                        (
+                            axum::http::StatusCode::NOT_FOUND,
+                            Json(json!({"error": "not found"})),
+                        )
+                    }
+                }
+            },
+        ),
+    );
+
+    let (url, server) = serve(router).await;
+    let client = Client::new(remote(url.clone(), authority), project, "synthetic", true).unwrap();
+
+    // 1. Missing path in commit
+    let out1 = std::env::temp_dir().join(format!("test-out-missing-path-{}.json", Uuid::new_v4()));
+    let err1 = transfer::export_file(&client, project, &commit_addr, "NonExistent.docx", &out1)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err1.contains("path 'NonExistent.docx' not found"),
+        "got: {err1}"
+    );
+    assert!(!out1.exists());
+
+    // 2. Absent commit (404)
+    let absent_commit = Address::try_from("0".repeat(64)).unwrap();
+    let out2 = std::env::temp_dir().join(format!("test-out-absent-commit-{}.json", Uuid::new_v4()));
+    let err2 = transfer::export_file(&client, project, &absent_commit, "Report.docx", &out2)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err2.contains("not found"), "got: {err2}");
+    assert!(!out2.exists());
+
+    // 3. Overwrite refusal
+    let existing_out = std::env::temp_dir().join(format!("test-existing-{}.json", Uuid::new_v4()));
+    std::fs::write(&existing_out, b"pre-existing content").unwrap();
+    let err3 = transfer::export_file(&client, project, &commit_addr, "Report.docx", &existing_out)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err3.contains("already exists; refusing overwrite"),
+        "got: {err3}"
+    );
+    assert_eq!(
+        std::fs::read(&existing_out).unwrap(),
+        b"pre-existing content"
+    );
+
+    server.abort();
+    let _ = server.await;
+    r1.close().await;
+    let _ = std::fs::remove_file(&existing_out);
+    remove(p1).await;
+}
+
+#[tokio::test]
+async fn export_file_expired_access_and_oversized_graph_fail() {
+    let project = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let (p1, r1) = repo(project).await;
+    let doc = Uuid::new_v4();
+    let signed = commit(&r1, doc, &key(7), vec![], "Expired access and limits test").await;
+    let commit_addr = signed.verify().unwrap();
+
+    // Router simulating 401 Unauthorized
+    let router_401 = Router::new().route(
+        "/projects/{id}/history/commits/{address}",
+        get(|| async { (axum::http::StatusCode::UNAUTHORIZED, "expired token") }),
+    );
+
+    let (url_401, server_401) = serve(router_401).await;
+    let client_401 = Client::new(remote(url_401, authority), project, "synthetic", true).unwrap();
+    let out_401 = std::env::temp_dir().join(format!("test-out-401-{}.json", Uuid::new_v4()));
+    let err_401 =
+        transfer::export_file(&client_401, project, &commit_addr, "Report.docx", &out_401)
+            .await
+            .unwrap_err()
+            .to_string();
+    assert!(
+        err_401.contains("401") || err_401.contains("expired token"),
+        "got: {err_401}"
+    );
+    assert!(!out_401.exists());
+    server_401.abort();
+    let _ = server_401.await;
+
+    // Router returning oversized payload
+    let signed_commit = signed.clone();
+    let router_large = Router::new()
+        .route(
+            "/projects/{id}/history/commits/{address}",
+            get(move || {
+                let c = signed_commit.clone();
+                async move { Json(json!(c)) }
+            }),
+        )
+        .route(
+            "/projects/{id}/history/commits/{commit}/objects/{doc}/{address}",
+            get(|| async {
+                Json(json!({"address": "0".repeat(64), "bytes": STANDARD.encode(vec![0u8; 2_000_000])}))
+            }),
+        );
+
+    let (url_large, server_large) = serve(router_large).await;
+    let client_large =
+        Client::new(remote(url_large, authority), project, "synthetic", true).unwrap();
+    let out_large = std::env::temp_dir().join(format!("test-out-large-{}.json", Uuid::new_v4()));
+    let _err_large = transfer::export_file(
+        &client_large,
+        project,
+        &commit_addr,
+        "Report.docx",
+        &out_large,
+    )
+    .await
+    .unwrap_err();
+    assert!(!out_large.exists());
+
+    server_large.abort();
+    let _ = server_large.await;
+    r1.close().await;
+    remove(p1).await;
+}
