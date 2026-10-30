@@ -1,0 +1,32 @@
+{
+  "date": "2026-10-21",
+  "limitations": "One disposable local database; sequential warm and incremental reads, no concurrent writers or lock wait. Incremental reads follow one committed edit and compare with the checked reader. Cache reads hold the document lock; lock acquisition and role checks are excluded from timings.",
+  "measurement": "Medians of 9 warm checked reads, warm cache reads, and incremental cached/checked reads after each new committed edit",
+  "platform": "linux x86_64; debug build; single-thread Tokio runtime; local PostgreSQL",
+  "results": [
+    {
+      "blocks": 1000,
+      "cache_hits": 18,
+      "cache_misses": 1,
+      "cache_serialized_bytes": 854223,
+      "cached_incremental_ms": 23.466582,
+      "cached_warm_ms": 3.9427359999999996,
+      "checked_incremental_ms": 110.96001,
+      "read_current_state_ms": 115.142304,
+      "snapshot_json_bytes": 1068086,
+      "tail_events": 500
+    },
+    {
+      "blocks": 8000,
+      "cache_hits": 18,
+      "cache_misses": 1,
+      "cache_serialized_bytes": 8597579,
+      "cached_incremental_ms": 215.931118,
+      "cached_warm_ms": 29.830748,
+      "checked_incremental_ms": 803.521207,
+      "read_current_state_ms": 814.717829,
+      "snapshot_json_bytes": 9005124,
+      "tail_events": 500
+    }
+  ]
+}

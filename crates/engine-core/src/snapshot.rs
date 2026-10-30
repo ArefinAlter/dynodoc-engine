@@ -1,5 +1,7 @@
 //! Snapshot engine (docs/15).
 
+pub mod cache;
+
 use engine_shared::{DocumentId, Event, EventPayload, Snapshot};
 use futures::TryStreamExt;
 use ring::digest::{Context, SHA256};

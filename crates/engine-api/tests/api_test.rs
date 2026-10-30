@@ -23,6 +23,109 @@ mod common;
 const KEY: [u8; 32] = [7u8; 32];
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn cached_writes_recheck_permissions_and_follow_another_process(pool: PgPool) {
+    let runtime = common::RuntimeDatabase::new(pool).await;
+    let cache = engine_core::snapshot::cache::CurrentStateCache::default();
+    let mut state = test_state(runtime.pool.clone());
+    state.write_cache = Some(cache.clone());
+    let router = app(state);
+    let owner = bearer(seed_identity(&runtime.pool, "cache-owner@example.test").await);
+    let editor_id = seed_identity(&runtime.pool, "cache-editor@example.test").await;
+    let editor = bearer(editor_id);
+    let doc = create_document(&router, &owner, "Cached writes").await;
+    sqlx::query("insert into document_access(document_id,identity_id,role) values($1,$2,'author')")
+        .bind(doc)
+        .bind(editor_id)
+        .execute(&runtime.pool)
+        .await
+        .unwrap();
+    let (status, created) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_type":"form","pos":"a0","fields":{"label":"Initial"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let node = created["event"]["target_node_id"].as_str().unwrap();
+    for (token, value) in [(&owner, "Owner edit"), (&editor, "Editor edit")] {
+        let (status, body) = send(
+            &router,
+            auth_post(
+                &format!("/documents/{doc}/ops/field-edit"),
+                token,
+                &json!({"node_id":node,"field":"label","value":value}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert!(
+        cache.stats().hits > 0,
+        "the real write path must use its opt-in cache"
+    );
+    let mut other_state = test_state(runtime.pool.clone());
+    other_state.write_cache = None;
+    let other_process = app(other_state);
+    let (status, body) = send(
+        &other_process,
+        auth_post(
+            &format!("/documents/{doc}/ops/field-edit"),
+            &owner,
+            &json!({"node_id":node,"field":"title","value":"Another process"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/field-edit"),
+            &owner,
+            &json!({"node_id":node,"field":"label","value":"Final"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    sqlx::query("delete from document_access where document_id=$1 and identity_id=$2")
+        .bind(doc)
+        .bind(editor_id)
+        .execute(&runtime.pool)
+        .await
+        .unwrap();
+    let before = cache.stats();
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/field-edit"),
+            &editor,
+            &json!({"node_id":node,"field":"label","value":"Forbidden"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        cache.stats(),
+        before,
+        "authorization must precede cache lookup"
+    );
+    let (status, read) = send(&router, auth_post_get(&format!("/documents/{doc}"), &owner)).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(
+        read["state"]["nodes"][node]["current_fields"]["label"],
+        "Final"
+    );
+    assert_eq!(
+        read["state"]["nodes"][node]["current_fields"]["title"],
+        "Another process"
+    );
+    assert_eq!(read["latest_seq"], 5);
+    runtime.close().await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn waiting_writer_rechecks_revoked_access(pool: PgPool) {
     let router = app(test_state(pool.clone()));
     let owner = bearer(seed_identity(&pool, "lock-owner@example.test").await);
