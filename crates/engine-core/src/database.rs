@@ -84,6 +84,7 @@ const INSERT_UPDATE: &[&str] = &[
     "project_agent_policy",
     "file_agent_policy",
     "agent_identity",
+    "export_node_token",
 ];
 const FUNCTIONS: &[&str] = &[
     "access_role_rank(text)",
