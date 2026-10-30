@@ -545,6 +545,33 @@ impl Client {
         }
         self.get("history/compare", &query, 512 * 1024).await
     }
+    pub async fn compare_file_page(
+        &self,
+        from: &Address,
+        to: &Address,
+        path: &str,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+        include_unchanged: bool,
+    ) -> anyhow::Result<engine_core::repository::compare::FileCompareReport> {
+        let mut query = vec![
+            ("from", from.as_str().to_string()),
+            ("to", to.as_str().to_string()),
+            ("path", path.to_string()),
+        ];
+        let limit_str;
+        if let Some(limit) = limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str));
+        }
+        if let Some(cursor) = cursor {
+            query.push(("cursor", cursor.to_string()));
+        }
+        if include_unchanged {
+            query.push(("include_unchanged", "true".to_string()));
+        }
+        self.get("history/compare/file", &query, 512 * 1024).await
+    }
     pub async fn post(&self, path: &str, body: Value) -> anyhow::Result<Value> {
         Ok(self
             .request(Method::POST, path, &[], Some(&body), 64 * 1024, false)

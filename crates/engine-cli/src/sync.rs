@@ -7,7 +7,9 @@ use engine_core::{
     repository::{
         attestation::{Scope, SignedReceipt},
         authority_epoch::{Kind, Refusal, SignedTransition},
-        compare::{DiffKind, DiffTotals, ProjectDiffReport},
+        compare::{
+            BoundedValue, DiffKind, DiffTotals, FileCompareReport, NodeDiffKind, ProjectDiffReport,
+        },
         local::{LocalRepository, ObjectKey, ObjectPacket},
         receipt_journal::ReceiptJournal,
         Head, SignedCommit, MAX_COMMIT_BYTES,
@@ -111,12 +113,15 @@ pub enum Action {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Compare two published remote commits across manifest paths.
+    /// Compare two published remote commits across manifest paths, or node-level file detail.
     Compare {
         #[arg(long, value_parser = parse_address)]
         from: Address,
         #[arg(long, value_parser = parse_address)]
         to: Address,
+        /// Compare node-level details for an exact file path.
+        #[arg(long)]
+        path: Option<String>,
         /// Format output as stable JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
@@ -250,12 +255,26 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
             client.authority().await?;
         }
         match options.action {
-            Action::Compare { from, to, json } => {
-                let report = compare(&client, &from, &to).await?;
-                if json {
-                    Ok(SyncOutput::Json(format_compare_json(&report)?))
+            Action::Compare {
+                from,
+                to,
+                path,
+                json,
+            } => {
+                if let Some(path) = path {
+                    let report = compare_file(&client, &from, &to, &path).await?;
+                    if json {
+                        Ok(SyncOutput::Json(format_file_compare_json(&report)?))
+                    } else {
+                        Ok(SyncOutput::Text(format_file_compare_text(&report)))
+                    }
                 } else {
-                    Ok(SyncOutput::Text(format_compare_text(&report)))
+                    let report = compare(&client, &from, &to).await?;
+                    if json {
+                        Ok(SyncOutput::Json(format_compare_json(&report)?))
+                    } else {
+                        Ok(SyncOutput::Text(format_compare_text(&report)))
+                    }
                 }
             }
             Action::Plan {
@@ -946,6 +965,287 @@ pub fn format_compare_text(report: &ProjectDiffReport) -> String {
 }
 
 pub fn format_compare_json(report: &ProjectDiffReport) -> anyhow::Result<Value> {
+    let mut value = serde_json::to_value(report)?;
+    if let Value::Object(ref mut map) = value {
+        map.insert("server_metadata".into(), Value::Bool(true));
+        map.insert(
+            "disclaimer".into(),
+            Value::String(
+                "Server-produced metadata; does not independently verify document content or cryptographic receipts.".into(),
+            ),
+        );
+    }
+    Ok(value)
+}
+
+pub async fn compare_file(
+    client: &Client,
+    from: &Address,
+    to: &Address,
+    path: &str,
+) -> anyhow::Result<FileCompareReport> {
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut initial_report: Option<FileCompareReport> = None;
+    let mut all_node_changes = Vec::new();
+    let mut last_node_id: Option<String> = None;
+
+    loop {
+        let page = client
+            .compare_file_page(from, to, path, None, cursor.as_deref(), false)
+            .await?;
+
+        ensure!(
+            page.project == client.project,
+            "remote report project mismatch: expected {}, got {}",
+            client.project,
+            page.project
+        );
+        ensure!(
+            &page.from == from,
+            "remote report from-address mismatch: expected {}, got {}",
+            from.as_str(),
+            page.from.as_str()
+        );
+        ensure!(
+            &page.to == to,
+            "remote report to-address mismatch: expected {}, got {}",
+            to.as_str(),
+            page.to.as_str()
+        );
+        ensure!(
+            page.path == path,
+            "remote report path mismatch: expected {}, got {}",
+            path,
+            page.path
+        );
+
+        if let Some(initial) = &initial_report {
+            ensure!(
+                initial.kind == page.kind,
+                "remote report diff kind changed across pages"
+            );
+            ensure!(
+                initial.document_replaced == page.document_replaced,
+                "remote report document_replaced flag changed across pages"
+            );
+            ensure!(
+                initial.from_file == page.from_file,
+                "remote report from_file changed across pages"
+            );
+            ensure!(
+                initial.to_file == page.to_file,
+                "remote report to_file changed across pages"
+            );
+            if let (Some(init_nd), Some(page_nd)) = (&initial.node_diff, &page.node_diff) {
+                ensure!(
+                    init_nd.document_id == page_nd.document_id,
+                    "remote report document_id changed across pages"
+                );
+                ensure!(
+                    init_nd.from_root == page_nd.from_root && init_nd.to_root == page_nd.to_root,
+                    "remote report roots changed across pages"
+                );
+                ensure!(
+                    init_nd.whole_state_identical == page_nd.whole_state_identical,
+                    "remote report whole_state_identical changed across pages"
+                );
+                ensure!(
+                    init_nd.totals == page_nd.totals,
+                    "remote report totals changed across pages"
+                );
+                ensure!(
+                    init_nd.components == page_nd.components,
+                    "remote report components changed across pages"
+                );
+            }
+        }
+
+        if let Some(node_diff) = &page.node_diff {
+            for change in &node_diff.changes {
+                if let Some(last) = &last_node_id {
+                    ensure!(
+                        change.node_id.0.as_str() > last.as_str(),
+                        "remote report node changes out of order"
+                    );
+                }
+                last_node_id = Some(change.node_id.0.clone());
+                all_node_changes.push(change.clone());
+            }
+        }
+
+        let is_more = page.more;
+        let next_cursor = page.next_cursor.clone();
+
+        if initial_report.is_none() {
+            initial_report = Some(page);
+        }
+
+        if !is_more {
+            ensure!(
+                next_cursor.is_none(),
+                "terminal page must not include next_cursor"
+            );
+            break;
+        }
+
+        let next = next_cursor.ok_or_else(|| {
+            anyhow!("remote report indicated more changes but omitted next_cursor")
+        })?;
+        ensure!(!next.is_empty(), "empty cursor");
+        ensure!(seen_cursors.insert(next.clone()), "cursor loop detected");
+        ensure!(seen_cursors.len() <= 10_000, "exceeded maximum page count");
+        cursor = Some(next);
+    }
+
+    let mut final_report = initial_report.ok_or_else(|| anyhow!("empty response"))?;
+    if let Some(ref mut nd) = final_report.node_diff {
+        ensure!(
+            all_node_changes.len() == nd.totals.total_changes,
+            "retrieved node changes count ({}) does not match report totals ({})",
+            all_node_changes.len(),
+            nd.totals.total_changes
+        );
+        nd.changes = all_node_changes;
+        nd.next_cursor = None;
+        nd.more = false;
+    }
+    final_report.next_cursor = None;
+    final_report.more = false;
+
+    Ok(final_report)
+}
+
+pub fn format_file_compare_text(report: &FileCompareReport) -> String {
+    let mut out = String::new();
+    out.push_str("Server-produced metadata (unverified by receipt journal)\n");
+    out.push_str(&format!("Project: {}\n", report.project));
+    out.push_str(&format!("From:    {}\n", report.from.as_str()));
+    out.push_str(&format!("To:      {}\n", report.to.as_str()));
+    out.push_str(&format!("Path:    {}\n", report.path));
+
+    let kind_str = match report.kind {
+        DiffKind::Added => "added",
+        DiffKind::Removed => "removed",
+        DiffKind::Modified => {
+            if report.document_replaced {
+                "modified (document identity replaced)"
+            } else {
+                "modified"
+            }
+        }
+        DiffKind::Unchanged => "unchanged",
+    };
+    out.push_str(&format!("Status:  {}\n", kind_str));
+
+    if let (Some(from), Some(to)) = (&report.from_file, &report.to_file) {
+        if from.document != to.document {
+            out.push_str(&format!(
+                "Document: replaced ({} -> {})\n",
+                from.document.0, to.document.0
+            ));
+        } else {
+            out.push_str(&format!("Document: {}\n", from.document.0));
+            out.push_str(&format!(
+                "Roots:    {} -> {}\n",
+                from.state.as_str(),
+                to.state.as_str()
+            ));
+        }
+    } else if let Some(to) = &report.to_file {
+        out.push_str(&format!(
+            "Document: {} (root {})\n",
+            to.document.0,
+            to.state.as_str()
+        ));
+    } else if let Some(from) = &report.from_file {
+        out.push_str(&format!(
+            "Document: {} (root {})\n",
+            from.document.0,
+            from.state.as_str()
+        ));
+    }
+
+    if let Some(nd) = &report.node_diff {
+        out.push_str(&format!(
+            "Node totals: {} change(s) ({} added, {} removed, {} modified, {} unchanged)\n",
+            nd.totals.total_changes,
+            nd.totals.added,
+            nd.totals.removed,
+            nd.totals.modified,
+            nd.totals.unchanged,
+        ));
+        out.push_str(&format!(
+            "Components: comments (from: {}, to: {}, changed: {}), suggestions (from: {}, to: {}, changed: {}), removed choices (from: {}, to: {}, changed: {})\n",
+            nd.components.comments_from_count,
+            nd.components.comments_to_count,
+            nd.components.comments_changed,
+            nd.components.suggestions_from_count,
+            nd.components.suggestions_to_count,
+            nd.components.suggestions_changed,
+            nd.components.removed_choices_from_count,
+            nd.components.removed_choices_to_count,
+            nd.components.removed_choices_changed,
+        ));
+
+        if !nd.changes.is_empty() {
+            out.push('\n');
+            for change in &nd.changes {
+                let symbol = match change.kind {
+                    NodeDiffKind::Added => "+",
+                    NodeDiffKind::Removed => "-",
+                    NodeDiffKind::Modified => "~",
+                    NodeDiffKind::Unchanged => "=",
+                };
+                let type_info = match (&change.from, &change.to) {
+                    (Some(f), Some(t)) if f.node_type != t.node_type => {
+                        format!(" ({}:{} -> {}:{})", f.node_type, f.pos, t.node_type, t.pos)
+                    }
+                    (Some(f), _) => format!(" ({}:{})", f.node_type, f.pos),
+                    (_, Some(t)) => format!(" ({}:{})", t.node_type, t.pos),
+                    (None, None) => String::new(),
+                };
+                out.push_str(&format!("  {} {}{}\n", symbol, change.node_id.0, type_info));
+
+                for field in &change.field_changes {
+                    out.push_str(&format!("    field {}: ", field.field));
+                    match (&field.from, &field.to) {
+                        (None, Some(to_val)) => {
+                            out.push_str(&format!("added {}\n", format_bounded_val(to_val)))
+                        }
+                        (Some(from_val), None) => out
+                            .push_str(&format!("removed (was {})\n", format_bounded_val(from_val))),
+                        (Some(from_val), Some(to_val)) => out.push_str(&format!(
+                            "{} -> {}\n",
+                            format_bounded_val(from_val),
+                            format_bounded_val(to_val)
+                        )),
+                        (None, None) => out.push_str("unchanged\n"),
+                    }
+                }
+            }
+        }
+    }
+
+    out.push_str(
+        "\nNote: Server-produced metadata; does not independently verify document content or native formatting.",
+    );
+    out
+}
+
+fn format_bounded_val(v: &BoundedValue) -> String {
+    match v {
+        BoundedValue::Value(val) => val.to_string(),
+        BoundedValue::Omitted(omitted) => {
+            format!(
+                "[omitted: {} bytes, sha256: {}]",
+                omitted.bytes, omitted.sha256
+            )
+        }
+    }
+}
+
+pub fn format_file_compare_json(report: &FileCompareReport) -> anyhow::Result<Value> {
     let mut value = serde_json::to_value(report)?;
     if let Value::Object(ref mut map) = value {
         map.insert("server_metadata".into(), Value::Bool(true));
