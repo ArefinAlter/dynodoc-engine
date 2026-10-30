@@ -119,6 +119,18 @@ enum Command {
     },
     /// Check schema and runtime privileges using DATABASE_URL; makes no changes.
     CheckRuntime,
+    /// Inspect database column collations and test SQL ordering parity with Rust byte order (read-only).
+    ///
+    /// Exit status:
+    ///   0: all relational ID/position columns and synthetic string tests match Rust byte order
+    ///   2: incompatible column collation or ordering mismatch detected
+    ///   1: connection or database query error
+    #[command(name = "check-ordering", alias = "ordering-audit")]
+    CheckOrdering {
+        /// Emit structured JSON report to standard output.
+        #[arg(long)]
+        json: bool,
+    },
     /// Independently verify the event chain and all legacy snapshots.
     Verify {
         /// Document id (UUID).
@@ -285,6 +297,7 @@ async fn run() -> anyhow::Result<()> {
             println!("Runtime schema and database privileges verified.");
             Ok(())
         }
+        Command::CheckOrdering { json } => check_ordering(json).await,
         Command::Verify {
             document_id,
             expect_head,
@@ -542,4 +555,90 @@ async fn shared_snapshot(document_id: String, through_seq: i64, typed: bool) -> 
         result.stats.new_objects, result.stats.new_bytes
     );
     Ok(())
+}
+
+async fn check_ordering(json: bool) -> anyhow::Result<()> {
+    let pool = connect().await?;
+    let report = engine_core::database::ordering::audit_ordering(&pool).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_ordering_report(&report);
+    }
+    if !report.compatible {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn print_ordering_report(report: &engine_core::database::ordering::OrderingAuditReport) {
+    println!(
+        "Database: {} (collation: {}, ctype: {}, provider: {})",
+        report.database.datname,
+        report.database.datcollate,
+        report.database.datctype,
+        report.database.datlocprovider
+    );
+    let db_byte_order = if report.database.is_byte_order_default {
+        "YES"
+    } else {
+        "NO"
+    };
+    println!("Database default byte-order collation: {db_byte_order}");
+    println!();
+    println!(
+        "Column Collation Inventory ({} columns):",
+        report.columns.len()
+    );
+    for col in &report.columns {
+        let status = if col.is_byte_order {
+            "OK"
+        } else {
+            "INCOMPATIBLE"
+        };
+        println!(
+            "  [{status}] {}.{} ({}, effective: {})",
+            col.table_name, col.column_name, col.data_type, col.effective_collation
+        );
+    }
+    if !report.foreign_keys.is_empty() {
+        println!();
+        println!(
+            "Foreign Key References ({} constraints):",
+            report.foreign_keys.len()
+        );
+        for fk in &report.foreign_keys {
+            println!(
+                "  {}: {}({}) -> {}({})",
+                fk.constraint_name,
+                fk.source_table,
+                fk.source_column,
+                fk.target_table,
+                fk.target_column
+            );
+        }
+    }
+    println!();
+    println!(
+        "Synthetic Ordering Parity Checks ({} categories):",
+        report.comparisons.len()
+    );
+    for cmp in &report.comparisons {
+        let status = if cmp.matches { "OK" } else { "MISMATCH" };
+        print!("  [{status}] {}: {} item(s)", cmp.category, cmp.count);
+        if let Some((sql_val, rust_val)) = &cmp.first_mismatch {
+            print!(" (first mismatch: SQL={sql_val:?}, Rust={rust_val:?})");
+        }
+        println!();
+    }
+    println!();
+    if report.compatible {
+        println!("Result: OK — all columns and synthetic strings match Rust byte order.");
+    } else {
+        println!(
+            "Result: MISMATCH — {} incompatible column(s), {} ordering mismatch(es) detected.",
+            report.incompatible_columns.len(),
+            report.ordering_mismatches
+        );
+    }
 }
