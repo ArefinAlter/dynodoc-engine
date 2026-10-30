@@ -431,9 +431,46 @@ impl<S: ObjectStore + Send> Writer<'_, S> {
         if self.budget.max_objects == 0 {
             return Err(Error::Limit("objects"));
         }
+        if let Some((_, bytes)) = self.pending.iter().find(|(a, _)| a == address) {
+            self.budget.consume(bytes.len())?;
+            return decode(address, bytes);
+        }
         let bytes = self.store.get(self.document, address).await?;
         self.budget.consume(bytes.len())?;
         decode(address, &bytes)
+    }
+
+    pub(crate) async fn lookup(
+        &mut self,
+        root: &Address,
+        key: &str,
+    ) -> Result<Option<Address>, Error> {
+        let r = route(key);
+        let mut curr = root.clone();
+        let mut depth = 0;
+        loop {
+            match self.read_object(&curr).await? {
+                Object::MapLeaf(entries) => {
+                    return Ok(entries
+                        .into_iter()
+                        .find(|e| e.key == key)
+                        .map(|e| e.address));
+                }
+                Object::MapBranch(children) => {
+                    if depth >= 64 {
+                        return Err(Error::Limit("radix depth"));
+                    }
+                    let nibble = &r[depth..depth + 1];
+                    depth += 1;
+                    if let Some(child) = children.get(nibble) {
+                        curr = child.clone();
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                _ => return Err(Error::Invalid("expected bounded map")),
+            }
+        }
     }
 
     async fn update_node(
@@ -791,6 +828,22 @@ pub async fn read_map<S: ObjectStore + Send>(
     reader.entries(root).await
 }
 
+/// Look up a single key in a canonical radix map root without reading the entire map.
+pub async fn lookup_map<S: ObjectStore + Send>(
+    store: &mut S,
+    document: DocumentId,
+    root: &Address,
+    key: &str,
+    limits: Limits,
+) -> Result<Option<Address>, Error> {
+    let mut reader = Reader {
+        store,
+        document,
+        budget: limits,
+    };
+    reader.lookup(root, key).await
+}
+
 /// Write a deterministic shared state graph. The store's caller controls atomic
 /// publication; use `postgres::take` for transactionally published checkpoints.
 pub async fn write_state<S: ObjectStore + Send>(
@@ -889,6 +942,39 @@ impl<S: ObjectStore + Send> Reader<'_, S> {
 
     async fn entries(&mut self, root: &Address) -> Result<BTreeMap<String, Address>, Error> {
         self.entries_limited(root, usize::MAX, usize::MAX).await
+    }
+
+    pub(crate) async fn lookup(
+        &mut self,
+        root: &Address,
+        key: &str,
+    ) -> Result<Option<Address>, Error> {
+        let r = route(key);
+        let mut curr = root.clone();
+        let mut depth = 0;
+        loop {
+            match self.object(&curr).await? {
+                Object::MapLeaf(entries) => {
+                    return Ok(entries
+                        .into_iter()
+                        .find(|e| e.key == key)
+                        .map(|e| e.address));
+                }
+                Object::MapBranch(children) => {
+                    if depth >= 64 {
+                        return Err(Error::Limit("radix depth"));
+                    }
+                    let nibble = &r[depth..depth + 1];
+                    depth += 1;
+                    if let Some(child) = children.get(nibble) {
+                        curr = child.clone();
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                _ => return Err(Error::Invalid("expected bounded map")),
+            }
+        }
     }
 
     async fn entries_limited(
