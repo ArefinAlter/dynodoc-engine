@@ -67,6 +67,7 @@ pub fn router() -> Router<AppState> {
             "/projects/{id}/history/commits/{address}/objects/{document}/{object}",
             get(object),
         )
+        .route("/projects/{id}/history/compare", get(compare))
         .route("/projects/{id}/history/refs", get(refs).post(advance))
         .route("/projects/{id}/history/reviews", get(reviews).post(review))
         .route("/projects/{id}/history/storage", get(storage))
@@ -224,6 +225,78 @@ async fn commit(
     authorize(&mut tx, &auth, id, &stored.scope, false).await?;
     tx.commit().await?;
     Ok(Json(json!(stored.signed)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompareQuery {
+    from: Address,
+    to: Address,
+    limit: Option<usize>,
+    cursor: Option<String>,
+    #[serde(default)]
+    include_unchanged: bool,
+}
+
+#[utoipa::path(
+    operation_id = "project_history_compare",
+    get,
+    path = "/projects/{id}/history/compare",
+    tag = "project history",
+    params(
+        ("id" = Uuid, Path, description = "Project ID"),
+        ("from" = String, Query, description = "Starting commit address"),
+        ("to" = String, Query, description = "Ending commit address"),
+        ("limit" = Option<usize>, Query, description = "Maximum number of changed paths to return (1-100, default 50)"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation cursor"),
+        ("include_unchanged" = Option<bool>, Query, description = "Whether to include unchanged paths")
+    ),
+    security(("paseto" = []), ("device_session" = ["history:read"])),
+    responses(
+        (status = 200, description = "Bounded two-commit diff report", body = Value),
+        (status = 400, description = "Invalid commit address, cursor or query parameters"),
+        (status = 403, description = "Project membership or document scope permission denied"),
+        (status = 404, description = "One or both commits not published in this project")
+    )
+)]
+async fn compare(
+    State(state): State<AppState>,
+    auth: ProjectAuth<HistoryRead>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<CompareQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(limit) = query.limit {
+        if !(1..=engine_core::repository::compare::MAX_DIFF_LIMIT).contains(&limit) {
+            return Err(bad("Page size must be 1 to 100"));
+        }
+    }
+
+    let mut tx = start(&state, &auth).await?;
+    member(&mut tx, &auth, id).await?;
+
+    let from_stored = load(&mut tx, id, &query.from).await?;
+    let to_stored = load(&mut tx, id, &query.to).await?;
+
+    let mut combined_scope: BTreeSet<Uuid> = from_stored.scope.into_iter().collect();
+    combined_scope.extend(to_stored.scope);
+    let union_scope: Vec<Uuid> = combined_scope.into_iter().collect();
+
+    authorize(&mut tx, &auth, id, &union_scope, false).await?;
+
+    tx.commit().await?;
+
+    let report = engine_core::repository::compare::compare_manifests(
+        &from_stored.signed,
+        &to_stored.signed,
+        engine_core::repository::compare::DiffOptions {
+            limit: query.limit,
+            cursor: query.cursor.as_deref(),
+            include_unchanged: query.include_unchanged,
+        },
+    )
+    .map_err(history_error)?;
+
+    Ok(Json(json!(report)))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1025,6 +1098,7 @@ async fn receipts(
     authority,
     rotations,
     receipts,
-    acknowledge
+    acknowledge,
+    compare
 ))]
 pub struct ProjectHistoryApi;
