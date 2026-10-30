@@ -265,20 +265,30 @@ pub async fn audit_ordering_connection(conn: &mut PgConnection) -> Result<Orderi
         }
     }
 
-    // 4. Compare SQL default ordering vs native Rust byte order on synthetic test cases
+    let all_columns_byte_order = !columns.is_empty() && incompatible_columns.is_empty();
+
+    // 4. Compare SQL ordering vs native Rust byte order on synthetic test cases.
+    // If all target columns use byte-order collation ("C"), test with explicit COLLATE "C".
+    // Otherwise, test against database default ordering to surface catalog/locale mismatches.
     let mut comparisons = Vec::new();
     let mut ordering_mismatches = 0;
+
+    let order_clause = if all_columns_byte_order {
+        "order by s collate \"C\""
+    } else {
+        "order by s"
+    };
 
     for (category, items) in synthetic_test_categories() {
         let mut rust_sorted = items.clone();
         rust_sorted.sort_unstable();
 
-        let rows: Vec<String> =
-            sqlx::query_scalar("select s::text from unnest($1::text[]) as s order by s")
-                .bind(&items)
-                .fetch_all(&mut *conn)
-                .await
-                .with_context(|| format!("testing ordering for category {category} failed"))?;
+        let query = format!("select s::text from unnest($1::text[]) as s {order_clause}");
+        let rows: Vec<String> = sqlx::query_scalar(&query)
+            .bind(&items)
+            .fetch_all(&mut *conn)
+            .await
+            .with_context(|| format!("testing ordering for category {category} failed"))?;
 
         let matches = rows == rust_sorted;
         let mut first_mismatch = None;
