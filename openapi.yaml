@@ -1539,6 +1539,155 @@ paths:
               schema: {}
       security:
       - bearer: []
+  /documents/{id}/export-tokens:
+    post:
+      tags:
+      - export tokens
+      summary: Mint random export-scoped tokens for nodes in a document at a checked revision.
+      operationId: create_export_tokens
+      parameters:
+      - name: id
+        in: path
+        description: Document identifier
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateExportTokensRequest'
+        required: true
+      responses:
+        '200':
+          description: Export node tokens created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportTokensResponse'
+        '400':
+          description: Invalid request or revision
+        '401':
+          description: Authentication required
+        '403':
+          description: Document access denied
+        '404':
+          description: Document not found
+        '409':
+          description: Idempotency conflict
+      security:
+      - paseto: []
+  /documents/{id}/export-tokens/resolve:
+    post:
+      tags:
+      - export tokens
+      summary: Resolve export tokens and legacy block IDs to stable node targets.
+      operationId: resolve_export_tokens
+      parameters:
+      - name: id
+        in: path
+        description: Document identifier
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveExportTokensRequest'
+        required: true
+      responses:
+        '200':
+          description: Export node tokens resolved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolveExportTokensResponse'
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required
+        '403':
+          description: Export revoked or access denied
+        '404':
+          description: Document or export not found
+      security:
+      - paseto: []
+      - connector_key: []
+  /documents/{id}/export-tokens/{export_id}:
+    get:
+      tags:
+      - export tokens
+      summary: Retrieve details and status of an export token map.
+      operationId: get_export_tokens
+      parameters:
+      - name: id
+        in: path
+        description: Document identifier
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: export_id
+        in: path
+        description: Export identifier
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Export token details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportDetailsResponse'
+        '401':
+          description: Authentication required
+        '403':
+          description: Access denied
+        '404':
+          description: Document or export not found
+      security:
+      - paseto: []
+  /documents/{id}/export-tokens/{export_id}/revoke:
+    post:
+      tags:
+      - export tokens
+      summary: Revoke an export, permanently preventing further token resolution.
+      operationId: revoke_export_tokens
+      parameters:
+      - name: id
+        in: path
+        description: Document identifier
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: export_id
+        in: path
+        description: Export identifier
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Export tokens revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevokeExportResponse'
+        '401':
+          description: Authentication required
+        '403':
+          description: Access denied
+        '404':
+          description: Document or export not found
+      security:
+      - paseto: []
   /documents/{id}/history-points:
     get:
       tags:
@@ -7061,6 +7210,28 @@ components:
             type: string
         title:
           type: string
+    CreateExportTokensRequest:
+      type: object
+      properties:
+        idempotency_key:
+          type:
+          - string
+          - 'null'
+          description: Creator-scoped idempotency key if not sent via Idempotency-Key header.
+        node_ids:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: Specific node IDs to map. Omitted means all live (non-deleted) nodes at this revision.
+        revision:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Checked revision (sequence number) in document history. Omitted means current head.
+      additionalProperties: false
     DeviceToken:
       type: object
       required:
@@ -7088,6 +7259,82 @@ components:
             type: string
         token_type:
           type: string
+    ExportDetailsResponse:
+      type: object
+      required:
+      - export_id
+      - document_id
+      - revision
+      - created_by
+      - created_at
+      - token_count
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        export_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          format: int64
+        revoked_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        token_count:
+          type: integer
+          format: int64
+    ExportTokenMapping:
+      type: object
+      required:
+      - node_id
+      - token
+      properties:
+        node_id:
+          type: string
+        token:
+          type: string
+    ExportTokensResponse:
+      type: object
+      required:
+      - format
+      - version
+      - export_id
+      - document_id
+      - revision
+      - created_at
+      - mappings
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        document_id:
+          type: string
+          format: uuid
+        export_id:
+          type: string
+          format: uuid
+        format:
+          type: string
+        mappings:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExportTokenMapping'
+        revision:
+          type: integer
+          format: int64
+        version:
+          type: integer
+          format: int32
+          minimum: 0
     FieldEditRequest:
       type: object
       description: '`POST /ops/field-edit`.'
@@ -7950,6 +8197,56 @@ components:
           type:
           - string
           - 'null'
+    ResolveExportTokensRequest:
+      type: object
+      properties:
+        export_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Export ID under which tokens were minted. Required when resolving export tokens.
+        format:
+          type:
+          - string
+          - 'null'
+          description: Versioned carrier format ("dynodoc.export-node-tokens").
+        legacy_ids:
+          type: array
+          items:
+            type: string
+          description: Legacy node IDs to resolve directly, preserving spelling.
+        tokens:
+          type: array
+          items:
+            type: string
+          description: Export tokens to resolve to node IDs.
+        version:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Carrier format version (1).
+          minimum: 0
+      additionalProperties: false
+    ResolveExportTokensResponse:
+      type: object
+      required:
+      - document_id
+      - items
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        export_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResolvedNodeTarget'
     ResolveRequest:
       type: object
       description: '`POST .../resolve` body. Exactly one of the two fields must be set.'
@@ -7961,6 +8258,28 @@ components:
           description: Accept this competing proposal's value as canonical.
         custom_value:
           description: Override all proposals with this custom value.
+    ResolvedNodeTarget:
+      type: object
+      required:
+      - deleted
+      - resolved
+      properties:
+        deleted:
+          type: boolean
+        legacy_id:
+          type:
+          - string
+          - 'null'
+        node_id:
+          type:
+          - string
+          - 'null'
+        resolved:
+          type: boolean
+        token:
+          type:
+          - string
+          - 'null'
     ReviewRequest:
       type: object
       required:
@@ -7986,6 +8305,17 @@ components:
         verdict:
           type: string
           description: '`approved`, `changes_requested` or `commented`.'
+    RevokeExportResponse:
+      type: object
+      required:
+      - revoked
+      - export_id
+      properties:
+        export_id:
+          type: string
+          format: uuid
+        revoked:
+          type: boolean
     SessionAnswer:
       type: object
       required:
