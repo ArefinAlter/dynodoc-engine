@@ -4663,3 +4663,148 @@ async fn new_pos_keys_are_validated_at_write_boundaries(pool: PgPool) {
         "expected 400 for newline new_pos: {body}"
     );
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn multiple_roots_compatibility_at_api_boundary(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let actor = seed_identity(&pool, "roots-test@example.test").await;
+    let owner = bearer(actor);
+    let doc = create_document(&router, &owner, "Multi-Root Document").await;
+
+    // 1. Create first root (Clause) -> 200 OK
+    let root1_id = ulid::Ulid::generate().to_string();
+    let (status, res1) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_id": root1_id, "node_type":"clause","pos":"a0","fields":{"title":"Root Clause 1"}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "first root create should succeed: {res1}"
+    );
+
+    // 2. Create a child clause under Root 1
+    let child_id = ulid::Ulid::generate().to_string();
+    let (status, res_child) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_id": child_id, "node_type":"clause","parent_id": root1_id,"pos":"a0","fields":{"title":"Child Clause"}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "child clause create should succeed: {res_child}"
+    );
+
+    // 3. Create a second root (Form at top-level) -> 200 OK (multiple roots permitted for compatibility)
+    let root2_id = ulid::Ulid::generate().to_string();
+    let (status, res2) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_id": root2_id, "node_type":"form","pos":"a1","fields":{"label":"Second Root Form"}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "second root create should succeed: {res2}"
+    );
+
+    // 4. Move the child clause to top-level (new_parent_id: null) via /batch -> 200 OK
+    let (status, res_move) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/batch"),
+            &owner,
+            &json!({"ops":[{"type":"NodeMoved","node_id": child_id, "new_parent_id": null, "new_pos": "a2"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "moving clause to root should succeed: {res_move}"
+    );
+
+    // 5. Create an item under Root 2 (Form), then attempt to move it to root -> 400 Bad Request
+    let item_id = ulid::Ulid::generate().to_string();
+    let (status, res_item) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_id": item_id, "node_type":"item","parent_id": root2_id,"pos":"a0","fields":{"label":"Form Item"}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "item create should succeed: {res_item}"
+    );
+
+    let (status, res_bad_move) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/batch"),
+            &owner,
+            &json!({"ops":[{"type":"NodeMoved","node_id": item_id, "new_parent_id": null, "new_pos": "a3"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "moving non-root item to root should fail: {res_bad_move}"
+    );
+
+    // Also attempt creating an illegal root directly (Item without parent) -> 400 Bad Request
+    let (status, res_bad_create) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_type":"item","pos":"a4","fields":{"label":"Illegal Root Item"}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "illegal root item should be rejected: {res_bad_create}"
+    );
+
+    // 6. Verify database node table contains all three live roots with parent_id IS NULL
+    let roots: Vec<String> = sqlx::query_scalar(
+        "select id from node where document_id = $1 and parent_id is null and not deleted order by pos asc",
+    )
+    .bind(doc)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(roots.len(), 3);
+    assert!(roots.contains(&root1_id));
+    assert!(roots.contains(&root2_id));
+    assert!(roots.contains(&child_id));
+
+    // 7. Verify /structure endpoint succeeds on multi-root document
+    let request = Request::builder()
+        .uri(format!("/documents/{doc}/structure"))
+        .header(header::AUTHORIZATION, &owner)
+        .body(Body::empty())
+        .unwrap();
+    let (status, analysis) = send(&router, request).await;
+    assert_eq!(status, StatusCode::OK, "{analysis}");
+}
