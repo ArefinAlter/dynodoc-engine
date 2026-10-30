@@ -8,7 +8,7 @@ use engine_core::{
         attestation::{Scope, SignedReceipt},
         authority_epoch::{Kind, Refusal, SignedTransition},
         local::{LocalRepository, ObjectKey, ObjectPacket},
-        log::CommitLogEntry,
+        log::{BoundedMessage, CommitLogEntry},
         receipt_journal::ReceiptJournal,
         Head, SignedCommit, MAX_COMMIT_BYTES,
     },
@@ -81,18 +81,24 @@ fn parse_address(s: &str) -> Result<Address, String> {
 pub enum Action {
     /// Retrieve a bounded page or full chain of first-parent commit history.
     Log {
-        /// Explicit starting commit address (required unless --cursor is supplied).
+        /// Explicit starting commit address (required unless --cursor or --expect-tip is supplied).
         #[arg(long, value_parser = parse_address)]
         head: Option<Address>,
         /// Page limit (1..=50, default 20).
         #[arg(long)]
         limit: Option<usize>,
         /// Continuation cursor for pagination.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "verify")]
         cursor: Option<String>,
         /// Retrieve all remaining first-parent commits across pages under budgets.
         #[arg(long)]
         all: bool,
+        /// Verify downloaded first-parent history against signed commit envelopes.
+        #[arg(long, requires = "expect_tip")]
+        verify: bool,
+        /// Independently supplied expected tip commit address.
+        #[arg(long, value_parser = parse_address, requires = "verify")]
+        expect_tip: Option<Address>,
         /// Format output as stable JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
@@ -263,9 +269,42 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                 limit,
                 cursor,
                 all,
+                verify,
+                expect_tip,
                 json,
             } => {
-                let log_res = log(&client, head.as_ref(), limit, cursor.as_deref(), all).await?;
+                if verify {
+                    ensure!(
+                        cursor.is_none(),
+                        "--cursor cannot be used when --verify is enabled; verification must start at --expect-tip"
+                    );
+                    let tip = expect_tip
+                        .as_ref()
+                        .expect("expect_tip required by clap when verify is true");
+                    if let Some(ref h) = head {
+                        ensure!(
+                            h == tip,
+                            "--head and --expect-tip must match when both are provided; expected tip {}, got head {}",
+                            tip.as_str(),
+                            h.as_str()
+                        );
+                    }
+                }
+                let effective_head = if verify {
+                    expect_tip.as_ref().or(head.as_ref())
+                } else {
+                    head.as_ref()
+                };
+                let log_res = log(
+                    &client,
+                    effective_head,
+                    limit,
+                    cursor.as_deref(),
+                    all,
+                    verify,
+                    expect_tip.as_ref(),
+                )
+                .await?;
                 if json {
                     Ok(SyncOutput::Json(format_log_json(&log_res)?))
                 } else {
@@ -791,6 +830,10 @@ pub struct RemoteLogResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     pub more: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_tip: Option<Address>,
 }
 
 pub async fn log(
@@ -799,21 +842,48 @@ pub async fn log(
     limit: Option<usize>,
     cursor: Option<&str>,
     all: bool,
+    verify: bool,
+    expect_tip: Option<&Address>,
 ) -> anyhow::Result<RemoteLogResult> {
-    ensure!(
-        head.is_some() || cursor.is_some(),
-        "--head is required when --cursor is not provided"
-    );
+    if verify {
+        ensure!(
+            cursor.is_none(),
+            "--cursor cannot be used when --verify is enabled; verification must start at --expect-tip"
+        );
+        let tip = expect_tip.ok_or_else(|| anyhow!("--verify requires --expect-tip"))?;
+        if let Some(h) = head {
+            ensure!(
+                h == tip,
+                "--head and --expect-tip must match when both are provided: head={}, expect_tip={}",
+                h.as_str(),
+                tip.as_str()
+            );
+        }
+    } else {
+        ensure!(
+            head.is_some() || cursor.is_some(),
+            "--head is required when --cursor is not provided"
+        );
+    }
     if let Some(l) = limit {
         ensure!(l > 0 && l <= 50, "limit must be between 1 and 50");
     }
 
+    let effective_head = if verify { expect_tip.or(head) } else { head };
+
     let mut current_cursor = cursor.map(|s| s.to_string());
     let mut seen_cursors = BTreeSet::new();
     let mut seen_addresses = BTreeSet::new();
-    let mut initial_head = head.cloned();
+    let mut initial_head = effective_head.cloned();
     let mut all_entries = Vec::new();
     let mut pages_fetched = 0usize;
+    let mut expected_next_commit: Option<Address> = if verify {
+        Some(expect_tip.unwrap().clone())
+    } else {
+        None
+    };
+    let mut total_envelope_bytes = 0usize;
+    const MAX_TOTAL_ENVELOPE_BYTES: usize = 64 * 1024 * 1024;
 
     loop {
         let page = client
@@ -838,24 +908,157 @@ pub async fn log(
             initial_head = Some(page.head.clone());
         }
 
-        for entry in page.entries {
+        if verify {
             ensure!(
-                seen_addresses.insert(entry.address.clone()),
-                "duplicate commit address encountered across pages: {}",
-                entry.address.as_str()
+                !page.entries.is_empty(),
+                "remote history log page is empty; expected commit {}",
+                expected_next_commit
+                    .as_ref()
+                    .map(|a| a.as_str())
+                    .unwrap_or("genesis")
             );
-            all_entries.push(entry);
+
+            let mut page_verified_entries = Vec::with_capacity(page.entries.len());
+
+            for entry in page.entries {
+                let Some(ref expected_addr) = expected_next_commit else {
+                    anyhow::bail!(
+                        "reported commit {} after genesis; expected end of history",
+                        entry.address.as_str()
+                    );
+                };
+                ensure!(
+                    &entry.address == expected_addr,
+                    "history chain discontinuity: expected commit {}, got {}",
+                    expected_addr.as_str(),
+                    entry.address.as_str()
+                );
+
+                ensure!(
+                    seen_addresses.insert(entry.address.clone()),
+                    "duplicate commit address encountered across pages: {}",
+                    entry.address.as_str()
+                );
+                ensure!(
+                    all_entries.len() + page_verified_entries.len() < MAX_COMMITS,
+                    "exceeded maximum commit limit (4096 commits)"
+                );
+
+                let signed = client.published(&entry.address).await?.ok_or_else(|| {
+                    anyhow!(
+                        "missing signed commit envelope for {}",
+                        entry.address.as_str()
+                    )
+                })?;
+
+                let verified_addr = signed.verify().map_err(|e| {
+                    anyhow!(
+                        "invalid signed commit envelope for {}: {}",
+                        entry.address.as_str(),
+                        e
+                    )
+                })?;
+                ensure!(
+                    verified_addr == entry.address,
+                    "signed commit address mismatch: expected {}, got {}",
+                    entry.address.as_str(),
+                    verified_addr.as_str()
+                );
+                ensure!(
+                    signed.commit.project == client.project,
+                    "signed commit project mismatch: expected {}, got {}",
+                    client.project,
+                    signed.commit.project
+                );
+                ensure!(
+                    signed.commit.project == page.project,
+                    "signed commit project differs from page project"
+                );
+
+                let envelope_bytes = serde_json::to_vec(&signed)?.len();
+                total_envelope_bytes += envelope_bytes;
+                ensure!(
+                    total_envelope_bytes <= MAX_TOTAL_ENVELOPE_BYTES,
+                    "exceeded total envelope transfer budget (64 MB)"
+                );
+
+                ensure!(
+                    entry.author_key == signed.commit.author_key,
+                    "untrusted metadata author_key mismatch for {}: expected {}, got {}",
+                    entry.address.as_str(),
+                    signed.commit.author_key,
+                    entry.author_key
+                );
+                ensure!(
+                    entry.authored_at_ms == signed.commit.authored_at_ms,
+                    "untrusted metadata authored_at_ms mismatch for {}: expected {}, got {}",
+                    entry.address.as_str(),
+                    signed.commit.authored_at_ms,
+                    entry.authored_at_ms
+                );
+                ensure!(
+                    entry.parents == signed.commit.parents,
+                    "untrusted metadata parents mismatch for {}: expected {:?}, got {:?}",
+                    entry.address.as_str(),
+                    signed.commit.parents,
+                    entry.parents
+                );
+                let expected_bounded_message = BoundedMessage::new(&signed.commit.message);
+                ensure!(
+                    entry.message == expected_bounded_message,
+                    "untrusted metadata message mismatch for {}",
+                    entry.address.as_str()
+                );
+
+                expected_next_commit = signed.commit.parents.first().cloned();
+
+                page_verified_entries.push(CommitLogEntry {
+                    address: verified_addr,
+                    parents: signed.commit.parents,
+                    author_key: signed.commit.author_key,
+                    authored_at_ms: signed.commit.authored_at_ms,
+                    message: expected_bounded_message,
+                });
+            }
+
+            if expected_next_commit.is_none() {
+                ensure!(
+                    !page.more && page.next_cursor.is_none(),
+                    "log reached genesis, but server claims more commits exist"
+                );
+            }
+
+            all_entries.extend(page_verified_entries);
+        } else {
+            for entry in page.entries {
+                ensure!(
+                    seen_addresses.insert(entry.address.clone()),
+                    "duplicate commit address encountered across pages: {}",
+                    entry.address.as_str()
+                );
+                all_entries.push(entry);
+            }
         }
 
         pages_fetched += 1;
 
         if !all {
+            if verify && !page.more && page.next_cursor.is_none() {
+                ensure!(
+                    expected_next_commit.is_none(),
+                    "log claims to have reached genesis (end of history), but last commit {} still has parent {}",
+                    all_entries.last().unwrap().address.as_str(),
+                    expected_next_commit.as_ref().unwrap().as_str()
+                );
+            }
             return Ok(RemoteLogResult {
                 project: page.project,
                 head: initial_head.unwrap_or(page.head),
                 entries: all_entries,
                 next_cursor: page.next_cursor,
                 more: page.more,
+                verified: verify,
+                verified_tip: if verify { expect_tip.cloned() } else { None },
             });
         }
 
@@ -880,12 +1083,22 @@ pub async fn log(
                     !page.more,
                     "remote indicated more commits exist but provided no continuation cursor"
                 );
+                if verify {
+                    ensure!(
+                        expected_next_commit.is_none(),
+                        "log claims to have reached genesis (end of history), but last commit {} still has parent {}",
+                        all_entries.last().unwrap().address.as_str(),
+                        expected_next_commit.as_ref().unwrap().as_str()
+                    );
+                }
                 return Ok(RemoteLogResult {
                     project: page.project,
                     head: initial_head.unwrap_or(page.head),
                     entries: all_entries,
                     next_cursor: None,
                     more: false,
+                    verified: verify,
+                    verified_tip: if verify { expect_tip.cloned() } else { None },
                 });
             }
         }
@@ -894,11 +1107,24 @@ pub async fn log(
 
 pub fn format_log_text(result: &RemoteLogResult) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "First-parent history for project {} at commit {}:\n\n",
-        result.project,
-        result.head.as_str()
-    ));
+    if result.verified {
+        out.push_str(&format!(
+            "First-parent history for project {} at commit {} (verified against expected tip {}):\n\n",
+            result.project,
+            result.head.as_str(),
+            result
+                .verified_tip
+                .as_ref()
+                .map(|t| t.as_str())
+                .unwrap_or(result.head.as_str())
+        ));
+    } else {
+        out.push_str(&format!(
+            "First-parent history for project {} at commit {}:\n\n",
+            result.project,
+            result.head.as_str()
+        ));
+    }
 
     if result.entries.is_empty() {
         out.push_str("No commits found.\n");
@@ -950,9 +1176,15 @@ pub fn format_log_text(result: &RemoteLogResult) -> String {
         }
     }
 
-    out.push_str(
-        "\nNote: First-parent history is not an exhaustive DAG traversal or independent proof of completeness.\n",
-    );
+    if result.verified {
+        out.push_str(
+            "\nNotice: Verified against signed commit envelopes. Proves consistency with selected first-parent tip; does not prove human authorship, independent timestamps, all second-parent work, or server freshness.\n",
+        );
+    } else {
+        out.push_str(
+            "\nNote: First-parent history is not an exhaustive DAG traversal or independent proof of completeness.\n",
+        );
+    }
     out
 }
 
@@ -966,6 +1198,21 @@ pub fn format_log_json(result: &RemoteLogResult) -> anyhow::Result<Value> {
                 "First-parent history is not an exhaustive DAG traversal or independent proof of completeness.".into(),
             ),
         );
+        if result.verified {
+            map.insert("verified".into(), Value::Bool(true));
+            if let Some(ref tip) = result.verified_tip {
+                map.insert(
+                    "verified_tip".into(),
+                    Value::String(tip.as_str().to_string()),
+                );
+            }
+            map.insert(
+                "verification_notice".into(),
+                Value::String(
+                    "Verified against signed commit envelopes. Proves consistency with selected first-parent tip; does not prove human authorship, independent timestamps, all second-parent work, or server freshness.".into(),
+                ),
+            );
+        }
     }
     Ok(value)
 }
