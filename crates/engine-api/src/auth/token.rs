@@ -244,6 +244,123 @@ fn device_claims(claims: &Claims) -> Result<DeviceClaims, AuthError> {
     })
 }
 
+// --- project history log pagination cursors --------------------------------------
+
+const HISTORY_CURSOR_TYPE: &str = "dynodoc.project-history-cursor.v1";
+const HISTORY_CURSOR_FOOTER_JSON: &[u8] = br#"{"typ":"dynodoc.project-history-cursor.v1"}"#;
+fn history_cursor_footer() -> Footer {
+    let mut footer = Footer::new();
+    footer
+        .add_additional("typ", HISTORY_CURSOR_TYPE)
+        .expect("static footer claim");
+    footer
+}
+const HISTORY_CURSOR_IMPLICIT: &[u8] = b"dynodoc.project-history-cursor.v1/implicit";
+pub const HISTORY_CURSOR_TTL_SECONDS: i64 = 3600;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryCursorClaims {
+    pub version: u8,
+    pub project: Uuid,
+    pub principal: Uuid,
+    pub head: engine_core::shared_checkpoint::Address,
+    pub next_address: engine_core::shared_checkpoint::Address,
+    pub limit: usize,
+}
+
+pub fn mint_history_cursor(
+    key: &[u8],
+    claims: &HistoryCursorClaims,
+    ttl_seconds: i64,
+) -> Result<String, AuthError> {
+    let sk = SymmetricKey::<V4>::from(key).map_err(|_| AuthError::InvalidKey)?;
+    let fail = |e: pasetors::errors::Error| AuthError::TokenMint(e.to_string());
+    let mut out = Claims::new().map_err(fail)?;
+    let expires = Utc::now() + chrono::Duration::seconds(ttl_seconds);
+    out.expiration(&expires.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .map_err(fail)?;
+    out.add_additional("typ", HISTORY_CURSOR_TYPE.to_owned())
+        .map_err(fail)?;
+    out.add_additional("version", claims.version as i64)
+        .map_err(fail)?;
+    out.add_additional("project", claims.project.to_string())
+        .map_err(fail)?;
+    out.add_additional("principal", claims.principal.to_string())
+        .map_err(fail)?;
+    out.add_additional("head", claims.head.as_str().to_owned())
+        .map_err(fail)?;
+    out.add_additional("next_address", claims.next_address.as_str().to_owned())
+        .map_err(fail)?;
+    out.add_additional("limit", claims.limit as i64)
+        .map_err(fail)?;
+    local::encrypt(
+        &sk,
+        &out,
+        Some(&history_cursor_footer()),
+        Some(HISTORY_CURSOR_IMPLICIT),
+    )
+    .map_err(fail)
+}
+
+pub fn is_history_cursor_token(token: &str) -> bool {
+    UntrustedToken::<Local, V4>::try_from(token)
+        .map(|t| t.untrusted_footer() == HISTORY_CURSOR_FOOTER_JSON)
+        .unwrap_or(false)
+}
+
+pub fn verify_history_cursor(key: &[u8], token: &str) -> Result<HistoryCursorClaims, AuthError> {
+    let sk = SymmetricKey::<V4>::from(key).map_err(|_| AuthError::InvalidKey)?;
+    let untrusted =
+        UntrustedToken::<Local, V4>::try_from(token).map_err(|_| AuthError::TokenInvalid)?;
+    let trusted = local::decrypt(
+        &sk,
+        &untrusted,
+        &ClaimsValidationRules::new(),
+        Some(&history_cursor_footer()),
+        Some(HISTORY_CURSOR_IMPLICIT),
+    )
+    .map_err(|_| AuthError::TokenInvalid)?;
+    let claims = trusted.payload_claims().ok_or(AuthError::TokenInvalid)?;
+    let text = |name: &str| {
+        claims
+            .get_claim(name)
+            .and_then(|v| v.as_str())
+            .ok_or(AuthError::TokenInvalid)
+    };
+    if text("typ")? != HISTORY_CURSOR_TYPE {
+        return Err(AuthError::TokenInvalid);
+    }
+    let version = claims
+        .get_claim("version")
+        .and_then(|v| v.as_i64())
+        .ok_or(AuthError::TokenInvalid)? as u8;
+    if version != 1 {
+        return Err(AuthError::TokenInvalid);
+    }
+    let project = Uuid::parse_str(text("project")?).map_err(|_| AuthError::TokenInvalid)?;
+    let principal = Uuid::parse_str(text("principal")?).map_err(|_| AuthError::TokenInvalid)?;
+    let head = engine_core::shared_checkpoint::Address::try_from(text("head")?.to_owned())
+        .map_err(|_| AuthError::TokenInvalid)?;
+    let next_address =
+        engine_core::shared_checkpoint::Address::try_from(text("next_address")?.to_owned())
+            .map_err(|_| AuthError::TokenInvalid)?;
+    let limit = claims
+        .get_claim("limit")
+        .and_then(|v| v.as_i64())
+        .ok_or(AuthError::TokenInvalid)? as usize;
+    if limit == 0 || limit > engine_core::repository::log::MAX_LOG_PAGE_LIMIT {
+        return Err(AuthError::TokenInvalid);
+    }
+    Ok(HistoryCursorClaims {
+        version,
+        project,
+        principal,
+        head,
+        next_address,
+        limit,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,5 +821,128 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn history_cursor_round_trip_and_properties() {
+        let key = [42u8; 32];
+        let project = Uuid::new_v4();
+        let principal = Uuid::new_v4();
+        let head = engine_core::shared_checkpoint::Address::try_from("1".repeat(64)).unwrap();
+        let next = engine_core::shared_checkpoint::Address::try_from("2".repeat(64)).unwrap();
+
+        let claims = HistoryCursorClaims {
+            version: 1,
+            project,
+            principal,
+            head: head.clone(),
+            next_address: next.clone(),
+            limit: 20,
+        };
+
+        let token = mint_history_cursor(&key, &claims, 3600).unwrap();
+        assert!(is_history_cursor_token(&token));
+
+        let verified = verify_history_cursor(&key, &token).unwrap();
+        assert_eq!(verified, claims);
+    }
+
+    #[test]
+    fn cursors_cannot_authenticate_as_account_or_device_tokens_and_vice_versa() {
+        let key = [42u8; 32];
+        let project = Uuid::new_v4();
+        let principal = Uuid::new_v4();
+        let head = engine_core::shared_checkpoint::Address::try_from("1".repeat(64)).unwrap();
+        let next = engine_core::shared_checkpoint::Address::try_from("2".repeat(64)).unwrap();
+
+        let cursor_token = mint_history_cursor(
+            &key,
+            &HistoryCursorClaims {
+                version: 1,
+                project,
+                principal,
+                head: head.clone(),
+                next_address: next.clone(),
+                limit: 20,
+            },
+            3600,
+        )
+        .unwrap();
+
+        let account_token = mint(&key, principal, 3600).unwrap();
+        let device_token = mint_project_device(
+            &key,
+            &DeviceClaims {
+                identity: principal,
+                key: Uuid::new_v4(),
+                project,
+                session: Uuid::new_v4(),
+                scopes: vec!["history:read".into()],
+                generation: 1,
+            },
+            3600,
+        )
+        .unwrap();
+
+        // Cursor cannot authenticate as account token
+        assert!(matches!(
+            verify(&key, &cursor_token),
+            Err(AuthError::TokenInvalid)
+        ));
+        assert!(matches!(
+            verify_bound_session(&key, &cursor_token),
+            Err(AuthError::TokenInvalid)
+        ));
+
+        // Cursor cannot authenticate as device token
+        assert!(matches!(
+            verify_project_device(&key, &cursor_token),
+            Err(AuthError::TokenInvalid)
+        ));
+
+        // Account token cannot authenticate as cursor
+        assert!(matches!(
+            verify_history_cursor(&key, &account_token),
+            Err(AuthError::TokenInvalid)
+        ));
+
+        // Device token cannot authenticate as cursor
+        assert!(matches!(
+            verify_history_cursor(&key, &device_token),
+            Err(AuthError::TokenInvalid)
+        ));
+
+        // Tampered cursor is rejected
+        let mut tampered = cursor_token.clone();
+        tampered.replace_range(15..17, "ab");
+        assert!(matches!(
+            verify_history_cursor(&key, &tampered),
+            Err(AuthError::TokenInvalid)
+        ));
+
+        // Wrong key is rejected
+        assert!(matches!(
+            verify_history_cursor(&[99u8; 32], &cursor_token),
+            Err(AuthError::TokenInvalid)
+        ));
+
+        // Expired cursor is rejected
+        let expired_token = mint_history_cursor(
+            &key,
+            &HistoryCursorClaims {
+                version: 1,
+                project,
+                principal,
+                head,
+                next_address: next,
+                limit: 20,
+            },
+            -10,
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_history_cursor(&key, &expired_token),
+            Err(AuthError::TokenInvalid)
+        ));
     }
 }
