@@ -15,6 +15,7 @@ use crate::{log::ZERO_HASH, materializer::DocumentState, snapshot::read_legacy_s
 pub enum Codec {
     V1 = 1,
     V2 = 2,
+    V3 = 3,
 }
 
 impl Codec {
@@ -30,6 +31,10 @@ impl Codec {
             Self::V2 => {
                 super::typed::write_state(store, document, state, limits, Default::default()).await
             }
+            Self::V3 => {
+                super::typed::write_state_v3(store, document, state, limits, Default::default())
+                    .await
+            }
         }
     }
     pub async fn read<S: ObjectStore>(
@@ -43,6 +48,9 @@ impl Codec {
             Self::V1 => read_state(store, document, root, limits).await,
             Self::V2 => {
                 super::typed::read_state(store, document, root, limits, Default::default()).await
+            }
+            Self::V3 => {
+                super::typed::read_state_v3(store, document, root, limits, Default::default()).await
             }
         }
     }
@@ -641,6 +649,7 @@ pub(crate) async fn load_in_connection(
     let codec = match version {
         1 => Codec::V1,
         2 => Codec::V2,
+        3 => Codec::V3,
         _ => return Err(Error::Invalid("unsupported checkpoint version")),
     };
     codec
