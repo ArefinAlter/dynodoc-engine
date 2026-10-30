@@ -444,7 +444,10 @@ mod tests {
         let a = random_secret().unwrap();
         let b = random_secret().unwrap();
         assert!(valid_secret(a.as_bytes()));
-        assert_ne!(a.as_bytes(), b.as_bytes());
+        assert!(
+            a.as_bytes() != b.as_bytes(),
+            "generated secrets should differ"
+        );
     }
 
     #[test]
@@ -461,7 +464,7 @@ mod tests {
         ] {
             assert!(
                 command.args.iter().all(|arg| !arg.contains(&secret_text)),
-                "{command:?}"
+                "a command argument contained secret material"
             );
             assert!(!command.program.contains(&secret_text));
         }
