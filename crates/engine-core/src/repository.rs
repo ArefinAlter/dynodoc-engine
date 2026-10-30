@@ -82,10 +82,10 @@ pub struct Commit {
     pub same_file_resolutions: Vec<convergence::Resolution>,
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn unhex(value: &str, size: usize) -> Result<Vec<u8>, Error> {
+pub(crate) fn unhex(value: &str, size: usize) -> Result<Vec<u8>, Error> {
     if value.len() != size * 2
         || !value
             .bytes()
