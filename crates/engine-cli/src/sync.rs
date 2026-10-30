@@ -7,6 +7,7 @@ use engine_core::{
     repository::{
         attestation::{Scope, SignedReceipt},
         authority_epoch::{Kind, Refusal, SignedTransition},
+        compare::{DiffKind, DiffTotals, ProjectDiffReport},
         local::{LocalRepository, ObjectKey, ObjectPacket},
         receipt_journal::ReceiptJournal,
         Head, SignedCommit, MAX_COMMIT_BYTES,
@@ -72,6 +73,10 @@ pub struct Options {
     #[command(subcommand)]
     action: Action,
 }
+fn parse_address(s: &str) -> Result<Address, String> {
+    Address::try_from(s.to_owned()).map_err(|e| e.to_string())
+}
+
 #[derive(Subcommand)]
 pub enum Action {
     /// Preview every newly visible commit (including ancestry/recovery sources).
@@ -105,6 +110,16 @@ pub enum Action {
     AuthorityProof {
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Compare two published remote commits across manifest paths.
+    Compare {
+        #[arg(long, value_parser = parse_address)]
+        from: Address,
+        #[arg(long, value_parser = parse_address)]
+        to: Address,
+        /// Format output as stable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -202,6 +217,11 @@ fn read(path: &Path, cap: usize) -> anyhow::Result<Vec<u8>> {
     ensure!(bytes.len() <= cap, "input exceeds byte limit");
     Ok(bytes)
 }
+enum SyncOutput {
+    Json(Value),
+    Text(String),
+}
+
 pub async fn run(options: Options) -> anyhow::Result<()> {
     ensure!(
         engine_core::repository::valid_branch(&options.branch),
@@ -216,8 +236,12 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
     // Open the repository first so the journal refuses aliases to it, even on first use.
     let repo = LocalRepository::open(&options.repository, options.project).await?;
     let journal = ReceiptJournal::open(&options.journal).await?;
-    let result = async {
-        if matches!(options.action, Action::Tracking) { return Ok(serde_json::to_value(journal.pin(&scope).await?)?); }
+    let result: anyhow::Result<SyncOutput> = async {
+        if matches!(options.action, Action::Tracking) {
+            return Ok(SyncOutput::Json(serde_json::to_value(
+                journal.pin(&scope).await?,
+            )?));
+        }
         let mut client = credentials(&options, remote)?;
         if let Some(key) = options.accept_authority_break.clone() {
             client = client.accepting_break(key)?;
@@ -226,42 +250,98 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
             client.authority().await?;
         }
         match options.action {
-            Action::Plan { candidate, out, publish_only } => {
-                let plan = plan(&repo, &client, &journal, &scope, Address::try_from(candidate)?, !publish_only).await?;
+            Action::Compare { from, to, json } => {
+                let report = compare(&client, &from, &to).await?;
+                if json {
+                    Ok(SyncOutput::Json(format_compare_json(&report)?))
+                } else {
+                    Ok(SyncOutput::Text(format_compare_text(&report)))
+                }
+            }
+            Action::Plan {
+                candidate,
+                out,
+                publish_only,
+            } => {
+                let plan = plan(
+                    &repo,
+                    &client,
+                    &journal,
+                    &scope,
+                    Address::try_from(candidate)?,
+                    !publish_only,
+                )
+                .await?;
                 let bytes = serde_json::to_vec_pretty(&plan)?;
                 ensure!(bytes.len() <= MAX_PLAN_BYTES, "review plan byte limit");
                 use std::io::Write;
-                let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(out)?;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(out)?;
                 file.write_all(&bytes)?;
                 file.sync_all()?;
-                Ok(json!({"commits_to_publish":plan.publish.len(),"candidate":plan.candidate,"update_branch":plan.update_branch,"expected":plan.expected,"instruction":"Review the complete plan, including parent and recovery commits, before sync push."}))
+                Ok(SyncOutput::Json(json!({"commits_to_publish":plan.publish.len(),"candidate":plan.candidate,"update_branch":plan.update_branch,"expected":plan.expected,"instruction":"Review the complete plan, including parent and recovery commits, before sync push."})))
             }
             Action::Push { plan: input } => {
                 let approved: Plan = serde_json::from_slice(&read(&input, MAX_PLAN_BYTES)?)?;
-                push(&repo, &client, &journal, &scope, approved).await
+                Ok(SyncOutput::Json(
+                    push(&repo, &client, &journal, &scope, approved).await?,
+                ))
             }
             Action::Fetch => {
-                let receipt = client.head(&scope).await?.ok_or_else(|| anyhow!("remote branch is absent; local tracking is retained"))?;
+                let receipt = client.head(&scope).await?.ok_or_else(|| {
+                    anyhow!("remote branch is absent; local tracking is retained")
+                })?;
                 proof(&client, &journal, &scope, &receipt).await?;
                 let count = transfer::fetch(&repo, &client, &receipt.receipt.head.commit).await?;
                 track(&client, &journal, &scope, receipt.clone()).await?;
-                Ok(json!({"head":receipt.receipt.head,"new_commits":count,"local_branches_changed":false}))
+                Ok(SyncOutput::Json(json!({
+                    "head": receipt.receipt.head,
+                    "new_commits": count,
+                    "local_branches_changed": false
+                })))
             }
-            Action::Pull { local_branch, expected, expected_generation } => {
-                let expected = match (expected,expected_generation) {
-                    (Some(address),Some(generation)) => Some(Head { commit:Address::try_from(address)?,generation }),
-                    (None,None) => None,
-                    _ => anyhow::bail!("expected local address and generation must be supplied together"),
+            Action::Pull {
+                local_branch,
+                expected,
+                expected_generation,
+            } => {
+                let expected = match (expected, expected_generation) {
+                    (Some(address), Some(generation)) => Some(Head {
+                        commit: Address::try_from(address)?,
+                        generation,
+                    }),
+                    (None, None) => None,
+                    _ => {
+                        anyhow::bail!("expected local address and generation must be supplied together")
+                    }
                 };
-                pull(&repo,&client,&journal,&scope,&local_branch,expected.as_ref()).await
+                Ok(SyncOutput::Json(
+                    pull(
+                        &repo,
+                        &client,
+                        &journal,
+                        &scope,
+                        &local_branch,
+                        expected.as_ref(),
+                    )
+                    .await?,
+                ))
             }
-            Action::AuthorityProof { out } => authority_proof(&client, &journal, &scope, &out).await,
+            Action::AuthorityProof { out } => Ok(SyncOutput::Json(
+                authority_proof(&client, &journal, &scope, &out).await?,
+            )),
             Action::Tracking => unreachable!(),
         }
-    }.await;
+    }
+    .await;
     journal.close().await;
     repo.close().await;
-    println!("{}", serde_json::to_string_pretty(&result?)?);
+    match result? {
+        SyncOutput::Json(value) => println!("{}", serde_json::to_string_pretty(&value)?),
+        SyncOutput::Text(text) => println!("{text}"),
+    }
     Ok(())
 }
 
@@ -726,4 +806,155 @@ async fn push(
     );
     track(client, journal, scope, receipt.clone()).await?;
     Ok(json!({"head":receipt.receipt.head,"published":true,"local_branches_changed":false}))
+}
+
+pub async fn compare(
+    client: &Client,
+    from: &Address,
+    to: &Address,
+) -> anyhow::Result<ProjectDiffReport> {
+    let mut all_changes = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut totals: Option<DiffTotals> = None;
+    let mut last_path: Option<String> = None;
+
+    loop {
+        let page = client
+            .compare_page(from, to, None, cursor.as_deref())
+            .await?;
+
+        ensure!(
+            page.project == client.project,
+            "remote report project mismatch: expected {}, got {}",
+            client.project,
+            page.project
+        );
+        ensure!(
+            &page.from == from,
+            "remote report from-address mismatch: expected {}, got {}",
+            from.as_str(),
+            page.from.as_str()
+        );
+        ensure!(
+            &page.to == to,
+            "remote report to-address mismatch: expected {}, got {}",
+            to.as_str(),
+            page.to.as_str()
+        );
+
+        if let Some(expected_totals) = &totals {
+            ensure!(
+                expected_totals == &page.totals,
+                "remote report totals changed across pages"
+            );
+        } else {
+            totals = Some(page.totals.clone());
+        }
+
+        for change in page.changes {
+            if let Some(last) = &last_path {
+                ensure!(
+                    change.path.as_str() > last.as_str(),
+                    "remote report changes out of order"
+                );
+            }
+            last_path = Some(change.path.clone());
+            all_changes.push(change);
+        }
+
+        if !page.more {
+            ensure!(
+                page.next_cursor.is_none(),
+                "terminal page must not include next_cursor"
+            );
+            break;
+        }
+
+        let next = page.next_cursor.ok_or_else(|| {
+            anyhow!("remote report indicated more changes but omitted next_cursor")
+        })?;
+        ensure!(!next.is_empty(), "empty cursor");
+        ensure!(seen_cursors.insert(next.clone()), "cursor loop detected");
+        ensure!(seen_cursors.len() <= 10_000, "exceeded maximum page count");
+        cursor = Some(next);
+    }
+
+    let totals = totals.unwrap_or(DiffTotals {
+        added: 0,
+        removed: 0,
+        modified: 0,
+        unchanged: 0,
+        total_changes: 0,
+    });
+    ensure!(
+        all_changes.len() == totals.total_changes,
+        "retrieved changes count ({}) does not match report totals ({})",
+        all_changes.len(),
+        totals.total_changes
+    );
+
+    Ok(ProjectDiffReport {
+        project: client.project,
+        from: from.clone(),
+        to: to.clone(),
+        totals,
+        changes: all_changes,
+        next_cursor: None,
+        more: false,
+    })
+}
+
+pub fn format_compare_text(report: &ProjectDiffReport) -> String {
+    let mut out = String::new();
+    out.push_str("Server-produced metadata (unverified by receipt journal)\n");
+    out.push_str(&format!("Project: {}\n", report.project));
+    out.push_str(&format!("From:    {}\n", report.from.as_str()));
+    out.push_str(&format!("To:      {}\n", report.to.as_str()));
+    out.push_str(&format!(
+        "Totals:  {} change(s) ({} added, {} removed, {} modified, {} unchanged)\n",
+        report.totals.total_changes,
+        report.totals.added,
+        report.totals.removed,
+        report.totals.modified,
+        report.totals.unchanged,
+    ));
+    if !report.changes.is_empty() {
+        out.push('\n');
+        for change in &report.changes {
+            let symbol = match change.kind {
+                DiffKind::Added => "+",
+                DiffKind::Removed => "-",
+                DiffKind::Modified => "~",
+                DiffKind::Unchanged => "=",
+            };
+            let doc_info = match (&change.from, &change.to) {
+                (Some(from), Some(to)) if from.document != to.document => {
+                    format!(" (document {} -> {})", from.document.0, to.document.0)
+                }
+                (_, Some(to)) => format!(" (document {})", to.document.0),
+                (Some(from), None) => format!(" (document {})", from.document.0),
+                (None, None) => String::new(),
+            };
+            out.push_str(&format!("  {} {}{}\n", symbol, change.path, doc_info));
+        }
+    }
+    out.push_str(
+        "\nNote: Server-produced metadata; does not independently verify document content.",
+    );
+    out
+}
+
+pub fn format_compare_json(report: &ProjectDiffReport) -> anyhow::Result<Value> {
+    let mut value = serde_json::to_value(report)?;
+    if let Value::Object(ref mut map) = value {
+        map.insert("server_metadata".into(), Value::Bool(true));
+        map.insert(
+            "disclaimer".into(),
+            Value::String(
+                "Server-produced metadata; does not independently verify document content or cryptographic receipts.".into(),
+            ),
+        );
+    }
+    Ok(value)
 }
