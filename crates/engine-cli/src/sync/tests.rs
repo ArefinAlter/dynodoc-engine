@@ -15,7 +15,7 @@ use engine_core::{
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 #[path = "../../../engine-api/tests/common/mod.rs"]
 mod common;
 const TOKEN_KEY: [u8; 32] = [9; 32];
@@ -1316,10 +1316,31 @@ fn device_scopes_are_the_least_the_action_needs_and_never_include_review() {
         scopes(&["push", "plan.json"]),
         ["history:read", "history:write"]
     );
+    assert_eq!(scopes(&["release", "list"]), ["history:read"]);
+    assert_eq!(scopes(&["release", "show", "v1.0.0"]), ["history:read"]);
+    assert_eq!(
+        scopes(&[
+            "release",
+            "create",
+            "v1.0.0",
+            "--expected-commit",
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ]),
+        ["history:read", "history:write"]
+    );
     for action in [
         &["fetch"][..],
         &["push", "plan.json"],
         &["plan", "ab", "--out", "p.json"],
+        &["release", "list"],
+        &["release", "show", "v1.0.0"],
+        &[
+            "release",
+            "create",
+            "v1.0.0",
+            "--expected-commit",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ],
     ] {
         assert!(!scopes(action).iter().any(|s| s == "history:review"));
     }
@@ -1830,5 +1851,668 @@ async fn revocation_refuses_clients_and_only_an_explicit_repin_crosses_the_recor
     for path in [p1, j1, j2, j3, j4] {
         remove(path).await;
     }
+    runtime.close().await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn release_create_success_and_idempotent_retry(pool: PgPool) {
+    let authority = engine_core::repository::server_authority::install(
+        &pool,
+        &hex::encode(key(99).public_key().as_ref()),
+    )
+    .await
+    .unwrap();
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let mut api_state = AppState::new(
+        runtime.pool.clone(),
+        AuthConfig {
+            paseto_key: TOKEN_KEY,
+            service_key: None,
+            token_ttl_seconds: 3600,
+            public_base_url: "http://test.local".into(),
+        },
+    );
+    api_state.ref_signer = Some(Arc::new(key(99)));
+    let (url, server) = serve(app(api_state)).await;
+    let (owner, login) = actor(&runtime.pool, "owner").await;
+    let (project, doc) = new_project(&url, &runtime.pool, &login, owner).await;
+    let owner_key = enroll(&url, &login, owner, 7).await;
+
+    let client = Client::new(remote(url.clone(), authority), project, &login, true).unwrap();
+    client.authority().await.unwrap();
+    let scope = Scope {
+        authority,
+        project,
+        branch: "main".into(),
+    };
+    let (p1, r1) = repo(project).await;
+    let (j1, journal1) = journal().await;
+    let first = commit(&r1, doc, &owner_key, vec![], "initial commit").await;
+    let head = first.verify().unwrap();
+    let approved = plan(&r1, &client, &journal1, &scope, head.clone(), true)
+        .await
+        .unwrap();
+    push(&r1, &client, &journal1, &scope, approved)
+        .await
+        .unwrap();
+
+    // Create release v1.0.0 targeting accepted head
+    let created = client.create_release("v1.0.0", &head).await.unwrap();
+    assert_eq!(created.project_id, project);
+    assert_eq!(created.name, "v1.0.0");
+    assert_eq!(created.commit, head.as_str());
+
+    // Idempotent retry with same name and same commit succeeds
+    let retried = client.create_release("v1.0.0", &head).await.unwrap();
+    assert_eq!(retried.project_id, project);
+    assert_eq!(retried.name, "v1.0.0");
+    assert_eq!(retried.commit, head.as_str());
+    assert_eq!(retried.created_at, created.created_at);
+
+    server.abort();
+    let _ = server.await;
+    journal1.close().await;
+    r1.close().await;
+    remove(p1).await;
+    remove(j1).await;
+    runtime.close().await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn release_create_conflict_409_and_stale_head_400(pool: PgPool) {
+    let authority = engine_core::repository::server_authority::install(
+        &pool,
+        &hex::encode(key(99).public_key().as_ref()),
+    )
+    .await
+    .unwrap();
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let mut api_state = AppState::new(
+        runtime.pool.clone(),
+        AuthConfig {
+            paseto_key: TOKEN_KEY,
+            service_key: None,
+            token_ttl_seconds: 3600,
+            public_base_url: "http://test.local".into(),
+        },
+    );
+    api_state.ref_signer = Some(Arc::new(key(99)));
+    let (url, server) = serve(app(api_state)).await;
+    let (owner, login) = actor(&runtime.pool, "owner").await;
+    let (project, doc) = new_project(&url, &runtime.pool, &login, owner).await;
+    let owner_key = enroll(&url, &login, owner, 7).await;
+
+    let client = Client::new(remote(url.clone(), authority), project, &login, true).unwrap();
+    client.authority().await.unwrap();
+    let scope = Scope {
+        authority,
+        project,
+        branch: "main".into(),
+    };
+    let (p1, r1) = repo(project).await;
+    let (j1, journal1) = journal().await;
+    let first = commit(&r1, doc, &owner_key, vec![], "initial commit").await;
+    let head1 = first.verify().unwrap();
+    let approved1 = plan(&r1, &client, &journal1, &scope, head1.clone(), true)
+        .await
+        .unwrap();
+    push(&r1, &client, &journal1, &scope, approved1)
+        .await
+        .unwrap();
+
+    // Create release v1.0.0 targeting head1
+    client.create_release("v1.0.0", &head1).await.unwrap();
+
+    // Advance main to head2
+    let second = commit(&r1, doc, &owner_key, vec![head1.clone()], "second commit").await;
+    let head2 = second.verify().unwrap();
+    let approved2 = plan(&r1, &client, &journal1, &scope, head2.clone(), true)
+        .await
+        .unwrap();
+    push(&r1, &client, &journal1, &scope, approved2)
+        .await
+        .unwrap();
+
+    // 1. Attempt to create v1.0.0 targeting head2 (different commit) -> 409 Conflict
+    let err_conflict = client.create_release("v1.0.0", &head2).await.unwrap_err();
+    assert!(
+        err_conflict.to_string().contains("409"),
+        "expected 409 conflict error, got: {err_conflict}"
+    );
+
+    // 2. Attempt to create v2.0.0 targeting head1 (stale, main is at head2) -> 400 Bad Request
+    let err_stale = client.create_release("v2.0.0", &head1).await.unwrap_err();
+    assert!(
+        err_stale.to_string().contains("400"),
+        "expected 400 bad request error, got: {err_stale}"
+    );
+
+    server.abort();
+    let _ = server.await;
+    journal1.close().await;
+    r1.close().await;
+    remove(p1).await;
+    remove(j1).await;
+    runtime.close().await;
+}
+
+#[tokio::test]
+async fn release_create_malformed_name_rejected_locally() {
+    let dummy_auth = Uuid::new_v4();
+    let dummy_proj = Uuid::new_v4();
+    let client = Client::new(
+        remote("http://127.0.0.1:9/".into(), dummy_auth),
+        dummy_proj,
+        "token",
+        true,
+    )
+    .unwrap();
+    let dummy_commit = Address::try_from(
+        "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+    )
+    .unwrap();
+
+    let invalid_names = [
+        "",
+        "-bad-start",
+        ".bad-start",
+        "_bad-start",
+        "has space",
+        "has/slash",
+        "has\\backslash",
+        "has?question",
+        "has#hash",
+    ];
+    for bad in invalid_names {
+        assert!(!http::valid_release_name(bad), "expected invalid: {bad}");
+        let err = client.create_release(bad, &dummy_commit).await.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid release name"),
+            "got: {err}"
+        );
+        let err_show = client.show_release(bad).await.unwrap_err();
+        assert!(
+            err_show.to_string().contains("invalid release name"),
+            "got: {err_show}"
+        );
+    }
+    let too_long = "a".repeat(101);
+    assert!(!http::valid_release_name(&too_long));
+    let err = client
+        .create_release(&too_long, &dummy_commit)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("invalid release name"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn release_show_success_and_not_found_404(pool: PgPool) {
+    let authority = engine_core::repository::server_authority::install(
+        &pool,
+        &hex::encode(key(99).public_key().as_ref()),
+    )
+    .await
+    .unwrap();
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let mut api_state = AppState::new(
+        runtime.pool.clone(),
+        AuthConfig {
+            paseto_key: TOKEN_KEY,
+            service_key: None,
+            token_ttl_seconds: 3600,
+            public_base_url: "http://test.local".into(),
+        },
+    );
+    api_state.ref_signer = Some(Arc::new(key(99)));
+    let (url, server) = serve(app(api_state)).await;
+    let (owner, login) = actor(&runtime.pool, "owner").await;
+    let (project, doc) = new_project(&url, &runtime.pool, &login, owner).await;
+    let owner_key = enroll(&url, &login, owner, 7).await;
+
+    let client = Client::new(remote(url.clone(), authority), project, &login, true).unwrap();
+    client.authority().await.unwrap();
+    let scope = Scope {
+        authority,
+        project,
+        branch: "main".into(),
+    };
+    let (p1, r1) = repo(project).await;
+    let (j1, journal1) = journal().await;
+    let first = commit(&r1, doc, &owner_key, vec![], "initial commit").await;
+    let head = first.verify().unwrap();
+    let approved = plan(&r1, &client, &journal1, &scope, head.clone(), true)
+        .await
+        .unwrap();
+    push(&r1, &client, &journal1, &scope, approved)
+        .await
+        .unwrap();
+
+    client.create_release("v1.0.0", &head).await.unwrap();
+
+    // Show existing release
+    let details = client
+        .show_release("v1.0.0")
+        .await
+        .unwrap()
+        .expect("release exists");
+    assert_eq!(details.project_id, project);
+    assert_eq!(details.name, "v1.0.0");
+    assert_eq!(details.commit, head.as_str());
+    assert_eq!(details.actor, owner);
+    assert_eq!(details.scope, vec![doc]);
+
+    // Show non-existent release returns Ok(None)
+    let absent = client.show_release("v9.9.9").await.unwrap();
+    assert!(absent.is_none());
+
+    // CLI release_show returns Err on absent release
+    let err = release_show(&client, "v9.9.9", false).await.unwrap_err();
+    assert!(err.to_string().contains("not found"));
+
+    server.abort();
+    let _ = server.await;
+    journal1.close().await;
+    r1.close().await;
+    remove(p1).await;
+    remove(j1).await;
+    runtime.close().await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn release_list_single_page_and_all_pagination(pool: PgPool) {
+    let authority = engine_core::repository::server_authority::install(
+        &pool,
+        &hex::encode(key(99).public_key().as_ref()),
+    )
+    .await
+    .unwrap();
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let mut api_state = AppState::new(
+        runtime.pool.clone(),
+        AuthConfig {
+            paseto_key: TOKEN_KEY,
+            service_key: None,
+            token_ttl_seconds: 3600,
+            public_base_url: "http://test.local".into(),
+        },
+    );
+    api_state.ref_signer = Some(Arc::new(key(99)));
+    let (url, server) = serve(app(api_state)).await;
+    let (owner, login) = actor(&runtime.pool, "owner").await;
+    let (project, doc) = new_project(&url, &runtime.pool, &login, owner).await;
+    let owner_key = enroll(&url, &login, owner, 7).await;
+
+    let client = Client::new(remote(url.clone(), authority), project, &login, true).unwrap();
+    client.authority().await.unwrap();
+    let scope = Scope {
+        authority,
+        project,
+        branch: "main".into(),
+    };
+    let (p1, r1) = repo(project).await;
+    let (j1, journal1) = journal().await;
+    let first = commit(&r1, doc, &owner_key, vec![], "initial commit").await;
+    let head = first.verify().unwrap();
+    let approved = plan(&r1, &client, &journal1, &scope, head.clone(), true)
+        .await
+        .unwrap();
+    push(&r1, &client, &journal1, &scope, approved)
+        .await
+        .unwrap();
+
+    // Create 3 releases with alphabetical names
+    client.create_release("v1.0", &head).await.unwrap();
+    client.create_release("v1.1", &head).await.unwrap();
+    client.create_release("v2.0", &head).await.unwrap();
+
+    // 1. Single page with limit=2
+    let page1 = client.list_releases(None, Some(2)).await.unwrap();
+    assert_eq!(page1.items.len(), 2);
+    assert_eq!(page1.items[0].name, "v1.0");
+    assert_eq!(page1.items[1].name, "v1.1");
+    assert_eq!(page1.next_cursor.as_deref(), Some("v1.1"));
+
+    // 2. Next page with after="v1.1"
+    let page2 = client.list_releases(Some("v1.1"), Some(2)).await.unwrap();
+    assert_eq!(page2.items.len(), 1);
+    assert_eq!(page2.items[0].name, "v2.0");
+    assert_eq!(page2.next_cursor.as_deref(), Some("v2.0"));
+
+    // 3. Exhaustive pagination with all=true
+    let all_out = release_list(&client, None, None, true, true).await.unwrap();
+    match all_out {
+        SyncOutput::Json(val) => {
+            let names: Vec<&str> = val["releases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, vec!["v1.0", "v1.1", "v2.0"]);
+            assert_eq!(val["count"], 3);
+        }
+        SyncOutput::Text(_) => panic!("expected json output"),
+    }
+
+    server.abort();
+    let _ = server.await;
+    journal1.close().await;
+    r1.close().await;
+    remove(p1).await;
+    remove(j1).await;
+    runtime.close().await;
+}
+
+#[tokio::test]
+async fn release_list_cursor_loop_and_out_of_order_rejection() {
+    let dummy_auth = Uuid::new_v4();
+    let dummy_proj = Uuid::new_v4();
+    let dummy_commit = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    // Router serving out-of-order items
+    let out_of_order_router = Router::new()
+        .route(
+            "/history/authority",
+            get({
+                let a = dummy_auth;
+                move || async move { Json(epoch_one(a)) }
+            }),
+        )
+        .route(
+            &format!("/projects/{dummy_proj}/history/releases"),
+            get(move || async move {
+                Json(json!({
+                    "items": [
+                        {
+                            "name": "v2.0",
+                            "commit": dummy_commit,
+                            "actor": Uuid::new_v4(),
+                            "created_at": chrono::Utc::now(),
+                        },
+                        {
+                            "name": "v1.0",
+                            "commit": dummy_commit,
+                            "actor": Uuid::new_v4(),
+                            "created_at": chrono::Utc::now(),
+                        }
+                    ],
+                    "next_cursor": null
+                }))
+            }),
+        );
+    let (url1, server1) = serve(out_of_order_router).await;
+    let client1 = Client::new(remote(url1, dummy_auth), dummy_proj, "token", true).unwrap();
+    let err_order = client1.list_releases(None, None).await.unwrap_err();
+    assert!(
+        err_order.to_string().contains("out-of-order"),
+        "expected out-of-order error, got: {err_order}"
+    );
+    server1.abort();
+    let _ = server1.await;
+
+    // Router serving a pagination cursor loop (next_cursor doesn't progress)
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cc = call_count.clone();
+    let loop_router = Router::new()
+        .route(
+            "/history/authority",
+            get({
+                let a = dummy_auth;
+                move || async move { Json(epoch_one(a)) }
+            }),
+        )
+        .route(
+            &format!("/projects/{dummy_proj}/history/releases"),
+            get(move || {
+                let cc = cc.clone();
+                async move {
+                    let n = cc.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        Json(json!({
+                            "items": [
+                                {
+                                    "name": "v2.0",
+                                    "commit": dummy_commit,
+                                    "actor": Uuid::new_v4(),
+                                    "created_at": chrono::Utc::now(),
+                                }
+                            ],
+                            "next_cursor": "v2.0"
+                        }))
+                    } else {
+                        // Returns previous cursor or backward progress
+                        Json(json!({
+                            "items": [
+                                {
+                                    "name": "v1.0",
+                                    "commit": dummy_commit,
+                                    "actor": Uuid::new_v4(),
+                                    "created_at": chrono::Utc::now(),
+                                }
+                            ],
+                            "next_cursor": "v1.0"
+                        }))
+                    }
+                }
+            }),
+        );
+    let (url2, server2) = serve(loop_router).await;
+    let client2 = Client::new(remote(url2, dummy_auth), dummy_proj, "token", true).unwrap();
+    let err_loop = release_list(&client2, None, None, true, false)
+        .await
+        .unwrap_err();
+    assert!(
+        err_loop.to_string().contains("cursor loop")
+            || err_loop.to_string().contains("out-of-order"),
+        "expected loop/order error, got: {err_loop}"
+    );
+    server2.abort();
+    let _ = server2.await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn release_permission_denial_403(pool: PgPool) {
+    let authority = engine_core::repository::server_authority::install(
+        &pool,
+        &hex::encode(key(99).public_key().as_ref()),
+    )
+    .await
+    .unwrap();
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let mut api_state = AppState::new(
+        runtime.pool.clone(),
+        AuthConfig {
+            paseto_key: TOKEN_KEY,
+            service_key: None,
+            token_ttl_seconds: 3600,
+            public_base_url: "http://test.local".into(),
+        },
+    );
+    api_state.ref_signer = Some(Arc::new(key(99)));
+    let (url, server) = serve(app(api_state)).await;
+    let (owner, login) = actor(&runtime.pool, "owner").await;
+    let (_stranger, stranger_login) = actor(&runtime.pool, "stranger").await;
+    let (project, doc) = new_project(&url, &runtime.pool, &login, owner).await;
+    let owner_key = enroll(&url, &login, owner, 7).await;
+
+    let client = Client::new(remote(url.clone(), authority), project, &login, true).unwrap();
+    client.authority().await.unwrap();
+    let scope = Scope {
+        authority,
+        project,
+        branch: "main".into(),
+    };
+    let (p1, r1) = repo(project).await;
+    let (j1, journal1) = journal().await;
+    let first = commit(&r1, doc, &owner_key, vec![], "initial commit").await;
+    let head = first.verify().unwrap();
+    let approved = plan(&r1, &client, &journal1, &scope, head.clone(), true)
+        .await
+        .unwrap();
+    push(&r1, &client, &journal1, &scope, approved)
+        .await
+        .unwrap();
+
+    // 1. Stranger (not member of project) attempts to create release -> 403 Forbidden
+    let stranger_client = Client::new(
+        remote(url.clone(), authority),
+        project,
+        &stranger_login,
+        true,
+    )
+    .unwrap();
+    let err_stranger = stranger_client
+        .create_release("v1.0.0", &head)
+        .await
+        .unwrap_err();
+    assert!(
+        err_stranger.to_string().contains("403"),
+        "expected 403 forbidden for non-member, got: {err_stranger}"
+    );
+
+    // 2. Device key with only history:read scope attempts create_release -> 403 Forbidden
+    enroll(&url, &login, owner, 8).await;
+    let read_only_device = device(&url, authority, project, 8, &["history:read"]);
+    let err_scope = read_only_device
+        .create_release("v1.0.0", &head)
+        .await
+        .unwrap_err();
+    assert!(
+        err_scope.to_string().contains("403"),
+        "expected 403 forbidden for read-only device session, got: {err_scope}"
+    );
+
+    server.abort();
+    let _ = server.await;
+    journal1.close().await;
+    r1.close().await;
+    remove(p1).await;
+    remove(j1).await;
+    runtime.close().await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn release_cli_options_execution_and_local_state_untouched(pool: PgPool) {
+    let authority = engine_core::repository::server_authority::install(
+        &pool,
+        &hex::encode(key(99).public_key().as_ref()),
+    )
+    .await
+    .unwrap();
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let mut api_state = AppState::new(
+        runtime.pool.clone(),
+        AuthConfig {
+            paseto_key: TOKEN_KEY,
+            service_key: None,
+            token_ttl_seconds: 3600,
+            public_base_url: "http://test.local".into(),
+        },
+    );
+    api_state.ref_signer = Some(Arc::new(key(99)));
+    let (url, server) = serve(app(api_state)).await;
+    let (owner, login) = actor(&runtime.pool, "owner").await;
+    let (project, doc) = new_project(&url, &runtime.pool, &login, owner).await;
+    let owner_key = enroll(&url, &login, owner, 7).await;
+
+    let client = Client::new(remote(url.clone(), authority), project, &login, true).unwrap();
+    client.authority().await.unwrap();
+    let scope = Scope {
+        authority,
+        project,
+        branch: "main".into(),
+    };
+    let (p1, r1) = repo(project).await;
+    let (j1, journal1) = journal().await;
+    let first = commit(&r1, doc, &owner_key, vec![], "initial commit").await;
+    let head = first.verify().unwrap();
+    let approved = plan(&r1, &client, &journal1, &scope, head.clone(), true)
+        .await
+        .unwrap();
+    push(&r1, &client, &journal1, &scope, approved)
+        .await
+        .unwrap();
+    client.create_release("v1.0.0", &head).await.unwrap();
+
+    // Prepare files for sync::run
+    let tmp = scratch();
+    let remote_path = tmp.join("remote.json");
+    let token_path = tmp.join("token.txt");
+    std::fs::write(
+        &remote_path,
+        serde_json::to_vec(&remote(url.clone(), authority)).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(&token_path, &login).unwrap();
+
+    // Snapshot repo and journal state
+    let head_before = r1.head("main").await.unwrap();
+    let pin_before = journal1.pin(&scope).await.unwrap();
+    journal1.close().await;
+    r1.close().await;
+    let p1_bytes_before = std::fs::read(&p1).unwrap();
+    let j1_bytes_before = std::fs::read(&j1).unwrap();
+
+    // Run sync release list via run
+    let options_list = Options {
+        repository: p1.clone(),
+        project,
+        remote: remote_path.clone(),
+        token_file: Some(token_path.clone()),
+        refresh_token_file: None,
+        device_key: None,
+        journal: j1.clone(),
+        branch: "main".into(),
+        allow_loopback_http: true,
+        accept_authority_break: None,
+        action: Action::Release {
+            action: ReleaseAction::List {
+                after: None,
+                limit: None,
+                all: false,
+                json: true,
+            },
+        },
+    };
+    run(options_list).await.unwrap();
+
+    // Run sync release show via run
+    let options_show = Options {
+        repository: p1.clone(),
+        project,
+        remote: remote_path.clone(),
+        token_file: Some(token_path.clone()),
+        refresh_token_file: None,
+        device_key: None,
+        journal: j1.clone(),
+        branch: "main".into(),
+        allow_loopback_http: true,
+        accept_authority_break: None,
+        action: Action::Release {
+            action: ReleaseAction::Show {
+                name: "v1.0.0".into(),
+                json: false,
+            },
+        },
+    };
+    run(options_show).await.unwrap();
+
+    // Verify DB file contents are unchanged
+    assert_eq!(std::fs::read(&p1).unwrap(), p1_bytes_before);
+    assert_eq!(std::fs::read(&j1).unwrap(), j1_bytes_before);
+
+    // Reopen and verify repo and journal states are untouched
+    let r1_after = LocalRepository::open(&p1, project).await.unwrap();
+    let journal1_after = ReceiptJournal::open(&j1).await.unwrap();
+    assert_eq!(r1_after.head("main").await.unwrap(), head_before);
+    assert_eq!(journal1_after.pin(&scope).await.unwrap(), pin_before);
+
+    server.abort();
+    let _ = server.await;
+    journal1_after.close().await;
+    r1_after.close().await;
+    remove(p1).await;
+    remove(j1).await;
+    let _ = std::fs::remove_dir_all(&tmp);
     runtime.close().await;
 }

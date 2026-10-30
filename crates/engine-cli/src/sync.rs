@@ -106,6 +106,48 @@ pub enum Action {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Inspect or create immutable named releases on the remote.
+    Release {
+        #[command(subcommand)]
+        action: ReleaseAction,
+    },
+}
+#[derive(Subcommand, Debug, Clone)]
+pub enum ReleaseAction {
+    /// List remote releases in deterministic ascending order by name.
+    List {
+        /// Keyset cursor: list releases with names strictly after this name.
+        #[arg(long)]
+        after: Option<String>,
+        /// Maximum number of releases to return in one page.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Exhaustively follow pagination cursors.
+        #[arg(long, conflicts_with = "limit", conflicts_with = "after")]
+        all: bool,
+        /// Format output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect a single remote release by name.
+    Show {
+        /// Release name.
+        name: String,
+        /// Format output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pin the accepted protected main head as an immutable named release.
+    Create {
+        /// Release name (1-100 characters, alphanumeric start, [a-zA-Z0-9._-]).
+        name: String,
+        /// Expected commit address that must match the accepted main head.
+        #[arg(long, visible_alias = "expected", value_name = "ADDRESS")]
+        expected_commit: String,
+        /// Format output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -133,7 +175,13 @@ struct Plan {
 ///   `history:review` and not `history:write`.
 fn device_scopes(action: &Action) -> Vec<String> {
     let mut scopes = vec!["history:read".to_owned()];
-    if matches!(action, Action::Push { .. }) {
+    if matches!(
+        action,
+        Action::Push { .. }
+            | Action::Release {
+                action: ReleaseAction::Create { .. }
+            }
+    ) {
         scopes.push("history:write".to_owned());
     }
     scopes
@@ -217,7 +265,11 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
     let repo = LocalRepository::open(&options.repository, options.project).await?;
     let journal = ReceiptJournal::open(&options.journal).await?;
     let result = async {
-        if matches!(options.action, Action::Tracking) { return Ok(serde_json::to_value(journal.pin(&scope).await?)?); }
+        if matches!(options.action, Action::Tracking) {
+            return Ok(SyncOutput::Json(serde_json::to_value(
+                journal.pin(&scope).await?,
+            )?));
+        }
         let mut client = credentials(&options, remote)?;
         if let Some(key) = options.accept_authority_break.clone() {
             client = client.accepting_break(key)?;
@@ -226,42 +278,81 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
             client.authority().await?;
         }
         match options.action {
-            Action::Plan { candidate, out, publish_only } => {
-                let plan = plan(&repo, &client, &journal, &scope, Address::try_from(candidate)?, !publish_only).await?;
+            Action::Plan {
+                candidate,
+                out,
+                publish_only,
+            } => {
+                let plan = plan(
+                    &repo,
+                    &client,
+                    &journal,
+                    &scope,
+                    Address::try_from(candidate)?,
+                    !publish_only,
+                )
+                .await?;
                 let bytes = serde_json::to_vec_pretty(&plan)?;
                 ensure!(bytes.len() <= MAX_PLAN_BYTES, "review plan byte limit");
                 use std::io::Write;
-                let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(out)?;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(out)?;
                 file.write_all(&bytes)?;
                 file.sync_all()?;
-                Ok(json!({"commits_to_publish":plan.publish.len(),"candidate":plan.candidate,"update_branch":plan.update_branch,"expected":plan.expected,"instruction":"Review the complete plan, including parent and recovery commits, before sync push."}))
+                Ok(SyncOutput::Json(json!({"commits_to_publish":plan.publish.len(),"candidate":plan.candidate,"update_branch":plan.update_branch,"expected":plan.expected,"instruction":"Review the complete plan, including parent and recovery commits, before sync push."})))
             }
             Action::Push { plan: input } => {
                 let approved: Plan = serde_json::from_slice(&read(&input, MAX_PLAN_BYTES)?)?;
-                push(&repo, &client, &journal, &scope, approved).await
+                Ok(SyncOutput::Json(push(&repo, &client, &journal, &scope, approved).await?))
             }
             Action::Fetch => {
-                let receipt = client.head(&scope).await?.ok_or_else(|| anyhow!("remote branch is absent; local tracking is retained"))?;
+                let receipt = client.head(&scope).await?.ok_or_else(|| {
+                    anyhow!("remote branch is absent; local tracking is retained")
+                })?;
                 proof(&client, &journal, &scope, &receipt).await?;
                 let count = transfer::fetch(&repo, &client, &receipt.receipt.head.commit).await?;
                 track(&client, &journal, &scope, receipt.clone()).await?;
-                Ok(json!({"head":receipt.receipt.head,"new_commits":count,"local_branches_changed":false}))
+                Ok(SyncOutput::Json(json!({"head":receipt.receipt.head,"new_commits":count,"local_branches_changed":false})))
             }
-            Action::Pull { local_branch, expected, expected_generation } => {
-                let expected = match (expected,expected_generation) {
-                    (Some(address),Some(generation)) => Some(Head { commit:Address::try_from(address)?,generation }),
-                    (None,None) => None,
-                    _ => anyhow::bail!("expected local address and generation must be supplied together"),
+            Action::Pull {
+                local_branch,
+                expected,
+                expected_generation,
+            } => {
+                let expected = match (expected, expected_generation) {
+                    (Some(address), Some(generation)) => Some(Head {
+                        commit: Address::try_from(address)?,
+                        generation,
+                    }),
+                    (None, None) => None,
+                    _ => anyhow::bail!(
+                        "expected local address and generation must be supplied together"
+                    ),
                 };
-                pull(&repo,&client,&journal,&scope,&local_branch,expected.as_ref()).await
+                Ok(SyncOutput::Json(pull(
+                    &repo,
+                    &client,
+                    &journal,
+                    &scope,
+                    &local_branch,
+                    expected.as_ref(),
+                )
+                .await?))
             }
-            Action::AuthorityProof { out } => authority_proof(&client, &journal, &scope, &out).await,
+            Action::AuthorityProof { out } => {
+                Ok(SyncOutput::Json(authority_proof(&client, &journal, &scope, &out).await?))
+            }
+            Action::Release { action } => handle_release(&client, action).await,
             Action::Tracking => unreachable!(),
         }
-    }.await;
+    }
+    .await;
     journal.close().await;
     repo.close().await;
-    println!("{}", serde_json::to_string_pretty(&result?)?);
+    let output: SyncOutput = result?;
+    println!("{output}");
     Ok(())
 }
 
@@ -726,4 +817,195 @@ async fn push(
     );
     track(client, journal, scope, receipt.clone()).await?;
     Ok(json!({"head":receipt.receipt.head,"published":true,"local_branches_changed":false}))
+}
+
+#[derive(Debug)]
+pub enum SyncOutput {
+    Json(Value),
+    Text(String),
+}
+
+impl std::fmt::Display for SyncOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncOutput::Json(v) => write!(
+                f,
+                "{}",
+                serde_json::to_string_pretty(v).map_err(|_| std::fmt::Error)?
+            ),
+            SyncOutput::Text(t) => write!(f, "{t}"),
+        }
+    }
+}
+
+async fn handle_release(client: &Client, action: ReleaseAction) -> anyhow::Result<SyncOutput> {
+    match action {
+        ReleaseAction::List {
+            after,
+            limit,
+            all,
+            json,
+        } => release_list(client, after.as_deref(), limit, all, json).await,
+        ReleaseAction::Show { name, json } => release_show(client, &name, json).await,
+        ReleaseAction::Create {
+            name,
+            expected_commit,
+            json,
+        } => {
+            let commit_addr = Address::try_from(expected_commit)
+                .map_err(|e| anyhow!("invalid expected commit address: {e}"))?;
+            release_create(client, &name, &commit_addr, json).await
+        }
+    }
+}
+
+async fn release_list(
+    client: &Client,
+    after: Option<&str>,
+    limit: Option<usize>,
+    all: bool,
+    json: bool,
+) -> anyhow::Result<SyncOutput> {
+    if all {
+        let mut all_items = Vec::new();
+        let mut cursor: Option<String> = None;
+        const MAX_PAGES: usize = 1000;
+        const MAX_TOTAL_RELEASES: usize = 100000;
+        for _ in 0..MAX_PAGES {
+            let page = client.list_releases(cursor.as_deref(), None).await?;
+            if page.items.is_empty() {
+                break;
+            }
+            for item in page.items {
+                all_items.push(item);
+                ensure!(
+                    all_items.len() <= MAX_TOTAL_RELEASES,
+                    "release list exceeded maximum budget of {MAX_TOTAL_RELEASES} releases"
+                );
+            }
+            match page.next_cursor {
+                Some(next) => {
+                    ensure!(
+                        cursor.as_deref().is_none_or(|c| next.as_str() > c),
+                        "cursor loop or backward progress detected: '{next}'"
+                    );
+                    cursor = Some(next);
+                }
+                None => break,
+            }
+        }
+        if json {
+            Ok(SyncOutput::Json(format_release_list_json(&all_items, None)))
+        } else {
+            Ok(SyncOutput::Text(format_release_list_text(&all_items, None)))
+        }
+    } else {
+        let page = client.list_releases(after, limit).await?;
+        if json {
+            Ok(SyncOutput::Json(format_release_list_json(
+                &page.items,
+                page.next_cursor.as_deref(),
+            )))
+        } else {
+            Ok(SyncOutput::Text(format_release_list_text(
+                &page.items,
+                page.next_cursor.as_deref(),
+            )))
+        }
+    }
+}
+
+async fn release_show(client: &Client, name: &str, json: bool) -> anyhow::Result<SyncOutput> {
+    let details = client
+        .show_release(name)
+        .await?
+        .ok_or_else(|| anyhow!("release '{name}' not found"))?;
+    if json {
+        Ok(SyncOutput::Json(format_release_show_json(&details)))
+    } else {
+        Ok(SyncOutput::Text(format_release_show_text(&details)))
+    }
+}
+
+async fn release_create(
+    client: &Client,
+    name: &str,
+    expected_commit: &Address,
+    json: bool,
+) -> anyhow::Result<SyncOutput> {
+    let created = client.create_release(name, expected_commit).await?;
+    if json {
+        Ok(SyncOutput::Json(format_release_create_json(&created)))
+    } else {
+        Ok(SyncOutput::Text(format_release_create_text(&created)))
+    }
+}
+
+fn format_release_create_json(created: &http::ReleaseCreated) -> Value {
+    json!({
+        "project_id": created.project_id,
+        "name": created.name,
+        "commit": created.commit,
+        "created_at": created.created_at,
+        "disclaimer": "Signed commits bind content; release names are server metadata."
+    })
+}
+
+fn format_release_create_text(created: &http::ReleaseCreated) -> String {
+    format!(
+        "Created release '{}' -> {}\nProject: {}\nCreated at: {}\nNotice: Signed commits bind content; release names are server metadata.",
+        created.name, created.commit, created.project_id, created.created_at
+    )
+}
+
+fn format_release_show_json(details: &http::ReleaseDetails) -> Value {
+    json!({
+        "project_id": details.project_id,
+        "name": details.name,
+        "commit": details.commit,
+        "actor": details.actor,
+        "created_at": details.created_at,
+        "scope": details.scope,
+        "disclaimer": "Signed commits bind content; release names are server metadata."
+    })
+}
+
+fn format_release_show_text(details: &http::ReleaseDetails) -> String {
+    let mut out = format!(
+        "Release: {}\nCommit: {}\nProject: {}\nActor: {}\nCreated at: {}\nNotice: Signed commits bind content; release names are server metadata.\nScope ({} documents):",
+        details.name, details.commit, details.project_id, details.actor, details.created_at, details.scope.len()
+    );
+    for doc in &details.scope {
+        out.push_str(&format!("\n  - {doc}"));
+    }
+    out
+}
+
+fn format_release_list_json(items: &[http::ReleaseItem], next_cursor: Option<&str>) -> Value {
+    json!({
+        "releases": items,
+        "count": items.len(),
+        "next_cursor": next_cursor,
+        "disclaimer": "Signed commits bind content; release names are server metadata."
+    })
+}
+
+fn format_release_list_text(items: &[http::ReleaseItem], next_cursor: Option<&str>) -> String {
+    if items.is_empty() {
+        return "No releases found.\nNotice: Signed commits bind content; release names are server metadata.".to_string();
+    }
+    let mut out = format!(
+        "Releases ({}):\nNotice: Signed commits bind content; release names are server metadata.\n",
+        items.len()
+    );
+    for item in items {
+        out.push_str(&format!(
+            "  {} -> {} ({})\n",
+            item.name, item.commit, item.created_at
+        ));
+    }
+    if let Some(cursor) = next_cursor {
+        out.push_str(&format!("Next cursor: {cursor}\n"));
+    }
+    out.trim_end().to_string()
 }
