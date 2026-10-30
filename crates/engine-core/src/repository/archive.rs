@@ -10,13 +10,14 @@
 //! 4. Footer frame (object count, commit count, bytes before footer, running SHA-256)
 #![allow(clippy::manual_is_multiple_of)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{self, Read, Write};
 
 use engine_shared::DocumentId;
 use ring::digest;
 use serde::{Deserialize, Serialize};
 
+use super::local::{LocalRepository, ObjectKey};
 use crate::repository::{SignedCommit, MAX_COMMIT_BYTES};
 use crate::shared_checkpoint::{Address, MAX_OBJECT_BYTES};
 use crate::transparency::encoding::{b64, hex, unb64};
@@ -665,4 +666,133 @@ pub fn verify_archive_stream<R: Read>(
     }
 
     summary.ok_or(ArchiveError::UnexpectedEof)
+}
+
+/// Export only the selected dependency closure and verified object graphs starting from `head`.
+pub async fn export_archive<W: Write>(
+    repo: &LocalRepository,
+    head: &Address,
+    writer: W,
+    limits: ArchiveLimits,
+) -> Result<ArchiveSummary, ArchiveError> {
+    let mut pending = vec![head.clone()];
+    let mut visited_commits = HashSet::new();
+    let mut commits_by_addr: BTreeMap<Address, SignedCommit> = BTreeMap::new();
+    let mut dep_graph: BTreeMap<Address, Vec<Address>> = BTreeMap::new();
+
+    while let Some(addr) = pending.pop() {
+        if visited_commits.insert(addr.clone()) {
+            if visited_commits.len() > limits.max_commits {
+                return Err(ArchiveError::Limit("exceeded maximum commit limit"));
+            }
+            let signed = repo
+                .commit(&addr)
+                .await
+                .map_err(|_| ArchiveError::InvalidFrame("commit in dependency closure missing"))?;
+            let deps = signed.commit.dependencies();
+            for dep in &deps {
+                if !visited_commits.contains(dep) {
+                    pending.push(dep.clone());
+                }
+            }
+            dep_graph.insert(addr.clone(), deps);
+            commits_by_addr.insert(addr, signed);
+        }
+    }
+
+    // Topological sort (dependency-first): dependencies before children, head is last
+    let mut ordered_commits = Vec::with_capacity(commits_by_addr.len());
+    let mut visited_for_sort = HashSet::new();
+    fn sort_visit(
+        addr: &Address,
+        dep_graph: &BTreeMap<Address, Vec<Address>>,
+        commits_by_addr: &BTreeMap<Address, SignedCommit>,
+        visited: &mut HashSet<Address>,
+        ordered: &mut Vec<SignedCommit>,
+    ) {
+        if visited.insert(addr.clone()) {
+            if let Some(deps) = dep_graph.get(addr) {
+                for dep in deps {
+                    sort_visit(dep, dep_graph, commits_by_addr, visited, ordered);
+                }
+            }
+            if let Some(c) = commits_by_addr.get(addr) {
+                ordered.push(c.clone());
+            }
+        }
+    }
+    sort_visit(
+        head,
+        &dep_graph,
+        &commits_by_addr,
+        &mut visited_for_sort,
+        &mut ordered_commits,
+    );
+
+    // Collect file roots across all commits in the closure
+    let mut file_roots: std::collections::HashMap<DocumentId, BTreeSet<Address>> =
+        std::collections::HashMap::new();
+    for c in &ordered_commits {
+        for file_entry in c.commit.files.values() {
+            file_roots
+                .entry(file_entry.document)
+                .or_default()
+                .insert(file_entry.state.clone());
+        }
+    }
+
+    // Traverse each file root's object graph
+    let mut visited_objects: HashSet<(DocumentId, Address)> = HashSet::new();
+    let mut objects_to_export: Vec<(DocumentId, Address, Vec<u8>)> = Vec::new();
+
+    for (doc_id, roots) in file_roots {
+        for root in roots {
+            let mut stack = vec![root];
+            while let Some(addr) = stack.pop() {
+                if visited_objects.insert((doc_id, addr.clone())) {
+                    if visited_objects.len() > limits.max_objects {
+                        return Err(ArchiveError::Limit("exceeded maximum object count"));
+                    }
+                    let packet = repo
+                        .object(&ObjectKey {
+                            document: doc_id,
+                            address: addr.clone(),
+                        })
+                        .await
+                        .map_err(|_| {
+                            ArchiveError::InvalidFrame("object in graph missing or corrupt")
+                        })?;
+
+                    crate::shared_checkpoint::validate_stored(&addr, &packet.bytes).map_err(
+                        |_| ArchiveError::InvalidFrame("object hash mismatch or invalid"),
+                    )?;
+
+                    let children = crate::shared_checkpoint::references(&addr, &packet.bytes)
+                        .map_err(|_| ArchiveError::InvalidFrame("malformed object references"))?;
+
+                    for child in children {
+                        if !visited_objects.contains(&(doc_id, child.clone())) {
+                            stack.push(child);
+                        }
+                    }
+
+                    objects_to_export.push((doc_id, addr, packet.bytes));
+                }
+            }
+        }
+    }
+
+    // Stream out to ArchiveWriter
+    let mut writer = ArchiveWriter::new(writer)?;
+    writer.write_header(ARCHIVE_VERSION_1, DocumentId(repo.project()), head.clone())?;
+
+    for (doc, addr, bytes) in objects_to_export {
+        writer.write_object(doc, addr, &bytes)?;
+    }
+
+    for commit in ordered_commits {
+        writer.write_commit(&commit)?;
+    }
+
+    writer.finish()
 }
