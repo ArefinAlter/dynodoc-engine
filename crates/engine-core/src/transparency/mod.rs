@@ -56,7 +56,7 @@
 
 pub mod assurance;
 pub mod bundle;
-mod encoding;
+pub(crate) mod encoding;
 pub mod leaf;
 pub mod log;
 pub mod merkle;

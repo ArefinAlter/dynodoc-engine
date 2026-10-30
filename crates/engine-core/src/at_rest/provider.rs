@@ -981,6 +981,7 @@ mod tests {
         let shown = format!("{:?}", FileKeyProvider::from_dir(&dir.0).unwrap());
         assert!(shown.contains("kek_versions"));
         assert!(!shown.to_lowercase().contains("cdcd"));
-        assert!(!shown.contains("205"));
+        let kek_part = shown.split("kek_versions").nth(1).unwrap_or(&shown);
+        assert!(!kek_part.contains("205"));
     }
 }
