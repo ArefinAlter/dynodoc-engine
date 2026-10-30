@@ -16,7 +16,7 @@
 //! * `tools/list` is deterministic (same bytes every time). When the request (or the
 //!   negotiated revision) is 2026-07-28 or later it carries `ttlMs` and `cacheScope`.
 //! * `tools/call` validates the arguments against the published schema. An unknown tool, or a
-//!   tool the connection's profile does not offer (the write tools unless `--write` was given), is a
+//!   tool the connection's profile does not offer is a
 //!   JSON-RPC error `-32602`; invalid arguments and every backend failure are a normal
 //!   result with `isError: true` and a `dd/1 error` line (spec 7.1, and the 2025-11-25
 //!   clarification that argument errors are tool errors so a model can correct itself).
@@ -38,7 +38,10 @@
 //! `io.modelcontextprotocol/protocolVersion` and the allowed values of `cacheScope` are
 //! therefore unverified: check at build time. They are isolated in the constants below.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
@@ -74,9 +77,22 @@ struct Connection {
     client: String,
 }
 
+/// A trusted host must show the exact tool and validated arguments to a person.
+/// The sink must also bind each decision to its backend project. The agent's own request
+/// or an untrusted MCP client must never implement this decision.
+/// The server asks again for each write and fails closed on denial or timeout.
+pub trait HumanConfirmation: Send + Sync {
+    fn confirm<'a>(
+        &'a self,
+        tool: Tool,
+        arguments: &'a Map<String, Value>,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+}
+
 struct Inner<B> {
     backend: B,
     profile: Profile,
+    confirmation: Option<Arc<dyn HumanConfirmation>>,
     connection: Mutex<Connection>,
 }
 
@@ -104,11 +120,30 @@ impl<B> Clone for Server<B> {
 }
 
 impl<B: Backend> Server<B> {
-    pub fn new(backend: B, profile: Profile) -> Self {
+    /// Without a trusted confirmation sink, the connection is always read-only.
+    pub fn new(backend: B, _profile: Profile) -> Self {
+        Self::build(backend, Profile::read_only(), None)
+    }
+
+    /// Only trusted hosts with a real human confirmation surface may expose writes.
+    pub fn with_human_confirmation(
+        backend: B,
+        profile: Profile,
+        confirmation: Arc<dyn HumanConfirmation>,
+    ) -> Self {
+        Self::build(backend, profile, Some(confirmation))
+    }
+
+    fn build(
+        backend: B,
+        profile: Profile,
+        confirmation: Option<Arc<dyn HumanConfirmation>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 backend,
                 profile,
+                confirmation,
                 connection: Mutex::new(Connection {
                     version: None,
                     client: String::new(),
@@ -290,6 +325,21 @@ impl<B: Backend> Server<B> {
         };
         if let Err(error) = self.inner.profile.validate(tool, &args) {
             return Ok(tool_result(ToolOutput::error(&error)));
+        }
+        if tool.is_write() {
+            let approved = match &self.inner.confirmation {
+                Some(sink) => {
+                    tokio::time::timeout(Duration::from_secs(120), sink.confirm(tool, &args))
+                        .await
+                        .unwrap_or(false)
+                }
+                None => false,
+            };
+            if !approved {
+                return Ok(tool_result(ToolOutput::error(&ToolError::new(
+                    "policy_denied",
+                ))));
+            }
         }
         let ctx = CallContext {
             client: self.connection().client.clone(),

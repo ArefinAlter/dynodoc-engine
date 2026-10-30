@@ -848,14 +848,14 @@ async fn the_token_and_the_query_never_appear_in_logs_or_results() {
         "the subscriber saw events, so the check below is meaningful"
     );
     for secret in ["SECRET", "v4.local", "Bearer"] {
-        assert!(!logs.contains(secret), "{secret} in logs:\n{logs}");
+        assert!(!logs.contains(secret), "sensitive value appeared in logs");
         for text in &results {
-            assert!(!text.contains(secret), "{secret} in {text}");
+            assert!(!text.contains(secret), "sensitive value appeared in output");
         }
     }
     assert!(
         !logs.contains("needle"),
-        "the caller's query text was logged:\n{logs}"
+        "the caller's query text was logged"
     );
 }
 
@@ -1555,12 +1555,12 @@ async fn the_write_tools_log_and_return_neither_the_token_nor_the_text() {
     let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
     assert!(!logs.is_empty(), "the subscriber saw events");
     for secret in ["SECRET", "v4.local", "Bearer"] {
-        assert!(!logs.contains(secret), "{secret} in logs:\n{logs}");
+        assert!(!logs.contains(secret), "sensitive value appeared in logs");
         for text in &results {
-            assert!(!text.contains(secret), "{secret} in {text}");
+            assert!(!text.contains(secret), "sensitive value appeared in output");
         }
     }
     for text in results.iter().map(String::as_str).chain([logs.as_str()]) {
-        assert!(!text.contains("needle"), "document text leaked: {text}");
+        assert!(!text.contains("needle"), "document text leaked");
     }
 }
