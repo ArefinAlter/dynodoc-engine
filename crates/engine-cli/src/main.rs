@@ -166,6 +166,9 @@ enum Command {
         /// Reuses unchanged components from an eligible earlier typed checkpoint (requires --typed).
         #[arg(long)]
         incremental: bool,
+        /// Explicit codec selection (e.g. 'compact-v3').
+        #[arg(long)]
+        codec: Option<String>,
     },
     /// Emit the generated OpenAPI document. With `--out`, write it there; otherwise
     /// print to stdout. CI compares the committed `openapi.yaml` against `--out -` to
@@ -301,7 +304,8 @@ async fn run() -> anyhow::Result<()> {
             through_seq,
             typed,
             incremental,
-        } => shared_snapshot(document_id, through_seq, typed, incremental).await,
+            codec,
+        } => shared_snapshot(document_id, through_seq, typed, incremental, codec).await,
         Command::Openapi { out } => openapi(out),
     }
 }
@@ -527,10 +531,26 @@ async fn shared_snapshot(
     through_seq: i64,
     typed: bool,
     incremental: bool,
+    codec_arg: Option<String>,
 ) -> anyhow::Result<()> {
-    if incremental && !typed {
+    if let Some(ref c) = codec_arg {
+        if c != "compact-v3" {
+            anyhow::bail!("unsupported codec '{c}', expected 'compact-v3'");
+        }
+        if typed {
+            anyhow::bail!("--codec {c} cannot be combined with --typed");
+        }
+        if incremental {
+            anyhow::bail!("--codec {c} cannot be combined with --incremental (compact v3 uses the full writer only)");
+        }
+    } else if incremental && !typed {
         anyhow::bail!("--incremental requires --typed");
     }
+
+    if through_seq < 0 {
+        anyhow::bail!("through_seq must be non-negative");
+    }
+
     let doc = parse_document_id(&document_id)?;
     let pool = connect().await?;
 
@@ -554,6 +574,10 @@ async fn shared_snapshot(
         }
         println!("fallback ran: {}", result.fallback_ran);
         println!(
+            "encoded objects: {}; encoded bytes: {}",
+            result.stats.visited_objects, result.stats.encoded_bytes
+        );
+        println!(
             "new objects: {}; new canonical bytes: {}",
             result.stats.new_objects, result.stats.new_bytes
         );
@@ -565,7 +589,11 @@ async fn shared_snapshot(
     }
 
     use engine_core::shared_checkpoint::postgres::Codec;
-    let codec = if typed { Codec::V2 } else { Codec::V1 };
+    let codec = match codec_arg.as_deref() {
+        Some("compact-v3") => Codec::V3,
+        _ if typed => Codec::V2,
+        _ => Codec::V1,
+    };
     let result = engine_core::shared_checkpoint::postgres::take_with_codec(
         &pool,
         doc,
@@ -579,6 +607,10 @@ async fn shared_snapshot(
         "shared checkpoint {codec:?} at revision {}: {}",
         result.through_seq,
         result.root.as_str()
+    );
+    println!(
+        "encoded objects: {}; encoded bytes: {}",
+        result.stats.visited_objects, result.stats.encoded_bytes
     );
     println!(
         "new objects: {}; new canonical bytes: {}",

@@ -81,3 +81,20 @@ Node identity comes from its state-map key in the radix map, omitting the redund
 Conflicting flags, existing reconstructed keys, unknown fields and noncanonical
 encodings fail closed. V2 readers reject V3 roots with `Error::Invalid("typed header/version")`,
 and V3 readers similarly reject V2 roots.
+
+### Operator selection and scope limits
+
+`engine-cli shared-snapshot DOCUMENT --through-seq N --codec compact-v3` publishes
+an explicit compact v3 shared checkpoint. Compact v3 uses the full writer only;
+`--incremental` and `--typed` are rejected in combination with `--codec compact-v3`.
+The publication is verified against the pinned event-derived state in a single
+transaction.
+
+**Scope and Limits:**
+- This is an operator-facing publication feature. It does not mark portable/native adoption
+  from PR-64/PR-65 as complete.
+- Periodic storage defaults and automatic migrations remain on their existing codecs.
+- Older engine binaries and reader distributions that do not include v3 codec support
+  cannot read v3 checkpoints and will fail closed on encountering a v3 root.
+- Reconstructed document states are mathematically and semantically identical across
+  all codecs; roots diverge deterministically due to format compaction.
