@@ -1,6 +1,6 @@
 //! Explicit local repository commands. These never contact a remote server or
 //! apply content to a native editor. Signing keys are supplied by the operator.
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::{Subcommand, ValueEnum};
 use engine_core::{
@@ -15,6 +15,7 @@ use engine_core::{
             CompactOptions, GcApplyOptions, GcPlanOptions, LocalRepository, ObjectKey,
             ObjectPacket, StorageLimits, SCHEMA_VERSION,
         },
+        log::{CommitLogEntry, FirstParentLogOptions, DEFAULT_LOG_PAGE_LIMIT},
         project_merge::SameFile,
         recovery, Commit, FileEntry, Head, SignedCommit,
     },
@@ -22,8 +23,10 @@ use engine_core::{
 };
 use engine_shared::DocumentId;
 use ring::signature::Ed25519KeyPair;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::Read,
     path::{Path, PathBuf},
 };
@@ -204,6 +207,23 @@ pub enum Action {
     ImportCommit { input: PathBuf },
     /// Print a verified signed commit for review or transfer.
     Show { commit: String },
+    /// Retrieve a bounded page or full chain of first-parent commit history from the local repository.
+    Log {
+        /// Starting commit address.
+        commit: String,
+        /// Page limit (1..=50, default 20).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Continuation cursor (the next first-parent commit address to continue from).
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Retrieve all remaining first-parent commits across pages under limits.
+        #[arg(long)]
+        all: bool,
+        /// Format output as stable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Read one project branch. Missing branches print null.
     Head { branch: String },
     /// Publish a project commit using an exact expected address AND generation.
@@ -522,8 +542,11 @@ fn today_start_ms() -> anyhow::Result<i64> {
 }
 
 pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::Result<()> {
-    // The retention and horizon plans must not create, upgrade or write the database.
-    let repo = if matches!(action, Action::GcPlan { .. } | Action::HorizonPlan { .. }) {
+    // The retention and horizon plans and log must not create, upgrade or write the database.
+    let repo = if matches!(
+        action,
+        Action::GcPlan { .. } | Action::HorizonPlan { .. } | Action::Log { .. }
+    ) {
         LocalRepository::open_read_only(&path, project).await?
     } else {
         // A destructive command never creates the database it would collect.
@@ -705,6 +728,34 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
             serde_json::json!({"commit":repo.import_commit(&read_json(&input, engine_core::repository::MAX_COMMIT_BYTES + 1024)?).await?})
         }
         Action::Show { commit } => serde_json::to_value(repo.commit(&address(commit)?).await?)?,
+        Action::Log {
+            commit,
+            limit,
+            cursor,
+            all,
+            json,
+        } => {
+            let commit_addr = address(commit)?;
+            let cursor_addr = match cursor {
+                Some(c) => Some(address(c)?),
+                None => None,
+            };
+            let result = local_log(
+                &repo,
+                project,
+                &commit_addr,
+                limit,
+                cursor_addr.as_ref(),
+                all,
+            )
+            .await?;
+            if json {
+                serde_json::to_value(&format_local_log_json(&result)?)?
+            } else {
+                text = Some(format_local_log_text(&result));
+                serde_json::Value::Null
+            }
+        }
         Action::Head { branch } => serde_json::to_value(repo.head(&branch).await?)?,
         Action::SetHead {
             branch,
@@ -847,6 +898,206 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
         Some(message) => anyhow::bail!(message),
         None => Ok(()),
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalLogResult {
+    pub project: uuid::Uuid,
+    pub head: Address,
+    pub entries: Vec<CommitLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub more: bool,
+}
+
+pub async fn local_log(
+    repo: &LocalRepository,
+    project: uuid::Uuid,
+    commit_addr: &Address,
+    limit: Option<usize>,
+    cursor: Option<&Address>,
+    all: bool,
+) -> anyhow::Result<LocalLogResult> {
+    if let Some(l) = limit {
+        ensure!(l > 0 && l <= 50, "limit must be between 1 and 50");
+    }
+    let effective_limit = limit.unwrap_or(DEFAULT_LOG_PAGE_LIMIT);
+
+    if let Some(cursor_addr) = cursor {
+        ensure!(
+            cursor_addr != commit_addr,
+            "cursor loop detected: continuation cursor cannot equal head"
+        );
+        // Validate that cursor_addr is reached from commit_addr along first parents
+        let mut curr = commit_addr.clone();
+        let mut found = false;
+        let mut steps = 0usize;
+        while steps < 65536 {
+            let commit = repo.commit(&curr).await?;
+            ensure!(commit.commit.project == project, "commit project mismatch");
+            if let Some(first_parent) = commit.commit.parents.first() {
+                if first_parent == cursor_addr {
+                    found = true;
+                    break;
+                }
+                curr = first_parent.clone();
+                steps += 1;
+            } else {
+                break;
+            }
+        }
+        ensure!(
+            found,
+            "continuation cursor is not on the first-parent chain of the specified commit"
+        );
+    }
+
+    let start_addr = cursor.unwrap_or(commit_addr);
+
+    if !all {
+        let page = repo
+            .first_parent_log(
+                start_addr,
+                FirstParentLogOptions {
+                    limit: Some(effective_limit),
+                },
+            )
+            .await?;
+        return Ok(LocalLogResult {
+            project,
+            head: commit_addr.clone(),
+            entries: page.entries,
+            next_cursor: page.next_address.map(|a| a.as_str().to_string()),
+            more: page.more,
+        });
+    }
+
+    let mut current_addr = start_addr.clone();
+    let mut all_entries = Vec::new();
+    let mut seen_addresses = BTreeSet::new();
+    let mut pages = 0usize;
+
+    loop {
+        let page = repo
+            .first_parent_log(
+                &current_addr,
+                FirstParentLogOptions {
+                    limit: Some(effective_limit),
+                },
+            )
+            .await?;
+
+        for entry in page.entries {
+            ensure!(
+                seen_addresses.insert(entry.address.clone()),
+                "duplicate commit address encountered: {}",
+                entry.address.as_str()
+            );
+            all_entries.push(entry);
+        }
+        pages += 1;
+
+        match page.next_address {
+            Some(next) => {
+                ensure!(page.more, "more=false but next_address is present");
+                ensure!(
+                    pages < 10_000,
+                    "exceeded maximum pagination limit (10000 pages)"
+                );
+                current_addr = next;
+            }
+            None => {
+                ensure!(!page.more, "more=true but no next_address present");
+                break;
+            }
+        }
+    }
+
+    Ok(LocalLogResult {
+        project,
+        head: commit_addr.clone(),
+        entries: all_entries,
+        next_cursor: None,
+        more: false,
+    })
+}
+
+pub fn format_local_log_text(result: &LocalLogResult) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "First-parent history for project {} at commit {}:\n\n",
+        result.project,
+        result.head.as_str()
+    ));
+
+    if result.entries.is_empty() {
+        out.push_str("No commits found.\n");
+    } else {
+        for (i, entry) in result.entries.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&format!("commit {}\n", entry.address.as_str()));
+            if entry.parents.len() > 1 {
+                let parents_str = entry
+                    .parents
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                out.push_str(&format!("Merge: {}\n", parents_str));
+            } else if let Some(parent) = entry.parents.first() {
+                out.push_str(&format!("Parent: {}\n", parent.as_str()));
+            }
+            out.push_str(&format!("Author: {}\n", entry.author_key));
+            out.push_str(&format!("Date:   {}\n", entry.authored_at_ms));
+            out.push('\n');
+            match &entry.message {
+                engine_core::repository::log::BoundedMessage::Value(msg) => {
+                    for line in msg.lines() {
+                        out.push_str(&format!("    {}\n", line));
+                    }
+                    if msg.is_empty() {
+                        out.push('\n');
+                    }
+                }
+                engine_core::repository::log::BoundedMessage::Omitted(omitted) => {
+                    out.push_str(&format!(
+                        "    [omitted: {} bytes, sha256: {}]\n",
+                        omitted.bytes, omitted.sha256
+                    ));
+                }
+            }
+        }
+    }
+
+    if result.more {
+        if let Some(ref cursor) = result.next_cursor {
+            out.push_str(&format!(
+                "\nMore commits available. Next cursor: {}\n",
+                cursor
+            ));
+        }
+    }
+
+    out.push_str(
+        "\nNote: First-parent history is not an exhaustive DAG traversal or independent proof of completeness.\n",
+    );
+    out
+}
+
+pub fn format_local_log_json(result: &LocalLogResult) -> anyhow::Result<Value> {
+    let mut value = serde_json::to_value(result)?;
+    if let Value::Object(ref mut map) = value {
+        map.insert("first_parent_history".into(), Value::Bool(true));
+        map.insert(
+            "disclaimer".into(),
+            Value::String(
+                "First-parent history is not an exhaustive DAG traversal or independent proof of completeness.".into(),
+            ),
+        );
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -1924,5 +2175,335 @@ mod tests {
             .clone()
             .try_get_matches_from(["gc-plan", "--format", "xml"])
             .is_err());
+    }
+
+    #[test]
+    fn log_arguments_parse_and_validate() {
+        let command = Action::augment_subcommands(Command::new("repository").no_binary_name(true));
+        let parse = |args: &[&str]| {
+            let matches = command.clone().try_get_matches_from(args).unwrap();
+            Action::from_arg_matches(&matches).unwrap()
+        };
+        assert!(command.clone().try_get_matches_from(["log"]).is_err());
+        assert!(matches!(
+            parse(&["log", "abc"]),
+            Action::Log {
+                commit,
+                limit: None,
+                cursor: None,
+                all: false,
+                json: false
+            } if commit == "abc"
+        ));
+        assert!(matches!(
+            parse(&[
+                "log",
+                "abc",
+                "--limit",
+                "25",
+                "--cursor",
+                "def",
+                "--all",
+                "--json"
+            ]),
+            Action::Log {
+                commit,
+                limit: Some(25),
+                cursor: Some(cur),
+                all: true,
+                json: true
+            } if commit == "abc" && cur == "def"
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_history_log_read_only_filesystem() {
+        let f = Fixture::new().await;
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let f0 = f.file(doc, &[]).await;
+        let c0 = f.commit(&[], vec![("a", f0)], "genesis").await;
+        let f1 = f.file(doc, &[(0, "edit")]).await;
+        let c1 = f.commit(&[&c0], vec![("a", f1)], "second").await;
+        f.repo.close().await;
+
+        let path = f.path.clone();
+        let project = f.project;
+
+        // Set file permissions to read-only (0o444)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+
+        // Run log on read-only database
+        run(
+            path.clone(),
+            project,
+            Action::Log {
+                commit: c1.as_str().to_string(),
+                limit: None,
+                cursor: None,
+                all: false,
+                json: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Restore write permissions before cleanup
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        remove_test_database(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_history_log_missing_database() {
+        let missing =
+            std::env::temp_dir().join(format!("dynodoc-missing-{}.sqlite", uuid::Uuid::new_v4()));
+        let project = uuid::Uuid::new_v4();
+        let err = run(
+            missing.clone(),
+            project,
+            Action::Log {
+                commit: "1".repeat(64),
+                limit: None,
+                cursor: None,
+                all: false,
+                json: true,
+            },
+        )
+        .await;
+        assert!(err.is_err());
+        assert!(!missing.exists(), "missing database must never be created");
+    }
+
+    #[tokio::test]
+    async fn local_history_log_schemas_1_2_3_fixtures() {
+        let f = Fixture::new().await;
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let f0 = f.file(doc, &[]).await;
+        let c0 = f.commit(&[], vec![("a", f0)], "c0").await;
+        let path = f.path.clone();
+        let project = f.project;
+        f.repo.close().await;
+
+        for schema_ver in [1i64, 2i64, 3i64] {
+            // Update version in local_meta
+            {
+                let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+                    .await
+                    .unwrap();
+                sqlx::query("update local_meta set version=?")
+                    .bind(schema_ver)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                pool.close().await;
+            }
+
+            // Run Action::Log
+            run(
+                path.clone(),
+                project,
+                Action::Log {
+                    commit: c0.as_str().to_string(),
+                    limit: None,
+                    cursor: None,
+                    all: false,
+                    json: true,
+                },
+            )
+            .await
+            .unwrap();
+
+            // Verify version is unchanged (never auto-upgraded by read_only)
+            {
+                let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+                    .await
+                    .unwrap();
+                let ver: i64 = sqlx::query_scalar("select version from local_meta")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(ver, schema_ver, "schema version must not be upgraded");
+                pool.close().await;
+            }
+        }
+
+        // Schema 4 (unsupported) must fail rather than proceed
+        {
+            let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+                .await
+                .unwrap();
+            sqlx::query("update local_meta set version=4")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+
+        let err = run(
+            path.clone(),
+            project,
+            Action::Log {
+                commit: c0.as_str().to_string(),
+                limit: None,
+                cursor: None,
+                all: false,
+                json: true,
+            },
+        )
+        .await;
+        assert!(err.is_err(), "unsupported schema version must fail");
+
+        remove_test_database(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_history_log_merge_recovery_and_cursor_validation() {
+        let f = Fixture::new().await;
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let f0 = f.file(doc, &[]).await;
+        let c0 = f.commit(&[], vec![("a", f0)], "c0 genesis").await;
+
+        let f1a = f.file(doc, &[(0, "branch a")]).await;
+        let c1a = f.commit(&[&c0], vec![("a", f1a)], "c1a mainline").await;
+
+        let f1b = f.file(doc, &[(1, "branch b")]).await;
+        let c1b = f.commit(&[&c0], vec![("a", f1b)], "c1b side branch").await;
+
+        let f2 = f.file(doc, &[(0, "branch a"), (1, "branch b")]).await;
+        let c2 = f
+            .commit(&[&c1a, &c1b], vec![("a", f2.clone())], "c2 merge")
+            .await;
+
+        // Commit 3: recovery commit onto c2
+        let key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let plan = f
+            .repo
+            .plan_recovery(
+                engine_core::repository::recovery::Kind::Revert,
+                &c1b,
+                &c2,
+                None,
+            )
+            .await
+            .unwrap();
+        let resolutions: BTreeMap<String, Option<FileEntry>> = plan
+            .changes
+            .conflicts
+            .iter()
+            .map(|c| (c.path.clone(), Some(f2.clone())))
+            .collect();
+        let c3_commit = plan
+            .resolve(&resolutions, 1_700_000_003_000, "c3 recovery".to_string())
+            .unwrap();
+        let c3 = f
+            .repo
+            .import_commit(&SignedCommit::sign(c3_commit, &key).unwrap())
+            .await
+            .unwrap();
+
+        // 1. Full chain traversal follows first-parent spine: c3 -> c2 -> c1a -> c0
+        let full = local_log(&f.repo, f.project, &c3, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(full.head, c3);
+        assert_eq!(full.entries.len(), 4);
+        assert_eq!(full.entries[0].address, c3);
+        assert_eq!(full.entries[1].address, c2);
+        assert_eq!(full.entries[2].address, c1a);
+        assert_eq!(full.entries[3].address, c0);
+        // c1b is never visited on first-parent traversal
+        assert!(!full.entries.iter().any(|e| e.address == c1b));
+
+        // Format checks: c2 has 2 parents -> Merge: c1a c1b
+        let text = format_local_log_text(&full);
+        assert!(text.contains(&format!("Merge: {} {}", c1a.as_str(), c1b.as_str())));
+        assert!(text.contains("Note: First-parent history is not an exhaustive DAG traversal or independent proof of completeness."));
+
+        let json_val = format_local_log_json(&full).unwrap();
+        assert_eq!(json_val["first_parent_history"], true);
+        assert_eq!(json_val["entries"].as_array().unwrap().len(), 4);
+
+        // 2. Single bounded page
+        let page1 = local_log(&f.repo, f.project, &c3, Some(2), None, false)
+            .await
+            .unwrap();
+        assert_eq!(page1.entries.len(), 2);
+        assert_eq!(page1.entries[0].address, c3);
+        assert_eq!(page1.entries[1].address, c2);
+        assert!(page1.more);
+        assert_eq!(page1.next_cursor.as_deref(), Some(c1a.as_str()));
+
+        // 3. Continuation from valid cursor c1a
+        let cont = local_log(&f.repo, f.project, &c3, Some(2), Some(&c1a), false)
+            .await
+            .unwrap();
+        assert_eq!(cont.head, c3); // Head is the original commit requested
+        assert_eq!(cont.entries.len(), 2);
+        assert_eq!(cont.entries[0].address, c1a);
+        assert_eq!(cont.entries[1].address, c0);
+        assert!(!cont.more);
+        assert_eq!(cont.next_cursor, None);
+
+        // 4. Bad cursors:
+        // a) Cursor equals head (loop)
+        let err_loop = local_log(&f.repo, f.project, &c3, None, Some(&c3), false)
+            .await
+            .unwrap_err();
+        assert!(err_loop.to_string().contains("cursor loop detected"));
+
+        // b) Cursor on secondary branch c1b (not on first-parent chain)
+        let err_side = local_log(&f.repo, f.project, &c3, None, Some(&c1b), false)
+            .await
+            .unwrap_err();
+        assert!(err_side
+            .to_string()
+            .contains("continuation cursor is not on the first-parent chain"));
+
+        // c) Nonexistent cursor
+        let non_existent = Address::try_from("f".repeat(64)).unwrap();
+        let err_none = local_log(&f.repo, f.project, &c3, None, Some(&non_existent), false)
+            .await
+            .unwrap_err();
+        assert!(err_none
+            .to_string()
+            .contains("continuation cursor is not on the first-parent chain"));
+
+        // 5. Database immutability: record snapshot, run action, verify unchanged
+        let (path, project) = (f.path.clone(), f.project);
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let snapshot = || {
+            (
+                std::fs::read(&path).unwrap(),
+                std::fs::read(&wal).unwrap_or_default(),
+            )
+        };
+        let before = snapshot();
+        run(
+            path.clone(),
+            project,
+            Action::Log {
+                commit: c3.as_str().to_string(),
+                limit: Some(2),
+                cursor: None,
+                all: false,
+                json: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            snapshot() == before,
+            "log action must not mutate the database or WAL"
+        );
+
+        f.finish().await;
     }
 }
