@@ -6,6 +6,7 @@ use super::*;
 use engine_core::repository::{
     authority_epoch::{Chain, Revocation, Served, SignedTransition},
     device_session::{SessionChallenge, SessionProof, TOKEN_TTL_SECONDS},
+    log::CommitLogEntry,
 };
 use reqwest::{header, Method, StatusCode, Url};
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -32,6 +33,16 @@ pub struct Remote {
     pub authority: Uuid,
     /// Obtain this key independently of the server's authority endpoint.
     pub public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteHistoryLogPage {
+    pub project: Uuid,
+    pub head: Address,
+    pub entries: Vec<CommitLogEntry>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    pub more: bool,
 }
 
 /// Where the bearer comes from and how it is renewed.
@@ -523,6 +534,26 @@ impl Client {
             );
         }
         Ok(result)
+    }
+    pub async fn log_page(
+        &self,
+        head: Option<&Address>,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+    ) -> anyhow::Result<RemoteHistoryLogPage> {
+        let mut query = Vec::new();
+        if let Some(head) = head {
+            query.push(("head", head.as_str().to_string()));
+        }
+        let limit_str;
+        if let Some(limit) = limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str));
+        }
+        if let Some(cursor) = cursor {
+            query.push(("cursor", cursor.to_string()));
+        }
+        self.get("history/log", &query, 512 * 1024).await
     }
     pub async fn post(&self, path: &str, body: Value) -> anyhow::Result<Value> {
         Ok(self
