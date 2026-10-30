@@ -126,6 +126,14 @@ pub enum Action {
         #[arg(long)]
         expect_head: String,
     },
+    /// Verify an offline history archive without modifying the repository.
+    ArchiveVerify {
+        /// Archive file to verify.
+        file: PathBuf,
+        /// Expected head commit address.
+        #[arg(long)]
+        expect_head: String,
+    },
     /// Import a private staging upload JSON batch, without moving any branch.
     ImportObjects { input: PathBuf },
     /// Read-only retention plan: what no branch head or recovery source reaches.
@@ -538,10 +546,13 @@ fn today_start_ms() -> anyhow::Result<i64> {
 }
 
 pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::Result<()> {
-    // The retention, horizon plans and archive export must not create, upgrade or write the database.
+    // The retention, horizon plans and archive export/verify must not create, upgrade or write the database.
     let repo = if matches!(
         action,
-        Action::GcPlan { .. } | Action::HorizonPlan { .. } | Action::ArchiveExport { .. }
+        Action::GcPlan { .. }
+            | Action::HorizonPlan { .. }
+            | Action::ArchiveExport { .. }
+            | Action::ArchiveVerify { .. }
     ) {
         LocalRepository::open_read_only(&path, project).await?
     } else {
@@ -699,6 +710,36 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                 "commits_imported": summary.commits_imported,
                 "total_objects": summary.total_objects,
                 "total_commits": summary.total_commits,
+            })
+        }
+        Action::ArchiveVerify { file, expect_head } => {
+            let expect_head_addr = address(expect_head)?;
+            anyhow::ensure!(
+                file.is_file(),
+                "archive file not found at {}",
+                file.display()
+            );
+
+            let file_handle = std::fs::File::open(&file)
+                .with_context(|| format!("failed to open archive at {}", file.display()))?;
+
+            let summary = engine_core::repository::archive::verify_archive(
+                file_handle,
+                engine_core::repository::archive::ArchiveLimits::default(),
+                Some(&expect_head_addr),
+                Some(DocumentId(project)),
+            )
+            .map_err(|e| anyhow::anyhow!("archive verification failed: {e}"))?;
+
+            serde_json::json!({
+                "file": file.display().to_string(),
+                "head": summary.head,
+                "project": summary.project.0,
+                "objects": summary.objects,
+                "commits": summary.commits,
+                "bytes_before_footer": summary.bytes_before_footer,
+                "total_bytes": summary.total_bytes,
+                "sha256": summary.sha256,
             })
         }
         Action::ImportObjects { input } => {
@@ -2660,5 +2701,295 @@ mod tests {
         let _ = std::fs::remove_file(&archive_path);
         f1.finish().await;
         f2.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_verify_valid_multi_parent_and_recovery_archive() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+
+        // Base commit c1
+        let f1 = f.file(doc1, &[(0, "Base")]).await;
+        let c1 = f.commit(&[], vec![("doc1.docx", f1)], "Base").await;
+
+        // Left branch c2
+        let f2 = f.file(doc1, &[(0, "Left branch")]).await;
+        let c2 = f
+            .commit(&[&c1], vec![("doc1.docx", f2)], "Left branch")
+            .await;
+
+        // Right branch c3
+        let f3 = f.file(doc1, &[(0, "Right branch")]).await;
+        let c3 = f
+            .commit(&[&c1], vec![("doc1.docx", f3.clone())], "Right branch")
+            .await;
+
+        // Merge commit c4
+        let c4 = f
+            .commit(&[&c2, &c3], vec![("doc1.docx", f3)], "Merge left and right")
+            .await;
+
+        let archive_path = std::env::temp_dir().join(format!(
+            "test-verify-merge-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&archive_path);
+
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c4.as_str().to_string(),
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1. Verify via repository action
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveVerify {
+                file: archive_path.clone(),
+                expect_head: c4.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 2. Verify via top-level archive_verify without repository
+        super::super::archive_verify(archive_path.clone(), f.project, c4.as_str().to_string())
+            .await
+            .unwrap();
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_verify_substituted_heads_and_scope_swaps_fail() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f.commit(&[], vec![("doc.docx", f1)], "Genesis").await;
+
+        let archive_path = std::env::temp_dir().join(format!(
+            "test-verify-subst-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&archive_path);
+
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Substituted head
+        let fake_head = Address::try_from(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        )
+        .unwrap();
+        let err = super::super::archive_verify(
+            archive_path.clone(),
+            f.project,
+            fake_head.as_str().to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("archive verification failed"));
+        assert!(err.to_string().contains("head mismatch"));
+
+        // Scope swap (wrong project UUID)
+        let other_project = uuid::Uuid::new_v4();
+        let err_proj = super::super::archive_verify(
+            archive_path.clone(),
+            other_project,
+            c1.as_str().to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err_proj.to_string().contains("archive verification failed"));
+        assert!(err_proj.to_string().contains("project mismatch"));
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_verify_altered_envelopes_and_missing_objects_fail() {
+        use engine_core::repository::archive::ArchiveWriter;
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        // 1. Missing objects in archive
+        let archive_missing = std::env::temp_dir().join(format!(
+            "test-verify-missing-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let file = std::fs::File::create(&archive_missing).unwrap();
+        let mut writer = ArchiveWriter::new(file).unwrap();
+        writer
+            .write_header(1, DocumentId(f.project), c1.clone())
+            .unwrap();
+        // Do NOT write the object frame for f1!
+        let signed_c1 = f.repo.commit(&c1).await.unwrap();
+        writer.write_commit(&signed_c1).unwrap();
+        writer.finish().unwrap();
+
+        let err = super::super::archive_verify(
+            archive_missing.clone(),
+            f.project,
+            c1.as_str().to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("object referenced in file graph is missing from archive"));
+        let _ = std::fs::remove_file(&archive_missing);
+
+        // 2. Altered envelope: export valid archive then alter envelope bytes
+        let archive_altered = std::env::temp_dir().join(format!(
+            "test-verify-altered-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                out: archive_altered.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut bytes = std::fs::read(&archive_altered).unwrap();
+        // Locate "envelope":" and alter a base64 character in the middle
+        let pos = bytes
+            .windows(12)
+            .position(|w| w == b"\"envelope\":\"")
+            .unwrap();
+        bytes[pos + 15] ^= 0x01;
+        std::fs::write(&archive_altered, bytes).unwrap();
+
+        let err2 = super::super::archive_verify(
+            archive_altered.clone(),
+            f.project,
+            c1.as_str().to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err2.to_string().contains("archive verification failed"));
+
+        let _ = std::fs::remove_file(&archive_altered);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_verify_repeated_frames_appended_data_and_truncation_fail() {
+        use engine_core::repository::archive::ArchiveWriter;
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        // 1. Repeated frame (duplicate object)
+        let archive_dup =
+            std::env::temp_dir().join(format!("test-verify-dup-{}.dynoarc", uuid::Uuid::new_v4()));
+        let file = std::fs::File::create(&archive_dup).unwrap();
+        let mut writer = ArchiveWriter::new(file).unwrap();
+        writer
+            .write_header(1, DocumentId(f.project), c1.clone())
+            .unwrap();
+        let keys = f.repo.inventory(None, 100).await.unwrap();
+        for key in &keys {
+            let p = f.repo.object(key).await.unwrap();
+            writer
+                .write_object(key.document, key.address.clone(), &p.bytes)
+                .unwrap();
+        }
+        // Write a duplicate object frame
+        let first_key = &keys[0];
+        let p_dup = f.repo.object(first_key).await.unwrap();
+        assert!(writer
+            .write_object(first_key.document, first_key.address.clone(), &p_dup.bytes)
+            .is_err());
+        let _ = std::fs::remove_file(&archive_dup);
+
+        // 2. Appended data after footer
+        let archive_appended = std::env::temp_dir().join(format!(
+            "test-verify-appended-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                out: archive_appended.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut bytes = std::fs::read(&archive_appended).unwrap();
+        bytes.extend_from_slice(b"trailing extra garbage bytes");
+        std::fs::write(&archive_appended, bytes).unwrap();
+
+        let err = super::super::archive_verify(
+            archive_appended.clone(),
+            f.project,
+            c1.as_str().to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unexpected trailing data after footer"));
+        let _ = std::fs::remove_file(&archive_appended);
+
+        // 3. Truncation
+        let archive_trunc = std::env::temp_dir().join(format!(
+            "test-verify-trunc-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                out: archive_trunc.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let bytes = std::fs::read(&archive_trunc).unwrap();
+        std::fs::write(&archive_trunc, &bytes[..bytes.len() - 25]).unwrap();
+
+        let err2 =
+            super::super::archive_verify(archive_trunc.clone(), f.project, c1.as_str().to_string())
+                .await
+                .unwrap_err();
+        assert!(err2.to_string().contains("archive verification failed"));
+        let _ = std::fs::remove_file(&archive_trunc);
+
+        f.finish().await;
     }
 }

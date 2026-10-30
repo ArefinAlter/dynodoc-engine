@@ -74,3 +74,20 @@ Any trailing bytes after the footer payload are rejected.
 Archive container v1 carries existing portable commits (versions 1, 2, and 3) and their
 referenced typed-v2 shared checkpoint object graphs. Archive version 1, Checkpoint v3,
 SQLite schema 3, and SignedCommit version 3 are distinct version dimensions.
+
+## Offline verification and integrity anchoring
+
+An independently obtained expected head commit address anchors archive integrity.
+A self-signed archive alone does not establish account authority, timestamps, server
+freshness, or native-format fidelity: an attacker could author a validly signed self-consistent
+fork. The expected head, obtained out-of-band or from an authoritative pin, ties the
+archive's cryptographic closure to the operator's trusted history.
+
+The offline verifier (`engine-cli archive-verify FILE --project UUID --expect-head ADDRESS`):
+- Operates entirely offline with no target repository, network access, account keys, or branch writes.
+- Uses bounded private temporary storage for frame staging and graph reachability validation.
+- Requires the exact dependency and object closure: every commit must be reachable from `head`,
+  and every object must be reachable from file roots within those commits.
+- Rejects extraneous commits, unreferenced objects, duplicate frame keys (even identical),
+  tampered signatures/payloads, and truncated or trailing data.
+- Returns nonzero on any integrity or closure failure, or emits JSON summary with verified counts on success.
