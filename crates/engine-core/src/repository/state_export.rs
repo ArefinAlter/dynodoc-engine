@@ -4,7 +4,6 @@
 //! normalized DocumentState JSON envelope. It is not a DOCX/XLSX/PPTX binary,
 //! but a verified canonical document model at an exact commit.
 
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
@@ -44,8 +43,21 @@ impl StateExportEnvelope {
         }
     }
 
+    /// Write this envelope as pretty JSON to a writer.
+    pub fn write_to_writer<W: Write>(&self, mut writer: W) -> anyhow::Result<()> {
+        let json_bytes = serde_json::to_vec_pretty(self)?;
+        anyhow::ensure!(
+            json_bytes.len() <= MAX_STATE_EXPORT_BYTES,
+            "exported state exceeds maximum size limit ({} bytes)",
+            MAX_STATE_EXPORT_BYTES
+        );
+        writer.write_all(&json_bytes)?;
+        writer.flush()?;
+        Ok(())
+    }
+
     /// Write this envelope to a new file created exclusively (refuses overwrite),
-    /// setting 0600 permissions on Unix.
+    /// setting private owner-only permissions (0600 on Unix, private ACL on Windows) from creation.
     ///
     /// If writing or serialization fails, any incomplete output file is cleaned up.
     pub fn write_to_path<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
@@ -56,34 +68,15 @@ impl StateExportEnvelope {
             p.display()
         );
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(p)
+        let mut file = super::private_fs::create_private_file(p)
             .map_err(|e| anyhow::anyhow!("creating output file at {}: {e}", p.display()))?;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
-        }
+        let guard = super::private_fs::AutoRemoveFile::new(p.to_path_buf());
 
-        let write_result = (|| -> anyhow::Result<()> {
-            let json_bytes = serde_json::to_vec_pretty(self)?;
-            anyhow::ensure!(
-                json_bytes.len() <= MAX_STATE_EXPORT_BYTES,
-                "exported state exceeds maximum size limit ({} bytes)",
-                MAX_STATE_EXPORT_BYTES
-            );
-            file.write_all(&json_bytes)?;
-            file.flush()?;
-            Ok(())
-        })();
-
-        if let Err(err) = write_result {
-            let _ = std::fs::remove_file(p);
-            return Err(err);
-        }
+        self.write_to_writer(&mut file)?;
+        file.sync_all()?;
+        drop(file);
+        guard.commit();
 
         Ok(())
     }

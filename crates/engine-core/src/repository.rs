@@ -20,6 +20,7 @@ pub mod device;
 pub mod device_session;
 pub mod horizon;
 pub mod local;
+pub mod private_fs;
 pub mod project_merge;
 pub mod receipt_journal;
 pub mod recovery;
