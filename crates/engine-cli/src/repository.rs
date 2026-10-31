@@ -3310,4 +3310,316 @@ mod tests {
         f1.finish().await;
         f2.finish().await;
     }
+
+    #[tokio::test]
+    async fn archive_export_deep_history_iterative_topological_sort() {
+        use engine_core::repository::archive::{
+            verify_archive_stream, ArchiveEntry, ArchiveLimits, ArchiveReader,
+        };
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+
+        // Build a 25-deep commit chain
+        let f1_v0 = f.file(doc1, &[(0, "Initial content")]).await;
+        let mut prev = f.commit(&[], vec![("doc.docx", f1_v0)], "Commit 0").await;
+        let mut all_commits = vec![prev.clone()];
+
+        for i in 1..25 {
+            let fi = f.file(doc1, &[(0, &format!("Content version {i}"))]).await;
+            let c = f
+                .commit(&[&prev], vec![("doc.docx", fi)], &format!("Commit {i}"))
+                .await;
+            all_commits.push(c.clone());
+            prev = c;
+        }
+
+        let head = prev;
+        let archive_path = std::env::temp_dir().join(format!(
+            "test-archive-deep-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&archive_path);
+
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: head.as_str().to_string(),
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(archive_path.is_file());
+
+        // Stream verification
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let summary = verify_archive_stream(
+            file,
+            ArchiveLimits::default(),
+            Some(&head),
+            Some(DocumentId(f.project)),
+        )
+        .unwrap();
+        assert_eq!(summary.head, head);
+        assert_eq!(summary.commits, 25);
+
+        // Frame order inspection: commits must appear in dependency-first order
+        let file2 = std::fs::File::open(&archive_path).unwrap();
+        let mut reader = ArchiveReader::new(file2, ArchiveLimits::default());
+        let mut seen_commits = Vec::new();
+        while let Some(entry) = reader.next_entry().unwrap() {
+            if let ArchiveEntry::Commit { address, .. } = entry {
+                seen_commits.push(address);
+            }
+        }
+        assert_eq!(seen_commits, all_commits);
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_export_shared_subgraphs_deduplicate_by_document_and_address() {
+        use engine_core::repository::archive::{ArchiveEntry, ArchiveLimits, ArchiveReader};
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let doc2 = DocumentId(uuid::Uuid::new_v4());
+
+        let f1 = f.file(doc1, &[(0, "Shared Doc1 content")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc1.docx", f1.clone())], "Genesis")
+            .await;
+
+        let f2 = f.file(doc2, &[(0, "Doc2 content")]).await;
+        let c2 = f
+            .commit(
+                &[&c1],
+                vec![("doc1.docx", f1.clone()), ("doc2.docx", f2.clone())],
+                "Add doc2 while doc1 unchanged",
+            )
+            .await;
+
+        let c3 = f
+            .commit(
+                &[&c1, &c2],
+                vec![("doc1.docx", f1.clone()), ("doc2.docx", f2.clone())],
+                "Merge branch",
+            )
+            .await;
+
+        let archive_path = std::env::temp_dir().join(format!(
+            "test-archive-shared-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&archive_path);
+
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c3.as_str().to_string(),
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let mut reader = ArchiveReader::new(file, ArchiveLimits::default());
+        let mut object_keys = Vec::new();
+        while let Some(entry) = reader.next_entry().unwrap() {
+            if let ArchiveEntry::Object {
+                document, address, ..
+            } = entry
+            {
+                object_keys.push((document, address));
+            }
+        }
+
+        // Each distinct (document, address) must appear exactly once
+        let mut set = std::collections::HashSet::new();
+        for key in &object_keys {
+            assert!(
+                set.insert(key.clone()),
+                "duplicate object in export: {:?}",
+                key
+            );
+        }
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_export_corrupt_or_missing_rows_removes_incomplete_output() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "File 1")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc1.docx", f1.clone())], "Genesis")
+            .await;
+        let f2 = f.file(doc1, &[(0, "File 2")]).await;
+        let c2 = f
+            .commit(&[&c1], vec![("doc1.docx", f2.clone())], "Child")
+            .await;
+
+        // 1. Missing dependency commit
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", f.path.display()))
+            .await
+            .unwrap();
+        sqlx::query("drop trigger if exists commits_no_delete")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("delete from commits where address = ?")
+            .bind(c1.as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let archive_fail_commit = std::env::temp_dir().join(format!(
+            "test-archive-fail-c-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&archive_fail_commit);
+
+        let err1 = run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                out: archive_fail_commit.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err1.to_string().contains("dependency closure missing")
+                || err1.to_string().contains("archive export failed")
+        );
+        assert!(
+            !archive_fail_commit.exists(),
+            "incomplete archive must be removed"
+        );
+
+        // 2. Corrupt object
+        let f_b = Fixture::new().await;
+        let doc_b = DocumentId(uuid::Uuid::new_v4());
+        let fb1 = f_b.file(doc_b, &[(0, "Object content")]).await;
+        let cb1 = f_b
+            .commit(&[], vec![("doc.docx", fb1.clone())], "Genesis")
+            .await;
+
+        let pool_b = sqlx::SqlitePool::connect(&format!("sqlite://{}", f_b.path.display()))
+            .await
+            .unwrap();
+        sqlx::query("drop trigger if exists objects_no_update")
+            .execute(&pool_b)
+            .await
+            .unwrap();
+        sqlx::query("update objects set bytes = x'cafebabe' where document = ? and address = ?")
+            .bind(doc_b.0.to_string())
+            .bind(fb1.state.as_str())
+            .execute(&pool_b)
+            .await
+            .unwrap();
+        pool_b.close().await;
+
+        let archive_fail_obj = std::env::temp_dir().join(format!(
+            "test-archive-fail-o-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&archive_fail_obj);
+
+        let err2 = run(
+            f_b.path.clone(),
+            f_b.project,
+            Action::ArchiveExport {
+                head: cb1.as_str().to_string(),
+                out: archive_fail_obj.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err2.to_string().contains("hash mismatch")
+                || err2.to_string().contains("archive export failed")
+        );
+        assert!(
+            !archive_fail_obj.exists(),
+            "incomplete archive must be removed"
+        );
+
+        f.finish().await;
+        f_b.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_export_large_synthetic_payload_set_streamed() {
+        use engine_core::repository::archive::{verify_archive_stream, ArchiveLimits};
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+
+        // Create multiple large paragraphs (synthetic payloads)
+        let large_text = "Dynodoc streaming archive export test string. ".repeat(500); // ~23 KB per entry
+        let f1 = f
+            .file(
+                doc1,
+                &[
+                    (0, &large_text),
+                    (1, &large_text),
+                    (2, &large_text),
+                    (3, &large_text),
+                ],
+            )
+            .await;
+        let c1 = f
+            .commit(&[], vec![("large.docx", f1)], "Commit with large payload")
+            .await;
+
+        let archive_out = std::env::temp_dir().join(format!(
+            "test-archive-large-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&archive_out);
+
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                out: archive_out.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(archive_out.is_file());
+        let meta = std::fs::metadata(&archive_out).unwrap();
+        assert!(meta.len() > 30_000, "archive should be sizable");
+
+        // Verify the entire streamed archive
+        let file = std::fs::File::open(&archive_out).unwrap();
+        let summary = verify_archive_stream(
+            file,
+            ArchiveLimits::default(),
+            Some(&c1),
+            Some(DocumentId(f.project)),
+        )
+        .unwrap();
+        assert_eq!(summary.head, c1);
+        assert_eq!(summary.commits, 1);
+        assert!(summary.objects >= 1);
+
+        let _ = std::fs::remove_file(&archive_out);
+        f.finish().await;
+    }
 }
