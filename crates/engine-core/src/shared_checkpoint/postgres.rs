@@ -426,6 +426,71 @@ pub async fn take_incremental_with_base(
     base_through_seq: Option<i64>,
     limits: Limits,
 ) -> Result<PublishedCheckpoint, Error> {
+    take_incremental_with_codec_and_base(
+        pool,
+        document,
+        through_seq,
+        base_through_seq,
+        limits,
+        Codec::V2,
+    )
+    .await
+}
+
+/// Atomically publish an incremental compact v3 checkpoint.
+/// Automatically selects the latest earlier verified compact v3 checkpoint for the same document.
+/// Falls back to a full v3 write if no eligible earlier base checkpoint exists.
+pub async fn take_incremental_v3(
+    pool: &PgPool,
+    document: DocumentId,
+    through_seq: i64,
+    limits: Limits,
+) -> Result<PublishedCheckpoint, Error> {
+    take_incremental_v3_with_base(pool, document, through_seq, None, limits).await
+}
+
+/// Atomically publish an incremental compact v3 checkpoint from an optional explicit base checkpoint.
+pub async fn take_incremental_v3_with_base(
+    pool: &PgPool,
+    document: DocumentId,
+    through_seq: i64,
+    base_through_seq: Option<i64>,
+    limits: Limits,
+) -> Result<PublishedCheckpoint, Error> {
+    take_incremental_with_codec_and_base(
+        pool,
+        document,
+        through_seq,
+        base_through_seq,
+        limits,
+        Codec::V3,
+    )
+    .await
+}
+
+/// Atomically publish an incremental checkpoint using the specified codec.
+pub async fn take_incremental_with_codec(
+    pool: &PgPool,
+    document: DocumentId,
+    through_seq: i64,
+    limits: Limits,
+    codec: Codec,
+) -> Result<PublishedCheckpoint, Error> {
+    take_incremental_with_codec_and_base(pool, document, through_seq, None, limits, codec).await
+}
+
+/// Atomically publish an incremental checkpoint from an optional explicit base checkpoint using the specified codec.
+pub async fn take_incremental_with_codec_and_base(
+    pool: &PgPool,
+    document: DocumentId,
+    through_seq: i64,
+    base_through_seq: Option<i64>,
+    limits: Limits,
+    codec: Codec,
+) -> Result<PublishedCheckpoint, Error> {
+    if !matches!(codec, Codec::V2 | Codec::V3) {
+        return Err(Error::Invalid("unsupported incremental codec"));
+    }
     if through_seq < 0 {
         return Err(Error::Invalid("negative revision"));
     }
@@ -451,10 +516,10 @@ pub async fn take_incremental_with_base(
     .await?;
 
     if let Some((existing_root, existing_chain, existing_codec)) = existing {
-        if existing_codec == Codec::V2 as i16 && existing_chain == event_chain_hash {
+        if existing_codec == codec as i16 && existing_chain == event_chain_hash {
             let root = Address::try_from(existing_root)?;
             let mut store = PgStore::new(&mut tx);
-            if Codec::V2.read(&mut store, document, &root, limits).await? != state {
+            if codec.read(&mut store, document, &root, limits).await? != state {
                 return Err(Error::Invalid(
                     "checkpoint reconstruction differs from history",
                 ));
@@ -473,16 +538,24 @@ pub async fn take_incremental_with_base(
                 base_seq: None,
                 fallback_ran: false,
             });
+        } else {
+            return Err(Error::Invalid(
+                "different checkpoint already published at revision",
+            ));
         }
     }
 
     let base_row: Option<(i64, String, Vec<u8>)> = if let Some(base_seq) = base_through_seq {
+        if base_seq >= through_seq {
+            return Err(Error::Invalid("base checkpoint not found"));
+        }
         sqlx::query_as(
             "select through_seq,state_root,event_chain_hash from shared_checkpoint
-             where document_id=$1 and through_seq=$2 and codec_version=2",
+             where document_id=$1 and through_seq=$2 and codec_version=$3",
         )
         .bind(document.0)
         .bind(base_seq)
+        .bind(codec as i16)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(Error::Invalid("base checkpoint not found"))
@@ -490,11 +563,12 @@ pub async fn take_incremental_with_base(
     } else {
         sqlx::query_as(
             "select through_seq,state_root,event_chain_hash from shared_checkpoint
-             where document_id=$1 and through_seq < $2 and codec_version=2
+             where document_id=$1 and through_seq < $2 and codec_version=$3
              order by through_seq desc limit 1",
         )
         .bind(document.0)
         .bind(through_seq)
+        .bind(codec as i16)
         .fetch_optional(&mut *tx)
         .await?
     };
@@ -508,7 +582,7 @@ pub async fn take_incremental_with_base(
                 &state,
                 event_chain_hash,
                 limits,
-                Codec::V2,
+                codec,
             )
             .await?;
             p.fallback_ran = true;
@@ -519,7 +593,7 @@ pub async fn take_incremental_with_base(
                 return Err(Error::Invalid("checkpoint version or chain position"));
             }
             let base_root = Address::try_from(base_root_str)?;
-            let base_state = Codec::V2
+            let base_state = codec
                 .read(&mut PgStore::new(&mut tx), document, &base_root, limits)
                 .await?;
 
@@ -533,6 +607,7 @@ pub async fn take_incremental_with_base(
                 &state,
                 event_chain_hash,
                 limits,
+                codec,
             )
             .await?
         }
@@ -553,20 +628,38 @@ pub(crate) async fn publish_incremental_in_connection(
     state: &DocumentState,
     event_chain_hash: Vec<u8>,
     limits: Limits,
+    codec: Codec,
 ) -> Result<PublishedCheckpoint, Error> {
     let mut store = PgStore::new(connection);
-    let (root, stats) = super::typed::update_state(
-        &mut store,
-        document,
-        base_root,
-        base_state,
-        state,
-        limits,
-        Default::default(),
-    )
-    .await?;
+    let (root, stats) = match codec {
+        Codec::V2 => {
+            super::typed::update_state(
+                &mut store,
+                document,
+                base_root,
+                base_state,
+                state,
+                limits,
+                Default::default(),
+            )
+            .await?
+        }
+        Codec::V3 => {
+            super::typed::update_state_v3(
+                &mut store,
+                document,
+                base_root,
+                base_state,
+                state,
+                limits,
+                Default::default(),
+            )
+            .await?
+        }
+        Codec::V1 => return Err(Error::Invalid("unsupported incremental codec")),
+    };
 
-    if Codec::V2.read(&mut store, document, &root, limits).await? != *state {
+    if codec.read(&mut store, document, &root, limits).await? != *state {
         return Err(Error::Invalid(
             "checkpoint reconstruction differs from history",
         ));
@@ -576,12 +669,13 @@ pub(crate) async fn publish_incremental_in_connection(
 
     sqlx::query(
         "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
-         values($1,$2,2,$3,$4) on conflict(document_id,through_seq) do nothing",
+         values($1,$2,$5,$3,$4) on conflict(document_id,through_seq) do nothing",
     )
     .bind(document.0)
     .bind(through_seq)
     .bind(root.as_str())
     .bind(&event_chain_hash)
+    .bind(codec as i16)
     .execute(&mut *connection)
     .await?;
 
@@ -593,7 +687,7 @@ pub(crate) async fn publish_incremental_in_connection(
     .fetch_one(&mut *connection)
     .await?;
 
-    if stored.0 != root.as_str() || stored.1 != event_chain_hash || stored.2 != 2 {
+    if stored.0 != root.as_str() || stored.1 != event_chain_hash || stored.2 != codec as i16 {
         return Err(Error::Invalid(
             "different checkpoint already published at revision",
         ));
