@@ -558,129 +558,42 @@ fn today_start_ms() -> anyhow::Result<i64> {
 }
 
 pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::Result<()> {
-    // The retention, horizon plans, archive export/verify, and export-file must not create, upgrade or write the database.
-    let repo = if matches!(
-        action,
-        Action::GcPlan { .. }
-            | Action::HorizonPlan { .. }
-            | Action::ArchiveExport { .. }
-            | Action::ArchiveVerify { .. }
-            | Action::ExportFile { .. }
-    ) {
-        LocalRepository::open_read_only(&path, project).await?
-    } else {
-        // A destructive command never creates the database it would collect.
-        if matches!(action, Action::Gc { .. }) {
-            anyhow::ensure!(
-                path.is_file(),
-                "no repository database at {}",
-                path.display()
-            );
-        }
-        LocalRepository::open(&path, project).await?
-    };
     let address = |s: String| Address::try_from(s);
     let mut text = None;
     let mut vacuum_failure = None;
-    let output = match action {
-        Action::Init => serde_json::json!({"project":project,"local_schema":SCHEMA_VERSION}),
-        Action::Storage => serde_json::to_value(repo.storage_usage().await?)?,
-        Action::Compact {
-            batch,
-            max_objects,
-            after_document,
-            after_address,
-            vacuum,
-            format,
-        } => {
-            let after = match (after_document, after_address) {
-                (Some(document), Some(value)) => Some(ObjectKey {
-                    document: DocumentId(document),
-                    address: address(value)?,
-                }),
-                _ => None,
-            };
-            let report = repo
-                .compact(CompactOptions {
-                    batch_objects: batch,
-                    max_objects,
-                    after,
-                    vacuum,
-                })
-                .await?;
-            vacuum_failure = report
-                .vacuum
-                .as_ref()
-                .and_then(|v| v.error.clone())
-                .map(|e| format!("compaction committed but VACUUM failed: {e}"));
-            match format {
-                PlanFormat::Json => serde_json::to_value(&report)?,
-                PlanFormat::Text => {
-                    text = Some(report.summary());
-                    serde_json::Value::Null
-                }
-            }
-        }
-        Action::Objects {
-            after_document,
-            after_address,
-            limit,
-        } => {
-            let after = match (after_document, after_address) {
-                (Some(document), Some(value)) => Some(ObjectKey {
-                    document: DocumentId(document),
-                    address: address(value)?,
-                }),
-                _ => None,
-            };
-            let keys = repo.inventory(after.as_ref(), limit).await?;
-            serde_json::json!({"objects":keys.iter().map(|k|serde_json::json!({"document":k.document,"address":k.address})).collect::<Vec<_>>()})
-        }
-        Action::ExportObject {
-            document,
-            address: value,
-        } => {
-            let packet = repo
-                .object(&ObjectKey {
-                    document: DocumentId(document),
-                    address: address(value)?,
-                })
-                .await?;
-            serde_json::json!({"address":packet.key.address,"bytes":STANDARD.encode(packet.bytes)})
-        }
-        Action::ArchiveExport { head, out } => {
-            let head_addr = address(head)?;
+
+    let (output, repo) = match action {
+        Action::ArchiveVerify { file, expect_head } => {
+            let expect_head_addr = address(expect_head)?;
             anyhow::ensure!(
-                !out.exists(),
-                "output file {} already exists; refusing overwrite",
-                out.display()
+                file.is_file(),
+                "archive file not found at {}",
+                file.display()
             );
 
-            let file = engine_core::repository::private_fs::create_private_file(&out)
-                .with_context(|| format!("creating output archive at {}", out.display()))?;
+            let file_handle = std::fs::File::open(&file)
+                .with_context(|| format!("failed to open archive at {}", file.display()))?;
 
-            let guard = engine_core::repository::private_fs::AutoRemoveFile::new(out.clone());
-
-            let summary = engine_core::repository::archive::export_archive(
-                &repo,
-                &head_addr,
-                file,
+            let summary = engine_core::repository::archive::verify_archive(
+                file_handle,
                 engine_core::repository::archive::ArchiveLimits::default(),
+                Some(&expect_head_addr),
+                Some(DocumentId(project)),
             )
             .await
-            .context("archive export failed")?;
+            .map_err(|e| anyhow::anyhow!("archive verification failed: {e}"))?;
 
-            guard.commit();
-
-            serde_json::json!({
-                "out": out.display().to_string(),
+            let out = serde_json::json!({
+                "file": file.display().to_string(),
                 "head": summary.head,
+                "project": summary.project.0,
                 "objects": summary.objects,
                 "commits": summary.commits,
-                "bytes": summary.total_bytes,
                 "bytes_before_footer": summary.bytes_before_footer,
+                "total_bytes": summary.total_bytes,
                 "sha256": summary.sha256,
-            })
+            });
+            (out, None)
         }
         Action::ArchiveImport { file, expect_head } => {
             let expect_head_addr = address(expect_head)?;
@@ -699,358 +612,469 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                 Some(&expect_head_addr),
                 Some(DocumentId(project)),
             )
+            .await
             .map_err(|e| anyhow::anyhow!("archive validation failed: {e}"))?;
+
+            let repo = LocalRepository::open(&path, project).await?;
 
             let summary = engine_core::repository::archive::import_archive(&repo, &staged)
                 .await
                 .map_err(|e| anyhow::anyhow!("archive import failed: {e}"))?;
 
-            serde_json::json!({
+            let out = serde_json::json!({
                 "file": file.display().to_string(),
                 "head": summary.head,
                 "objects_imported": summary.objects_imported,
                 "commits_imported": summary.commits_imported,
                 "total_objects": summary.total_objects,
                 "total_commits": summary.total_commits,
-            })
+            });
+            (out, Some(repo))
         }
-        Action::ArchiveVerify { file, expect_head } => {
-            let expect_head_addr = address(expect_head)?;
-            anyhow::ensure!(
-                file.is_file(),
-                "archive file not found at {}",
-                file.display()
-            );
+        other_action => {
+            // The retention, horizon plans, archive export, and export-file must not create, upgrade or write the database.
+            let repo = if matches!(
+                other_action,
+                Action::GcPlan { .. }
+                    | Action::HorizonPlan { .. }
+                    | Action::ArchiveExport { .. }
+                    | Action::ExportFile { .. }
+            ) {
+                LocalRepository::open_read_only(&path, project).await?
+            } else {
+                // A destructive command never creates the database it would collect.
+                if matches!(other_action, Action::Gc { .. }) {
+                    anyhow::ensure!(
+                        path.is_file(),
+                        "no repository database at {}",
+                        path.display()
+                    );
+                }
+                LocalRepository::open(&path, project).await?
+            };
+            let out = match other_action {
+                Action::ArchiveVerify { .. } | Action::ArchiveImport { .. } => unreachable!(),
+                Action::Init => {
+                    serde_json::json!({"project":project,"local_schema":SCHEMA_VERSION})
+                }
+                Action::Storage => serde_json::to_value(repo.storage_usage().await?)?,
+                Action::Compact {
+                    batch,
+                    max_objects,
+                    after_document,
+                    after_address,
+                    vacuum,
+                    format,
+                } => {
+                    let after = match (after_document, after_address) {
+                        (Some(document), Some(value)) => Some(ObjectKey {
+                            document: DocumentId(document),
+                            address: address(value)?,
+                        }),
+                        _ => None,
+                    };
+                    let report = repo
+                        .compact(CompactOptions {
+                            batch_objects: batch,
+                            max_objects,
+                            after,
+                            vacuum,
+                        })
+                        .await?;
+                    vacuum_failure = report
+                        .vacuum
+                        .as_ref()
+                        .and_then(|v| v.error.clone())
+                        .map(|e| format!("compaction committed but VACUUM failed: {e}"));
+                    match format {
+                        PlanFormat::Json => serde_json::to_value(&report)?,
+                        PlanFormat::Text => {
+                            text = Some(report.summary());
+                            serde_json::Value::Null
+                        }
+                    }
+                }
+                Action::Objects {
+                    after_document,
+                    after_address,
+                    limit,
+                } => {
+                    let after = match (after_document, after_address) {
+                        (Some(document), Some(value)) => Some(ObjectKey {
+                            document: DocumentId(document),
+                            address: address(value)?,
+                        }),
+                        _ => None,
+                    };
+                    let keys = repo.inventory(after.as_ref(), limit).await?;
+                    serde_json::json!({"objects":keys.iter().map(|k|serde_json::json!({"document":k.document,"address":k.address})).collect::<Vec<_>>()})
+                }
+                Action::ExportObject {
+                    document,
+                    address: value,
+                } => {
+                    let packet = repo
+                        .object(&ObjectKey {
+                            document: DocumentId(document),
+                            address: address(value)?,
+                        })
+                        .await?;
+                    serde_json::json!({"address":packet.key.address,"bytes":STANDARD.encode(packet.bytes)})
+                }
+                Action::ArchiveExport { head, out } => {
+                    let head_addr = address(head)?;
+                    anyhow::ensure!(
+                        !out.exists(),
+                        "output file {} already exists; refusing overwrite",
+                        out.display()
+                    );
 
-            let file_handle = std::fs::File::open(&file)
-                .with_context(|| format!("failed to open archive at {}", file.display()))?;
+                    let file = engine_core::repository::private_fs::create_private_file(&out)
+                        .with_context(|| format!("creating output archive at {}", out.display()))?;
 
-            let summary = engine_core::repository::archive::verify_archive(
-                file_handle,
-                engine_core::repository::archive::ArchiveLimits::default(),
-                Some(&expect_head_addr),
-                Some(DocumentId(project)),
-            )
-            .map_err(|e| anyhow::anyhow!("archive verification failed: {e}"))?;
+                    let guard =
+                        engine_core::repository::private_fs::AutoRemoveFile::new(out.clone());
 
-            serde_json::json!({
-                "file": file.display().to_string(),
-                "head": summary.head,
-                "project": summary.project.0,
-                "objects": summary.objects,
-                "commits": summary.commits,
-                "bytes_before_footer": summary.bytes_before_footer,
-                "total_bytes": summary.total_bytes,
-                "sha256": summary.sha256,
-            })
-        }
-        Action::ExportFile {
-            commit,
-            path: file_path,
-            out,
-        } => {
-            let commit_addr = address(commit)?;
-            anyhow::ensure!(
-                !out.exists(),
-                "output file {} already exists; refusing overwrite",
-                out.display()
-            );
-
-            let signed = repo.commit(&commit_addr).await.with_context(|| {
-                format!("commit {} not found in repository", commit_addr.as_str())
-            })?;
-
-            let verified_addr = signed.verify().with_context(|| {
-                format!(
-                    "commit {} signature verification failed",
-                    commit_addr.as_str()
-                )
-            })?;
-            anyhow::ensure!(
-                verified_addr == commit_addr,
-                "commit address mismatch: expected {}, verified {}",
-                commit_addr.as_str(),
-                verified_addr.as_str()
-            );
-
-            anyhow::ensure!(
-                signed.commit.project == project,
-                "commit project {} does not match repository project {project}",
-                signed.commit.project
-            );
-
-            let file_entry = signed
-                .commit
-                .files
-                .get(&file_path)
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "path {file_path:?} not found in commit {}",
-                        commit_addr.as_str()
+                    let summary = engine_core::repository::archive::export_archive(
+                        &repo,
+                        &head_addr,
+                        file,
+                        engine_core::repository::archive::ArchiveLimits::default(),
                     )
-                })?;
+                    .await
+                    .context("archive export failed")?;
 
-            let state = repo
-                .read_state(file_entry.document, &file_entry.state)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to reconstruct state root {} for document {}",
-                        file_entry.state.as_str(),
-                        file_entry.document.0
-                    )
-                })?;
+                    guard.commit();
 
-            let envelope = engine_core::repository::state_export::StateExportEnvelope::new(
-                file_path.clone(),
-                signed,
-                state,
-            );
-
-            envelope.write_to_path(&out)?;
-
-            serde_json::json!({
-                "out": out.display().to_string(),
-                "commit": commit_addr,
-                "path": file_path,
-                "document": file_entry.document.0,
-                "state_root": file_entry.state,
-                "format": engine_core::repository::state_export::STATE_EXPORT_FORMAT,
-                "version": engine_core::repository::state_export::STATE_EXPORT_VERSION,
-            })
-        }
-        Action::ImportObjects { input } => {
-            let batch: TransferBatch = read_json(&input, 1_500_000)?;
-            anyhow::ensure!(batch.objects.len() <= 64, "import at most 64 objects");
-            let mut bytes = 0usize;
-            let packets = batch
-                .objects
-                .into_iter()
-                .map(|object| {
-                    let decoded = STANDARD.decode(object.bytes)?;
-                    bytes += decoded.len();
-                    anyhow::ensure!(bytes <= 1024 * 1024, "import at most 1 MiB");
-                    Ok(ObjectPacket {
-                        key: ObjectKey {
-                            document: DocumentId(batch.document),
-                            address: object.address,
-                        },
-                        bytes: decoded,
+                    serde_json::json!({
+                        "out": out.display().to_string(),
+                        "head": summary.head,
+                        "objects": summary.objects,
+                        "commits": summary.commits,
+                        "bytes": summary.total_bytes,
+                        "bytes_before_footer": summary.bytes_before_footer,
+                        "sha256": summary.sha256,
                     })
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            serde_json::json!({"new_objects":repo.import_objects(&packets).await?,"published":false})
-        }
-        Action::GcPlan { top, list, format } => {
-            let plan = repo
-                .gc_plan(GcPlanOptions {
-                    top_reasons: top,
+                }
+                Action::ExportFile {
+                    commit,
+                    path: file_path,
+                    out,
+                } => {
+                    let commit_addr = address(commit)?;
+                    anyhow::ensure!(
+                        !out.exists(),
+                        "output file {} already exists; refusing overwrite",
+                        out.display()
+                    );
+
+                    let signed = repo.commit(&commit_addr).await.with_context(|| {
+                        format!("commit {} not found in repository", commit_addr.as_str())
+                    })?;
+
+                    let verified_addr = signed.verify().with_context(|| {
+                        format!(
+                            "commit {} signature verification failed",
+                            commit_addr.as_str()
+                        )
+                    })?;
+                    anyhow::ensure!(
+                        verified_addr == commit_addr,
+                        "commit address mismatch: expected {}, verified {}",
+                        commit_addr.as_str(),
+                        verified_addr.as_str()
+                    );
+
+                    anyhow::ensure!(
+                        signed.commit.project == project,
+                        "commit project {} does not match repository project {project}",
+                        signed.commit.project
+                    );
+
+                    let file_entry =
+                        signed
+                            .commit
+                            .files
+                            .get(&file_path)
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "path {file_path:?} not found in commit {}",
+                                    commit_addr.as_str()
+                                )
+                            })?;
+
+                    let state = repo
+                        .read_state(file_entry.document, &file_entry.state)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to reconstruct state root {} for document {}",
+                                file_entry.state.as_str(),
+                                file_entry.document.0
+                            )
+                        })?;
+
+                    let envelope = engine_core::repository::state_export::StateExportEnvelope::new(
+                        file_path.clone(),
+                        signed,
+                        state,
+                    );
+
+                    envelope.write_to_path(&out)?;
+
+                    serde_json::json!({
+                        "out": out.display().to_string(),
+                        "commit": commit_addr,
+                        "path": file_path,
+                        "document": file_entry.document.0,
+                        "state_root": file_entry.state,
+                        "format": engine_core::repository::state_export::STATE_EXPORT_FORMAT,
+                        "version": engine_core::repository::state_export::STATE_EXPORT_VERSION,
+                    })
+                }
+                Action::ImportObjects { input } => {
+                    let batch: TransferBatch = read_json(&input, 1_500_000)?;
+                    anyhow::ensure!(batch.objects.len() <= 64, "import at most 64 objects");
+                    let mut bytes = 0usize;
+                    let packets = batch
+                        .objects
+                        .into_iter()
+                        .map(|object| {
+                            let decoded = STANDARD.decode(object.bytes)?;
+                            bytes += decoded.len();
+                            anyhow::ensure!(bytes <= 1024 * 1024, "import at most 1 MiB");
+                            Ok(ObjectPacket {
+                                key: ObjectKey {
+                                    document: DocumentId(batch.document),
+                                    address: object.address,
+                                },
+                                bytes: decoded,
+                            })
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    serde_json::json!({"new_objects":repo.import_objects(&packets).await?,"published":false})
+                }
+                Action::GcPlan { top, list, format } => {
+                    let plan = repo
+                        .gc_plan(GcPlanOptions {
+                            top_reasons: top,
+                            list,
+                        })
+                        .await?;
+                    match format {
+                        PlanFormat::Json => serde_json::to_value(&plan)?,
+                        PlanFormat::Text => {
+                            text = Some(plan.summary());
+                            serde_json::Value::Null
+                        }
+                    }
+                }
+                Action::HorizonPlan {
+                    policy,
                     list,
-                })
-                .await?;
-            match format {
-                PlanFormat::Json => serde_json::to_value(&plan)?,
-                PlanFormat::Text => {
-                    text = Some(plan.summary());
+                    as_of_ms,
+                    out,
+                    format,
+                } => {
+                    text = Some(horizon_plan(&repo, &policy, list, as_of_ms, out, format).await?);
                     serde_json::Value::Null
                 }
-            }
-        }
-        Action::HorizonPlan {
-            policy,
-            list,
-            as_of_ms,
-            out,
-            format,
-        } => {
-            text = Some(horizon_plan(&repo, &policy, list, as_of_ms, out, format).await?);
-            serde_json::Value::Null
-        }
-        Action::Gc {
-            plan_hash,
-            vacuum,
-            format,
-        } => {
-            let report = repo.gc_apply(&plan_hash, GcApplyOptions { vacuum }).await?;
-            // A failed shrink does not hide the deletion: print it, then fail.
-            vacuum_failure = report
-                .vacuum
-                .as_ref()
-                .and_then(|v| v.error.clone())
-                .map(|e| format!("deletion committed but VACUUM failed: {e}"));
-            match format {
-                PlanFormat::Json => serde_json::to_value(&report)?,
-                PlanFormat::Text => {
-                    text = Some(report.summary());
-                    serde_json::Value::Null
+                Action::Gc {
+                    plan_hash,
+                    vacuum,
+                    format,
+                } => {
+                    let report = repo.gc_apply(&plan_hash, GcApplyOptions { vacuum }).await?;
+                    // A failed shrink does not hide the deletion: print it, then fail.
+                    vacuum_failure = report
+                        .vacuum
+                        .as_ref()
+                        .and_then(|v| v.error.clone())
+                        .map(|e| format!("deletion committed but VACUUM failed: {e}"));
+                    match format {
+                        PlanFormat::Json => serde_json::to_value(&report)?,
+                        PlanFormat::Text => {
+                            text = Some(report.summary());
+                            serde_json::Value::Null
+                        }
+                    }
                 }
-            }
-        }
-        Action::StorageLimits {
-            bytes,
-            objects,
-            commits,
-            branches,
-        } => serde_json::to_value(
-            repo.set_storage_limits(StorageLimits {
-                bytes,
-                objects,
-                commits,
-                branches,
-            })
-            .await?,
-        )?,
-        Action::StoreState { document, input } => {
-            let state = read_json(&input, 16 * 1024 * 1024)?;
-            let (root, stats) = repo.write_state(DocumentId(document), &state).await?;
-            serde_json::json!({"state":root,"new_objects":stats.new_objects,"new_bytes":stats.new_bytes})
-        }
-        Action::ReadState { document, root } => serde_json::to_value(
-            repo.read_state(DocumentId(document), &address(root)?)
-                .await?,
-        )?,
-        Action::Commit { manifest, key } => {
-            let commit: Commit = read_json(&manifest, engine_core::repository::MAX_COMMIT_BYTES)?;
-            let key = crate::signing::load(&key)?;
-            let signed = SignedCommit::sign(commit, &key)?;
-            serde_json::json!({"commit":repo.import_commit(&signed).await?})
-        }
-        Action::ImportCommit { input } => {
-            serde_json::json!({"commit":repo.import_commit(&read_json(&input, engine_core::repository::MAX_COMMIT_BYTES + 1024)?).await?})
-        }
-        Action::Show { commit } => serde_json::to_value(repo.commit(&address(commit)?).await?)?,
-        Action::Head { branch } => serde_json::to_value(repo.head(&branch).await?)?,
-        Action::SetHead {
-            branch,
-            commit,
-            expected,
-            expected_generation,
-        } => {
-            let expected = match (expected, expected_generation) {
-                (Some(commit), Some(generation)) => Some(Head {
-                    commit: address(commit)?,
-                    generation,
-                }),
-                (None, None) => None,
-                _ => anyhow::bail!("expected address and generation must be supplied together"),
-            };
-            serde_json::to_value(
-                repo.compare_and_swap(&branch, expected.as_ref(), &address(commit)?)
+                Action::StorageLimits {
+                    bytes,
+                    objects,
+                    commits,
+                    branches,
+                } => serde_json::to_value(
+                    repo.set_storage_limits(StorageLimits {
+                        bytes,
+                        objects,
+                        commits,
+                        branches,
+                    })
                     .await?,
-            )?
-        }
-        Action::MergeBases { left, right } => {
-            serde_json::to_value(repo.merge_bases(&address(left)?, &address(right)?).await?)?
-        }
-        Action::Compare {
-            base,
-            left,
-            right,
-            explain,
-            merge_policy,
-        } => {
-            let policy = explain
-                .then(|| load_policy(merge_policy.as_deref()))
-                .transpose()?;
-            compare_explained(
-                &repo,
-                address(base)?,
-                address(left)?,
-                address(right)?,
-                policy.as_ref(),
-            )
-            .await?
-        }
-        Action::Merge {
-            left,
-            right,
-            same_file_merge,
-            resolutions,
-            key,
-            message,
-            authored_at_ms,
-            explain,
-        } => {
-            let resolutions = match resolutions {
-                Some(path) => read_json(&path, engine_core::repository::MAX_COMMIT_BYTES)?,
-                None => BTreeMap::new(),
+                )?,
+                Action::StoreState { document, input } => {
+                    let state = read_json(&input, 16 * 1024 * 1024)?;
+                    let (root, stats) = repo.write_state(DocumentId(document), &state).await?;
+                    serde_json::json!({"state":root,"new_objects":stats.new_objects,"new_bytes":stats.new_bytes})
+                }
+                Action::ReadState { document, root } => serde_json::to_value(
+                    repo.read_state(DocumentId(document), &address(root)?)
+                        .await?,
+                )?,
+                Action::Commit { manifest, key } => {
+                    let commit: Commit =
+                        read_json(&manifest, engine_core::repository::MAX_COMMIT_BYTES)?;
+                    let key = crate::signing::load(&key)?;
+                    let signed = SignedCommit::sign(commit, &key)?;
+                    serde_json::json!({"commit":repo.import_commit(&signed).await?})
+                }
+                Action::ImportCommit { input } => {
+                    serde_json::json!({"commit":repo.import_commit(&read_json(&input, engine_core::repository::MAX_COMMIT_BYTES + 1024)?).await?})
+                }
+                Action::Show { commit } => {
+                    serde_json::to_value(repo.commit(&address(commit)?).await?)?
+                }
+                Action::Head { branch } => serde_json::to_value(repo.head(&branch).await?)?,
+                Action::SetHead {
+                    branch,
+                    commit,
+                    expected,
+                    expected_generation,
+                } => {
+                    let expected = match (expected, expected_generation) {
+                        (Some(commit), Some(generation)) => Some(Head {
+                            commit: address(commit)?,
+                            generation,
+                        }),
+                        (None, None) => None,
+                        _ => anyhow::bail!(
+                            "expected address and generation must be supplied together"
+                        ),
+                    };
+                    serde_json::to_value(
+                        repo.compare_and_swap(&branch, expected.as_ref(), &address(commit)?)
+                            .await?,
+                    )?
+                }
+                Action::MergeBases { left, right } => serde_json::to_value(
+                    repo.merge_bases(&address(left)?, &address(right)?).await?,
+                )?,
+                Action::Compare {
+                    base,
+                    left,
+                    right,
+                    explain,
+                    merge_policy,
+                } => {
+                    let policy = explain
+                        .then(|| load_policy(merge_policy.as_deref()))
+                        .transpose()?;
+                    compare_explained(
+                        &repo,
+                        address(base)?,
+                        address(left)?,
+                        address(right)?,
+                        policy.as_ref(),
+                    )
+                    .await?
+                }
+                Action::Merge {
+                    left,
+                    right,
+                    same_file_merge,
+                    resolutions,
+                    key,
+                    message,
+                    authored_at_ms,
+                    explain,
+                } => {
+                    let resolutions = match resolutions {
+                        Some(path) => read_json(&path, engine_core::repository::MAX_COMMIT_BYTES)?,
+                        None => BTreeMap::new(),
+                    };
+                    // Load the key before anything is stored.
+                    let key = crate::signing::load(&key)?;
+                    let args = MergeArgs {
+                        left: address(left)?,
+                        right: address(right)?,
+                        same_file: match same_file_merge {
+                            Some(SameFileMerge::Clean) => SameFile::Clean,
+                            None => SameFile::Off,
+                        },
+                        resolutions,
+                        message,
+                        authored_at_ms,
+                        explain,
+                    };
+                    merge_value(&repo, args, &key).await?
+                }
+                Action::VerifyMerge { commit, explain } => {
+                    let commit = address(commit)?;
+                    let verified = repo.verify_same_file_resolutions(&commit).await?;
+                    let mut output = serde_json::json!({"commit":commit,"verified_same_file_resolutions":verified});
+                    if explain {
+                        let policy = merge_policy::default::policy();
+                        let records = repo.commit(&commit).await?.commit.same_file_resolutions;
+                        output["explain"] = explain_value(
+                            policy,
+                            repo.explain_resolutions(&records, policy).await?,
+                        )?;
+                    }
+                    output
+                }
+                Action::RecoveryPlan {
+                    source,
+                    onto,
+                    kind,
+                    mainline,
+                } => {
+                    let mainline = mainline.map(address).transpose()?;
+                    serde_json::to_value(
+                        repo.plan_recovery(
+                            kind.into(),
+                            &address(source)?,
+                            &address(onto)?,
+                            mainline.as_ref(),
+                        )
+                        .await?,
+                    )?
+                }
+                Action::Recover {
+                    source,
+                    onto,
+                    kind,
+                    mainline,
+                    resolutions,
+                    key,
+                    message,
+                    authored_at_ms,
+                } => {
+                    let mainline = mainline.map(address).transpose()?;
+                    let plan = repo
+                        .plan_recovery(
+                            kind.into(),
+                            &address(source)?,
+                            &address(onto)?,
+                            mainline.as_ref(),
+                        )
+                        .await?;
+                    let resolutions = match resolutions {
+                        Some(path) => read_json(&path, engine_core::repository::MAX_COMMIT_BYTES)?,
+                        None => BTreeMap::new(),
+                    };
+                    let commit = plan.resolve(&resolutions, authored_at_ms, message)?;
+                    let signed = SignedCommit::sign(commit, &crate::signing::load(&key)?)?;
+                    serde_json::json!({"commit":repo.import_commit(&signed).await?,"recovery":signed.commit.recovery,"parents":signed.commit.parents})
+                }
             };
-            // Load the key before anything is stored.
-            let key = crate::signing::load(&key)?;
-            let args = MergeArgs {
-                left: address(left)?,
-                right: address(right)?,
-                same_file: match same_file_merge {
-                    Some(SameFileMerge::Clean) => SameFile::Clean,
-                    None => SameFile::Off,
-                },
-                resolutions,
-                message,
-                authored_at_ms,
-                explain,
-            };
-            merge_value(&repo, args, &key).await?
-        }
-        Action::VerifyMerge { commit, explain } => {
-            let commit = address(commit)?;
-            let verified = repo.verify_same_file_resolutions(&commit).await?;
-            let mut output =
-                serde_json::json!({"commit":commit,"verified_same_file_resolutions":verified});
-            if explain {
-                let policy = merge_policy::default::policy();
-                let records = repo.commit(&commit).await?.commit.same_file_resolutions;
-                output["explain"] =
-                    explain_value(policy, repo.explain_resolutions(&records, policy).await?)?;
-            }
-            output
-        }
-        Action::RecoveryPlan {
-            source,
-            onto,
-            kind,
-            mainline,
-        } => {
-            let mainline = mainline.map(address).transpose()?;
-            serde_json::to_value(
-                repo.plan_recovery(
-                    kind.into(),
-                    &address(source)?,
-                    &address(onto)?,
-                    mainline.as_ref(),
-                )
-                .await?,
-            )?
-        }
-        Action::Recover {
-            source,
-            onto,
-            kind,
-            mainline,
-            resolutions,
-            key,
-            message,
-            authored_at_ms,
-        } => {
-            let mainline = mainline.map(address).transpose()?;
-            let plan = repo
-                .plan_recovery(
-                    kind.into(),
-                    &address(source)?,
-                    &address(onto)?,
-                    mainline.as_ref(),
-                )
-                .await?;
-            let resolutions = match resolutions {
-                Some(path) => read_json(&path, engine_core::repository::MAX_COMMIT_BYTES)?,
-                None => BTreeMap::new(),
-            };
-            let commit = plan.resolve(&resolutions, authored_at_ms, message)?;
-            let signed = SignedCommit::sign(commit, &crate::signing::load(&key)?)?;
-            serde_json::json!({"commit":repo.import_commit(&signed).await?,"recovery":signed.commit.recovery,"parents":signed.commit.parents})
+            (out, Some(repo))
         }
     };
-    repo.close().await;
+    if let Some(r) = repo {
+        r.close().await;
+    }
     match text {
         Some(text) => print!("{text}"),
         None => println!(
@@ -3620,6 +3644,252 @@ mod tests {
         assert!(summary.objects >= 1);
 
         let _ = std::fs::remove_file(&archive_out);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_preflight_rejects_invalid_typed_root_and_leaves_target_untouched() {
+        use engine_core::repository::archive::ArchiveWriter;
+
+        let project_id = uuid::Uuid::new_v4();
+        let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+
+        // Create a real file to obtain a valid typed child node (which is a valid stored object
+        // that passes validate_stored and references, but is NOT an Object::State root).
+        let f_init = Fixture::with_project(project_id).await;
+        let f1 = f_init.file(doc1, &[(0, "Hello world")]).await;
+        let p_root = f_init
+            .repo
+            .object(&ObjectKey {
+                document: doc1,
+                address: f1.state.clone(),
+            })
+            .await
+            .unwrap();
+        let children =
+            engine_core::shared_checkpoint::references(&f1.state, &p_root.bytes).unwrap();
+        let child_addr = children[0].clone();
+        let p_child = f_init
+            .repo
+            .object(&ObjectKey {
+                document: doc1,
+                address: child_addr.clone(),
+            })
+            .await
+            .unwrap();
+        f_init.finish().await;
+
+        // Sign a commit referencing this child node (not a State root) as the file's state
+        let mut files = BTreeMap::new();
+        files.insert(
+            "doc.docx".to_string(),
+            engine_core::repository::FileEntry {
+                document: doc1,
+                state: child_addr.clone(),
+            },
+        );
+        let commit = engine_core::repository::Commit {
+            version: 1,
+            project: project_id,
+            parents: vec![],
+            authored_at_ms: 1700000000000,
+            author_key: String::new(),
+            files,
+            same_file_resolutions: Vec::new(),
+            recovery: None,
+            message: "Commit with non-state typed root".into(),
+        };
+        let signed = SignedCommit::sign(commit, &key).unwrap();
+        let head = signed.verify().unwrap();
+
+        // Write a complete DYNOARC archive with valid footer
+        let archive_path = std::env::temp_dir().join(format!(
+            "test-preflight-invalid-typed-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut writer = ArchiveWriter::new(file).unwrap();
+        writer
+            .write_header(1, DocumentId(project_id), head.clone())
+            .unwrap();
+        writer
+            .write_object(doc1, child_addr.clone(), &p_child.bytes)
+            .unwrap();
+        writer.write_commit(&signed).unwrap();
+        writer.finish().unwrap();
+
+        // 1. Standalone archive-verify MUST reject during semantic preflight
+        let err_verify = super::super::archive_verify(
+            archive_path.clone(),
+            project_id,
+            head.as_str().to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err_verify.to_string().contains("semantic preflight")
+                || err_verify
+                    .to_string()
+                    .contains("archive verification failed")
+        );
+
+        // 2. Archive-import into an absent destination MUST fail AND leave absent target absent
+        let absent_target =
+            std::env::temp_dir().join(format!("test-absent-target-{}.db", uuid::Uuid::new_v4()));
+        assert!(!absent_target.exists());
+
+        let err_import = run(
+            absent_target.clone(),
+            project_id,
+            Action::ArchiveImport {
+                file: archive_path.clone(),
+                expect_head: head.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err_import.to_string().contains("archive validation failed"));
+        assert!(
+            !absent_target.exists(),
+            "absent target must remain absent after preflight rejection"
+        );
+
+        // 3. Archive-import into an existing destination MUST leave existing target unchanged
+        let f_existing = Fixture::with_project(project_id).await;
+        let existing_inv_before = f_existing.repo.inventory(None, 10).await.unwrap();
+
+        let err_import2 = run(
+            f_existing.path.clone(),
+            f_existing.project,
+            Action::ArchiveImport {
+                file: archive_path.clone(),
+                expect_head: head.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err_import2
+            .to_string()
+            .contains("archive validation failed"));
+
+        let existing_inv_after = f_existing.repo.inventory(None, 10).await.unwrap();
+        assert_eq!(
+            existing_inv_before, existing_inv_after,
+            "existing target repository must remain completely unchanged"
+        );
+
+        let _ = std::fs::remove_file(&archive_path);
+        f_existing.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_preflight_rejects_false_recovery_evidence() {
+        use engine_core::repository::archive::ArchiveWriter;
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Base")]).await;
+        let c1 = f.commit(&[], vec![("doc.docx", f1.clone())], "Base").await;
+
+        let f2 = f.file(doc1, &[(0, "Modified")]).await;
+        let c2 = f
+            .commit(&[&c1], vec![("doc.docx", f2.clone())], "Modified")
+            .await;
+
+        let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+
+        // Sign a commit claiming to revert c2, but providing false/falsified file content
+        let f_fake = f.file(doc1, &[(0, "False content")]).await;
+        let commit = engine_core::repository::Commit {
+            version: 2,
+            project: f.project,
+            parents: vec![c2.clone()],
+            authored_at_ms: 1700000000000,
+            author_key: String::new(),
+            files: {
+                let mut map = BTreeMap::new();
+                map.insert("doc.docx".to_string(), f_fake.clone());
+                map
+            },
+            same_file_resolutions: Vec::new(),
+            recovery: Some(engine_core::repository::recovery::Source {
+                kind: engine_core::repository::recovery::Kind::Revert,
+                commit: c2.clone(),
+                mainline: None,
+            }),
+            message: "Commit with false recovery".into(),
+        };
+        let signed = SignedCommit::sign(commit, &key).unwrap();
+        let head = signed.verify().unwrap();
+
+        let archive_path = std::env::temp_dir().join(format!(
+            "test-preflight-false-recovery-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut writer = ArchiveWriter::new(file).unwrap();
+        writer
+            .write_header(1, DocumentId(f.project), head.clone())
+            .unwrap();
+
+        // Write objects for f1, f2, and f_fake
+        let p1 = f
+            .repo
+            .object(&ObjectKey {
+                document: doc1,
+                address: f1.state.clone(),
+            })
+            .await
+            .unwrap();
+        writer
+            .write_object(doc1, f1.state.clone(), &p1.bytes)
+            .unwrap();
+
+        let p2 = f
+            .repo
+            .object(&ObjectKey {
+                document: doc1,
+                address: f2.state.clone(),
+            })
+            .await
+            .unwrap();
+        writer
+            .write_object(doc1, f2.state.clone(), &p2.bytes)
+            .unwrap();
+
+        let p_fake = f
+            .repo
+            .object(&ObjectKey {
+                document: doc1,
+                address: f_fake.state.clone(),
+            })
+            .await
+            .unwrap();
+        writer
+            .write_object(doc1, f_fake.state.clone(), &p_fake.bytes)
+            .unwrap();
+
+        let signed_c1 = f.repo.commit(&c1).await.unwrap();
+        writer.write_commit(&signed_c1).unwrap();
+        let signed_c2 = f.repo.commit(&c2).await.unwrap();
+        writer.write_commit(&signed_c2).unwrap();
+        writer.write_commit(&signed).unwrap();
+        writer.finish().unwrap();
+
+        let err = super::super::archive_verify(
+            archive_path.clone(),
+            f.project,
+            head.as_str().to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("semantic preflight")
+                || err.to_string().contains("archive verification failed")
+        );
+
+        let _ = std::fs::remove_file(&archive_path);
         f.finish().await;
     }
 }
