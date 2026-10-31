@@ -3299,6 +3299,204 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_export_verify_cli_workflow() {
+        use crate::{Cli, Command};
+        use clap::Parser;
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Report initial content")]).await;
+        let c1 = f
+            .commit(&[], vec![("Report.docx", f1)], "Genesis commit")
+            .await;
+
+        let export_out =
+            std::env::temp_dir().join(format!("test-verify-cli-{}.json", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&export_out);
+
+        // Export Report.docx from c1
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ExportFile {
+                commit: c1.as_str().to_string(),
+                path: "Report.docx".to_string(),
+                out: export_out.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1. Verify clap parsing and dispatch
+        let parsed = Cli::try_parse_from([
+            "engine-cli",
+            "state-export-verify",
+            export_out.to_str().unwrap(),
+            "--project",
+            &f.project.to_string(),
+            "--expect-commit",
+            c1.as_str(),
+            "--path",
+            "Report.docx",
+        ])
+        .expect("clap parsing state-export-verify");
+
+        match parsed.command {
+            Command::StateExportVerify {
+                file,
+                project,
+                expect_commit,
+                path,
+            } => {
+                assert_eq!(file, export_out);
+                assert_eq!(project, f.project);
+                assert_eq!(expect_commit, c1.as_str());
+                assert_eq!(path, "Report.docx");
+            }
+            _ => panic!("expected Command::StateExportVerify"),
+        }
+
+        // 1b. Verify clap parsing with --expect-path alias
+        let parsed_alias = Cli::try_parse_from([
+            "engine-cli",
+            "state-export-verify",
+            export_out.to_str().unwrap(),
+            "--project",
+            &f.project.to_string(),
+            "--expect-commit",
+            c1.as_str(),
+            "--expect-path",
+            "Report.docx",
+        ])
+        .expect("clap parsing state-export-verify with alias");
+        assert!(matches!(
+            parsed_alias.command,
+            Command::StateExportVerify { .. }
+        ));
+
+        // 1c. Missing required flags fails clap parsing
+        assert!(Cli::try_parse_from([
+            "engine-cli",
+            "state-export-verify",
+            export_out.to_str().unwrap(),
+            "--expect-commit",
+            c1.as_str(),
+            "--path",
+            "Report.docx",
+        ])
+        .is_err());
+
+        assert!(Cli::try_parse_from([
+            "engine-cli",
+            "state-export-verify",
+            export_out.to_str().unwrap(),
+            "--project",
+            &f.project.to_string(),
+            "--path",
+            "Report.docx",
+        ])
+        .is_err());
+
+        assert!(Cli::try_parse_from([
+            "engine-cli",
+            "state-export-verify",
+            export_out.to_str().unwrap(),
+            "--project",
+            &f.project.to_string(),
+            "--expect-commit",
+            c1.as_str(),
+        ])
+        .is_err());
+
+        // 2. Successful verification via CLI entrypoint
+        super::super::state_export_verify(
+            export_out.clone(),
+            f.project,
+            c1.as_str().to_string(),
+            "Report.docx".to_string(),
+        )
+        .await
+        .expect("state_export_verify should succeed");
+
+        // 3. Wrong project expectation fails
+        let wrong_proj = uuid::Uuid::new_v4();
+        let err_proj = super::super::state_export_verify(
+            export_out.clone(),
+            wrong_proj,
+            c1.as_str().to_string(),
+            "Report.docx".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err_proj
+            .to_string()
+            .contains("does not match expected project"));
+
+        // 4. Wrong commit expectation fails
+        let wrong_commit = "00".repeat(32);
+        let err_commit = super::super::state_export_verify(
+            export_out.clone(),
+            f.project,
+            wrong_commit,
+            "Report.docx".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err_commit
+            .to_string()
+            .contains("does not match expected commit"));
+
+        // 5. Wrong path expectation fails
+        let err_path = super::super::state_export_verify(
+            export_out.clone(),
+            f.project,
+            c1.as_str().to_string(),
+            "Other.docx".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err_path
+            .to_string()
+            .contains("does not match expected path"));
+
+        // 6. Corrupted input file fails
+        let corrupt_path =
+            std::env::temp_dir().join(format!("test-verify-corrupt-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&corrupt_path, b"not valid json").unwrap();
+        let err_corrupt = super::super::state_export_verify(
+            corrupt_path.clone(),
+            f.project,
+            c1.as_str().to_string(),
+            "Report.docx".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err_corrupt.to_string().contains("verification failed"));
+        let _ = std::fs::remove_file(&corrupt_path);
+
+        // 7. Missing input file fails
+        let missing_path =
+            std::env::temp_dir().join(format!("nonexistent-{}.json", uuid::Uuid::new_v4()));
+        let err_missing = super::super::state_export_verify(
+            missing_path.clone(),
+            f.project,
+            c1.as_str().to_string(),
+            "Report.docx".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err_missing
+            .to_string()
+            .contains("state export file not found"));
+
+        // 8. Confirm no new files or repository alterations were made
+        assert_eq!(f.repo.head("main").await.unwrap(), None);
+
+        let _ = std::fs::remove_file(&export_out);
+        f.finish().await;
+    }
+
+    #[tokio::test]
     async fn export_file_project_mismatch_fails() {
         let f1 = Fixture::new().await;
         let doc1 = DocumentId(uuid::Uuid::new_v4());
