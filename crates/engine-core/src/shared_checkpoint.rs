@@ -17,7 +17,7 @@ pub mod content;
 pub mod postgres;
 pub mod typed;
 use canonical::ObjectRef;
-pub use typed::{read_state_v3, write_state_v3};
+pub use typed::{read_state_v3, update_state_v3, write_state_v3};
 
 pub const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 /// Maximum values fetched together. PostgreSQL retains at most this many encoded
