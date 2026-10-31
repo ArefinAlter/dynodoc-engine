@@ -808,12 +808,7 @@ impl PrivateTempDir {
     pub fn new() -> io::Result<Self> {
         let path =
             std::env::temp_dir().join(format!("dynodoc-archive-staging-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
-        }
+        super::private_fs::create_private_dir(&path)?;
         Ok(Self { path })
     }
 
@@ -914,7 +909,7 @@ pub fn validate_and_stage_archive_in<R: Read>(
 ) -> Result<StagedArchive, ArchiveError> {
     let mut archive_reader = ArchiveReader::new(reader, limits);
     let objects_dir = staging_dir.path().join("objects");
-    std::fs::create_dir_all(&objects_dir)?;
+    super::private_fs::create_private_dir(&objects_dir)?;
 
     let mut staged_objects: Vec<StagedObjectEntry> = Vec::new();
     let mut staged_commits: Vec<SignedCommit> = Vec::new();
@@ -960,7 +955,10 @@ pub fn validate_and_stage_archive_in<R: Read>(
                     return Err(ArchiveError::Limit("maximum object count exceeded"));
                 }
                 let obj_file = objects_dir.join(format!("{}.bin", staged_objects.len()));
-                std::fs::write(&obj_file, &bytes)?;
+                let mut obj_f = super::private_fs::create_private_file(&obj_file)?;
+                use std::io::Write;
+                obj_f.write_all(&bytes)?;
+                obj_f.sync_all()?;
                 staged_objects_map.insert((document, address.clone()), staged_objects.len());
                 staged_objects.push(StagedObjectEntry {
                     document,

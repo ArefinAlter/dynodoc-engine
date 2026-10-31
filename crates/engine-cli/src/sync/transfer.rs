@@ -334,12 +334,7 @@ struct PrivateExportDir {
 impl PrivateExportDir {
     fn new() -> std::io::Result<Self> {
         let path = std::env::temp_dir().join(format!("dynodoc-export-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
-        }
+        engine_core::repository::private_fs::create_private_dir(&path)?;
         Ok(Self { path })
     }
 
@@ -436,14 +431,15 @@ impl<'a> RemoteExportStore<'a> {
         );
         self.bytes += bytes.len();
 
-        std::fs::write(&scratch_file, &bytes)
+        let mut scratch_f = engine_core::repository::private_fs::create_private_file(&scratch_file)
+            .with_context(|| format!("creating scratch object {}", address.as_str()))?;
+        use std::io::Write;
+        scratch_f
+            .write_all(&bytes)
             .with_context(|| format!("writing scratch object {}", address.as_str()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&scratch_file, std::fs::Permissions::from_mode(0o600));
-        }
+        scratch_f
+            .sync_all()
+            .with_context(|| format!("syncing scratch object {}", address.as_str()))?;
 
         Ok(bytes)
     }
