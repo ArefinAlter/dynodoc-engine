@@ -871,6 +871,25 @@ pub enum ArchiveImportError {
     Io(#[from] io::Error),
 }
 
+/// Fully verify an offline history archive without keeping staged data.
+///
+/// An independently obtained expected head anchors integrity. A self-signed
+/// archive alone does not establish account authority, timestamps, server
+/// freshness or native-format fidelity.
+///
+/// Requires the exact selected dependency and object closure, full footer,
+/// valid signatures and hashes, matching head and project.
+/// Private bounded temporary disk is cleaned up on completion or failure.
+pub fn verify_archive<R: Read>(
+    reader: R,
+    limits: ArchiveLimits,
+    expected_head: Option<&Address>,
+    expected_project: Option<DocumentId>,
+) -> Result<ArchiveSummary, ArchiveError> {
+    let staged = validate_and_stage_archive(reader, limits, expected_head, expected_project)?;
+    Ok(staged.summary)
+}
+
 /// Validate an archive stream and stage its objects into a fresh private temporary directory.
 ///
 /// Verifies magic, frames, hashes, signatures, counts, dependency closure and object graph.

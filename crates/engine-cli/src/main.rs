@@ -119,6 +119,21 @@ enum Command {
     },
     /// Check schema and runtime privileges using DATABASE_URL; makes no changes.
     CheckRuntime,
+    /// Offline history archive verification (no repository required).
+    ///
+    /// An independently obtained expected head anchors integrity. A self-signed
+    /// archive alone does not establish account authority, timestamps, server
+    /// freshness or native-format fidelity.
+    ArchiveVerify {
+        /// History archive file (.dynoarc) to verify.
+        file: std::path::PathBuf,
+        /// Expected project id (UUID).
+        #[arg(long)]
+        project: Uuid,
+        /// Expected head commit address.
+        #[arg(long)]
+        expect_head: String,
+    },
     /// Independently verify the event chain and all legacy snapshots.
     Verify {
         /// Document id (UUID).
@@ -285,6 +300,11 @@ async fn run() -> anyhow::Result<()> {
             println!("Runtime schema and database privileges verified.");
             Ok(())
         }
+        Command::ArchiveVerify {
+            file,
+            project,
+            expect_head,
+        } => archive_verify(file, project, expect_head).await,
         Command::Verify {
             document_id,
             expect_head,
@@ -322,6 +342,44 @@ fn parse_document_id(document_id: &str) -> anyhow::Result<DocumentId> {
     Uuid::parse_str(document_id)
         .map(DocumentId)
         .with_context(|| format!("invalid document id (expected a UUID): {document_id}"))
+}
+
+/// Verify an offline history archive without any database or target repository.
+async fn archive_verify(
+    file: std::path::PathBuf,
+    project: Uuid,
+    expect_head: String,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        file.is_file(),
+        "archive file not found at {}",
+        file.display()
+    );
+    let expect_head_addr = engine_core::shared_checkpoint::Address::try_from(expect_head)
+        .context("invalid expect_head address")?;
+    let file_handle = std::fs::File::open(&file)
+        .with_context(|| format!("failed to open archive at {}", file.display()))?;
+
+    let summary = engine_core::repository::archive::verify_archive(
+        file_handle,
+        engine_core::repository::archive::ArchiveLimits::default(),
+        Some(&expect_head_addr),
+        Some(DocumentId(project)),
+    )
+    .map_err(|e| anyhow::anyhow!("archive verification failed: {e}"))?;
+
+    let output = serde_json::json!({
+        "file": file.display().to_string(),
+        "head": summary.head,
+        "project": summary.project.0,
+        "objects": summary.objects,
+        "commits": summary.commits,
+        "bytes_before_footer": summary.bytes_before_footer,
+        "total_bytes": summary.total_bytes,
+        "sha256": summary.sha256,
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
 }
 
 /// Connect to Postgres from `DATABASE_URL`.
