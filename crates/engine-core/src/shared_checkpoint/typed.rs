@@ -257,6 +257,54 @@ impl<S: ObjectStore> Encoder<'_, S> {
         };
         self.object(object).await
     }
+
+    async fn read_object(&mut self, address: &Address) -> Result<Object, Error> {
+        if self.writer.budget.max_objects == 0 {
+            return Err(Error::Limit("objects"));
+        }
+        let bytes = if let Some((_, b)) = self.writer.pending.iter().find(|(a, _)| a == address) {
+            self.writer.budget.consume(b.len())?;
+            b.clone()
+        } else {
+            let b = self.writer.store.get(self.writer.document, address).await?;
+            self.writer.budget.consume(b.len())?;
+            b
+        };
+        decode(address, &bytes)
+    }
+}
+
+fn charge_value(semantic: &mut SemanticLimits, value: &Value, depth: usize) -> Result<(), Error> {
+    semantic.value(depth)?;
+    match value {
+        Value::String(text) => {
+            semantic.bytes(text.len())?;
+        }
+        Value::Array(values) => {
+            if values.len() > semantic.values {
+                return Err(Error::Limit("semantic values"));
+            }
+            for value in values {
+                charge_value(semantic, value, depth + 1)?;
+            }
+        }
+        Value::Object(values) => {
+            if values.len() > semantic.values {
+                return Err(Error::Limit("semantic values"));
+            }
+            let mut keys: Vec<_> = values.keys().collect();
+            keys.sort_unstable();
+            for key in keys {
+                if key.len() > MAX_KEY_BYTES {
+                    return Err(Error::Limit("property key bytes"));
+                }
+                semantic.bytes(key.len())?;
+                charge_value(semantic, &values[key], depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn node_metadata(limits: &mut SemanticLimits, node: &MaterializedNode) -> Result<(), Error> {
@@ -382,6 +430,415 @@ pub async fn write_state<S: ObjectStore>(
         ));
     }
     let removed_choices = encoder.writer.entries(entries).await?;
+    let root = encoder
+        .object(Object::State(StateRoots {
+            nodes,
+            comments,
+            suggestions,
+            removed_choices,
+        }))
+        .await?;
+    encoder.writer.flush().await?;
+    Ok((root, encoder.writer.stats))
+}
+
+fn is_integrity_error(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::HashMismatch
+            | Error::Missing(_)
+            | Error::Limit(_)
+            | Error::Db(_)
+            | Error::Io(_)
+            | Error::History(_)
+            | Error::Json(_)
+            | Error::Invalid("typed header/version")
+            | Error::Invalid("declared content length")
+            | Error::Invalid("text UTF-8")
+            | Error::Invalid("noncanonical typed object")
+            | Error::Invalid("radix depth")
+            | Error::Invalid("map key route or duplicate")
+            | Error::Invalid("map entries or key bytes")
+            | Error::Invalid("unnecessary map branch")
+            | Error::Invalid("empty branch child")
+    )
+}
+
+/// Incrementally update an already verified base state with a validated target state.
+/// Reuses unchanged node and field objects without re-encoding, falling back to full
+/// write_state on unsupported delta shapes or state-metadata inconsistencies.
+/// Integrity errors (corruption, hash mismatches, missing objects, limit exhaustion) fail closed.
+pub async fn update_state<S: ObjectStore>(
+    store: &mut S,
+    document: DocumentId,
+    base_root: &Address,
+    base_state: &DocumentState,
+    target_state: &DocumentState,
+    limits: Limits,
+    semantic: SemanticLimits,
+) -> Result<(Address, WriteStats), Error> {
+    for (id, node) in &target_state.nodes {
+        if id != &node.id {
+            return Err(Error::Invalid("node map key differs from logical id"));
+        }
+    }
+
+    match try_update_state(
+        store,
+        document,
+        base_root,
+        base_state,
+        target_state,
+        limits,
+        semantic,
+    )
+    .await
+    {
+        Ok(res) => Ok(res),
+        Err(err) if is_integrity_error(&err) => Err(err),
+        Err(Error::Invalid("node map key differs from logical id")) => {
+            Err(Error::Invalid("node map key differs from logical id"))
+        }
+        Err(_) => write_state(store, document, target_state, limits, semantic).await,
+    }
+}
+
+async fn try_update_state<S: ObjectStore>(
+    store: &mut S,
+    document: DocumentId,
+    base_root: &Address,
+    base_state: &DocumentState,
+    target_state: &DocumentState,
+    limits: Limits,
+    semantic: SemanticLimits,
+) -> Result<(Address, WriteStats), Error> {
+    let mut encoder = Encoder {
+        writer: Writer {
+            store,
+            document,
+            budget: limits,
+            stats: WriteStats::default(),
+            pending: Vec::new(),
+            pending_bytes: 0,
+        },
+        semantic,
+    };
+
+    let base_obj = encoder.read_object(base_root).await?;
+    let Object::State(base_roots) = base_obj else {
+        return Err(Error::Invalid("expected typed state"));
+    };
+
+    // No-op check: enforce semantic budgets across all reachable items, write 0 objects
+    if target_state == base_state {
+        for (id, node) in &target_state.nodes {
+            encoder.semantic.value(0)?;
+            if id != &node.id {
+                return Err(Error::Invalid("node map key differs from logical id"));
+            }
+            node_metadata(&mut encoder.semantic, node)?;
+            charge_value(&mut encoder.semantic, &node.current_fields, 0)?;
+        }
+        for comment in &target_state.comments {
+            encoder.semantic.value(0)?;
+            if let Some(id) = &comment.node_id {
+                encoder.semantic.metadata(&id.0)?;
+            }
+            encoder.semantic.bytes(comment.body.len())?;
+        }
+        for (key, suggestion) in &target_state.suggestions {
+            encoder.semantic.value(0)?;
+            encoder.semantic.metadata(key)?;
+            if let Some(id) = &suggestion.target_node_id {
+                encoder.semantic.metadata(&id.0)?;
+            }
+            charge_value(&mut encoder.semantic, &suggestion.detail, 0)?;
+            if let Some(reason) = &suggestion.rejected_reason {
+                encoder.semantic.bytes(reason.len())?;
+            }
+        }
+        if target_state.removed_choices.len() > encoder.semantic.values {
+            return Err(Error::Limit("semantic values"));
+        }
+        let mut removed: Vec<_> = target_state.removed_choices.iter().collect();
+        removed.sort();
+        for id in removed {
+            encoder.semantic.value(0)?;
+            encoder.semantic.metadata(&id.0)?;
+        }
+        return Ok((base_root.clone(), encoder.writer.stats));
+    }
+
+    // 1. Process nodes
+    let mut node_edits: Vec<(String, Option<Address>)> = Vec::new();
+
+    // Deleted nodes
+    for id in base_state.nodes.keys() {
+        if !target_state.nodes.contains_key(id) {
+            node_edits.push((id.0.clone(), None));
+        }
+    }
+
+    // Unchanged, modified, or added nodes
+    for (id, node) in &target_state.nodes {
+        encoder.semantic.value(0)?;
+        if id != &node.id {
+            return Err(Error::Invalid("node map key differs from logical id"));
+        }
+        node_metadata(&mut encoder.semantic, node)?;
+
+        if let Some(base_node) = base_state.nodes.get(id) {
+            if base_node == node {
+                charge_value(&mut encoder.semantic, &node.current_fields, 0)?;
+            } else {
+                let fields = if base_node.current_fields == node.current_fields {
+                    charge_value(&mut encoder.semantic, &node.current_fields, 0)?;
+                    let old_node_addr = encoder
+                        .writer
+                        .lookup(&base_roots.nodes, &id.0)
+                        .await?
+                        .ok_or(Error::Invalid("base node missing from radix map"))?;
+                    match encoder.read_object(&old_node_addr).await? {
+                        Object::Node { fields, .. } => fields,
+                        _ => return Err(Error::Invalid("expected typed node")),
+                    }
+                } else {
+                    encoder.value(&node.current_fields, 0).await?
+                };
+
+                let addr = encoder
+                    .object(Object::Node {
+                        id: id.clone(),
+                        parent_id: node.parent_id.clone(),
+                        node_type: node.node_type.clone(),
+                        pos: node.pos.clone(),
+                        var_name: node.var_name.clone(),
+                        deleted: node.deleted,
+                        fields,
+                    })
+                    .await?;
+                node_edits.push((id.0.clone(), Some(addr)));
+            }
+        } else {
+            let fields = encoder.value(&node.current_fields, 0).await?;
+            let addr = encoder
+                .object(Object::Node {
+                    id: id.clone(),
+                    parent_id: node.parent_id.clone(),
+                    node_type: node.node_type.clone(),
+                    pos: node.pos.clone(),
+                    var_name: node.var_name.clone(),
+                    deleted: node.deleted,
+                    fields,
+                })
+                .await?;
+            node_edits.push((id.0.clone(), Some(addr)));
+        }
+    }
+
+    let nodes = if node_edits.is_empty() {
+        base_roots.nodes.clone()
+    } else {
+        encoder
+            .writer
+            .update_map(&base_roots.nodes, node_edits)
+            .await?
+    };
+
+    // 2. Process comments
+    let comments = if target_state.comments == base_state.comments {
+        for comment in &target_state.comments {
+            encoder.semantic.value(0)?;
+            if let Some(id) = &comment.node_id {
+                encoder.semantic.metadata(&id.0)?;
+            }
+            encoder.semantic.bytes(comment.body.len())?;
+        }
+        base_roots.comments.clone()
+    } else {
+        let mut comment_edits = Vec::new();
+        let max_len = target_state.comments.len().max(base_state.comments.len());
+        for i in 0..max_len {
+            let key = format!("{i:016x}");
+            match (target_state.comments.get(i), base_state.comments.get(i)) {
+                (Some(target_c), Some(base_c)) => {
+                    encoder.semantic.value(0)?;
+                    if let Some(id) = &target_c.node_id {
+                        encoder.semantic.metadata(&id.0)?;
+                    }
+                    if target_c == base_c {
+                        encoder.semantic.bytes(target_c.body.len())?;
+                    } else {
+                        let body = encoder.text(target_c.body.as_bytes()).await?;
+                        let addr = encoder
+                            .object(Object::Comment {
+                                node_id: target_c.node_id.clone(),
+                                body,
+                            })
+                            .await?;
+                        comment_edits.push((key, Some(addr)));
+                    }
+                }
+                (Some(target_c), None) => {
+                    encoder.semantic.value(0)?;
+                    if let Some(id) = &target_c.node_id {
+                        encoder.semantic.metadata(&id.0)?;
+                    }
+                    let body = encoder.text(target_c.body.as_bytes()).await?;
+                    let addr = encoder
+                        .object(Object::Comment {
+                            node_id: target_c.node_id.clone(),
+                            body,
+                        })
+                        .await?;
+                    comment_edits.push((key, Some(addr)));
+                }
+                (None, Some(_)) => {
+                    comment_edits.push((key, None));
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+        encoder
+            .writer
+            .update_map(&base_roots.comments, comment_edits)
+            .await?
+    };
+
+    // 3. Process suggestions
+    let suggestions = if target_state.suggestions == base_state.suggestions {
+        for (key, suggestion) in &target_state.suggestions {
+            encoder.semantic.value(0)?;
+            encoder.semantic.metadata(key)?;
+            if let Some(id) = &suggestion.target_node_id {
+                encoder.semantic.metadata(&id.0)?;
+            }
+            charge_value(&mut encoder.semantic, &suggestion.detail, 0)?;
+            if let Some(reason) = &suggestion.rejected_reason {
+                encoder.semantic.bytes(reason.len())?;
+            }
+        }
+        base_roots.suggestions.clone()
+    } else {
+        let mut sugg_edits = Vec::new();
+        for key in base_state.suggestions.keys() {
+            if !target_state.suggestions.contains_key(key) {
+                sugg_edits.push((key.clone(), None));
+            }
+        }
+        for (key, target_s) in &target_state.suggestions {
+            encoder.semantic.value(0)?;
+            encoder.semantic.metadata(key)?;
+            if let Some(id) = &target_s.target_node_id {
+                encoder.semantic.metadata(&id.0)?;
+            }
+
+            if let Some(base_s) = base_state.suggestions.get(key) {
+                if base_s == target_s {
+                    charge_value(&mut encoder.semantic, &target_s.detail, 0)?;
+                    if let Some(reason) = &target_s.rejected_reason {
+                        encoder.semantic.bytes(reason.len())?;
+                    }
+                } else {
+                    let detail = if base_s.detail == target_s.detail {
+                        charge_value(&mut encoder.semantic, &target_s.detail, 0)?;
+                        let old_sugg_addr = encoder
+                            .writer
+                            .lookup(&base_roots.suggestions, key)
+                            .await?
+                            .ok_or(Error::Invalid("base suggestion missing from map"))?;
+                        match encoder.read_object(&old_sugg_addr).await? {
+                            Object::Suggestion { detail, .. } => detail,
+                            _ => return Err(Error::Invalid("expected typed suggestion")),
+                        }
+                    } else {
+                        encoder.value(&target_s.detail, 0).await?
+                    };
+
+                    let rejected_reason = match &target_s.rejected_reason {
+                        Some(reason) => Some(encoder.text(reason.as_bytes()).await?),
+                        None => None,
+                    };
+                    let addr = encoder
+                        .object(Object::Suggestion {
+                            target_node_id: target_s.target_node_id.clone(),
+                            detail,
+                            accepted: target_s.accepted,
+                            rejected_reason,
+                        })
+                        .await?;
+                    sugg_edits.push((key.clone(), Some(addr)));
+                }
+            } else {
+                let detail = encoder.value(&target_s.detail, 0).await?;
+                let rejected_reason = match &target_s.rejected_reason {
+                    Some(reason) => Some(encoder.text(reason.as_bytes()).await?),
+                    None => None,
+                };
+                let addr = encoder
+                    .object(Object::Suggestion {
+                        target_node_id: target_s.target_node_id.clone(),
+                        detail,
+                        accepted: target_s.accepted,
+                        rejected_reason,
+                    })
+                    .await?;
+                sugg_edits.push((key.clone(), Some(addr)));
+            }
+        }
+        encoder
+            .writer
+            .update_map(&base_roots.suggestions, sugg_edits)
+            .await?
+    };
+
+    // 4. Process removed_choices
+    let removed_choices = if target_state.removed_choices == base_state.removed_choices {
+        if target_state.removed_choices.len() > encoder.semantic.values {
+            return Err(Error::Limit("semantic values"));
+        }
+        let mut removed: Vec<_> = target_state.removed_choices.iter().collect();
+        removed.sort();
+        for id in removed {
+            encoder.semantic.value(0)?;
+            encoder.semantic.metadata(&id.0)?;
+        }
+        base_roots.removed_choices.clone()
+    } else {
+        if target_state.removed_choices.len() > encoder.semantic.values {
+            return Err(Error::Limit("semantic values"));
+        }
+        let mut rc_edits = Vec::new();
+        for id in &base_state.removed_choices {
+            if !target_state.removed_choices.contains(id) {
+                rc_edits.push((id.0.clone(), None));
+            }
+        }
+        let mut removed: Vec<_> = target_state.removed_choices.iter().collect();
+        removed.sort();
+        for id in removed {
+            encoder.semantic.value(0)?;
+            encoder.semantic.metadata(&id.0)?;
+            if !base_state.removed_choices.contains(id) {
+                let addr = encoder.object(Object::RemovedChoice(id.clone())).await?;
+                rc_edits.push((id.0.clone(), Some(addr)));
+            }
+        }
+        encoder
+            .writer
+            .update_map(&base_roots.removed_choices, rc_edits)
+            .await?
+    };
+
+    if nodes == base_roots.nodes
+        && comments == base_roots.comments
+        && suggestions == base_roots.suggestions
+        && removed_choices == base_roots.removed_choices
+    {
+        encoder.writer.flush().await?;
+        return Ok((base_root.clone(), encoder.writer.stats));
+    }
+
     let root = encoder
         .object(Object::State(StateRoots {
             nodes,
@@ -1085,6 +1542,588 @@ mod tests {
             let mut bad = MAGIC.to_vec();
             bad.extend_from_slice(tail);
             assert!(decode(&address(&bad), &bad).is_err());
+        }
+    }
+
+    fn make_test_state(n_nodes: usize) -> DocumentState {
+        let mut state = DocumentState::default();
+        for i in 0..n_nodes {
+            let id = NodeId(format!("node_{i:04}"));
+            state.nodes.insert(
+                id.clone(),
+                MaterializedNode {
+                    id: id.clone(),
+                    parent_id: if i > 0 {
+                        Some(NodeId(format!("node_{:04}", i / 2)))
+                    } else {
+                        None
+                    },
+                    node_type: "block".into(),
+                    pos: format!("{i:04}"),
+                    current_fields: json!({"text": format!("Content for node {i}"), "index": i}),
+                    var_name: Some(format!("var_{i}")),
+                    deleted: false,
+                },
+            );
+        }
+        state.comments.push(CommentState {
+            node_id: Some(NodeId("node_0000".into())),
+            body: "First comment".into(),
+        });
+        state.suggestions.insert(
+            "sugg_0".into(),
+            SuggestionState {
+                target_node_id: Some(NodeId("node_0000".into())),
+                detail: json!({"replace": "new text"}),
+                accepted: false,
+                rejected_reason: None,
+            },
+        );
+        state
+            .removed_choices
+            .insert(NodeId("choice_deleted".into()));
+        state
+    }
+
+    #[tokio::test]
+    async fn update_state_noop_reproduces_root_with_zero_writes() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+        let state = make_test_state(40);
+        let (base_root, initial_stats) = write(&mut store, document, &state).await;
+        assert!(initial_stats.new_objects > 0);
+
+        let (noop_root, update_stats) = update_state(
+            &mut store,
+            document,
+            &base_root,
+            &state,
+            &state,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(noop_root, base_root);
+        assert_eq!(update_stats.new_objects, 0);
+        assert_eq!(update_stats.new_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn update_state_exact_oracle_equality_across_edits() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+        let base_state = make_test_state(40);
+        let (base_root, _) = write(&mut store, document, &base_state).await;
+
+        let mut target_state = base_state.clone();
+        // 1. Add node
+        let new_id = NodeId("node_9999".into());
+        target_state.nodes.insert(
+            new_id.clone(),
+            MaterializedNode {
+                id: new_id.clone(),
+                parent_id: None,
+                node_type: "item".into(),
+                pos: "9999".into(),
+                current_fields: json!({"title": "new item"}),
+                var_name: None,
+                deleted: false,
+            },
+        );
+        // 2. Delete node
+        target_state.nodes.remove(&NodeId("node_0005".into()));
+        // 3. Modify node metadata only
+        if let Some(n) = target_state.nodes.get_mut(&NodeId("node_0010".into())) {
+            n.pos = "updated_pos".into();
+            n.deleted = true;
+        }
+        // 4. Modify node fields
+        if let Some(n) = target_state.nodes.get_mut(&NodeId("node_0020".into())) {
+            n.current_fields = json!({"text": "brand new text", "changed": true});
+        }
+        // 5. Add, modify, delete comments
+        target_state.comments.push(CommentState {
+            node_id: None,
+            body: "Appended comment".into(),
+        });
+        target_state.comments[0].body = "Updated comment 0".into();
+        // 6. Suggestions edit
+        target_state.suggestions.insert(
+            "sugg_1".into(),
+            SuggestionState {
+                target_node_id: None,
+                detail: json!({"extra": 123}),
+                accepted: true,
+                rejected_reason: Some("already done".into()),
+            },
+        );
+        target_state.suggestions.remove("sugg_0");
+        // 7. Removed choices edit
+        target_state
+            .removed_choices
+            .insert(NodeId("choice_new".into()));
+        target_state
+            .removed_choices
+            .remove(&NodeId("choice_deleted".into()));
+
+        // Call update_state
+        let (update_root, stats) = update_state(
+            &mut store,
+            document,
+            &base_root,
+            &base_state,
+            &target_state,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        // Call write_state oracle on fresh store
+        let mut oracle_store = MemoryStore::default();
+        let (oracle_root, oracle_stats) = write(&mut oracle_store, document, &target_state).await;
+
+        assert_eq!(update_root, oracle_root);
+        assert!(stats.new_objects > 0);
+        assert!(stats.new_objects < oracle_stats.new_objects);
+
+        // Verify reconstruction
+        let reconstructed = read_state(
+            &mut store,
+            document,
+            &update_root,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reconstructed, target_state);
+    }
+
+    #[tokio::test]
+    async fn update_state_reused_fields_avoid_reencoding() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+        let mut base_state = DocumentState::default();
+        let id = NodeId("node_0001".into());
+        let large_fields = json!({
+            "large_text": "a".repeat(10_000),
+            "numbers": (0..100).collect::<Vec<_>>(),
+        });
+        base_state.nodes.insert(
+            id.clone(),
+            MaterializedNode {
+                id: id.clone(),
+                parent_id: None,
+                node_type: "block".into(),
+                pos: "1".into(),
+                current_fields: large_fields.clone(),
+                var_name: None,
+                deleted: false,
+            },
+        );
+        let (base_root, _) = write(&mut store, document, &base_state).await;
+
+        let mut target_state = base_state.clone();
+        target_state.nodes.get_mut(&id).unwrap().pos = "2".into();
+
+        let (new_root, update_stats) = update_state(
+            &mut store,
+            document,
+            &base_root,
+            &base_state,
+            &target_state,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        let (oracle_root, _) = write(&mut MemoryStore::default(), document, &target_state).await;
+        assert_eq!(new_root, oracle_root);
+        eprintln!("REUSED STATS: {:?}", update_stats);
+
+        // 1 Node + 1 map leaf + 1 State root = 3 objects
+        assert_eq!(update_stats.new_objects, 3);
+        assert!(update_stats.new_bytes < 1000);
+    }
+
+    #[tokio::test]
+    async fn update_state_unicode_handling() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+        let mut base_state = DocumentState::default();
+        let id = NodeId("নথি_১".into());
+        base_state.nodes.insert(
+            id.clone(),
+            MaterializedNode {
+                id: id.clone(),
+                parent_id: None,
+                node_type: "অনচ্ছেদ".into(),
+                pos: "১".into(),
+                current_fields: json!({"বাংলা": "টেক্সট", "emoji": "🎉🚀🦀"}),
+                var_name: Some("চলক".into()),
+                deleted: false,
+            },
+        );
+        base_state.comments.push(CommentState {
+            node_id: Some(id.clone()),
+            body: "মন্তব্য".into(),
+        });
+        base_state.suggestions.insert(
+            "পরামর্শ".into(),
+            SuggestionState {
+                target_node_id: Some(id.clone()),
+                detail: json!({"সংশোধন": "নতুন লেখা"}),
+                accepted: false,
+                rejected_reason: Some("প্রত্যাখ্যাত".into()),
+            },
+        );
+        base_state.removed_choices.insert(NodeId("পছন্দ".into()));
+        let (base_root, _) = write(&mut store, document, &base_state).await;
+
+        let mut target_state = base_state.clone();
+        target_state.nodes.get_mut(&id).unwrap().pos = "২".into();
+        target_state.comments.push(CommentState {
+            node_id: None,
+            body: "আরেকটি মন্তব্য".into(),
+        });
+
+        let (new_root, _) = update_state(
+            &mut store,
+            document,
+            &base_root,
+            &base_state,
+            &target_state,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        let (oracle_root, _) = write(&mut MemoryStore::default(), document, &target_state).await;
+        assert_eq!(new_root, oracle_root);
+
+        let read_back = read_state(
+            &mut store,
+            document,
+            &new_root,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_back, target_state);
+    }
+
+    #[tokio::test]
+    async fn update_state_mismatched_node_ids_rejected() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+        let base_state = make_test_state(5);
+        let (base_root, _) = write(&mut store, document, &base_state).await;
+
+        let mut bad_target = base_state.clone();
+        let mut bad_node = bad_target.nodes.values().next().unwrap().clone();
+        bad_node.id = NodeId("different_id".into());
+        bad_target.nodes.insert(NodeId("key_id".into()), bad_node);
+
+        let err = update_state(
+            &mut store,
+            document,
+            &base_root,
+            &base_state,
+            &bad_target,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            Error::Invalid("node map key differs from logical id") => {}
+            other => panic!("expected mismatched node id error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_state_corrupt_base_fails_closed() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+        let base_state = make_test_state(5);
+        let (base_root, _) = write(&mut store, document, &base_state).await;
+
+        let mut target_state = base_state.clone();
+        target_state.nodes.values_mut().next().unwrap().pos = "99".into();
+
+        // 1. Missing base root
+        let missing_root =
+            Address("0000000000000000000000000000000000000000000000000000000000000000".into());
+        let err = update_state(
+            &mut store,
+            document,
+            &missing_root,
+            &base_state,
+            &target_state,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::Missing(_)));
+
+        // 2. Corrupt base root bytes
+        let corrupt_root =
+            Address("1111111111111111111111111111111111111111111111111111111111111111".into());
+        store
+            .objects
+            .insert((document.0, corrupt_root.clone()), b"corrupted".to_vec());
+        let err = update_state(
+            &mut store,
+            document,
+            &corrupt_root,
+            &base_state,
+            &target_state,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Invalid("typed header/version") | Error::HashMismatch
+        ));
+
+        // 3. Corrupt a child object of base_root in store
+        let Object::State(roots) =
+            decode(&base_root, &store.objects[&(document.0, base_root.clone())]).unwrap()
+        else {
+            panic!()
+        };
+        store.objects.insert(
+            (document.0, roots.nodes.clone()),
+            b"corrupted child".to_vec(),
+        );
+        let err = update_state(
+            &mut store,
+            document,
+            &base_root,
+            &base_state,
+            &target_state,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::Invalid(_) | Error::HashMismatch));
+    }
+
+    #[tokio::test]
+    async fn update_state_semantic_limits_enforced_on_reused_content() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+        let base_state = make_test_state(20);
+        let (base_root, _) = write(&mut store, document, &base_state).await;
+
+        let tight_semantic = SemanticLimits {
+            values: 5,
+            string_bytes: 1024 * 1024,
+            depth: 64,
+        };
+        let err = update_state(
+            &mut store,
+            document,
+            &base_root,
+            &base_state,
+            &base_state,
+            Limits::default(),
+            tight_semantic,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::Limit("semantic values")));
+    }
+
+    #[tokio::test]
+    async fn update_state_io_limits_charge_only_new_objects() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+        let base_state = make_test_state(100);
+        let (base_root, _) = write(&mut store, document, &base_state).await;
+
+        let mut target_state = base_state.clone();
+        target_state.nodes.values_mut().next().unwrap().pos = "updated".into();
+
+        let tight_io = Limits {
+            max_objects: 15,
+            max_bytes: 1024 * 1024,
+        };
+
+        let res = update_state(
+            &mut store,
+            document,
+            &base_root,
+            &base_state,
+            &target_state,
+            tight_io,
+            SemanticLimits::default(),
+        )
+        .await;
+        assert!(res.is_ok());
+
+        let mut store2 = MemoryStore::default();
+        let err = write_state(
+            &mut store2,
+            document,
+            &target_state,
+            tight_io,
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::Limit("objects")));
+    }
+
+    #[tokio::test]
+    async fn update_state_unsupported_delta_fallback() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+        let (scalar_addr, encoded) = encode(&Object::Scalar(Value::Bool(true))).unwrap();
+        store.put(document, &scalar_addr, &encoded).await.unwrap();
+
+        let base_state = DocumentState::default();
+        let target_state = make_test_state(5);
+
+        let (new_root, stats) = update_state(
+            &mut store,
+            document,
+            &scalar_addr,
+            &base_state,
+            &target_state,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        let (oracle_root, _) = write(&mut MemoryStore::default(), document, &target_state).await;
+        assert_eq!(new_root, oracle_root);
+        assert!(stats.new_objects > 0);
+    }
+
+    #[tokio::test]
+    async fn update_state_randomized_edits_fuzz() {
+        struct SimpleRng(u64);
+        impl SimpleRng {
+            fn next_u32(&mut self) -> u32 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (self.0 >> 32) as u32
+            }
+            fn gen_range(&mut self, low: usize, high: usize) -> usize {
+                low + (self.next_u32() as usize % (high - low))
+            }
+        }
+
+        let mut rng = SimpleRng(20261030);
+        let mut store = MemoryStore::default();
+        let document = doc();
+
+        let mut current_state = make_test_state(30);
+        let (mut current_root, _) = write(&mut store, document, &current_state).await;
+
+        for step in 0..20 {
+            let mut target_state = current_state.clone();
+            let action = rng.gen_range(0, 6);
+            match action {
+                0 => {
+                    let id = NodeId(format!("fuzzy_node_{}_{}", step, rng.next_u32()));
+                    target_state.nodes.insert(
+                        id.clone(),
+                        MaterializedNode {
+                            id: id.clone(),
+                            parent_id: None,
+                            node_type: "fuzzy".into(),
+                            pos: format!("pos_{step}"),
+                            current_fields: json!({"step": step, "rand": rng.next_u32()}),
+                            var_name: None,
+                            deleted: false,
+                        },
+                    );
+                }
+                1 => {
+                    if !target_state.nodes.is_empty() {
+                        let idx = rng.gen_range(0, target_state.nodes.len());
+                        let key = target_state.nodes.keys().nth(idx).unwrap().clone();
+                        target_state.nodes.remove(&key);
+                    }
+                }
+                2 => {
+                    if !target_state.nodes.is_empty() {
+                        let idx = rng.gen_range(0, target_state.nodes.len());
+                        let key = target_state.nodes.keys().nth(idx).unwrap().clone();
+                        let n = target_state.nodes.get_mut(&key).unwrap();
+                        n.pos = format!("moved_{step}");
+                        n.deleted = rng.next_u32().is_multiple_of(2);
+                    }
+                }
+                3 => {
+                    if !target_state.nodes.is_empty() {
+                        let idx = rng.gen_range(0, target_state.nodes.len());
+                        let key = target_state.nodes.keys().nth(idx).unwrap().clone();
+                        let n = target_state.nodes.get_mut(&key).unwrap();
+                        n.current_fields = json!({"updated_at_step": step});
+                    }
+                }
+                4 => {
+                    if rng.next_u32().is_multiple_of(2) {
+                        target_state.comments.push(CommentState {
+                            node_id: None,
+                            body: format!("Comment at {step}"),
+                        });
+                    } else if !target_state.comments.is_empty() {
+                        target_state.comments.pop();
+                    }
+                }
+                _ => {
+                    let key = format!("sugg_{step}");
+                    target_state.suggestions.insert(
+                        key,
+                        SuggestionState {
+                            target_node_id: None,
+                            detail: json!({"step": step}),
+                            accepted: false,
+                            rejected_reason: None,
+                        },
+                    );
+                    target_state
+                        .removed_choices
+                        .insert(NodeId(format!("rc_{step}")));
+                }
+            }
+
+            let (new_root, _) = update_state(
+                &mut store,
+                document,
+                &current_root,
+                &current_state,
+                &target_state,
+                Limits::default(),
+                SemanticLimits::default(),
+            )
+            .await
+            .unwrap();
+
+            let (oracle_root, _) =
+                write(&mut MemoryStore::default(), document, &target_state).await;
+            assert_eq!(
+                new_root, oracle_root,
+                "Fuzz step {step} root mismatch with oracle"
+            );
+
+            current_state = target_state;
+            current_root = new_root;
         }
     }
 }
