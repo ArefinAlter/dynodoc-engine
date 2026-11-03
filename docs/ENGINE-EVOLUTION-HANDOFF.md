@@ -1,5 +1,47 @@
 # Engine evolution handoff
 
+## Source: 51 contributor pull requests of the public engine repository integrated (3 November 2026)
+
+Every open pull request by `happinessisreal` in `ArefinAlter/dynodoc-engine` (#39, #56, #59, #60, #62, #66, #74 to #82, #84 to #119)
+was reviewed and merged with `--no-ff` merge commits, contributor commits intact, review patches as separate commits. The private
+repository received the same crate, migration and OpenAPI changes. Dependabot #69 to #73 and the owner's own #83 were not part of this
+and stay open.
+
+**What landed.** Write-path robustness: no `unwrap`/`expect` outside tests in engine-core and engine-api (#62, gate in `lib.rs`,
+proofs in `PANIC-AUDIT.md`), poisoned-lock recovery for live subscriptions, explicit errors for unrepresentable event diffs (#59), an
+opt-in verified-prefix write cache (`DYNODOC_WRITE_STATE_CACHE`, default off, #56), opt-in grouped insertions for interleaved merges
+(#39, default merge unchanged; my 18 October objections are addressed). Snapshots and audit proofs bind an event-prefix Merkle root
+for NEW snapshots only (#60; old snapshots keep their exact v1/v2 envelopes; independent Python vectors added for the 3-leaf root
+and the v3 envelope). Shared checkpoints: incremental updates, typed deltas, atomic publication and compact codec v3, all operator
+opt-in (#85 to #89, #100 to #103, #116 to #119). History: bounded first-parent log (API, remote and local CLI, verification against
+signed envelopes, #93 to #96, #99), two-commit and per-file comparison (API and CLI, #81, #82, #84, #90 to #92), history archives and
+normalized-state export with offline verification (#104 to #115), immutable named releases (#77, #97), per-export node tokens
+(#78, #98), an SQL ordering diagnostic (#79), plus #74 (design note), #76 (multiple-roots tests).
+
+**Migrations 0048 to 0054** (NOT released; production is at schema 47): 0048 drops the duplicate `event_document_seq_idx` (the unique
+constraint keeps the same index); 0049 adds nullable `snapshot.event_merkle_root` and receipt versions 3 and 4; 0050 sets LZ4 on
+`event.payload`, `snapshot.state`, `node.current_fields` (new values only; refuses a PostgreSQL built without LZ4); 0051
+`project_release` (immutable, audited erasure only); 0052 `export_node_token` (SHA-256 of 256-bit tokens, revoke-once); 0053 sets
+`COLLATE "C"` on node ids, parent ids, positions and node references so SQL order equals Rust and browser byte order (production's
+database collation is `en_US.utf8`, so this changes SQL ordering of mixed-case keys to match the engine; indexes and two foreign keys are
+rebuilt: production has 1,379 nodes and 1,970 events, so seconds); 0054 allows checkpoint codec 3. Rehearse on a production copy
+before any release.
+
+**Review patches** (each with a test or a reason): #78 device-token resolution of export tokens now applies the project-route rules
+(person read scope only, the agent scope refused; key reach; session generation; file membership; new test fails without it); #105,
+#110, #111, #114 archive export buffered and synced before success, absolute icacls path, unknown fields refused in state-export
+verification, honest archive docs; #60 independent vectors and a missing field in a #65 test; #62 with #82, #91, #94 the panic gate
+kept green across stacks; #81, #90, #116 the Rust 1.85 baseline of this repository (no `is_multiple_of`). Conflicts between stacks
+(release, log, compare and archive commands in `engine-cli` sync and repository code) were resolved by keeping both sides; #84 was
+re-applied on the merged files because its textual merge had about thirty hunks.
+
+**Evidence (local).** Engine integration branch: fmt, clippy `-D warnings`, rustdoc `-D warnings`, OpenAPI no drift, 1,732 tests passed,
+4 ignored, 1 failed (the known Windows-only `sse_delivers_a_new_event_within_100ms`). Private repository port: the same gates and 1,645
+passed with 23 failures that were sqlx test-database name collisions left by an interrupted run; after dropping the stale test
+databases every affected binary passed, only the SSE timing test failed. **Not verified:** the new migrations against a copy of
+production, the frontend against the new routes (no frontend change was needed: the routes are new and additive), Linux and macOS for
+this batch (engine CI runs after the push), any real client of the new CLI commands.
+
 ## Live: schema 47 release (23 October 2026, 05:35 UTC)
 
 The VPS workspace (app.dynodoc.online), private API and admin site run application `3fa06fd` at PostgreSQL schema 47; the previous
