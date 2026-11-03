@@ -2235,6 +2235,7 @@ pub async fn read_asset<S: ObjectStore, W: AsyncWrite + Unpin + Send>(
 }
 
 #[cfg(test)]
+#[allow(clippy::manual_is_multiple_of)] // Rust 1.85 lacks is_multiple_of
 mod tests {
     use super::*;
     use crate::shared_checkpoint::{MemoryStore, MAX_OBJECT_BYTES};
@@ -3165,7 +3166,7 @@ mod tests {
                         let key = target_state.nodes.keys().nth(idx).unwrap().clone();
                         let n = target_state.nodes.get_mut(&key).unwrap();
                         n.pos = format!("moved_{step}");
-                        n.deleted = rng.next_u32().is_multiple_of(2);
+                        n.deleted = rng.next_u32() % 2 == 0;
                     }
                 }
                 3 => {
@@ -3177,7 +3178,7 @@ mod tests {
                     }
                 }
                 4 => {
-                    if rng.next_u32().is_multiple_of(2) {
+                    if rng.next_u32() % 2 == 0 {
                         target_state.comments.push(CommentState {
                             node_id: None,
                             body: format!("Comment at {step}"),

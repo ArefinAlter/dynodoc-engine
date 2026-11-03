@@ -4,6 +4,10 @@
 //! changes are explicit conflicts. No guessed identity matching, silent file
 //! deletion, or automatic merge of shared constraints.
 
+// The application builds the same source with Rust 1.85, which lacks `is_multiple_of`;
+// Clippy asks for it on newer toolchains, so the lint is allowed here.
+#![allow(clippy::manual_is_multiple_of)]
+
 use super::{Address, Commit, Error, FileEntry, SignedCommit};
 use engine_shared::{DocumentId, NodeId};
 use serde::{Deserialize, Serialize};
@@ -89,7 +93,7 @@ impl CompareCursor {
         expected_from: &Address,
         expected_to: &Address,
     ) -> Result<Self, Error> {
-        if !raw.len().is_multiple_of(2) || raw.len() > 2048 {
+        if raw.len() % 2 != 0 || raw.len() > 2048 {
             return Err(Error::Invalid("invalid cursor encoding"));
         }
         let bytes =
@@ -399,7 +403,7 @@ impl NodeCompareCursor {
         expected_from: &Address,
         expected_to: &Address,
     ) -> Result<Self, Error> {
-        if !raw.len().is_multiple_of(2) || raw.len() > 4096 {
+        if raw.len() % 2 != 0 || raw.len() > 4096 {
             return Err(Error::Invalid("invalid cursor encoding"));
         }
         let bytes =
