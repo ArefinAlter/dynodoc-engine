@@ -4,13 +4,18 @@
 //! normalized DocumentState JSON envelope. It is not a DOCX/XLSX/PPTX binary,
 //! but a verified canonical document model at an exact commit.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
+use serde::de::{DeserializeSeed, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::materializer::DocumentState;
 use crate::repository::SignedCommit;
+use crate::shared_checkpoint::{
+    self, validate_stored, Address, Error as CheckpointError, Limits, ObjectStore,
+};
+use engine_shared::DocumentId;
 
 /// Format identifier for normalized historical state exports.
 pub const STATE_EXPORT_FORMAT: &str = "dynodoc.state-export";
@@ -20,6 +25,16 @@ pub const STATE_EXPORT_VERSION: u32 = 1;
 
 /// Maximum size in bytes allowed for a state export JSON output (64 MiB).
 pub const MAX_STATE_EXPORT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Summary report returned upon successful state export verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedStateExportReport {
+    pub project: uuid::Uuid,
+    pub commit: Address,
+    pub path: String,
+    pub document: DocumentId,
+    pub root: Address,
+}
 
 /// Versioned normalized state export envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,6 +166,327 @@ impl StateExportEnvelope {
 
         Ok(bytes)
     }
+}
+
+/// A bounded discard store that validates each object's address matches its canonical
+/// hash without storing or retaining an object graph in memory.
+pub struct DiscardHashStore {
+    limits: Limits,
+    objects_visited: usize,
+    bytes_visited: usize,
+}
+
+impl DiscardHashStore {
+    pub fn new(limits: Limits) -> Self {
+        Self {
+            limits,
+            objects_visited: 0,
+            bytes_visited: 0,
+        }
+    }
+
+    pub fn objects_visited(&self) -> usize {
+        self.objects_visited
+    }
+
+    pub fn bytes_visited(&self) -> usize {
+        self.bytes_visited
+    }
+}
+
+impl ObjectStore for DiscardHashStore {
+    async fn put(
+        &mut self,
+        _document: DocumentId,
+        address: &Address,
+        bytes: &[u8],
+    ) -> Result<bool, CheckpointError> {
+        self.objects_visited += 1;
+        self.bytes_visited += bytes.len();
+        if self.objects_visited > self.limits.max_objects
+            || self.bytes_visited > self.limits.max_bytes
+        {
+            return Err(CheckpointError::Limit("discard hash store budget exceeded"));
+        }
+        validate_stored(address, bytes)?;
+        Ok(true)
+    }
+
+    async fn get(
+        &mut self,
+        _document: DocumentId,
+        address: &Address,
+    ) -> Result<Vec<u8>, CheckpointError> {
+        Err(CheckpointError::Missing(address.as_str().into()))
+    }
+}
+
+struct StrictJsonVisitor;
+
+impl<'de> Visitor<'de> for StrictJsonVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("JSON value with unique keys")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_borrowed_str<E>(self, _: &'de str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i128<E>(self, _: i128) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u128<E>(self, _: u128) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_char<E>(self, _: char) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_bytes<E>(self, _: &[u8]) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_borrowed_bytes<E>(self, _: &'de [u8]) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while let Some(()) = seq.next_element_seed(StrictJsonSeed)? {}
+        Ok(())
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let mut seen = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                return Err(serde::de::Error::custom(format!("duplicate key `{key}`")));
+            }
+            map.next_value_seed(StrictJsonSeed)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StrictJsonSeed;
+
+impl<'de> DeserializeSeed<'de> for StrictJsonSeed {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(StrictJsonVisitor)
+    }
+}
+
+fn validate_no_duplicate_keys(bytes: &[u8]) -> anyhow::Result<()> {
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    StrictJsonSeed
+        .deserialize(&mut de)
+        .map_err(|e| anyhow::anyhow!("duplicate JSON key or malformed syntax: {e}"))?;
+    Ok(())
+}
+
+/// Offline verification of an exported state against an expected project, signed commit, and path.
+///
+/// Validates:
+/// - Input size bounds (<= 64 MiB by default)
+/// - Format and version matching (`dynodoc.state-export`, v1)
+/// - Exact JSON syntax with NO duplicate keys anywhere in the hierarchy
+/// - No trailing non-whitespace data
+/// - Commit cryptographic signature (Ed25519) and project UUID
+/// - Exact path presence in the signed commit's manifest
+/// - Node map keys matching logical node IDs
+/// - Full re-encoding of DocumentState using typed-v2 rules matching the signed file root
+///
+/// Returns a `VerifiedStateExportReport` on success.
+pub async fn verify_state_export<R: std::io::Read>(
+    reader: R,
+    expected_project: uuid::Uuid,
+    expected_commit: &Address,
+    expected_path: &str,
+) -> anyhow::Result<VerifiedStateExportReport> {
+    verify_state_export_limited(
+        reader,
+        expected_project,
+        expected_commit,
+        expected_path,
+        MAX_STATE_EXPORT_BYTES,
+    )
+    .await
+}
+
+/// Offline verification of an exported state file at a filesystem path.
+pub async fn verify_state_export_file<P: AsRef<Path>>(
+    path: P,
+    expected_project: uuid::Uuid,
+    expected_commit: &Address,
+    expected_path: &str,
+) -> anyhow::Result<VerifiedStateExportReport> {
+    let file = std::fs::File::open(path.as_ref()).map_err(|e| {
+        anyhow::anyhow!(
+            "opening state export file at {}: {e}",
+            path.as_ref().display()
+        )
+    })?;
+    verify_state_export(file, expected_project, expected_commit, expected_path).await
+}
+
+/// Offline verification of an exported state with an explicit byte limit.
+pub async fn verify_state_export_limited<R: std::io::Read>(
+    reader: R,
+    expected_project: uuid::Uuid,
+    expected_commit: &Address,
+    expected_path: &str,
+    limit: usize,
+) -> anyhow::Result<VerifiedStateExportReport> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("reading state export input: {e}"))?;
+
+    anyhow::ensure!(
+        bytes.len() <= limit,
+        "state export exceeds maximum size limit ({limit} bytes)"
+    );
+    anyhow::ensure!(!bytes.is_empty(), "state export input is empty");
+
+    // 1. Strict duplicate key check across all objects in JSON
+    validate_no_duplicate_keys(&bytes)?;
+
+    // 2. Deserialize envelope and ensure NO trailing data
+    let mut de = serde_json::Deserializer::from_slice(&bytes);
+    let envelope = StateExportEnvelope::deserialize(&mut de)
+        .map_err(|e| anyhow::anyhow!("deserializing state export envelope: {e}"))?;
+    de.end()
+        .map_err(|e| anyhow::anyhow!("trailing characters in state export input: {e}"))?;
+
+    // 3. Format and version validation
+    anyhow::ensure!(
+        envelope.format == STATE_EXPORT_FORMAT,
+        "unsupported state export format `{}`; expected `{}`",
+        envelope.format,
+        STATE_EXPORT_FORMAT
+    );
+    anyhow::ensure!(
+        envelope.version == STATE_EXPORT_VERSION,
+        "unsupported state export version {}; expected version {}",
+        envelope.version,
+        STATE_EXPORT_VERSION
+    );
+
+    // 4. Expected path validation
+    anyhow::ensure!(
+        envelope.path == expected_path,
+        "envelope path `{}` does not match expected path `{}`",
+        envelope.path,
+        expected_path
+    );
+
+    // 5. Commit project and signature validation
+    anyhow::ensure!(
+        envelope.commit.commit.project == expected_project,
+        "commit project `{}` does not match expected project `{}`",
+        envelope.commit.commit.project,
+        expected_project
+    );
+
+    let actual_commit_address = envelope
+        .commit
+        .verify()
+        .map_err(|e| anyhow::anyhow!("verifying commit signature: {e}"))?;
+    anyhow::ensure!(
+        &actual_commit_address == expected_commit,
+        "commit address `{}` does not match expected commit `{}`",
+        actual_commit_address.as_str(),
+        expected_commit.as_str()
+    );
+
+    // 6. Locate path in signed manifest
+    let file_entry = envelope
+        .commit
+        .commit
+        .files
+        .get(expected_path)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "path `{}` not found in signed commit files manifest",
+                expected_path
+            )
+        })?;
+
+    // 7. Verify map-key to logical node ID agreement
+    for (key, node) in &envelope.state.nodes {
+        anyhow::ensure!(
+            key == &node.id,
+            "node map key `{}` differs from logical node id `{}`",
+            key.0,
+            node.id.0
+        );
+    }
+
+    // 8. Re-encode full supplied DocumentState using typed-v2 rules
+    let mut store = DiscardHashStore::new(Limits::default());
+    let (computed_root, _) = shared_checkpoint::typed::write_state(
+        &mut store,
+        file_entry.document,
+        &envelope.state,
+        Limits::default(),
+        shared_checkpoint::typed::SemanticLimits::default(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("re-encoding state under typed-v2 rules: {e}"))?;
+
+    anyhow::ensure!(
+        computed_root == file_entry.state,
+        "computed state root `{}` does not match signed manifest state root `{}`",
+        computed_root.as_str(),
+        file_entry.state.as_str()
+    );
+
+    Ok(VerifiedStateExportReport {
+        project: expected_project,
+        commit: actual_commit_address,
+        path: expected_path.to_string(),
+        document: file_entry.document,
+        root: computed_root,
+    })
 }
 
 #[cfg(test)]
@@ -442,5 +778,471 @@ mod tests {
         let roundtrip: StateExportEnvelope =
             serde_json::from_reader(std::fs::File::open(&ok_path).unwrap()).unwrap();
         assert_eq!(roundtrip, envelope);
+    }
+
+    async fn make_signed_export(
+        project: uuid::Uuid,
+        doc: DocumentId,
+        path: &str,
+        state: DocumentState,
+    ) -> (StateExportEnvelope, Address, Address) {
+        let mut store = DiscardHashStore::new(Limits::default());
+        let (root, _) = shared_checkpoint::typed::write_state(
+            &mut store,
+            doc,
+            &state,
+            Limits::default(),
+            shared_checkpoint::typed::SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        let key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let commit = Commit {
+            version: 1,
+            project,
+            parents: vec![],
+            files: BTreeMap::from([(
+                path.to_string(),
+                crate::repository::FileEntry {
+                    document: doc,
+                    state: root.clone(),
+                },
+            )]),
+            author_key: String::new(),
+            authored_at_ms: 1000,
+            message: "valid test export commit".into(),
+            recovery: None,
+            same_file_resolutions: vec![],
+        };
+        let signed = SignedCommit::sign(commit, &key).unwrap();
+        let commit_addr = signed.verify().unwrap();
+        let envelope = StateExportEnvelope::new(path.to_string(), signed, state);
+        (envelope, commit_addr, root)
+    }
+
+    fn sample_full_state() -> DocumentState {
+        let node1 = MaterializedNode {
+            id: NodeId("01ARZ3NDEKTSV4RRFFQ69G5FA1".into()),
+            parent_id: None,
+            node_type: "paragraph".into(),
+            pos: "a0".into(),
+            var_name: Some("p1".into()),
+            deleted: false,
+            current_fields: json!({"text": "Hello world", "optional": null}),
+        };
+        let node2 = MaterializedNode {
+            id: NodeId("01ARZ3NDEKTSV4RRFFQ69G5FA2".into()),
+            parent_id: Some(node1.id.clone()),
+            node_type: "run".into(),
+            pos: "a1".into(),
+            var_name: None,
+            deleted: false,
+            current_fields: json!({"bold": true}),
+        };
+        let comments = vec![CommentState {
+            node_id: Some(node1.id.clone()),
+            body: "A comment".into(),
+        }];
+        let mut suggestions = BTreeMap::new();
+        suggestions.insert(
+            "sug-1".into(),
+            SuggestionState {
+                target_node_id: Some(node1.id.clone()),
+                detail: json!({"change": "edit"}),
+                accepted: false,
+                rejected_reason: None,
+            },
+        );
+        let removed_choices = BTreeSet::new();
+
+        DocumentState {
+            nodes: BTreeMap::from([(node1.id.clone(), node1), (node2.id.clone(), node2)]),
+            comments,
+            suggestions,
+            removed_choices,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_export_success_pretty_and_compact() {
+        let project = uuid::Uuid::new_v4();
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let path = "docs/overview.docx";
+        let state = sample_full_state();
+
+        let (envelope, commit_addr, state_root) =
+            make_signed_export(project, doc, path, state).await;
+
+        // 1. Pretty JSON export verification
+        let mut pretty = Vec::new();
+        envelope.write_to_writer(&mut pretty).unwrap();
+
+        let report = verify_state_export(&pretty[..], project, &commit_addr, path)
+            .await
+            .expect("verify pretty export");
+        assert_eq!(report.project, project);
+        assert_eq!(report.commit, commit_addr);
+        assert_eq!(report.path, path);
+        assert_eq!(report.document, doc);
+        assert_eq!(report.root, state_root);
+
+        // 2. Compact JSON export verification
+        let compact = serde_json::to_vec(&envelope).unwrap();
+        let compact_report = verify_state_export(&compact[..], project, &commit_addr, path)
+            .await
+            .expect("verify compact export");
+        assert_eq!(compact_report, report);
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_export_tampered_state_field() {
+        let project = uuid::Uuid::new_v4();
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let path = "docs/report.docx";
+        let state = sample_full_state();
+
+        let (mut envelope, commit_addr, _) = make_signed_export(project, doc, path, state).await;
+
+        // Tamper state: change text in node1
+        let node1 = envelope
+            .state
+            .nodes
+            .get_mut(&NodeId("01ARZ3NDEKTSV4RRFFQ69G5FA1".into()))
+            .unwrap();
+        node1.current_fields = json!({"text": "Tampered text", "optional": null});
+
+        let mut buf = Vec::new();
+        envelope.write_to_writer(&mut buf).unwrap();
+
+        let err = verify_state_export(&buf[..], project, &commit_addr, path)
+            .await
+            .expect_err("tampered text must fail");
+        assert!(
+            err.to_string().contains("computed state root")
+                && err
+                    .to_string()
+                    .contains("does not match signed manifest state root"),
+            "expected root mismatch error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_export_tampered_comments_suggestions_choices() {
+        let project = uuid::Uuid::new_v4();
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let path = "docs/report.docx";
+
+        // A. Tamper comment
+        let (mut env_comment, commit_addr, _) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+        env_comment.state.comments[0].body = "Tampered comment".into();
+        let mut buf = Vec::new();
+        env_comment.write_to_writer(&mut buf).unwrap();
+        let err = verify_state_export(&buf[..], project, &commit_addr, path)
+            .await
+            .expect_err("tampered comment must fail");
+        assert!(err
+            .to_string()
+            .contains("does not match signed manifest state root"));
+
+        // B. Tamper suggestions
+        let (mut env_sug, commit_addr, _) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+        env_sug.state.suggestions.clear();
+        let mut buf = Vec::new();
+        env_sug.write_to_writer(&mut buf).unwrap();
+        let err = verify_state_export(&buf[..], project, &commit_addr, path)
+            .await
+            .expect_err("cleared suggestion must fail");
+        assert!(err
+            .to_string()
+            .contains("does not match signed manifest state root"));
+
+        // C. Tamper removed_choices
+        let (mut env_rc, commit_addr, _) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+        env_rc
+            .state
+            .removed_choices
+            .insert(NodeId("01ARZ3NDEKTSV4RRFFQ69G5FA1".into()));
+        let mut buf = Vec::new();
+        env_rc.write_to_writer(&mut buf).unwrap();
+        let err = verify_state_export(&buf[..], project, &commit_addr, path)
+            .await
+            .expect_err("tampered removed_choices must fail");
+        assert!(err
+            .to_string()
+            .contains("does not match signed manifest state root"));
+
+        // D. Tamper deleted flag
+        let (mut env_del, commit_addr, _) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+        env_del
+            .state
+            .nodes
+            .get_mut(&NodeId("01ARZ3NDEKTSV4RRFFQ69G5FA1".into()))
+            .unwrap()
+            .deleted = true;
+        let mut buf = Vec::new();
+        env_del.write_to_writer(&mut buf).unwrap();
+        let err = verify_state_export(&buf[..], project, &commit_addr, path)
+            .await
+            .expect_err("tampered deleted flag must fail");
+        assert!(err
+            .to_string()
+            .contains("does not match signed manifest state root"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_export_null_vs_missing_field_difference() {
+        let project = uuid::Uuid::new_v4();
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let path = "docs/report.docx";
+
+        let (mut envelope, commit_addr, _) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+
+        // Change `{"text": "Hello world", "optional": null}` to missing optional: `{"text": "Hello world"}`
+        let node1 = envelope
+            .state
+            .nodes
+            .get_mut(&NodeId("01ARZ3NDEKTSV4RRFFQ69G5FA1".into()))
+            .unwrap();
+        node1.current_fields = json!({"text": "Hello world"});
+
+        let mut buf = Vec::new();
+        envelope.write_to_writer(&mut buf).unwrap();
+
+        let err = verify_state_export(&buf[..], project, &commit_addr, path)
+            .await
+            .expect_err("null vs missing difference must change root");
+        assert!(err
+            .to_string()
+            .contains("does not match signed manifest state root"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_export_tampered_commit_signature() {
+        let project = uuid::Uuid::new_v4();
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let path = "docs/report.docx";
+
+        let (mut envelope, commit_addr, _) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+
+        // Tamper signature string
+        let mut sig_chars: Vec<char> = envelope.commit.signature.chars().collect();
+        sig_chars[0] = if sig_chars[0] == '0' { '1' } else { '0' };
+        envelope.commit.signature = sig_chars.into_iter().collect();
+
+        let mut buf = Vec::new();
+        envelope.write_to_writer(&mut buf).unwrap();
+
+        let err = verify_state_export(&buf[..], project, &commit_addr, path)
+            .await
+            .expect_err("bad signature must fail");
+        assert!(err.to_string().contains("verifying commit signature"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_export_wrong_project_or_commit_or_path() {
+        let project = uuid::Uuid::new_v4();
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let path = "docs/report.docx";
+
+        let (envelope, commit_addr, _) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+
+        let mut buf = Vec::new();
+        envelope.write_to_writer(&mut buf).unwrap();
+
+        // 1. Wrong project
+        let wrong_proj = uuid::Uuid::new_v4();
+        let err = verify_state_export(&buf[..], wrong_proj, &commit_addr, path)
+            .await
+            .expect_err("wrong project must fail");
+        assert!(err.to_string().contains("does not match expected project"));
+
+        // 2. Wrong commit
+        let wrong_commit = Address::try_from("00".repeat(32)).unwrap();
+        let err = verify_state_export(&buf[..], project, &wrong_commit, path)
+            .await
+            .expect_err("wrong commit must fail");
+        assert!(err.to_string().contains("does not match expected commit"));
+
+        // 3. Wrong expected path
+        let err = verify_state_export(&buf[..], project, &commit_addr, "docs/other.docx")
+            .await
+            .expect_err("mismatched path must fail");
+        assert!(err.to_string().contains("does not match expected path"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_export_map_key_node_id_mismatch() {
+        let project = uuid::Uuid::new_v4();
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let path = "docs/report.docx";
+
+        let (mut envelope, commit_addr, _) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+
+        // Disagree: map key is different from node.id
+        let wrong_key = NodeId("01DIFFERENTKEY0000000000000".into());
+        let node = envelope
+            .state
+            .nodes
+            .remove(&NodeId("01ARZ3NDEKTSV4RRFFQ69G5FA2".into()))
+            .unwrap();
+        envelope.state.nodes.insert(wrong_key, node);
+
+        let mut buf = Vec::new();
+        envelope.write_to_writer(&mut buf).unwrap();
+
+        let err = verify_state_export(&buf[..], project, &commit_addr, path)
+            .await
+            .expect_err("map key mismatch must fail");
+        assert!(err.to_string().contains("differs from logical node id"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_export_duplicate_keys_rejected() {
+        let project = uuid::Uuid::new_v4();
+        let commit_addr = Address::try_from("aa".repeat(32)).unwrap();
+
+        // Top-level duplicate key
+        let dup_json = r#"{
+            "format": "dynodoc.state-export",
+            "format": "dynodoc.state-export",
+            "version": 1,
+            "path": "test.docx",
+            "commit": null,
+            "state": null
+        }"#;
+
+        let err = verify_state_export(dup_json.as_bytes(), project, &commit_addr, "test.docx")
+            .await
+            .expect_err("duplicate top-level key must fail");
+        assert!(err.to_string().contains("duplicate key `format`"));
+
+        // Nested duplicate key in object
+        let nested_dup_json = r#"{
+            "format": "dynodoc.state-export",
+            "version": 1,
+            "path": "test.docx",
+            "commit": {
+                "version": 1,
+                "project": "00000000-0000-0000-0000-000000000000",
+                "parents": [],
+                "files": {},
+                "author_key": "abc",
+                "author_key": "abc",
+                "authored_at_ms": 1,
+                "message": ""
+            },
+            "state": { "nodes": {} }
+        }"#;
+
+        let err2 = verify_state_export(
+            nested_dup_json.as_bytes(),
+            project,
+            &commit_addr,
+            "test.docx",
+        )
+        .await
+        .expect_err("nested duplicate key must fail");
+        assert!(err2.to_string().contains("duplicate key `author_key`"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_export_trailing_data_rejected() {
+        let project = uuid::Uuid::new_v4();
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let path = "docs/report.docx";
+
+        let (envelope, commit_addr, _) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+
+        let mut buf = Vec::new();
+        envelope.write_to_writer(&mut buf).unwrap();
+        // Append trailing data
+        buf.extend_from_slice(b" {\"extra\": 123}");
+
+        let err = verify_state_export(&buf[..], project, &commit_addr, path)
+            .await
+            .expect_err("trailing characters must fail");
+        assert!(err.to_string().contains("trailing characters"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_export_oversized_input_rejected() {
+        let project = uuid::Uuid::new_v4();
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let path = "docs/report.docx";
+
+        let (envelope, commit_addr, _) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+
+        let mut buf = Vec::new();
+        envelope.write_to_writer(&mut buf).unwrap();
+
+        let err = verify_state_export_limited(&buf[..], project, &commit_addr, path, 100)
+            .await
+            .expect_err("tiny limit must reject input");
+        assert!(err.to_string().contains("exceeds maximum size limit"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_export_unsupported_version_or_format() {
+        let project = uuid::Uuid::new_v4();
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let path = "docs/report.docx";
+
+        // 1. Wrong format
+        let (mut env_fmt, commit_addr, _) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+        env_fmt.format = "unknown-format".into();
+        let mut buf = Vec::new();
+        env_fmt.write_to_writer(&mut buf).unwrap();
+        let err = verify_state_export(&buf[..], project, &commit_addr, path)
+            .await
+            .expect_err("unknown format must fail");
+        assert!(err.to_string().contains("unsupported state export format"));
+
+        // 2. Wrong version
+        let (mut env_ver, commit_addr, _) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+        env_ver.version = 99;
+        let mut buf2 = Vec::new();
+        env_ver.write_to_writer(&mut buf2).unwrap();
+        let err2 = verify_state_export(&buf2[..], project, &commit_addr, path)
+            .await
+            .expect_err("unknown version must fail");
+        assert!(err2
+            .to_string()
+            .contains("unsupported state export version"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_export_file_helper() {
+        let dir = TempDir::new();
+        let project = uuid::Uuid::new_v4();
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let path = "docs/file_helper.docx";
+
+        let (envelope, commit_addr, state_root) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+
+        let file_path = dir.path().join("export.json");
+        envelope.write_to_path(&file_path).unwrap();
+
+        let report = verify_state_export_file(&file_path, project, &commit_addr, path)
+            .await
+            .expect("file verification should succeed");
+        assert_eq!(report.project, project);
+        assert_eq!(report.commit, commit_addr);
+        assert_eq!(report.path, path);
+        assert_eq!(report.document, doc);
+        assert_eq!(report.root, state_root);
     }
 }
