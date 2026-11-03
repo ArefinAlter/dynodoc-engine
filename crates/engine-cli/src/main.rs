@@ -366,6 +366,7 @@ async fn archive_verify(
         Some(&expect_head_addr),
         Some(DocumentId(project)),
     )
+    .await
     .map_err(|e| anyhow::anyhow!("archive verification failed: {e}"))?;
 
     let output = serde_json::json!({

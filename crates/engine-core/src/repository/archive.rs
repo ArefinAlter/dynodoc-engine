@@ -934,13 +934,14 @@ pub enum ArchiveImportError {
 /// Requires the exact selected dependency and object closure, full footer,
 /// valid signatures and hashes, matching head and project.
 /// Private bounded temporary disk is cleaned up on completion or failure.
-pub fn verify_archive<R: Read>(
+pub async fn verify_archive<R: Read>(
     reader: R,
     limits: ArchiveLimits,
     expected_head: Option<&Address>,
     expected_project: Option<DocumentId>,
 ) -> Result<ArchiveSummary, ArchiveError> {
-    let staged = validate_and_stage_archive(reader, limits, expected_head, expected_project)?;
+    let staged =
+        validate_and_stage_archive(reader, limits, expected_head, expected_project).await?;
     Ok(staged.summary)
 }
 
@@ -948,7 +949,7 @@ pub fn verify_archive<R: Read>(
 ///
 /// Verifies magic, frames, hashes, signatures, counts, dependency closure and object graph.
 /// All objects and commits must belong to the selected head closure (no extra or missing data).
-pub fn validate_and_stage_archive<R: Read>(
+pub async fn validate_and_stage_archive<R: Read>(
     reader: R,
     limits: ArchiveLimits,
     expected_head: Option<&Address>,
@@ -956,10 +957,11 @@ pub fn validate_and_stage_archive<R: Read>(
 ) -> Result<StagedArchive, ArchiveError> {
     let staging_dir = PrivateTempDir::new()?;
     validate_and_stage_archive_in(reader, limits, expected_head, expected_project, staging_dir)
+        .await
 }
 
 /// Validate and stage an archive into the given private temporary directory.
-pub fn validate_and_stage_archive_in<R: Read>(
+pub async fn validate_and_stage_archive_in<R: Read>(
     reader: R,
     limits: ArchiveLimits,
     expected_head: Option<&Address>,
@@ -1124,6 +1126,64 @@ pub fn validate_and_stage_archive_in<R: Read>(
             "archive contains extra objects outside the selected object closure",
         ));
     }
+
+    // 3. Async semantic preflight in a private disposable LocalRepository.
+    // Verifies complete typed reconstructions, recovery and merge evidence
+    // before touching any destination repository.
+    let scratch_db_path = staging_dir.path().join("preflight_scratch.db");
+    let scratch_repo = LocalRepository::open(&scratch_db_path, summary.project.0)
+        .await
+        .map_err(|_| {
+            ArchiveError::InvalidFrame("failed to initialize preflight scratch repository")
+        })?;
+
+    let mut batch_packets: Vec<ObjectPacket> = Vec::new();
+    let mut batch_bytes = 0usize;
+
+    for entry in &staged_objects {
+        let bytes = std::fs::read(&entry.path)?;
+        batch_bytes += bytes.len();
+        batch_packets.push(ObjectPacket {
+            key: ObjectKey {
+                document: entry.document,
+                address: entry.address.clone(),
+            },
+            bytes,
+        });
+        if batch_packets.len() >= 64 || batch_bytes >= 800 * 1024 {
+            scratch_repo
+                .import_objects(&batch_packets)
+                .await
+                .map_err(|_| ArchiveError::InvalidFrame("preflight object staging failed"))?;
+            batch_packets.clear();
+            batch_bytes = 0;
+        }
+    }
+    if !batch_packets.is_empty() {
+        scratch_repo
+            .import_objects(&batch_packets)
+            .await
+            .map_err(|_| ArchiveError::InvalidFrame("preflight object staging failed"))?;
+    }
+
+    for signed in &staged_commits {
+        scratch_repo
+            .import_commit(signed)
+            .await
+            .map_err(|e| match e {
+                crate::repository::Error::Limit(_) => {
+                    ArchiveError::Limit("semantic preflight limit exceeded")
+                }
+                _ => ArchiveError::InvalidFrame(
+                    "archive contains semantically invalid commits or object graphs",
+                ),
+            })?;
+    }
+
+    scratch_repo.close().await;
+    let _ = std::fs::remove_file(&scratch_db_path);
+    let _ = std::fs::remove_file(staging_dir.path().join("preflight_scratch.db-wal"));
+    let _ = std::fs::remove_file(staging_dir.path().join("preflight_scratch.db-shm"));
 
     Ok(StagedArchive {
         summary,
