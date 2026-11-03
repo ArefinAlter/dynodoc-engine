@@ -79,6 +79,7 @@ impl Policy {
     /// policy's origin, the log's signature, and every cosignature line that names
     /// a policy witness. A signature line of a policy key that does not verify is an
     /// error, not an ignored line; lines of other keys are ignored.
+    #[allow(clippy::expect_used, reason = "a cosignature carries a time")]
     pub fn verify_checkpoint(&self, note: &Note) -> Result<VerifiedCheckpoint, Error> {
         let checkpoint = Checkpoint::parse(note.text())?;
         if checkpoint.origin != self.origin().as_str() {

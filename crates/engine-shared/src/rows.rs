@@ -83,6 +83,9 @@ pub struct Snapshot {
     pub merkle_root: Vec<u8>,
     /// The `event.chain_hash` at `through_seq`, binding the snapshot to the chain.
     pub event_chain_hash: Vec<u8>,
+    /// Audit event-tree root for seq <= through_seq; absent on immutable old snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_merkle_root: Option<Vec<u8>>,
     pub created_at: DateTime<Utc>,
 }
 

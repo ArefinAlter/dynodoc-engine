@@ -1539,6 +1539,155 @@ paths:
               schema: {}
       security:
       - bearer: []
+  /documents/{id}/export-tokens:
+    post:
+      tags:
+      - export tokens
+      summary: Mint random export-scoped tokens for nodes in a document at a checked revision.
+      operationId: create_export_tokens
+      parameters:
+      - name: id
+        in: path
+        description: Document identifier
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateExportTokensRequest'
+        required: true
+      responses:
+        '200':
+          description: Export node tokens created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportTokensResponse'
+        '400':
+          description: Invalid request or revision
+        '401':
+          description: Authentication required
+        '403':
+          description: Document access denied
+        '404':
+          description: Document not found
+        '409':
+          description: Idempotency conflict
+      security:
+      - paseto: []
+  /documents/{id}/export-tokens/resolve:
+    post:
+      tags:
+      - export tokens
+      summary: Resolve export tokens and legacy block IDs to stable node targets.
+      operationId: resolve_export_tokens
+      parameters:
+      - name: id
+        in: path
+        description: Document identifier
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveExportTokensRequest'
+        required: true
+      responses:
+        '200':
+          description: Export node tokens resolved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolveExportTokensResponse'
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required
+        '403':
+          description: Export revoked or access denied
+        '404':
+          description: Document or export not found
+      security:
+      - paseto: []
+      - connector_key: []
+  /documents/{id}/export-tokens/{export_id}:
+    get:
+      tags:
+      - export tokens
+      summary: Retrieve details and status of an export token map.
+      operationId: get_export_tokens
+      parameters:
+      - name: id
+        in: path
+        description: Document identifier
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: export_id
+        in: path
+        description: Export identifier
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Export token details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportDetailsResponse'
+        '401':
+          description: Authentication required
+        '403':
+          description: Access denied
+        '404':
+          description: Document or export not found
+      security:
+      - paseto: []
+  /documents/{id}/export-tokens/{export_id}/revoke:
+    post:
+      tags:
+      - export tokens
+      summary: Revoke an export, permanently preventing further token resolution.
+      operationId: revoke_export_tokens
+      parameters:
+      - name: id
+        in: path
+        description: Document identifier
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: export_id
+        in: path
+        description: Export identifier
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Export tokens revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevokeExportResponse'
+        '401':
+          description: Authentication required
+        '403':
+          description: Access denied
+        '404':
+          description: Document or export not found
+      security:
+      - paseto: []
   /documents/{id}/history-points:
     get:
       tags:
@@ -1704,7 +1853,7 @@ paths:
           type: string
       responses:
         '200':
-          description: Inclusion proof
+          description: Inclusion proof checked against the snapshot event root when present
           content:
             application/json:
               schema: {}
@@ -2262,7 +2411,7 @@ paths:
           format: uuid
       responses:
         '200':
-          description: The snapshot
+          description: The snapshot; new snapshots include a separate event_merkle_root
           content:
             application/json:
               schema: {}
@@ -4428,6 +4577,183 @@ paths:
       - paseto: []
       - device_session:
         - history:read
+  /projects/{id}/history/compare:
+    get:
+      tags:
+      - project history
+      operationId: project_history_compare
+      parameters:
+      - name: id
+        in: path
+        description: Project ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: from
+        in: query
+        description: Starting commit address
+        required: true
+        schema:
+          type: string
+      - name: to
+        in: query
+        description: Ending commit address
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Maximum number of changed paths to return (1-100, default 50)
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: cursor
+        in: query
+        description: Opaque continuation cursor
+        required: false
+        schema:
+          type: string
+      - name: include_unchanged
+        in: query
+        description: Whether to include unchanged paths
+        required: false
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: Bounded two-commit diff report
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid commit address, cursor or query parameters
+        '403':
+          description: Project membership or document scope permission denied
+        '404':
+          description: One or both commits not published in this project
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
+  /projects/{id}/history/compare/file:
+    get:
+      tags:
+      - project history
+      operationId: project_history_compare_file
+      parameters:
+      - name: id
+        in: path
+        description: Project ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: from
+        in: query
+        description: Starting commit address
+        required: true
+        schema:
+          type: string
+      - name: to
+        in: query
+        description: Ending commit address
+        required: true
+        schema:
+          type: string
+      - name: path
+        in: query
+        description: Exact file path within project
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Maximum number of changed nodes to return (1-100, default 50)
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: cursor
+        in: query
+        description: Opaque continuation cursor
+        required: false
+        schema:
+          type: string
+      - name: include_unchanged
+        in: query
+        description: Whether to include unchanged nodes
+        required: false
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: Bounded file and node comparison report
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid commit address, path, cursor or query parameters
+        '403':
+          description: Project membership or document scope permission denied
+        '404':
+          description: One or both commits not published, or file not found in either commit
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
+  /projects/{id}/history/log:
+    get:
+      tags:
+      - project history
+      operationId: project_history_log
+      parameters:
+      - name: id
+        in: path
+        description: Project ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: head
+        in: query
+        description: Explicit starting commit address
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page limit (1..=50, default 20)
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: cursor
+        in: query
+        description: Opaque authenticated continuation cursor
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Authorized paged first-parent commit log
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectHistoryLogView'
+        '400':
+          description: Bad request, missing head, or invalid/tampered cursor
+        '401':
+          description: Authentication required
+        '403':
+          description: Membership or commit scope access denied
+        '404':
+          description: Project or starting commit not found
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
   /projects/{id}/history/receipts:
     get:
       tags:
@@ -4542,6 +4868,100 @@ paths:
       - paseto: []
       - device_session:
         - history:write
+  /projects/{id}/history/releases:
+    get:
+      tags:
+      - project history
+      operationId: project_history_releases
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: after
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: Keyset page of project releases; requires current access to every historical file in release scopes
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
+    post:
+      tags:
+      - project history
+      operationId: project_history_create_release
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Pin accepted protected main head as an immutable named release; current project and file merge authority required
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid release name or commit does not equal accepted main head
+        '403':
+          description: Current project/file merge authority required
+        '409':
+          description: Release name already exists with a different commit, or storage quota exceeded
+      security:
+      - paseto: []
+      - device_session:
+        - history:write
+  /projects/{id}/history/releases/{name}:
+    get:
+      tags:
+      - project history
+      operationId: project_history_release
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Single project release details with file scope verification
+          content:
+            application/json:
+              schema: {}
+        '404':
+          description: Release not found or unavailable after erasure
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
   /projects/{id}/history/reviews:
     get:
       tags:
@@ -7002,6 +7422,27 @@ components:
           type:
           - string
           - 'null'
+    CommitLogEntryView:
+      type: object
+      required:
+      - address
+      - parents
+      - author_key
+      - authored_at_ms
+      - message
+      properties:
+        address:
+          type: string
+        author_key:
+          type: string
+        authored_at_ms:
+          type: integer
+          format: int64
+        message: {}
+        parents:
+          type: array
+          items:
+            type: string
     ConflictOption:
       type: object
       description: |-
@@ -7061,6 +7502,28 @@ components:
             type: string
         title:
           type: string
+    CreateExportTokensRequest:
+      type: object
+      properties:
+        idempotency_key:
+          type:
+          - string
+          - 'null'
+          description: Creator-scoped idempotency key if not sent via Idempotency-Key header.
+        node_ids:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: Specific node IDs to map. Omitted means all live (non-deleted) nodes at this revision.
+        revision:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Checked revision (sequence number) in document history. Omitted means current head.
+      additionalProperties: false
     DeviceToken:
       type: object
       required:
@@ -7088,6 +7551,82 @@ components:
             type: string
         token_type:
           type: string
+    ExportDetailsResponse:
+      type: object
+      required:
+      - export_id
+      - document_id
+      - revision
+      - created_by
+      - created_at
+      - token_count
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        export_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          format: int64
+        revoked_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        token_count:
+          type: integer
+          format: int64
+    ExportTokenMapping:
+      type: object
+      required:
+      - node_id
+      - token
+      properties:
+        node_id:
+          type: string
+        token:
+          type: string
+    ExportTokensResponse:
+      type: object
+      required:
+      - format
+      - version
+      - export_id
+      - document_id
+      - revision
+      - created_at
+      - mappings
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        document_id:
+          type: string
+          format: uuid
+        export_id:
+          type: string
+          format: uuid
+        format:
+          type: string
+        mappings:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExportTokenMapping'
+        revision:
+          type: integer
+          format: int64
+        version:
+          type: integer
+          format: int32
+          minimum: 0
     FieldEditRequest:
       type: object
       description: '`POST /ops/field-edit`.'
@@ -7855,6 +8394,29 @@ components:
             What agents may write: `none` (the default: they only read), `draft` (they stage
             drafts that a person submits) or `change_request` (they may submit, unless
             `submit_requires_person`). The kill switch sets it back to `none`.
+    ProjectHistoryLogView:
+      type: object
+      required:
+      - project
+      - head
+      - entries
+      - more
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/CommitLogEntryView'
+        head:
+          type: string
+        more:
+          type: boolean
+        next_cursor:
+          type:
+          - string
+          - 'null'
+        project:
+          type: string
+          format: uuid
     RecoveryRequest:
       type: object
       required:
@@ -7950,6 +8512,56 @@ components:
           type:
           - string
           - 'null'
+    ResolveExportTokensRequest:
+      type: object
+      properties:
+        export_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Export ID under which tokens were minted. Required when resolving export tokens.
+        format:
+          type:
+          - string
+          - 'null'
+          description: Versioned carrier format ("dynodoc.export-node-tokens").
+        legacy_ids:
+          type: array
+          items:
+            type: string
+          description: Legacy node IDs to resolve directly, preserving spelling.
+        tokens:
+          type: array
+          items:
+            type: string
+          description: Export tokens to resolve to node IDs.
+        version:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Carrier format version (1).
+          minimum: 0
+      additionalProperties: false
+    ResolveExportTokensResponse:
+      type: object
+      required:
+      - document_id
+      - items
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        export_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResolvedNodeTarget'
     ResolveRequest:
       type: object
       description: '`POST .../resolve` body. Exactly one of the two fields must be set.'
@@ -7961,6 +8573,28 @@ components:
           description: Accept this competing proposal's value as canonical.
         custom_value:
           description: Override all proposals with this custom value.
+    ResolvedNodeTarget:
+      type: object
+      required:
+      - deleted
+      - resolved
+      properties:
+        deleted:
+          type: boolean
+        legacy_id:
+          type:
+          - string
+          - 'null'
+        node_id:
+          type:
+          - string
+          - 'null'
+        resolved:
+          type: boolean
+        token:
+          type:
+          - string
+          - 'null'
     ReviewRequest:
       type: object
       required:
@@ -7986,6 +8620,17 @@ components:
         verdict:
           type: string
           description: '`approved`, `changes_requested` or `commented`.'
+    RevokeExportResponse:
+      type: object
+      required:
+      - revoked
+      - export_id
+      properties:
+        export_id:
+          type: string
+          format: uuid
+        revoked:
+          type: boolean
     SessionAnswer:
       type: object
       required:

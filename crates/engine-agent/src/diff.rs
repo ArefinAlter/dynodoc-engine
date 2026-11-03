@@ -787,7 +787,7 @@ pub fn diff(
             usize::try_from(c.pos).map_err(|_| AgentError::BadRequest { field: "cursor" })?
         }
     };
-    let ops = workspace_merge::diff(from, to);
+    let ops = workspace_merge::diff(from, to).map_err(|_| AgentError::UnsupportedStructure)?;
     let touched: BTreeSet<NodeId> = ops
         .iter()
         .filter_map(|op| op.target_node_id().cloned())
@@ -851,6 +851,27 @@ pub fn diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_nodes_are_an_error_not_an_incomplete_report() {
+        let fixture = crate::fixtures::document();
+        let from = &fixture.base.state;
+        let mut to = from.clone();
+        let mut node = from.nodes.values().next().unwrap().clone();
+        node.id = NodeId("unsupported-node".into());
+        node.node_type = "future-widget".into();
+        to.nodes.insert(node.id.clone(), node);
+        let error = diff(
+            &fixture.edited.meta,
+            fixture.base.meta.rev,
+            from,
+            &to,
+            &DiffOptions::default(),
+        )
+        .unwrap_err();
+        // Keep the agent error vocabulary bounded: never echo node/type strings.
+        assert_eq!(error, AgentError::UnsupportedStructure);
+    }
 
     #[test]
     fn inline_diff_matches_the_spec_example() {

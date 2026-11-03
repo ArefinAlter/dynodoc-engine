@@ -4,6 +4,10 @@ use crate::{
     access::{self, MemberRole, Policy},
     auth::{
         device::{HistoryRead, HistoryReview, HistoryWrite, ProjectAuth},
+        token::{
+            mint_history_cursor, verify_history_cursor, HistoryCursorClaims,
+            HISTORY_CURSOR_TTL_SECONDS,
+        },
         AuthContext,
     },
     devices,
@@ -24,12 +28,18 @@ use engine_core::{
     repository::{
         attestation::{Receipt, Scope, SignedReceipt},
         authority_epoch::{MAX_CHAIN_PAGE, MAX_EPOCH},
+        compare::{self, DiffKind, FileCompareReport, MAX_NODE_DIFF_LIMIT},
+        log::{
+            first_parent_log, CommitLoader, FirstParentLogOptions, LoadedEnvelope,
+            DEFAULT_LOG_PAGE_LIMIT,
+        },
         server_authority, valid_branch, Head, SignedCommit,
     },
-    shared_checkpoint::{self, typed, Address},
+    shared_checkpoint::{self, typed, Address, ObjectStore},
 };
+use engine_shared::DocumentId;
 use ring::signature::KeyPair;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgConnection;
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,7 +77,15 @@ pub fn router() -> Router<AppState> {
             "/projects/{id}/history/commits/{address}/objects/{document}/{object}",
             get(object),
         )
+        .route("/projects/{id}/history/log", get(log))
+        .route("/projects/{id}/history/compare", get(compare))
+        .route("/projects/{id}/history/compare/file", get(compare_file))
         .route("/projects/{id}/history/refs", get(refs).post(advance))
+        .route(
+            "/projects/{id}/history/releases",
+            get(releases).post(create_release),
+        )
+        .route("/projects/{id}/history/releases/{name}", get(release))
         .route("/projects/{id}/history/reviews", get(reviews).post(review))
         .route("/projects/{id}/history/storage", get(storage))
         .route("/projects/{id}/history/authority", get(authority))
@@ -224,6 +242,570 @@ async fn commit(
     authorize(&mut tx, &auth, id, &stored.scope, false).await?;
     tx.commit().await?;
     Ok(Json(json!(stored.signed)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogQuery {
+    pub head: Option<Address>,
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct CommitLogEntryView {
+    pub address: String,
+    pub parents: Vec<String>,
+    pub author_key: String,
+    pub authored_at_ms: i64,
+    pub message: Value,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct ProjectHistoryLogView {
+    pub project: Uuid,
+    pub head: String,
+    pub entries: Vec<CommitLogEntryView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub more: bool,
+}
+
+#[utoipa::path(
+    operation_id = "project_history_log",
+    get,
+    path = "/projects/{id}/history/log",
+    tag = "project history",
+    params(
+        ("id" = Uuid, Path, description = "Project ID"),
+        ("head" = Option<String>, Query, description = "Explicit starting commit address"),
+        ("limit" = Option<usize>, Query, description = "Page limit (1..=50, default 20)"),
+        ("cursor" = Option<String>, Query, description = "Opaque authenticated continuation cursor")
+    ),
+    security(
+        ("paseto" = []),
+        ("device_session" = ["history:read"])
+    ),
+    responses(
+        (status = 200, description = "Authorized paged first-parent commit log", body = ProjectHistoryLogView),
+        (status = 400, description = "Bad request, missing head, or invalid/tampered cursor"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Membership or commit scope access denied"),
+        (status = 404, description = "Project or starting commit not found")
+    )
+)]
+async fn log(
+    State(state): State<AppState>,
+    auth: ProjectAuth<HistoryRead>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<LogQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let mut tx = start(&state, &auth).await?;
+    member(&mut tx, &auth, id).await?;
+
+    let (start_address, requested_head, effective_limit) = if let Some(cursor_str) = &query.cursor {
+        let claims = verify_history_cursor(&state.auth.paseto_key, cursor_str)
+            .map_err(|_| bad("invalid, tampered or expired continuation cursor"))?;
+        if claims.project != id {
+            return Err(bad("cursor project mismatch"));
+        }
+        if claims.principal != auth.identity_id {
+            return Err(ApiError::Forbidden);
+        }
+        if let Some(ref q_head) = query.head {
+            if q_head != &claims.head {
+                return Err(bad("cursor head mismatch"));
+            }
+        }
+        if claims.next_address == claims.head {
+            return Err(bad("cursor loop detected"));
+        }
+        let limit = query.limit.unwrap_or(claims.limit);
+        (claims.next_address, claims.head, limit)
+    } else {
+        let head = query
+            .head
+            .ok_or_else(|| bad("head parameter is required"))?;
+        let limit = query.limit.unwrap_or(DEFAULT_LOG_PAGE_LIMIT);
+        (head.clone(), head, limit)
+    };
+
+    struct PublishedCommitLoader<'a, 'b> {
+        tx: &'a mut sqlx::Transaction<'b, sqlx::Postgres>,
+        auth: &'a AuthContext,
+        project: Uuid,
+    }
+
+    impl<'a, 'b> CommitLoader for PublishedCommitLoader<'a, 'b> {
+        async fn load(
+            &mut self,
+            address: &Address,
+        ) -> Result<LoadedEnvelope, engine_core::repository::Error> {
+            let row: Option<(Vec<u8>, Vec<Uuid>, i64)> = sqlx::query_as(
+                "select body, scope, height from project_published_commit where project_id=$1 and address=$2",
+            )
+            .bind(self.project)
+            .bind(address.as_str())
+            .fetch_optional(&mut **self.tx)
+            .await
+            .map_err(|_| engine_core::repository::Error::Invalid("database read error"))?;
+
+            let (body, scope, _height) =
+                row.ok_or_else(|| engine_core::repository::Error::Missing(address.clone()))?;
+
+            authorize(self.tx, self.auth, self.project, &scope, false)
+                .await
+                .map_err(|_| {
+                    engine_core::repository::Error::Invalid("unauthorized commit scope")
+                })?;
+
+            let signed: SignedCommit = serde_json::from_slice(&body)
+                .map_err(|_| engine_core::repository::Error::Invalid("stored commit encoding"))?;
+
+            Ok(LoadedEnvelope::new(signed, body.len()))
+        }
+    }
+
+    let page = {
+        let mut loader = PublishedCommitLoader {
+            tx: &mut tx,
+            auth: &auth,
+            project: id,
+        };
+        first_parent_log(
+            &mut loader,
+            id,
+            &start_address,
+            FirstParentLogOptions {
+                limit: Some(effective_limit),
+            },
+        )
+        .await
+    };
+
+    let page = match page {
+        Ok(p) => p,
+        Err(engine_core::repository::Error::Invalid("unauthorized commit scope")) => {
+            return Err(ApiError::Forbidden);
+        }
+        Err(engine_core::repository::Error::Missing(_)) => {
+            return Err(ApiError::NotFound);
+        }
+        Err(engine_core::repository::Error::Limit(msg)) => {
+            return Err(bad(msg));
+        }
+        Err(engine_core::repository::Error::Invalid(msg)) => {
+            return Err(bad(msg));
+        }
+        Err(other) => return Err(chain_error(other)),
+    };
+
+    let next_cursor = match page.next_address {
+        Some(next_addr) => Some(
+            mint_history_cursor(
+                &state.auth.paseto_key,
+                &HistoryCursorClaims {
+                    version: 1,
+                    project: id,
+                    principal: auth.identity_id,
+                    head: requested_head.clone(),
+                    next_address: next_addr,
+                    limit: effective_limit,
+                },
+                HISTORY_CURSOR_TTL_SECONDS,
+            )
+            .map_err(|e| ApiError::Internal(e.to_string()))?,
+        ),
+        None => None,
+    };
+
+    tx.commit().await?;
+
+    Ok(Json(json!({
+        "project": id,
+        "head": requested_head,
+        "entries": page.entries,
+        "next_cursor": next_cursor,
+        "more": page.more,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompareQuery {
+    from: Address,
+    to: Address,
+    limit: Option<usize>,
+    cursor: Option<String>,
+    #[serde(default)]
+    include_unchanged: bool,
+}
+
+#[utoipa::path(
+    operation_id = "project_history_compare",
+    get,
+    path = "/projects/{id}/history/compare",
+    tag = "project history",
+    params(
+        ("id" = Uuid, Path, description = "Project ID"),
+        ("from" = String, Query, description = "Starting commit address"),
+        ("to" = String, Query, description = "Ending commit address"),
+        ("limit" = Option<usize>, Query, description = "Maximum number of changed paths to return (1-100, default 50)"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation cursor"),
+        ("include_unchanged" = Option<bool>, Query, description = "Whether to include unchanged paths")
+    ),
+    security(("paseto" = []), ("device_session" = ["history:read"])),
+    responses(
+        (status = 200, description = "Bounded two-commit diff report", body = Value),
+        (status = 400, description = "Invalid commit address, cursor or query parameters"),
+        (status = 403, description = "Project membership or document scope permission denied"),
+        (status = 404, description = "One or both commits not published in this project")
+    )
+)]
+async fn compare(
+    State(state): State<AppState>,
+    auth: ProjectAuth<HistoryRead>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<CompareQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(limit) = query.limit {
+        if !(1..=engine_core::repository::compare::MAX_DIFF_LIMIT).contains(&limit) {
+            return Err(bad("Page size must be 1 to 100"));
+        }
+    }
+
+    let mut tx = start(&state, &auth).await?;
+    member(&mut tx, &auth, id).await?;
+
+    let from_stored = load(&mut tx, id, &query.from).await?;
+    let to_stored = load(&mut tx, id, &query.to).await?;
+
+    let mut combined_scope: BTreeSet<Uuid> = from_stored.scope.into_iter().collect();
+    combined_scope.extend(to_stored.scope);
+    let union_scope: Vec<Uuid> = combined_scope.into_iter().collect();
+
+    authorize(&mut tx, &auth, id, &union_scope, false).await?;
+
+    tx.commit().await?;
+
+    let report = engine_core::repository::compare::compare_manifests(
+        &from_stored.signed,
+        &to_stored.signed,
+        engine_core::repository::compare::DiffOptions {
+            limit: query.limit,
+            cursor: query.cursor.as_deref(),
+            include_unchanged: query.include_unchanged,
+        },
+    )
+    .map_err(history_error)?;
+
+    Ok(Json(json!(report)))
+}
+
+struct PublishedStore<'a> {
+    db: &'a mut PgConnection,
+    project: Uuid,
+    state_root: Address,
+    budget: shared_checkpoint::Limits,
+    prefetched: BTreeMap<(Uuid, Address), Vec<u8>>,
+}
+
+impl ObjectStore for PublishedStore<'_> {
+    async fn prefetch(
+        &mut self,
+        document: DocumentId,
+        addresses: &[Address],
+    ) -> Result<(), shared_checkpoint::Error> {
+        self.prefetched.clear();
+        if addresses.len() > shared_checkpoint::READ_BATCH_OBJECTS {
+            return Err(shared_checkpoint::Error::Limit("read batch objects"));
+        }
+        if addresses.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<_> = addresses.iter().map(Address::as_str).collect();
+        let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "select o.address,o.bytes from project_published_object p join checkpoint_object o using(document_id,address) where p.project_id=$1 and p.state_root=$2 and p.document_id=$3 and p.address=any($4)"
+        )
+        .bind(self.project)
+        .bind(self.state_root.as_str())
+        .bind(document.0)
+        .bind(&keys)
+        .fetch_all(&mut *self.db)
+        .await?;
+        for (address, bytes) in rows {
+            self.prefetched
+                .insert((document.0, Address::try_from(address)?), bytes);
+        }
+        Ok(())
+    }
+
+    async fn put(
+        &mut self,
+        _: DocumentId,
+        _: &Address,
+        _: &[u8],
+    ) -> Result<bool, shared_checkpoint::Error> {
+        Err(shared_checkpoint::Error::Invalid(
+            "read-only published store",
+        ))
+    }
+
+    async fn get(
+        &mut self,
+        document: DocumentId,
+        address: &Address,
+    ) -> Result<Vec<u8>, shared_checkpoint::Error> {
+        if self.budget.max_objects == 0 {
+            return Err(shared_checkpoint::Error::Limit("objects"));
+        }
+        let bytes = if let Some(bytes) = self.prefetched.get(&(document.0, address.clone())) {
+            bytes.clone()
+        } else {
+            sqlx::query_scalar::<_, Vec<u8>>(
+                "select o.bytes from project_published_object p join checkpoint_object o using(document_id,address) where p.project_id=$1 and p.state_root=$2 and p.document_id=$3 and p.address=$4"
+            )
+            .bind(self.project)
+            .bind(self.state_root.as_str())
+            .bind(document.0)
+            .bind(address.as_str())
+            .fetch_optional(&mut *self.db)
+            .await?
+            .ok_or_else(|| shared_checkpoint::Error::Missing(address.as_str().into()))?
+        };
+        self.budget.max_objects = self
+            .budget
+            .max_objects
+            .checked_sub(1)
+            .ok_or(shared_checkpoint::Error::Limit("objects"))?;
+        self.budget.max_bytes = self
+            .budget
+            .max_bytes
+            .checked_sub(bytes.len())
+            .ok_or(shared_checkpoint::Error::Limit("bytes"))?;
+        shared_checkpoint::validate_stored(address, &bytes)?;
+        Ok(bytes)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompareFileQuery {
+    from: Address,
+    to: Address,
+    path: String,
+    limit: Option<usize>,
+    cursor: Option<String>,
+    #[serde(default)]
+    include_unchanged: bool,
+}
+
+#[utoipa::path(
+    operation_id = "project_history_compare_file",
+    get,
+    path = "/projects/{id}/history/compare/file",
+    tag = "project history",
+    params(
+        ("id" = Uuid, Path, description = "Project ID"),
+        ("from" = String, Query, description = "Starting commit address"),
+        ("to" = String, Query, description = "Ending commit address"),
+        ("path" = String, Query, description = "Exact file path within project"),
+        ("limit" = Option<usize>, Query, description = "Maximum number of changed nodes to return (1-100, default 50)"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation cursor"),
+        ("include_unchanged" = Option<bool>, Query, description = "Whether to include unchanged nodes")
+    ),
+    security(("paseto" = []), ("device_session" = ["history:read"])),
+    responses(
+        (status = 200, description = "Bounded file and node comparison report", body = Value),
+        (status = 400, description = "Invalid commit address, path, cursor or query parameters"),
+        (status = 403, description = "Project membership or document scope permission denied"),
+        (status = 404, description = "One or both commits not published, or file not found in either commit")
+    )
+)]
+async fn compare_file(
+    State(state): State<AppState>,
+    auth: ProjectAuth<HistoryRead>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<CompareFileQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !engine_core::repository::valid_path(&query.path) {
+        return Err(bad("Invalid file path"));
+    }
+    if let Some(limit) = query.limit {
+        if !(1..=MAX_NODE_DIFF_LIMIT).contains(&limit) {
+            return Err(bad("Page size must be 1 to 100"));
+        }
+    }
+
+    let _permit = state.workloads.enter(auth.identity_id, Some(id))?;
+
+    let mut tx = start(&state, &auth).await?;
+    member(&mut tx, &auth, id).await?;
+
+    let from_stored = load(&mut tx, id, &query.from).await?;
+    let to_stored = load(&mut tx, id, &query.to).await?;
+
+    let mut combined_scope: BTreeSet<Uuid> = from_stored.scope.into_iter().collect();
+    combined_scope.extend(to_stored.scope);
+    let union_scope: Vec<Uuid> = combined_scope.into_iter().collect();
+
+    authorize(&mut tx, &auth, id, &union_scope, false).await?;
+
+    let from_file = from_stored.signed.commit.files.get(&query.path).cloned();
+    let to_file = to_stored.signed.commit.files.get(&query.path).cloned();
+
+    if from_file.is_none() && to_file.is_none() {
+        return Err(ApiError::NotFound);
+    }
+
+    if from_file.is_none() {
+        if query.cursor.is_some() {
+            return Err(bad("Cursor cannot be used for added file"));
+        }
+        tx.commit().await?;
+        let report = FileCompareReport {
+            project: id,
+            from: query.from,
+            to: query.to,
+            path: query.path,
+            kind: DiffKind::Added,
+            from_file: None,
+            to_file,
+            document_replaced: false,
+            node_diff: None,
+            next_cursor: None,
+            more: false,
+        };
+        return Ok(Json(json!(report)));
+    }
+
+    if to_file.is_none() {
+        if query.cursor.is_some() {
+            return Err(bad("Cursor cannot be used for removed file"));
+        }
+        tx.commit().await?;
+        let report = FileCompareReport {
+            project: id,
+            from: query.from,
+            to: query.to,
+            path: query.path,
+            kind: DiffKind::Removed,
+            from_file,
+            to_file: None,
+            document_replaced: false,
+            node_diff: None,
+            next_cursor: None,
+            more: false,
+        };
+        return Ok(Json(json!(report)));
+    }
+
+    // Both are present: the branches above returned when either was absent.
+    let (Some(from_entry), Some(to_entry)) = (from_file, to_file) else {
+        return Err(ApiError::Internal(
+            "file comparison lost a checked file".into(),
+        ));
+    };
+
+    if from_entry.document != to_entry.document {
+        if query.cursor.is_some() {
+            return Err(bad("Cursor cannot be used for replaced document"));
+        }
+        tx.commit().await?;
+        let report = FileCompareReport {
+            project: id,
+            from: query.from,
+            to: query.to,
+            path: query.path,
+            kind: DiffKind::Modified,
+            from_file: Some(from_entry),
+            to_file: Some(to_entry),
+            document_replaced: true,
+            node_diff: None,
+            next_cursor: None,
+            more: false,
+        };
+        return Ok(Json(json!(report)));
+    }
+
+    let doc_id = from_entry.document;
+    let from_root = from_entry.state.clone();
+    let to_root = to_entry.state.clone();
+
+    let mut from_store = PublishedStore {
+        db: &mut tx,
+        project: id,
+        state_root: from_root.clone(),
+        budget: READ_LIMIT,
+        prefetched: BTreeMap::new(),
+    };
+    let from_state = typed::read_state(
+        &mut from_store,
+        doc_id,
+        &from_root,
+        READ_LIMIT,
+        Default::default(),
+    )
+    .await
+    .map_err(content_error)?;
+
+    let mut to_store = PublishedStore {
+        db: &mut tx,
+        project: id,
+        state_root: to_root.clone(),
+        budget: READ_LIMIT,
+        prefetched: BTreeMap::new(),
+    };
+    let to_state = typed::read_state(
+        &mut to_store,
+        doc_id,
+        &to_root,
+        READ_LIMIT,
+        Default::default(),
+    )
+    .await
+    .map_err(content_error)?;
+
+    tx.commit().await?;
+
+    let node_diff = compare::compare_nodes(
+        doc_id,
+        &from_root,
+        &to_root,
+        &from_state,
+        &to_state,
+        compare::NodeDiffOptions {
+            limit: query.limit,
+            cursor: query.cursor.as_deref(),
+            include_unchanged: query.include_unchanged,
+        },
+    )
+    .map_err(history_error)?;
+
+    let kind = if from_root == to_root && node_diff.whole_state_identical {
+        DiffKind::Unchanged
+    } else {
+        DiffKind::Modified
+    };
+
+    let next_cursor = node_diff.next_cursor.clone();
+    let more = node_diff.more;
+
+    let report = FileCompareReport {
+        project: id,
+        from: query.from,
+        to: query.to,
+        path: query.path,
+        kind,
+        from_file: Some(from_entry),
+        to_file: Some(to_entry),
+        document_replaced: false,
+        next_cursor,
+        more,
+        node_diff: Some(node_diff),
+    };
+
+    Ok(Json(json!(report)))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -701,7 +1283,9 @@ async fn refs(
                 body.clone(),
                 receipt_address.clone(),
             ),
-            binding.as_ref().expect("nonempty rows have authority"),
+            binding.as_ref().ok_or_else(|| {
+                ApiError::Internal("History rows have no authority binding".into())
+            })?,
         )?);
         let address = Address::try_from(address.clone()).map_err(content_error)?;
         scope.extend(
@@ -1011,20 +1595,275 @@ async fn receipts(
         json!({"next_generation":items.last().map(|r|r.receipt.head.generation),"items":items,"epoch":active.epoch,"revocation":active.revocation,"rotations":bridge.iter().map(epoch_item).collect::<Vec<_>>()}),
     ))
 }
+
+#[derive(Deserialize)]
+struct ReleaseCreate {
+    name: String,
+    commit: Option<String>,
+}
+
+fn valid_release_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 100 {
+        return false;
+    }
+    let first = bytes[0];
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+#[utoipa::path(
+    operation_id = "project_history_create_release",
+    post,
+    path = "/projects/{id}/history/releases",
+    tag = "project history",
+    params(("id" = Uuid, Path)),
+    request_body = Value,
+    security(("paseto" = []), ("device_session" = ["history:write"])),
+    responses(
+        (status = 200, description = "Pin accepted protected main head as an immutable named release; current project and file merge authority required", body = Value),
+        (status = 400, description = "Invalid release name or commit does not equal accepted main head"),
+        (status = 403, description = "Current project/file merge authority required"),
+        (status = 409, description = "Release name already exists with a different commit, or storage quota exceeded")
+    )
+)]
+async fn create_release(
+    State(state): State<AppState>,
+    auth: ProjectAuth<HistoryWrite>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ReleaseCreate>,
+) -> Result<Json<Value>, ApiError> {
+    if !valid_release_name(&body.name) {
+        return Err(bad(
+            "Invalid release name; must be 1-100 characters starting with alphanumeric and containing only alphanumeric, dot, underscore, or hyphen",
+        ));
+    }
+    let mut tx = start(&state, &auth).await?;
+    member(&mut tx, &auth, id).await?;
+    serial(&mut tx, id).await?;
+    let _permit = state.workloads.enter(auth.identity_id, Some(id))?;
+
+    let main_head = head(&mut tx, id, "main")
+        .await?
+        .ok_or_else(|| bad("Project main branch has no published commits"))?;
+
+    if let Some(ref target_commit) = body.commit {
+        if target_commit != main_head.commit.as_str() {
+            return Err(bad(
+                "Release target commit must equal the accepted protected main head",
+            ));
+        }
+    }
+
+    let candidate = load(&mut tx, id, &main_head.commit).await?;
+    let policy = rules(&mut tx, id, &candidate.scope).await?;
+    if !policy.can_merge(role(&mut tx, id, auth.identity_id).await?) {
+        return Err(ApiError::Forbidden);
+    }
+    for doc in &candidate.scope {
+        if !policy.can_merge(access::governance_role(&mut tx, *doc, auth.identity_id).await?) {
+            return Err(ApiError::Forbidden);
+        }
+    }
+    authorize(&mut tx, &auth, id, &candidate.scope, false).await?;
+
+    let existing: Option<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "select commit_address, created_at from project_release where project_id=$1 and name=$2",
+    )
+    .bind(id)
+    .bind(&body.name)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((existing_commit, created_at)) = existing {
+        if existing_commit == main_head.commit.as_str() {
+            return Ok(Json(json!({
+                "project_id": id,
+                "name": body.name,
+                "commit": existing_commit,
+                "created_at": created_at
+            })));
+        } else {
+            return Err(ApiError::Conflict {
+                reason: "Release name already exists with a different commit".into(),
+            });
+        }
+    }
+
+    let created_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "insert into project_release (project_id, name, commit_address, actor)
+         values ($1, $2, $3, $4)
+         returning created_at",
+    )
+    .bind(id)
+    .bind(&body.name)
+    .bind(main_head.commit.as_str())
+    .bind(auth.identity_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    audit(
+        &mut tx,
+        auth.identity_id,
+        "project.release.create",
+        id,
+        json!({"name": body.name, "commit": main_head.commit.as_str()}),
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok(Json(json!({
+        "project_id": id,
+        "name": body.name,
+        "commit": main_head.commit.as_str(),
+        "created_at": created_at
+    })))
+}
+
+#[derive(Deserialize)]
+struct ReleasePage {
+    after: Option<String>,
+    limit: Option<i64>,
+}
+
+#[utoipa::path(
+    operation_id = "project_history_releases",
+    get,
+    path = "/projects/{id}/history/releases",
+    tag = "project history",
+    params(
+        ("id" = Uuid, Path),
+        ("after" = Option<String>, Query),
+        ("limit" = Option<i64>, Query)
+    ),
+    security(("paseto" = []), ("device_session" = ["history:read"])),
+    responses(
+        (status = 200, description = "Keyset page of project releases; requires current access to every historical file in release scopes", body = Value)
+    )
+)]
+async fn releases(
+    State(state): State<AppState>,
+    auth: ProjectAuth<HistoryRead>,
+    Path(id): Path<Uuid>,
+    Query(page): Query<ReleasePage>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = page_limit(page.limit)?;
+    let mut tx = start(&state, &auth).await?;
+    authorize(&mut tx, &auth, id, &[], false).await?;
+
+    let rows: Vec<(String, String, Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "select name, commit_address, actor, created_at from project_release
+         where project_id=$1 and name > $2
+         order by name asc limit $3",
+    )
+    .bind(id)
+    .bind(page.after.unwrap_or_default())
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut scope = BTreeSet::new();
+    let mut items = Vec::new();
+    for (name, commit_address, actor, created_at) in rows {
+        let addr = Address::try_from(commit_address.clone()).map_err(content_error)?;
+        let commit = load(&mut tx, id, &addr).await.map_err(|e| match e {
+            ApiError::NotFound => ApiError::Conflict {
+                reason: "A release commit is unavailable after erasure".into(),
+            },
+            other => other,
+        })?;
+        scope.extend(commit.scope);
+        items.push(json!({
+            "name": name,
+            "commit": commit_address,
+            "actor": actor,
+            "created_at": created_at
+        }));
+    }
+
+    let scope_vec: Vec<Uuid> = scope.into_iter().collect();
+    authorize(&mut tx, &auth, id, &scope_vec, false).await?;
+
+    Ok(Json(json!({
+        "items": items,
+        "next_cursor": items.last().and_then(|i| i["name"].as_str())
+    })))
+}
+
+#[utoipa::path(
+    operation_id = "project_history_release",
+    get,
+    path = "/projects/{id}/history/releases/{name}",
+    tag = "project history",
+    params(
+        ("id" = Uuid, Path),
+        ("name" = String, Path)
+    ),
+    security(("paseto" = []), ("device_session" = ["history:read"])),
+    responses(
+        (status = 200, description = "Single project release details with file scope verification", body = Value),
+        (status = 404, description = "Release not found or unavailable after erasure")
+    )
+)]
+async fn release(
+    State(state): State<AppState>,
+    auth: ProjectAuth<HistoryRead>,
+    Path((id, name)): Path<(Uuid, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let mut tx = start(&state, &auth).await?;
+    authorize(&mut tx, &auth, id, &[], false).await?;
+
+    let row: (String, Uuid, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "select commit_address, actor, created_at from project_release
+         where project_id=$1 and name=$2",
+    )
+    .bind(id)
+    .bind(&name)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+
+    let addr = Address::try_from(row.0.clone()).map_err(content_error)?;
+    let commit = load(&mut tx, id, &addr).await?;
+    authorize(&mut tx, &auth, id, &commit.scope, false).await?;
+
+    Ok(Json(json!({
+        "project_id": id,
+        "name": name,
+        "commit": row.0,
+        "actor": row.1,
+        "created_at": row.2,
+        "scope": commit.scope
+    })))
+}
+
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(
-    publish,
-    commit,
-    inventory,
-    object,
-    advance,
-    refs,
-    review,
-    reviews,
-    storage,
-    authority,
-    rotations,
-    receipts,
-    acknowledge
-))]
+#[openapi(
+    paths(
+        publish,
+        commit,
+        inventory,
+        object,
+        advance,
+        refs,
+        create_release,
+        releases,
+        release,
+        review,
+        reviews,
+        storage,
+        authority,
+        rotations,
+        receipts,
+        acknowledge,
+        log,
+        compare,
+        compare_file
+    ),
+    components(schemas(CommitLogEntryView, ProjectHistoryLogView))
+)]
 pub struct ProjectHistoryApi;

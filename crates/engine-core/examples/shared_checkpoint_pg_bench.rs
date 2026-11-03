@@ -169,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let mode = std::env::var("DYNODOC_CHECKPOINT_BENCH_MODE").unwrap_or_else(|_| "batched".into());
     anyhow::ensure!(
-        ["batched", "individual"].contains(&mode.as_str()),
+        ["batched", "individual", "typed", "incremental"].contains(&mode.as_str()),
         "unknown benchmark mode"
     );
     let workload =
@@ -178,7 +178,9 @@ async fn main() -> anyhow::Result<()> {
         ["repeated", "varied"].contains(&workload.as_str()),
         "unknown benchmark workload"
     );
-    let blocks = 8000usize;
+    let blocks = std::env::var("DYNODOC_CHECKPOINT_BENCH_BLOCKS")
+        .unwrap_or_else(|_| "8000".into())
+        .parse::<usize>()?;
     let edits: usize = std::env::var("DYNODOC_CHECKPOINT_BENCH_EDITS")
         .unwrap_or_else(|_| "5".into())
         .parse()?;
@@ -255,15 +257,46 @@ async fn main() -> anyhow::Result<()> {
         let probe = tokio::spawn(strong_lock_probe(pool.clone(), doc, finished.clone()));
         let start = Instant::now();
         let seq = (blocks + edit) as i64;
-        let (write_queries, read_queries, published_root) = if mode == "individual" {
-            publish_individually(&pool, doc, seq).await?
-        } else {
-            let published = postgres::take(&pool, doc, seq, Limits::default()).await?;
-            (
-                published.object_write_queries,
-                published.object_read_queries,
-                published.root,
-            )
+        let (write_queries, read_queries, published_root, fallback_ran) = match mode.as_str() {
+            "individual" => {
+                let (w, r, root) = publish_individually(&pool, doc, seq).await?;
+                (w, r, root, false)
+            }
+            "typed" => {
+                let published = postgres::take_with_codec(
+                    &pool,
+                    doc,
+                    seq,
+                    Limits::default(),
+                    postgres::Codec::V2,
+                )
+                .await?;
+                (
+                    published.object_write_queries,
+                    published.object_read_queries,
+                    published.root,
+                    false,
+                )
+            }
+            "incremental" => {
+                let published =
+                    postgres::take_incremental(&pool, doc, seq, Limits::default()).await?;
+                (
+                    published.object_write_queries,
+                    published.object_read_queries,
+                    published.root,
+                    published.fallback_ran,
+                )
+            }
+            _ => {
+                let published = postgres::take(&pool, doc, seq, Limits::default()).await?;
+                (
+                    published.object_write_queries,
+                    published.object_read_queries,
+                    published.root,
+                    false,
+                )
+            }
         };
         let shared_ms = start.elapsed().as_secs_f64() * 1000.0;
         finished.store(true, Ordering::Release);
@@ -279,10 +312,6 @@ async fn main() -> anyhow::Result<()> {
         let actual = read_state_at(&mut connection, doc, seq).await?;
         let normal_read_ms = start.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(actual.state, expected);
-        assert_eq!(
-            actual.checkpoint_format,
-            engine_core::snapshot::CheckpointFormat::SharedV1
-        );
         let root: String = sqlx::query_scalar(
             "select state_root from shared_checkpoint where document_id=$1 and through_seq=$2",
         )
@@ -292,20 +321,45 @@ async fn main() -> anyhow::Result<()> {
         .await?;
         let root = Address::try_from(root)?;
         assert_eq!(root, published_root);
+
+        if mode == "incremental" && edit > 0 {
+            let oracle =
+                postgres::take_with_codec(&pool, doc, seq, Limits::default(), postgres::Codec::V2)
+                    .await?;
+            assert_eq!(
+                oracle.root, root,
+                "incremental root must match full typed root"
+            );
+        }
+
         let mut store = PgStore::new(&mut connection);
         let start = Instant::now();
-        assert_eq!(
-            read_state(&mut store, doc, &root, Limits::default()).await?,
-            expected
-        );
+        if mode == "typed" || mode == "incremental" {
+            let restored = postgres::Codec::V2
+                .read(&mut store, doc, &root, Limits::default())
+                .await?;
+            assert_eq!(restored, expected);
+        } else {
+            assert_eq!(
+                read_state(&mut store, doc, &root, Limits::default()).await?,
+                expected
+            );
+        }
         let batched_ms = start.elapsed().as_secs_f64() * 1000.0;
         let batched_queries = store.read_queries();
         let mut unbatched = Unbatched(PgStore::new(&mut connection));
         let start = Instant::now();
-        assert_eq!(
-            read_state(&mut unbatched, doc, &root, Limits::default()).await?,
-            expected
-        );
+        if mode == "typed" || mode == "incremental" {
+            let restored = postgres::Codec::V2
+                .read(&mut unbatched, doc, &root, Limits::default())
+                .await?;
+            assert_eq!(restored, expected);
+        } else {
+            assert_eq!(
+                read_state(&mut unbatched, doc, &root, Limits::default()).await?,
+                expected
+            );
+        }
         let unbatched_ms = start.elapsed().as_secs_f64() * 1000.0;
         let unbatched_queries = unbatched.0.read_queries();
         let start = Instant::now();
@@ -319,10 +373,101 @@ async fn main() -> anyhow::Result<()> {
         let decoded: DocumentState = serde_json::from_value(value)?;
         assert_eq!(decoded, expected);
         let legacy_read_ms = start.elapsed().as_secs_f64() * 1000.0;
-        results.push(json!({"revision":seq,"root":root.as_str(),"publication_object_inserts":write_queries,"publication_object_selects":read_queries,"strong_lock_wait_ms":strong_lock_wait_ms,"legacy_write_ms":legacy_ms,"shared_write_verify_ms":shared_ms,"legacy_wal_bytes":legacy_wal,"shared_wal_bytes":shared_wal,"normal_read_ms":normal_read_ms,"batched_read_ms":batched_ms,"batched_object_selects":batched_queries,"unbatched_read_ms":unbatched_ms,"unbatched_object_selects":unbatched_queries,"legacy_read_ms":legacy_read_ms}));
+        results.push(json!({"revision":seq,"root":root.as_str(),"fallback_ran":fallback_ran,"publication_object_inserts":write_queries,"publication_object_selects":read_queries,"strong_lock_wait_ms":strong_lock_wait_ms,"legacy_write_ms":legacy_ms,"shared_write_verify_ms":shared_ms,"legacy_wal_bytes":legacy_wal,"shared_wal_bytes":shared_wal,"normal_read_ms":normal_read_ms,"batched_read_ms":batched_ms,"batched_object_selects":batched_queries,"unbatched_read_ms":unbatched_ms,"unbatched_object_selects":unbatched_queries,"legacy_read_ms":legacy_read_ms}));
         eprintln!("Measured checkpoint {edit}/{edits}");
     }
     verify_chain(&pool, doc).await?;
+
+    if mode == "incremental" {
+        // Acceptance verification: unsupported-delta fallback
+        let dummy_seq = (blocks + edits + 1) as i64;
+        let mut tx = pool.begin().await?;
+        let event = append_in_tx(
+            &mut tx,
+            doc,
+            &EventPayload::FieldEdited {
+                node_id: ids[0].clone(),
+                field: "fallback_test".into(),
+                value: json!("fallback"),
+            },
+            actor,
+        )
+        .await?;
+        apply_payload(&mut expected, &serde_json::from_value(event.payload)?)?;
+        tx.commit().await?;
+
+        let published_fb =
+            postgres::take_incremental(&pool, doc, dummy_seq, Limits::default()).await?;
+        assert_eq!(published_fb.through_seq, dummy_seq);
+        let mut conn = pool.acquire().await?;
+        let mut fb_store = PgStore::new(&mut conn);
+        let fb_restored = postgres::Codec::V2
+            .read(&mut fb_store, doc, &published_fb.root, Limits::default())
+            .await?;
+        assert_eq!(fb_restored, expected);
+
+        // Acceptance verification: quota-failure rollback
+        let (objects_before, bytes_before): (i64, i64) = sqlx::query_as(
+            "select count(*), coalesce(sum(octet_length(bytes))::bigint, 0) from checkpoint_object where document_id=$1",
+        )
+        .bind(doc.0)
+        .fetch_one(&pool)
+        .await?;
+
+        // Enforce quota capped to current usage
+        sqlx::query(
+            "update checkpoint_storage_document set byte_limit = bytes_used, object_limit = objects_used where document_id = $1",
+        )
+        .bind(doc.0)
+        .execute(&pool)
+        .await?;
+
+        let dummy_seq2 = dummy_seq + 1;
+        let mut tx = pool.begin().await?;
+        append_in_tx(
+            &mut tx,
+            doc,
+            &EventPayload::FieldEdited {
+                node_id: ids[1].clone(),
+                field: "quota_test".into(),
+                value: json!("quota"),
+            },
+            actor,
+        )
+        .await?;
+        tx.commit().await?;
+
+        let quota_res = postgres::take_incremental(&pool, doc, dummy_seq2, Limits::default()).await;
+        assert!(quota_res.is_err(), "quota failure must fail publication");
+
+        let (objects_after, bytes_after): (i64, i64) = sqlx::query_as(
+            "select count(*), coalesce(sum(octet_length(bytes))::bigint, 0) from checkpoint_object where document_id=$1",
+        )
+        .bind(doc.0)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            objects_after, objects_before,
+            "storage objects must not change on quota rollback"
+        );
+        assert_eq!(
+            bytes_after, bytes_before,
+            "storage bytes must not change on quota rollback"
+        );
+
+        let chk_count: i64 = sqlx::query_scalar(
+            "select count(*) from shared_checkpoint where document_id=$1 and through_seq=$2",
+        )
+        .bind(doc.0)
+        .bind(dummy_seq2)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            chk_count, 0,
+            "checkpoint must not be created on quota rollback"
+        );
+        eprintln!("Incremental acceptance boundary (fallback & quota rollback) verified.");
+    }
     let (objects, bytes): (i64,i64) = sqlx::query_as("select count(*),sum(octet_length(bytes))::bigint from checkpoint_object where document_id=$1").bind(doc.0).fetch_one(&pool).await?;
     println!(
         "{}",

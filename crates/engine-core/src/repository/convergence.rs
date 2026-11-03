@@ -151,7 +151,7 @@ impl Merger for Whole {
         team: &DocumentState,
         draft: &DocumentState,
     ) -> workspace_merge::MergePlan {
-        workspace_merge::merge(base, team, draft, &BTreeMap::new())
+        workspace_merge::merge_for_signed_v1(base, team, draft, &BTreeMap::new())
     }
     fn comments(
         &mut self,
@@ -227,7 +227,7 @@ impl Merger for Policied<'_> {
         team: &DocumentState,
         draft: &DocumentState,
     ) -> workspace_merge::MergePlan {
-        let (plan, evidence) = workspace_merge::merge_with_registry(
+        let (plan, evidence) = workspace_merge::merge_for_signed_v1_with_registry(
             base,
             team,
             draft,
@@ -724,6 +724,31 @@ mod tests {
     use super::*;
     use crate::materializer::{CommentState, MaterializedNode, SuggestionState};
 
+    #[test]
+    fn signed_v1_does_not_inherit_new_event_diff_validation() {
+        let base = document(vec![node("p", plain("base", "note"))]);
+        let team = document(vec![node("p", plain("edited", "note"))]);
+        let mut future = node("future", json!({}));
+        future.node_type = "future-widget".into();
+        let mut draft = base.clone();
+        draft.nodes.insert(future.id.clone(), future.clone());
+        for (left, right) in [(&team, &draft), (&draft, &team)] {
+            let result = merge_states(&base, left, right);
+            assert!(result.conflicts.is_empty());
+            assert_eq!(result.state.nodes[&future.id], future);
+            assert_eq!(field(&result.state, "p", "label"), "edited");
+            let registry = Registry::builtin();
+            let mut policy = Policied::new(crate::merge_policy::default::policy(), &registry);
+            let policied = merge_states_with(&base, left, right, &mut policy);
+            assert!(policied.conflicts.is_empty());
+            assert_eq!(policied.state, result.state);
+            assert_eq!(policied.state.nodes[&future.id], future);
+        }
+        let checked = workspace_merge::merge(&base, &team, &draft, &BTreeMap::new());
+        assert!(!checked.conflicts.is_empty());
+        assert!(checked.ops.is_empty());
+    }
+
     fn node(id: &str, fields: Value) -> MaterializedNode {
         MaterializedNode {
             id: NodeId(id.into()),
@@ -803,6 +828,36 @@ mod tests {
             assert_eq!((&a.left, &a.right), (&b.right, &b.left));
         }
         forward
+    }
+
+    #[tokio::test]
+    async fn signed_v1_keeps_original_concurrent_insertion_positions() {
+        let base = document(vec![]);
+        let (mut left, mut right) = (base.clone(), base.clone());
+        for (side, prefix) in [(&mut left, "left"), (&mut right, "right")] {
+            for (suffix, pos) in [("1", "m"), ("2", "n")] {
+                let mut added = node(&format!("{prefix}{suffix}"), plain(prefix, ""));
+                added.pos = pos.into();
+                side.nodes.insert(added.id.clone(), added);
+            }
+        }
+        let report = mirrored(&base, &left, &right).await;
+        assert!(report.clean && report.conflicts.is_empty());
+        let mut expected = left.clone();
+        expected.nodes.extend(right.nodes.clone());
+        assert_eq!(report.merged.as_ref(), Some(&expected));
+        assert_eq!(
+            report.address,
+            Some(state_address(doc_id(), &expected).await.unwrap())
+        );
+
+        // The workspace intentionally offers different ordering. Only a new
+        // signed strategy may adopt that ordering for portable resolutions.
+        let default = workspace_merge::merge(&base, &left, &right, &BTreeMap::new());
+        assert_eq!(default.state, expected);
+        let workspace =
+            workspace_merge::merge_with_grouped_insertions(&base, &left, &right, &BTreeMap::new());
+        assert_ne!(workspace.state, expected);
     }
 
     #[tokio::test]

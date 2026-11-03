@@ -23,6 +23,109 @@ mod common;
 const KEY: [u8; 32] = [7u8; 32];
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn cached_writes_recheck_permissions_and_follow_another_process(pool: PgPool) {
+    let runtime = common::RuntimeDatabase::new(pool).await;
+    let cache = engine_core::snapshot::cache::CurrentStateCache::default();
+    let mut state = test_state(runtime.pool.clone());
+    state.write_cache = Some(cache.clone());
+    let router = app(state);
+    let owner = bearer(seed_identity(&runtime.pool, "cache-owner@example.test").await);
+    let editor_id = seed_identity(&runtime.pool, "cache-editor@example.test").await;
+    let editor = bearer(editor_id);
+    let doc = create_document(&router, &owner, "Cached writes").await;
+    sqlx::query("insert into document_access(document_id,identity_id,role) values($1,$2,'author')")
+        .bind(doc)
+        .bind(editor_id)
+        .execute(&runtime.pool)
+        .await
+        .unwrap();
+    let (status, created) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_type":"form","pos":"a0","fields":{"label":"Initial"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let node = created["event"]["target_node_id"].as_str().unwrap();
+    for (token, value) in [(&owner, "Owner edit"), (&editor, "Editor edit")] {
+        let (status, body) = send(
+            &router,
+            auth_post(
+                &format!("/documents/{doc}/ops/field-edit"),
+                token,
+                &json!({"node_id":node,"field":"label","value":value}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert!(
+        cache.stats().hits > 0,
+        "the real write path must use its opt-in cache"
+    );
+    let mut other_state = test_state(runtime.pool.clone());
+    other_state.write_cache = None;
+    let other_process = app(other_state);
+    let (status, body) = send(
+        &other_process,
+        auth_post(
+            &format!("/documents/{doc}/ops/field-edit"),
+            &owner,
+            &json!({"node_id":node,"field":"title","value":"Another process"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/field-edit"),
+            &owner,
+            &json!({"node_id":node,"field":"label","value":"Final"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    sqlx::query("delete from document_access where document_id=$1 and identity_id=$2")
+        .bind(doc)
+        .bind(editor_id)
+        .execute(&runtime.pool)
+        .await
+        .unwrap();
+    let before = cache.stats();
+    let (status, body) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/field-edit"),
+            &editor,
+            &json!({"node_id":node,"field":"label","value":"Forbidden"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        cache.stats(),
+        before,
+        "authorization must precede cache lookup"
+    );
+    let (status, read) = send(&router, auth_post_get(&format!("/documents/{doc}"), &owner)).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(
+        read["state"]["nodes"][node]["current_fields"]["label"],
+        "Final"
+    );
+    assert_eq!(
+        read["state"]["nodes"][node]["current_fields"]["title"],
+        "Another process"
+    );
+    assert_eq!(read["latest_seq"], 5);
+    runtime.close().await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn waiting_writer_rechecks_revoked_access(pool: PgPool) {
     let router = app(test_state(pool.clone()));
     let owner = bearer(seed_identity(&pool, "lock-owner@example.test").await);
@@ -1748,6 +1851,85 @@ async fn anonymous_read_requires_auth(pool: PgPool) {
     let router = app(test_state(pool));
     let (status, _) = send(&router, get(&format!("/documents/{}", Uuid::new_v4()))).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn event_proofs_match_the_stored_snapshot_prefix_root(pool: PgPool) {
+    use engine_core::snapshot::{SnapshotEngine, SnapshotReason};
+    use engine_shared::{EventPayload, IdentityId};
+    let router = app(test_state(pool.clone()));
+    let identity = seed_identity(&pool, "prefix-root@example.test").await;
+    let token = bearer(identity);
+    let document = create_document(&router, &token, "Synthetic snapshot prefix").await;
+    let mut events = Vec::new();
+    for i in 0..3 {
+        events.push(
+            engine_core::log::append(
+                &pool,
+                DocumentId(document),
+                &EventPayload::CommentAdded {
+                    node_id: None,
+                    body: format!("Synthetic {i}"),
+                },
+                IdentityId(identity),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let snapshot = SnapshotEngine::new(pool.clone())
+        .take(DocumentId(document), SnapshotReason::Periodic)
+        .await
+        .unwrap();
+    let root = snapshot.event_merkle_root.as_ref().unwrap();
+    let root_hex: String = root.iter().map(|byte| format!("{byte:02x}")).collect();
+    let later = engine_core::log::append(
+        &pool,
+        DocumentId(document),
+        &EventPayload::CommentAdded {
+            node_id: None,
+            body: "Outside prefix".into(),
+        },
+        IdentityId(identity),
+    )
+    .await
+    .unwrap();
+    for event in &events {
+        let (status, proof) = send(
+            &router,
+            auth_post_get(
+                &format!("/documents/{document}/merkle-proof/{}", event.id.0),
+                &token,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{proof}");
+        assert_eq!(proof["root"], root_hex);
+        assert_eq!(proof["through_seq"], 3);
+        assert_eq!(proof["seq"], event.seq);
+    }
+    assert_eq!(
+        send(
+            &router,
+            auth_post_get(
+                &format!("/documents/{document}/merkle-proof/{}", later.id.0),
+                &token
+            )
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, wire) = send(
+        &router,
+        auth_post_get(
+            &format!("/documents/{document}/snapshot/{}", snapshot.id.0),
+            &token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(wire["event_merkle_root"], json!(root));
 }
 
 // --- write path + governance ----------------------------------------------------
@@ -4662,4 +4844,149 @@ async fn new_pos_keys_are_validated_at_write_boundaries(pool: PgPool) {
         StatusCode::BAD_REQUEST,
         "expected 400 for newline new_pos: {body}"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn multiple_roots_compatibility_at_api_boundary(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let actor = seed_identity(&pool, "roots-test@example.test").await;
+    let owner = bearer(actor);
+    let doc = create_document(&router, &owner, "Multi-Root Document").await;
+
+    // 1. Create first root (Clause) -> 200 OK
+    let root1_id = ulid::Ulid::generate().to_string();
+    let (status, res1) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_id": root1_id, "node_type":"clause","pos":"a0","fields":{"title":"Root Clause 1"}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "first root create should succeed: {res1}"
+    );
+
+    // 2. Create a child clause under Root 1
+    let child_id = ulid::Ulid::generate().to_string();
+    let (status, res_child) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_id": child_id, "node_type":"clause","parent_id": root1_id,"pos":"a0","fields":{"title":"Child Clause"}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "child clause create should succeed: {res_child}"
+    );
+
+    // 3. Create a second root (Form at top-level) -> 200 OK (multiple roots permitted for compatibility)
+    let root2_id = ulid::Ulid::generate().to_string();
+    let (status, res2) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_id": root2_id, "node_type":"form","pos":"a1","fields":{"label":"Second Root Form"}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "second root create should succeed: {res2}"
+    );
+
+    // 4. Move the child clause to top-level (new_parent_id: null) via /batch -> 200 OK
+    let (status, res_move) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/batch"),
+            &owner,
+            &json!({"ops":[{"type":"NodeMoved","node_id": child_id, "new_parent_id": null, "new_pos": "a2"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "moving clause to root should succeed: {res_move}"
+    );
+
+    // 5. Create an item under Root 2 (Form), then attempt to move it to root -> 400 Bad Request
+    let item_id = ulid::Ulid::generate().to_string();
+    let (status, res_item) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_id": item_id, "node_type":"item","parent_id": root2_id,"pos":"a0","fields":{"label":"Form Item"}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "item create should succeed: {res_item}"
+    );
+
+    let (status, res_bad_move) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/batch"),
+            &owner,
+            &json!({"ops":[{"type":"NodeMoved","node_id": item_id, "new_parent_id": null, "new_pos": "a3"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "moving non-root item to root should fail: {res_bad_move}"
+    );
+
+    // Also attempt creating an illegal root directly (Item without parent) -> 400 Bad Request
+    let (status, res_bad_create) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/ops/node-create"),
+            &owner,
+            &json!({"node_type":"item","pos":"a4","fields":{"label":"Illegal Root Item"}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "illegal root item should be rejected: {res_bad_create}"
+    );
+
+    // 6. Verify database node table contains all three live roots with parent_id IS NULL
+    let roots: Vec<String> = sqlx::query_scalar(
+        "select id from node where document_id = $1 and parent_id is null and not deleted order by pos asc",
+    )
+    .bind(doc)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(roots.len(), 3);
+    assert!(roots.contains(&root1_id));
+    assert!(roots.contains(&root2_id));
+    assert!(roots.contains(&child_id));
+
+    // 7. Verify /structure endpoint succeeds on multi-root document
+    let request = Request::builder()
+        .uri(format!("/documents/{doc}/structure"))
+        .header(header::AUTHORIZATION, &owner)
+        .body(Body::empty())
+        .unwrap();
+    let (status, analysis) = send(&router, request).await;
+    assert_eq!(status, StatusCode::OK, "{analysis}");
 }

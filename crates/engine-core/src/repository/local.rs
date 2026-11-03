@@ -160,6 +160,31 @@ async fn load_commit(
     Ok((decode_commit(&bytes, address, project)?, height))
 }
 
+pub struct LocalCommitLoader<'a> {
+    pub connection: &'a mut SqliteConnection,
+    pub project: uuid::Uuid,
+}
+
+impl<'a> crate::repository::log::CommitLoader for LocalCommitLoader<'a> {
+    async fn load(
+        &mut self,
+        address: &Address,
+    ) -> Result<crate::repository::log::LoadedEnvelope, Error> {
+        let (bytes, _height): (Vec<u8>, i64) = sqlx::query_as(
+            "select body,height from commits where address=? and length(body)<=1049600",
+        )
+        .bind(address.as_str())
+        .fetch_optional(&mut *self.connection)
+        .await?
+        .ok_or_else(|| Error::Missing(address.clone()))?;
+        let signed = decode_commit(&bytes, address, self.project)?;
+        Ok(crate::repository::log::LoadedEnvelope {
+            signed,
+            bytes: bytes.len(),
+        })
+    }
+}
+
 async fn load_recovery_plan(
     connection: &mut SqliteConnection,
     project: uuid::Uuid,
@@ -518,6 +543,20 @@ impl LocalRepository {
     pub async fn commit(&self, address: &Address) -> Result<SignedCommit, Error> {
         let mut connection = self.pool.acquire().await?;
         Ok(load_commit(&mut connection, self.project, address).await?.0)
+    }
+
+    /// Retrieve a bounded page of first-parent commit history starting at `head`.
+    pub async fn first_parent_log(
+        &self,
+        head: &Address,
+        options: crate::repository::log::FirstParentLogOptions,
+    ) -> Result<crate::repository::log::FirstParentLogPage, Error> {
+        let mut connection = self.pool.acquire().await?;
+        let mut loader = LocalCommitLoader {
+            connection: &mut connection,
+            project: self.project,
+        };
+        crate::repository::log::first_parent_log(&mut loader, self.project, head, options).await
     }
 
     /// Preview a historical delta against an exact current commit, without
@@ -1288,6 +1327,53 @@ mod tests {
             .execute(&repo.pool)
             .await
             .is_err());
+        cleanup(repo, &file).await;
+    }
+
+    #[tokio::test]
+    async fn first_parent_log_on_local_repository() {
+        let file = path();
+        let project = uuid::Uuid::new_v4();
+        let repo = LocalRepository::open(&file, project).await.unwrap();
+
+        let c0 = signed(project, vec![], BTreeMap::new(), "Genesis");
+        let a0 = repo.import_commit(&c0).await.unwrap();
+
+        let c1 = signed(project, vec![a0.clone()], BTreeMap::new(), "First commit");
+        let a1 = repo.import_commit(&c1).await.unwrap();
+
+        let c2 = signed(project, vec![a1.clone()], BTreeMap::new(), "Second commit");
+        let a2 = repo.import_commit(&c2).await.unwrap();
+
+        // Paged traversal with limit 2
+        let page1 = repo
+            .first_parent_log(
+                &a2,
+                crate::repository::log::FirstParentLogOptions { limit: Some(2) },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page1.entries.len(), 2);
+        assert_eq!(page1.entries[0].address, a2);
+        assert_eq!(page1.entries[1].address, a1);
+        assert_eq!(page1.next_address, Some(a0.clone()));
+        assert!(page1.more);
+
+        // Continuation page
+        let page2 = repo
+            .first_parent_log(
+                &page1.next_address.unwrap(),
+                crate::repository::log::FirstParentLogOptions { limit: Some(2) },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page2.entries.len(), 1);
+        assert_eq!(page2.entries[0].address, a0);
+        assert_eq!(page2.next_address, None);
+        assert!(!page2.more);
+
         cleanup(repo, &file).await;
     }
 }

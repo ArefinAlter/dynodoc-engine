@@ -91,10 +91,17 @@ async fn main() -> anyhow::Result<()> {
         .fetch_one(&mut *gate)
         .await?;
     let committed = Arc::new(AtomicBool::new(false));
+    let incremental = std::env::var("DYNODOC_CHECKPOINT_INCREMENTAL")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
     let worker_pool = pool.clone();
     let publication_done = committed.clone();
     let publisher = tokio::spawn(async move {
-        let result = postgres::take(&worker_pool, doc, 8000, Limits::default()).await;
+        let result = if incremental {
+            postgres::take_incremental(&worker_pool, doc, 8000, Limits::default()).await
+        } else {
+            postgres::take(&worker_pool, doc, 8000, Limits::default()).await
+        };
         publication_done.store(true, Ordering::Release);
         result
     });

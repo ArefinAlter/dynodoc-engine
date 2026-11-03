@@ -20,6 +20,7 @@ use uuid::Uuid;
 mod auth;
 mod authority;
 mod device;
+mod export_token;
 mod keyfile;
 mod keystore;
 mod mcp;
@@ -52,6 +53,9 @@ struct Cli {
 enum Command {
     /// Selected-history transfer. Remote heads are pinned separately from local branches.
     Sync(sync::Options),
+    /// Private export-carrier actions (mint, status, resolve, revoke).
+    #[command(alias = "export-tokens", alias = "export")]
+    ExportToken(export_token::Options),
     /// Read-only MCP server for AI agents over standard input and output (Claude Code,
     /// Claude Desktop). Launched by the client, not run by hand.
     Mcp(mcp::Options),
@@ -119,6 +123,51 @@ enum Command {
     },
     /// Check schema and runtime privileges using DATABASE_URL; makes no changes.
     CheckRuntime,
+    /// Inspect database column collations and test SQL ordering parity with Rust byte order (read-only).
+    ///
+    /// Exit status:
+    ///   0: all relational ID/position columns and synthetic string tests match Rust byte order
+    ///   2: incompatible column collation or ordering mismatch detected
+    ///   1: connection or database query error
+    #[command(name = "check-ordering", alias = "ordering-audit")]
+    CheckOrdering {
+        /// Emit structured JSON report to standard output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Offline history archive verification (no repository required).
+    ///
+    /// An independently obtained expected head anchors integrity. A self-signed
+    /// archive alone does not establish account authority, timestamps, server
+    /// freshness or native-format fidelity.
+    ArchiveVerify {
+        /// History archive file (.dynoarc) to verify.
+        file: std::path::PathBuf,
+        /// Expected project id (UUID).
+        #[arg(long)]
+        project: Uuid,
+        /// Expected head commit address.
+        #[arg(long)]
+        expect_head: String,
+    },
+    /// Offline normalized state export verification (no repository required).
+    ///
+    /// An independently obtained expected commit address and path anchor integrity.
+    /// A self-contained state export envelope alone does not establish account authority,
+    /// timestamps, server freshness or native-format fidelity.
+    StateExportVerify {
+        /// Normalized state export JSON file (.json) to verify.
+        file: std::path::PathBuf,
+        /// Expected project id (UUID).
+        #[arg(long)]
+        project: Uuid,
+        /// Expected commit address (lowercase hex SHA-256).
+        #[arg(long)]
+        expect_commit: String,
+        /// Expected document file path in commit manifest.
+        #[arg(long, visible_alias = "expect-path")]
+        path: String,
+    },
     /// Independently verify the event chain and all legacy snapshots.
     Verify {
         /// Document id (UUID).
@@ -163,6 +212,12 @@ enum Command {
         /// Use typed chunked state objects (requires schema 30).
         #[arg(long)]
         typed: bool,
+        /// Reuses unchanged components from an eligible earlier typed checkpoint (requires --typed).
+        #[arg(long)]
+        incremental: bool,
+        /// Explicit codec selection (e.g. 'compact-v3').
+        #[arg(long)]
+        codec: Option<String>,
     },
     /// Emit the generated OpenAPI document. With `--out`, write it there; otherwise
     /// print to stdout. CI compares the committed `openapi.yaml` against `--out -` to
@@ -206,6 +261,7 @@ async fn run() -> anyhow::Result<()> {
     private_file::allow_insecure(cli.allow_insecure_key_file);
     passphrase::set_file(cli.passphrase_file);
     match cli.command {
+        Command::ExportToken(options) => export_token::run(options).await,
         Command::Sync(options) => sync::run(options).await,
         Command::Mcp(options) => mcp::run(options).await,
         Command::Device { action } => device::run(action),
@@ -285,6 +341,18 @@ async fn run() -> anyhow::Result<()> {
             println!("Runtime schema and database privileges verified.");
             Ok(())
         }
+        Command::CheckOrdering { json } => check_ordering(json).await,
+        Command::ArchiveVerify {
+            file,
+            project,
+            expect_head,
+        } => archive_verify(file, project, expect_head).await,
+        Command::StateExportVerify {
+            file,
+            project,
+            expect_commit,
+            path,
+        } => state_export_verify(file, project, expect_commit, path).await,
         Command::Verify {
             document_id,
             expect_head,
@@ -297,7 +365,9 @@ async fn run() -> anyhow::Result<()> {
             document_id,
             through_seq,
             typed,
-        } => shared_snapshot(document_id, through_seq, typed).await,
+            incremental,
+            codec,
+        } => shared_snapshot(document_id, through_seq, typed, incremental, codec).await,
         Command::Openapi { out } => openapi(out),
     }
 }
@@ -322,6 +392,81 @@ fn parse_document_id(document_id: &str) -> anyhow::Result<DocumentId> {
     Uuid::parse_str(document_id)
         .map(DocumentId)
         .with_context(|| format!("invalid document id (expected a UUID): {document_id}"))
+}
+
+/// Verify an offline history archive without any database or target repository.
+async fn archive_verify(
+    file: std::path::PathBuf,
+    project: Uuid,
+    expect_head: String,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        file.is_file(),
+        "archive file not found at {}",
+        file.display()
+    );
+    let expect_head_addr = engine_core::shared_checkpoint::Address::try_from(expect_head)
+        .context("invalid expect_head address")?;
+    let file_handle = std::fs::File::open(&file)
+        .with_context(|| format!("failed to open archive at {}", file.display()))?;
+
+    let summary = engine_core::repository::archive::verify_archive(
+        file_handle,
+        engine_core::repository::archive::ArchiveLimits::default(),
+        Some(&expect_head_addr),
+        Some(DocumentId(project)),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("archive verification failed: {e}"))?;
+
+    let output = serde_json::json!({
+        "file": file.display().to_string(),
+        "head": summary.head,
+        "project": summary.project.0,
+        "objects": summary.objects,
+        "commits": summary.commits,
+        "bytes_before_footer": summary.bytes_before_footer,
+        "total_bytes": summary.total_bytes,
+        "sha256": summary.sha256,
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+/// Verify an offline normalized state export file without any database or target repository.
+async fn state_export_verify(
+    file: std::path::PathBuf,
+    project: Uuid,
+    expect_commit: String,
+    path: String,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        file.is_file(),
+        "state export file not found at {}",
+        file.display()
+    );
+    let expect_commit_addr = engine_core::shared_checkpoint::Address::try_from(expect_commit)
+        .context("invalid expect_commit address")?;
+
+    let report = engine_core::repository::state_export::verify_state_export_file(
+        &file,
+        project,
+        &expect_commit_addr,
+        &path,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("state export verification failed: {e}"))?;
+
+    let output = serde_json::json!({
+        "file": file.display().to_string(),
+        "project": report.project,
+        "commit": report.commit.as_str(),
+        "path": report.path,
+        "document": report.document.0,
+        "root": report.root.as_str(),
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
 }
 
 /// Connect to Postgres from `DATABASE_URL`.
@@ -518,11 +663,85 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-async fn shared_snapshot(document_id: String, through_seq: i64, typed: bool) -> anyhow::Result<()> {
+async fn shared_snapshot(
+    document_id: String,
+    through_seq: i64,
+    typed: bool,
+    incremental: bool,
+    codec_arg: Option<String>,
+) -> anyhow::Result<()> {
+    if let Some(ref c) = codec_arg {
+        if c != "compact-v3" {
+            anyhow::bail!("unsupported codec '{c}', expected 'compact-v3'");
+        }
+        if typed {
+            anyhow::bail!("--codec {c} cannot be combined with --typed");
+        }
+    } else if incremental && !typed {
+        anyhow::bail!("--incremental requires --typed");
+    }
+
+    if through_seq < 0 {
+        anyhow::bail!("through_seq must be non-negative");
+    }
+
     let doc = parse_document_id(&document_id)?;
     let pool = connect().await?;
+
+    if incremental {
+        let is_v3 = matches!(codec_arg.as_deref(), Some("compact-v3"));
+        let result = if is_v3 {
+            engine_core::shared_checkpoint::postgres::take_incremental_v3(
+                &pool,
+                doc,
+                through_seq,
+                engine_core::shared_checkpoint::Limits::default(),
+            )
+            .await
+            .context("publishing shared checkpoint failed")?
+        } else {
+            engine_core::shared_checkpoint::postgres::take_incremental(
+                &pool,
+                doc,
+                through_seq,
+                engine_core::shared_checkpoint::Limits::default(),
+            )
+            .await
+            .context("publishing shared checkpoint failed")?
+        };
+
+        let codec_name = if is_v3 { "V3" } else { "V2" };
+        println!(
+            "shared checkpoint {codec_name} (incremental) at revision {}: {}",
+            result.through_seq,
+            result.root.as_str()
+        );
+        match result.base_seq {
+            Some(base) => println!("selected base: revision {base}"),
+            None => println!("selected base: none"),
+        }
+        println!("fallback ran: {}", result.fallback_ran);
+        println!(
+            "encoded objects: {}; encoded bytes: {}",
+            result.stats.visited_objects, result.stats.encoded_bytes
+        );
+        println!(
+            "new objects: {}; new canonical bytes: {}",
+            result.stats.new_objects, result.stats.new_bytes
+        );
+        println!(
+            "read queries: {}; write queries: {}",
+            result.object_read_queries, result.object_write_queries
+        );
+        return Ok(());
+    }
+
     use engine_core::shared_checkpoint::postgres::Codec;
-    let codec = if typed { Codec::V2 } else { Codec::V1 };
+    let codec = match codec_arg.as_deref() {
+        Some("compact-v3") => Codec::V3,
+        _ if typed => Codec::V2,
+        _ => Codec::V1,
+    };
     let result = engine_core::shared_checkpoint::postgres::take_with_codec(
         &pool,
         doc,
@@ -538,8 +757,98 @@ async fn shared_snapshot(document_id: String, through_seq: i64, typed: bool) -> 
         result.root.as_str()
     );
     println!(
+        "encoded objects: {}; encoded bytes: {}",
+        result.stats.visited_objects, result.stats.encoded_bytes
+    );
+    println!(
         "new objects: {}; new canonical bytes: {}",
         result.stats.new_objects, result.stats.new_bytes
     );
     Ok(())
+}
+
+async fn check_ordering(json: bool) -> anyhow::Result<()> {
+    let pool = connect().await?;
+    let report = engine_core::database::ordering::audit_ordering(&pool).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_ordering_report(&report);
+    }
+    if !report.compatible {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn print_ordering_report(report: &engine_core::database::ordering::OrderingAuditReport) {
+    println!(
+        "Database: {} (collation: {}, ctype: {}, provider: {})",
+        report.database.datname,
+        report.database.datcollate,
+        report.database.datctype,
+        report.database.datlocprovider
+    );
+    let db_byte_order = if report.database.is_byte_order_default {
+        "YES"
+    } else {
+        "NO"
+    };
+    println!("Database default byte-order collation: {db_byte_order}");
+    println!();
+    println!(
+        "Column Collation Inventory ({} columns):",
+        report.columns.len()
+    );
+    for col in &report.columns {
+        let status = if col.is_byte_order {
+            "OK"
+        } else {
+            "INCOMPATIBLE"
+        };
+        println!(
+            "  [{status}] {}.{} ({}, effective: {})",
+            col.table_name, col.column_name, col.data_type, col.effective_collation
+        );
+    }
+    if !report.foreign_keys.is_empty() {
+        println!();
+        println!(
+            "Foreign Key References ({} constraints):",
+            report.foreign_keys.len()
+        );
+        for fk in &report.foreign_keys {
+            println!(
+                "  {}: {}({}) -> {}({})",
+                fk.constraint_name,
+                fk.source_table,
+                fk.source_column,
+                fk.target_table,
+                fk.target_column
+            );
+        }
+    }
+    println!();
+    println!(
+        "Synthetic Ordering Parity Checks ({} categories):",
+        report.comparisons.len()
+    );
+    for cmp in &report.comparisons {
+        let status = if cmp.matches { "OK" } else { "MISMATCH" };
+        print!("  [{status}] {}: {} item(s)", cmp.category, cmp.count);
+        if let Some((sql_val, rust_val)) = &cmp.first_mismatch {
+            print!(" (first mismatch: SQL={sql_val:?}, Rust={rust_val:?})");
+        }
+        println!();
+    }
+    println!();
+    if report.compatible {
+        println!("Result: OK — all columns and synthetic strings match Rust byte order.");
+    } else {
+        println!(
+            "Result: MISMATCH — {} incompatible column(s), {} ordering mismatch(es) detected.",
+            report.incompatible_columns.len(),
+            report.ordering_mismatches
+        );
+    }
 }

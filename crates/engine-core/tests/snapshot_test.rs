@@ -246,6 +246,7 @@ fn materializes_large_document_from_snapshot_plus_tail() -> anyhow::Result<()> {
         state: snapshot_value,
         merkle_root: vec![0; 32],
         event_chain_hash: vec![0; 32],
+        event_merkle_root: None,
         created_at: chrono::Utc::now(),
     };
 
@@ -290,7 +291,7 @@ async fn legacy_fixture(
     let events = engine_core::log::read_range(pool, doc, 1, seq).await?;
     let state = Materializer::fold(&events)?;
     let chain = events.last().map_or(vec![0; 32], |e| e.chain_hash.clone());
-    Ok(sqlx::query_as("insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash) values($1,$2,$3,$4,$5) returning *")
+    Ok(sqlx::query_as("insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash) values($1,$2,$3,$4,$5) returning id,document_id,through_seq,state,merkle_root,event_chain_hash,created_at,null::bytea as event_merkle_root")
         .bind(doc.0).bind(seq).bind(json!(state)).bind(engine_core::snapshot::merkle_root(&state)?.as_slice())
         .bind(chain).fetch_one(pool).await?)
 }
@@ -551,6 +552,7 @@ async fn schema_27_upgrade_requires_replay_without_rewriting_old_snapshots(
         .execute(&pool)
         .await?;
     all.run(&pool).await?;
+    let pool = PgPool::connect_with(pool.connect_options().as_ref().clone()).await?;
     let mut connection = pool.acquire().await?;
     assert!(matches!(
         snapshot_verification::load(&mut connection, doc, snapshot.id.0).await,
@@ -732,7 +734,7 @@ async fn shared_named_snapshots_reuse_objects_and_preserve_mixed_history(
     .bind(doc.0)
     .fetch_all(&pool)
     .await?;
-    assert_eq!(versions, vec![1, 2, 2, 1]);
+    assert_eq!(versions, vec![3, 4, 4, 3]);
     assert_eq!(verify_document(&pool, doc, true).await?.snapshots, 4);
     Ok(())
 }
@@ -871,9 +873,90 @@ async fn concurrent_mixed_snapshot_writers_keep_one_format_and_receipt(
         .bind(doc.0).bind(a.id.0).fetch_one(&pool).await?;
     assert_eq!(
         objects == 0,
-        version == 1,
+        version == 3,
         "losing typed publication must not leave objects"
     );
     assert_eq!(verify_document(&pool, doc, false).await?.snapshots, 1);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn snapshot_reconstruction_preserves_multi_root_forest(pool: PgPool) -> anyhow::Result<()> {
+    let (author, doc, root1) = seed(&pool).await?;
+
+    // Create a second root (Clause) at top level
+    let root2 = NodeId(ulid::Ulid::generate().to_string());
+    sqlx::query(
+        "insert into node (id, document_id, parent_id, type, pos, current_fields, var_name)
+         values ($1, $2, null, 'clause', 'a1', '{}'::jsonb, null)",
+    )
+    .bind(&root2.0)
+    .bind(doc.0)
+    .execute(&pool)
+    .await?;
+
+    append(
+        &pool,
+        doc,
+        &EventPayload::NodeCreated {
+            node_id: root2.clone(),
+            node_type: engine_shared::NodeType::Clause,
+            parent_id: None,
+            pos: "a1".into(),
+            fields: json!({ "title": "Second Root Clause" }),
+            var_name: None,
+        },
+        author,
+    )
+    .await?;
+
+    // Create a child node under root2
+    let child = NodeId(ulid::Ulid::generate().to_string());
+    sqlx::query(
+        "insert into node (id, document_id, parent_id, type, pos, current_fields, var_name)
+         values ($1, $2, $3, 'item', 'a0', '{}'::jsonb, null)",
+    )
+    .bind(&child.0)
+    .bind(doc.0)
+    .bind(&root2.0)
+    .execute(&pool)
+    .await?;
+
+    append(
+        &pool,
+        doc,
+        &EventPayload::NodeCreated {
+            node_id: child.clone(),
+            node_type: engine_shared::NodeType::Item,
+            parent_id: Some(root2.clone()),
+            pos: "a0".into(),
+            fields: json!({ "label": "Child of root 2" }),
+            var_name: None,
+        },
+        author,
+    )
+    .await?;
+
+    // Take snapshot of multi-root document
+    let engine = SnapshotEngine::new(pool.clone());
+    let _snapshot = engine.take(doc, SnapshotReason::Periodic).await?;
+
+    // Read state from snapshot
+    let mut conn = pool.acquire().await?;
+    let hist = read_state_at(&mut conn, doc, 3).await?;
+    let state = hist.state;
+    assert_eq!(state.nodes.len(), 3);
+    assert!(state.nodes.contains_key(&root1));
+    assert!(state.nodes.contains_key(&root2));
+    assert!(state.nodes.contains_key(&child));
+    assert_eq!(state.nodes[&root1].parent_id, None);
+    assert_eq!(state.nodes[&root2].parent_id, None);
+    assert_eq!(state.nodes[&child].parent_id, Some(root2.clone()));
+
+    // Verify snapshot verification passes
+    let record = verify_document(&pool, doc, false).await?;
+    assert_eq!(record.snapshots, 1);
+    assert_eq!(record.through_seq, 3);
+
     Ok(())
 }

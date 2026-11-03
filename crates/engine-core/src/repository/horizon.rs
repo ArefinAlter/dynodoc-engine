@@ -204,6 +204,10 @@ pub struct HorizonRecord {
     pub evidence: Vec<String>,
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "ring SHA-256 always returns exactly 32 bytes"
+)]
 fn sha256(parts: &[&[u8]]) -> [u8; 32] {
     let mut context = digest::Context::new(&digest::SHA256);
     for part in parts {
@@ -216,6 +220,10 @@ fn sha256(parts: &[&[u8]]) -> [u8; 32] {
         .expect("SHA-256 output")
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "Address construction validates exactly 64 hexadecimal digits"
+)]
 pub(crate) fn raw(address: &Address) -> [u8; 32] {
     unhex(address.as_str(), 32)
         .ok()
@@ -223,6 +231,10 @@ pub(crate) fn raw(address: &Address) -> [u8; 32] {
         .expect("an Address is 64 lowercase hexadecimal digits")
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "hex encoding 32 bytes yields a valid 64-digit Address"
+)]
 pub(crate) fn address_of(raw: &[u8; 32]) -> Address {
     Address::try_from(hex(raw)).expect("64 lowercase hexadecimal digits")
 }

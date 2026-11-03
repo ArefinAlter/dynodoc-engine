@@ -1,5 +1,7 @@
 //! Snapshot engine (docs/15).
 
+pub mod cache;
+
 use engine_shared::{DocumentId, Event, EventPayload, Snapshot};
 use futures::TryStreamExt;
 use ring::digest::{Context, SHA256};
@@ -76,6 +78,7 @@ pub enum CheckpointFormat {
     Legacy,
     SharedV1,
     SharedV2,
+    SharedV3,
 }
 
 /// Automatic writes retain a reversible rollout boundary. Readers always support
@@ -150,12 +153,13 @@ async fn read_state_at_with_formats(
     .fetch_optional(&mut *connection)
     .await?;
     let (snapshot_seq, checkpoint_format, mut state) = match selected {
-        Some((seq, version @ 1..=2)) => (
+        Some((seq, version @ 1..=3)) => (
             seq,
-            if version == 1 {
-                CheckpointFormat::SharedV1
-            } else {
-                CheckpointFormat::SharedV2
+            match version {
+                1 => CheckpointFormat::SharedV1,
+                2 => CheckpointFormat::SharedV2,
+                3 => CheckpointFormat::SharedV3,
+                _ => unreachable!(),
             },
             shared::load_in_connection(connection, document_id, seq, Limits::default()).await?,
         ),

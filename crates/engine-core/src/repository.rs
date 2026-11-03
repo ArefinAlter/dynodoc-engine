@@ -11,6 +11,7 @@ use ring::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod archive;
 pub mod attestation;
 pub mod authority_epoch;
 pub mod compare;
@@ -19,10 +20,13 @@ pub mod device;
 pub mod device_session;
 pub mod horizon;
 pub mod local;
+pub mod log;
+pub mod private_fs;
 pub mod project_merge;
 pub mod receipt_journal;
 pub mod recovery;
 pub mod server_authority;
+pub mod state_export;
 
 pub const MAX_FILES: usize = 4096;
 pub const MAX_COMMIT_BYTES: usize = 1024 * 1024;
@@ -82,10 +86,10 @@ pub struct Commit {
     pub same_file_resolutions: Vec<convergence::Resolution>,
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn unhex(value: &str, size: usize) -> Result<Vec<u8>, Error> {
+pub(crate) fn unhex(value: &str, size: usize) -> Result<Vec<u8>, Error> {
     if value.len() != size * 2
         || !value
             .bytes()
@@ -220,7 +224,7 @@ impl Commit {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedCommit {
     pub commit: Commit,

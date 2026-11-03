@@ -399,7 +399,11 @@ pub(crate) async fn begin_write(
     actor: IdentityId,
 ) -> Result<(Transaction<'_, Postgres>, Role, DocumentState), ApiError> {
     let (mut tx, role) = begin_write_locked(state, document_id, actor).await?;
-    let (current, _) = engine_core::snapshot::read_current_state(&mut tx, document_id).await?;
+    let (current, _) = if let Some(cache) = &state.write_cache {
+        cache.read(&mut tx, document_id).await?
+    } else {
+        engine_core::snapshot::read_current_state(&mut tx, document_id).await?
+    };
     Ok((tx, role, current))
 }
 
