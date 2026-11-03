@@ -218,7 +218,6 @@ async fn expected_indexes_exist(pool: PgPool) -> sqlx::Result<()> {
         "node_parent_idx",
         "node_varname_idx",
         "node_fields_gin",
-        "event_document_seq_idx",
         "event_target_node_idx",
         "event_type_idx",
         "snapshot_latest_idx",
@@ -230,6 +229,139 @@ async fn expected_indexes_exist(pool: PgPool) -> sqlx::Result<()> {
             "missing index {expected}; have {names:?}"
         );
     }
+    assert!(!names.iter().any(|name| name == "event_document_seq_idx"));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn retained_indexes_support_json_containment_and_mixed_snapshot_ordering(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let s = seed(&pool).await?;
+    let other: uuid::Uuid = sqlx::query_scalar(
+        "insert into document(title,created_by) values('Other snapshots',$1) returning id",
+    )
+    .bind(s.identity_id)
+    .fetch_one(&pool)
+    .await?;
+    let mut expected = vec![
+        (s.document_id, 1_i64),
+        (s.document_id, 3),
+        (other, 2),
+        (other, 4),
+    ];
+    for (document, seq) in &expected {
+        sqlx::query("insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash) values($1,$2,'{}'::jsonb,$3,$4)")
+            .bind(document).bind(seq).bind(&digest(0x33)[..]).bind(&digest(0x22)[..])
+            .execute(&pool).await?;
+    }
+    let mut tx = pool.begin().await?;
+    // Check access-path capability independently of small-fixture cost choices.
+    sqlx::query("set local enable_seqscan=off")
+        .execute(&mut *tx)
+        .await?;
+    let containment = "select id from node where current_fields @> '{\"label\":{\"en\":\"How many hours outdoors?\"}}'::jsonb";
+    let matching: Vec<String> = sqlx::query_scalar(containment).fetch_all(&mut *tx).await?;
+    assert_eq!(matching, vec![s.node_id]);
+    let plan: serde_json::Value =
+        sqlx::query_scalar(&format!("explain (format json) {containment}"))
+            .fetch_one(&mut *tx)
+            .await?;
+    assert!(plan.to_string().contains("node_fields_gin"), "{plan}");
+
+    let ordered =
+        "select document_id,through_seq from snapshot order by document_id asc,through_seq desc";
+    let actual: Vec<(uuid::Uuid, i64)> = sqlx::query_as(ordered).fetch_all(&mut *tx).await?;
+    expected.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    assert_eq!(actual, expected);
+    let plan: serde_json::Value = sqlx::query_scalar(&format!("explain (format json) {ordered}"))
+        .fetch_one(&mut *tx)
+        .await?;
+    assert!(plan.to_string().contains("snapshot_latest_idx"), "{plan}");
+    assert!(
+        !plan.to_string().contains("\"Node Type\":\"Sort\""),
+        "{plan}"
+    );
+    tx.rollback().await?;
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+async fn history_index_upgrade_preserves_rows_and_sequence_uniqueness(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let all = sqlx::migrate!("../../migrations");
+    let old = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            all.iter().filter(|m| m.version <= 47).cloned().collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    old.run(&pool).await?;
+    let s = seed(&pool).await?;
+    let snapshot_id: uuid::Uuid = sqlx::query_scalar(
+        "insert into snapshot (document_id, through_seq, state, merkle_root, event_chain_hash)
+         values ($1, 1, $2, $3, $4) returning id",
+    )
+    .bind(s.document_id)
+    .bind(serde_json::json!({"nodes": 1}))
+    .bind(&digest(0x33)[..])
+    .bind(&digest(0x22)[..])
+    .fetch_one(&pool)
+    .await?;
+    let contents = "select jsonb_build_object(
+        'node', (select to_jsonb(n) from node n where id=$1),
+        'event', (select to_jsonb(e) from event e where id=$2),
+        'snapshot', (select jsonb_build_array(id,document_id,through_seq,state,
+             merkle_root,event_chain_hash,created_at) from snapshot where id=$3))";
+    let before: serde_json::Value = sqlx::query_scalar(contents)
+        .bind(&s.node_id)
+        .bind(&s.event_id)
+        .bind(snapshot_id)
+        .fetch_one(&pool)
+        .await?;
+    all.run(&pool).await?;
+    let after: serde_json::Value = sqlx::query_scalar(contents)
+        .bind(&s.node_id)
+        .bind(&s.event_id)
+        .bind(snapshot_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(before, after);
+
+    let duplicate_event = sqlx::query(
+        "insert into event (id,document_id,seq,type,actor_id,target_node_id,payload,
+             content_hash,prev_chain_hash,chain_hash)
+         select $1,document_id,seq,type,actor_id,target_node_id,payload,
+             content_hash,prev_chain_hash,$2 from event where id=$3",
+    )
+    .bind(ulid::Ulid::generate().to_string())
+    .bind(&digest(0x55)[..])
+    .bind(&s.event_id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        duplicate_event
+            .as_database_error()
+            .and_then(|e| e.constraint()),
+        Some("event_document_seq_unique")
+    );
+    let duplicate_snapshot = sqlx::query(
+        "insert into snapshot (document_id,through_seq,state,merkle_root,event_chain_hash)
+         select document_id,through_seq,state,merkle_root,event_chain_hash
+         from snapshot where id=$1",
+    )
+    .bind(snapshot_id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        duplicate_snapshot
+            .as_database_error()
+            .and_then(|e| e.constraint()),
+        Some("snapshot_document_seq_unique")
+    );
     Ok(())
 }
 
