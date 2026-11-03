@@ -302,3 +302,44 @@ async fn content_hash_is_not_null(pool: PgPool) -> sqlx::Result<()> {
     );
     Ok(())
 }
+
+/// Ordering diagnostic audits catalog collations and synthetic ordering without modifying data.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ordering_audit_diagnoses_catalog_collations(pool: PgPool) -> anyhow::Result<()> {
+    let report = engine_core::database::ordering::audit_ordering(&pool).await?;
+
+    // Verifies that the inventory includes the required ID, pos, and reference columns.
+    assert!(report
+        .columns
+        .iter()
+        .any(|c| c.table_name == "node" && c.column_name == "id"));
+    assert!(report
+        .columns
+        .iter()
+        .any(|c| c.table_name == "node" && c.column_name == "pos"));
+    assert!(report
+        .columns
+        .iter()
+        .any(|c| c.table_name == "node" && c.column_name == "parent_id"));
+    assert!(report
+        .columns
+        .iter()
+        .any(|c| c.table_name == "event" && c.column_name == "target_node_id"));
+
+    // Foreign keys to node(id) are inventoried
+    assert!(report
+        .foreign_keys
+        .iter()
+        .any(|fk| fk.target_table == "node" && fk.target_column == "id"));
+
+    // Synthetic comparisons were evaluated without printing/reading node contents
+    assert_eq!(report.comparisons.len(), 5);
+
+    // On standard non-C database, ordering mismatches and incompatible columns are detected
+    if !report.database.is_byte_order_default {
+        assert!(!report.compatible);
+        assert!(!report.incompatible_columns.is_empty());
+        assert!(report.ordering_mismatches > 0);
+    }
+    Ok(())
+}
