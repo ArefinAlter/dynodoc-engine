@@ -67,13 +67,25 @@ fn put_address(bytes: &mut Vec<u8>, address: &Address) {
     }
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "reference callers pass a checked 40-byte record"
+)]
 fn reference(bytes: &[u8]) -> Reference {
     Reference {
         address: Address(super::hex(&bytes[..32])),
-        length: u64::from_be_bytes(bytes[32..40].try_into().unwrap()),
+        length: u64::from_be_bytes(
+            bytes[32..40]
+                .try_into()
+                .expect("reference callers pass a checked 40-byte record"),
+        ),
     }
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "the matching branch checked the header length; the matching branch checked at least 21 bytes"
+)]
 fn decode<'a>(expected: &Address, bytes: &'a [u8]) -> Result<Object<'a>, Error> {
     if bytes.len() > HEADER + CHUNK_BYTES {
         return Err(Error::Limit("content object bytes"));
@@ -88,8 +100,16 @@ fn decode<'a>(expected: &Address, bytes: &'a [u8]) -> Result<Object<'a>, Error> 
         1 => Ok(Object::Chunk(&bytes[HEADER..])),
         2 if bytes.len() >= 21 => {
             let height = bytes[10];
-            let length = u64::from_be_bytes(bytes[11..19].try_into().unwrap());
-            let count = u16::from_be_bytes(bytes[19..21].try_into().unwrap()) as usize;
+            let length = u64::from_be_bytes(
+                bytes[11..19]
+                    .try_into()
+                    .expect("the matching branch checked the header length"),
+            );
+            let count = u16::from_be_bytes(
+                bytes[19..21]
+                    .try_into()
+                    .expect("the matching branch checked at least 21 bytes"),
+            ) as usize;
             if height == 0
                 || height > MAX_HEIGHT
                 || count == 0
@@ -117,7 +137,11 @@ fn decode<'a>(expected: &Address, bytes: &'a [u8]) -> Result<Object<'a>, Error> 
         }
         3 if bytes.len() == 51 => {
             let height = bytes[10];
-            let length = u64::from_be_bytes(bytes[11..19].try_into().unwrap());
+            let length = u64::from_be_bytes(
+                bytes[11..19]
+                    .try_into()
+                    .expect("the matching branch checked the header length"),
+            );
             if height_for(length)? != height {
                 return Err(Error::Invalid("content root height"));
             }
@@ -186,13 +210,22 @@ impl<S: ObjectStore> Builder<'_, '_, S> {
         }
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the branch checked exactly one reference"
+    )]
     async fn finish(&mut self) -> Result<(u8, Reference), Error> {
         for level in 0..=MAX_HEIGHT as usize {
             if self.levels[level].is_empty() {
                 continue;
             }
             if self.levels[level].len() == 1 && self.levels[level + 1..].iter().all(Vec::is_empty) {
-                return Ok((level as u8, self.levels[level].pop().unwrap()));
+                return Ok((
+                    level as u8,
+                    self.levels[level]
+                        .pop()
+                        .expect("the branch checked exactly one reference"),
+                ));
             }
             if level == MAX_HEIGHT as usize {
                 return Err(Error::Limit("content tree height"));

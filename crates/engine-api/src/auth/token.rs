@@ -119,6 +119,7 @@ pub fn verify_bound_session(
 const DEVICE_TYPE: &str = "dynodoc.project-device-session.v1";
 /// The footer is the JSON object `{"typ":"dynodoc.project-device-session.v1"}`.
 const DEVICE_FOOTER_JSON: &[u8] = br#"{"typ":"dynodoc.project-device-session.v1"}"#;
+#[allow(clippy::expect_used, reason = "static footer claim")]
 fn device_footer() -> Footer {
     let mut footer = Footer::new();
     footer

@@ -6,6 +6,8 @@
 //! the governance-gated write path, the per-document event stream, and the public
 //! audit endpoints.
 
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+
 use std::net::SocketAddr;
 
 use anyhow::Context as _;

@@ -303,6 +303,7 @@ impl MemoryTree {
         index
     }
 
+    #[allow(clippy::expect_used, reason = "the full tree is stored")]
     pub fn root(&self) -> Hash {
         tree_root(self, self.size()).expect("the full tree is stored")
     }

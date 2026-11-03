@@ -122,6 +122,12 @@ async fn recover(
     {
         return Err(bad("Choose a range with 0 <= from_seq < through_seq"));
     }
+    let range_start = if req.mode == Mode::Restore {
+        0 // Restore has no range; none of its branches uses this value.
+    } else {
+        req.from_seq
+            .ok_or_else(|| bad("Choose a starting revision"))?
+    };
     let chain_hash = crate::provenance::anchor(&mut tx, id, req.through_seq).await?;
     let mut source = json!({"kind":"history_recovery","version":1,
         "through_seq":req.through_seq,"chain_hash":chain_hash,
@@ -130,7 +136,7 @@ async fn recover(
         source["mode"] = json!(req.mode);
         source["from_seq"] = json!(req.from_seq);
         source["from_chain_hash"] =
-            json!(crate::provenance::anchor(&mut tx, id, req.from_seq.unwrap()).await?);
+            json!(crate::provenance::anchor(&mut tx, id, range_start).await?);
         source["resolutions"] = json!(req.resolutions);
     }
     let draft_id = if req.action == Action::Create {
@@ -168,12 +174,12 @@ async fn recover(
     let (base, historical) = match req.mode {
         Mode::Restore => (team.clone(), historical),
         Mode::CherryPick => (
-            crate::reviews::state_through(&mut tx, id, req.from_seq.unwrap()).await?,
+            crate::reviews::state_through(&mut tx, id, range_start).await?,
             historical,
         ),
         Mode::Revert => (
             historical,
-            crate::reviews::state_through(&mut tx, id, req.from_seq.unwrap()).await?,
+            crate::reviews::state_through(&mut tx, id, range_start).await?,
         ),
     };
     let target = if let Some(ids) = &selection {
@@ -299,8 +305,8 @@ async fn recover(
     let inserted = sqlx::query("insert into workspace_draft(id,document_id,name,base_seq,base_state,created_by,source,revision,content_changed_at) values($1,$2,$3,$4,$5,$6,$7,1,now()) on conflict(id) do nothing")
         .bind(draft_id).bind(id).bind(match req.mode {
             Mode::Restore => format!("Recover content from revision {}", req.through_seq),
-            Mode::Revert => format!("Revert revisions {}–{}", req.from_seq.unwrap() + 1, req.through_seq),
-            Mode::CherryPick => format!("Cherry-pick revisions {}–{}", req.from_seq.unwrap() + 1, req.through_seq),
+            Mode::Revert => format!("Revert revisions {}–{}", range_start + 1, req.through_seq),
+            Mode::CherryPick => format!("Cherry-pick revisions {}–{}", range_start + 1, req.through_seq),
         })
         .bind(head).bind(stored).bind(auth.identity_id).bind(&source).execute(&mut *tx).await?;
     if inserted.rows_affected() != 1 {

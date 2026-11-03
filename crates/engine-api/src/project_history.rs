@@ -701,7 +701,9 @@ async fn refs(
                 body.clone(),
                 receipt_address.clone(),
             ),
-            binding.as_ref().expect("nonempty rows have authority"),
+            binding.as_ref().ok_or_else(|| {
+                ApiError::Internal("History rows have no authority binding".into())
+            })?,
         )?);
         let address = Address::try_from(address.clone()).map_err(content_error)?;
         scope.extend(

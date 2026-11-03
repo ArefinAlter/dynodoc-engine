@@ -174,6 +174,7 @@ impl MergeEvidence {
         }
     }
 
+    #[allow(clippy::expect_used, reason = "evidence is plain JSON data")]
     pub fn to_json(&self) -> Value {
         serde_json::to_value(self).expect("evidence is plain JSON data")
     }
