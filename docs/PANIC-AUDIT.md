@@ -11,6 +11,7 @@ Remaining expectations have an explicit local proof and a function-local lint al
 | `engine-api/src/agent/error.rs` | `agent_details` | details is the JSON object literal constructed above |
 | `engine-api/src/auth/agent.rs` | `binding` | an agent login always carries its device binding |
 | `engine-api/src/auth/token.rs` | `device_footer` | static footer claim |
+| `engine-api/src/auth/token.rs` | `history_cursor_footer` | static footer claim |
 | `engine-api/src/pagination.rs` | `encode` | cursor serialization is infallible |
 | `engine-api/src/product.rs` | `pseudonym` | the configured SHA-256 HMAC has 32 bytes |
 | `engine-api/src/project_activity.rs` | `project_activity_feed` | the folds guard checked the last group is present |
@@ -21,6 +22,7 @@ Remaining expectations have an explicit local proof and a function-local lint al
 | `engine-core/src/merge_policy/evidence.rs` | `to_json` | evidence is plain JSON data |
 | `engine-core/src/merge_policy/policy.rs` | `canonical_value` | a policy is plain JSON data |
 | `engine-core/src/merge_policy/registry.rs` | `builtin` | built-in strategy ids are unique |
+| `engine-core/src/repository/compare.rs` | `CompareCursor::encode`, `NodeCompareCursor::encode` | a cursor of a version, UUID, two addresses and a string always serializes |
 | `engine-core/src/repository/horizon.rs` | `sha256` | ring SHA-256 always returns exactly 32 bytes |
 | `engine-core/src/repository/horizon.rs` | `raw` | Address construction validates exactly 64 hexadecimal digits |
 | `engine-core/src/repository/horizon.rs` | `address_of` | hex encoding 32 bytes yields a valid 64-digit Address |

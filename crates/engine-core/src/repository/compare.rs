@@ -75,6 +75,10 @@ pub struct CompareCursor {
 }
 
 impl CompareCursor {
+    #[allow(
+        clippy::expect_used,
+        reason = "a cursor of a version, UUID, two addresses and a string always serializes"
+    )]
     pub fn encode(&self) -> String {
         super::hex(&serde_json::to_vec(self).expect("valid cursor serialization"))
     }
@@ -381,6 +385,10 @@ pub struct NodeCompareCursor {
 }
 
 impl NodeCompareCursor {
+    #[allow(
+        clippy::expect_used,
+        reason = "a cursor of a version, UUID, two addresses and a string always serializes"
+    )]
     pub fn encode(&self) -> String {
         super::hex(&serde_json::to_vec(self).expect("valid cursor serialization"))
     }

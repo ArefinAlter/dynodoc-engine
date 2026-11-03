@@ -700,8 +700,12 @@ async fn compare_file(
         return Ok(Json(json!(report)));
     }
 
-    let from_entry = from_file.unwrap();
-    let to_entry = to_file.unwrap();
+    // Both are present: the branches above returned when either was absent.
+    let (Some(from_entry), Some(to_entry)) = (from_file, to_file) else {
+        return Err(ApiError::Internal(
+            "file comparison lost a checked file".into(),
+        ));
+    };
 
     if from_entry.document != to_entry.document {
         if query.cursor.is_some() {

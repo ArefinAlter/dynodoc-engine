@@ -249,6 +249,7 @@ fn device_claims(claims: &Claims) -> Result<DeviceClaims, AuthError> {
 
 const HISTORY_CURSOR_TYPE: &str = "dynodoc.project-history-cursor.v1";
 const HISTORY_CURSOR_FOOTER_JSON: &[u8] = br#"{"typ":"dynodoc.project-history-cursor.v1"}"#;
+#[allow(clippy::expect_used, reason = "static footer claim")]
 fn history_cursor_footer() -> Footer {
     let mut footer = Footer::new();
     footer
