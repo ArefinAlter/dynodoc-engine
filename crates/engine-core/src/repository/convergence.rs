@@ -831,6 +831,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signed_v1_keeps_original_concurrent_insertion_positions() {
+        let base = document(vec![]);
+        let (mut left, mut right) = (base.clone(), base.clone());
+        for (side, prefix) in [(&mut left, "left"), (&mut right, "right")] {
+            for (suffix, pos) in [("1", "m"), ("2", "n")] {
+                let mut added = node(&format!("{prefix}{suffix}"), plain(prefix, ""));
+                added.pos = pos.into();
+                side.nodes.insert(added.id.clone(), added);
+            }
+        }
+        let report = mirrored(&base, &left, &right).await;
+        assert!(report.clean && report.conflicts.is_empty());
+        let mut expected = left.clone();
+        expected.nodes.extend(right.nodes.clone());
+        assert_eq!(report.merged.as_ref(), Some(&expected));
+        assert_eq!(
+            report.address,
+            Some(state_address(doc_id(), &expected).await.unwrap())
+        );
+
+        // The workspace intentionally offers different ordering. Only a new
+        // signed strategy may adopt that ordering for portable resolutions.
+        let default = workspace_merge::merge(&base, &left, &right, &BTreeMap::new());
+        assert_eq!(default.state, expected);
+        let workspace =
+            workspace_merge::merge_with_grouped_insertions(&base, &left, &right, &BTreeMap::new());
+        assert_ne!(workspace.state, expected);
+    }
+
+    #[tokio::test]
     async fn disjoint_field_and_node_edits_merge_to_one_address_in_either_order() {
         let base = document(vec![node("a", plain("A", "n")), node("b", plain("B", "m"))]);
         let mut left = base.clone();
