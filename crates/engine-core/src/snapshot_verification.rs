@@ -539,6 +539,43 @@ mod tests {
             "3108937000f9ea2d5fef24341ac085f2886808ba24f9197613ea603e23ff3d76"
         );
     }
+
+    #[test]
+    fn legacy_receipt_v3_binds_the_event_root_with_a_stable_vector() {
+        // The event-prefix root of three events whose content hashes are the 8-byte
+        // big-endian integers 0, 1 and 2: H(01 || H(01 || L0 || L1) || H(01 || L2 || 0^32))
+        // with L = H(00 || content). Both values come from an independent Python
+        // SHA-256 and sorted-key JSON encoding, which also reproduces the v1 vector.
+        let mut tree = crate::event_merkle::Accumulator::default();
+        for i in 0u64..3 {
+            tree.push(&i.to_be_bytes());
+        }
+        let root: String = tree.root().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            root,
+            "13b31ea3a88420c777689f6bfcd086e83175c18eabf9391e69eec852935a5e9f"
+        );
+        let snapshot = Snapshot {
+            id: engine_shared::SnapshotId(Uuid::nil()),
+            document_id: DocumentId(Uuid::from_u128(1)),
+            through_seq: 0,
+            state: serde_json::json!({"nodes":{},"comments":[],"suggestions":{},"removed_choices":[]}),
+            merkle_root: vec![0; 32],
+            event_chain_hash: vec![0; 32],
+            event_merkle_root: Some(tree.root().to_vec()),
+            created_at: "2026-10-11T00:00:00Z".parse().unwrap(),
+        };
+        assert_eq!(receipt_version(&snapshot), 3);
+        let hex: String = fingerprint(&snapshot)
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "182a3adf17d794ee38ec54d3b2f5440107af691861ef2332359d5a7753d0ac09"
+        );
+    }
     async fn event_fixture(
         pool: &PgPool,
     ) -> anyhow::Result<(DocumentId, engine_shared::IdentityId)> {

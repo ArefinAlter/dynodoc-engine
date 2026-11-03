@@ -461,6 +461,7 @@ mod tests {
             state: serde_json::to_value(&prefix).unwrap(),
             merkle_root: crate::snapshot::merkle_root(&prefix).unwrap().to_vec(),
             event_chain_hash: vec![0; 32],
+            event_merkle_root: None,
             created_at: chrono::Utc::now(),
         };
         assert_eq!(
