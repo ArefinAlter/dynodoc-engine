@@ -460,7 +460,10 @@ mod tests {
             "7034d450-1111-4222-8333-444455556666",
         ] {
             let plan = plan(Tool::Diff, &args(json!({"file": good, "from": 1})), PROJECT).unwrap();
-            assert!(plan.path.contains("/files/7034d450"), "{}", plan.path);
+            assert!(
+                plan.path.contains("/files/7034d450"),
+                "expected file path missing"
+            );
         }
         for bad in [
             "../x",

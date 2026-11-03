@@ -712,6 +712,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "engine-core",
  "engine-shared",
  "futures",
  "insta",

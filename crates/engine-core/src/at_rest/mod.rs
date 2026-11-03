@@ -32,10 +32,11 @@ pub use envelope::{
     HEADER_LEN, MAGIC, MAX_NAME_BYTES, MAX_PLAINTEXT_BYTES, MAX_ROW_KEY_BYTES, MIN_ENVELOPE_LEN,
     SALT_LEN, TAG_LEN, VERSION,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use provider::TestKeyProvider;
 pub use provider::{
-    FileKeyProvider, KeyProvider, ProviderError, ProviderInfo, Purpose, TestKeyProvider,
-    WrapContext, Wrapped, MAX_KEK_FILE_BYTES, MAX_KEK_VERSIONS, MAX_WRAPPED_BYTES,
-    MIN_WRAPPED_BYTES,
+    FileKeyProvider, KeyProvider, ProviderError, ProviderInfo, Purpose, WrapContext, Wrapped,
+    MAX_KEK_FILE_BYTES, MAX_KEK_VERSIONS, MAX_WRAPPED_BYTES, MIN_WRAPPED_BYTES,
 };
 pub use secret::{DataKey, Dek, Kek};
 

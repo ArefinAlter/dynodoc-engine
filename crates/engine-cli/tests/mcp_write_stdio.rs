@@ -1,4 +1,4 @@
-//! The real `engine-cli mcp` process with the write tools, against a loopback service that
+//! The real `engine-cli mcp` process and its write switch, against a loopback service that
 //! plays the device-session routes and the agent routes: what it asks for, what it lists,
 //! what it sends, and that standard output carries protocol messages and nothing else even
 //! when a write is refused. The service is a stand-in written for this test; nothing here ran
@@ -298,10 +298,6 @@ fn names(reply: &Value) -> Vec<&str> {
         .collect()
 }
 
-fn result_text(reply: &Value) -> &str {
-    reply["result"]["content"][0]["text"].as_str().unwrap()
-}
-
 /// Neither the issued token nor an `Authorization` header appears anywhere in the output.
 fn assert_no_secrets(output: &Output) {
     for stream in [text(&output.stdout), text(&output.stderr)] {
@@ -314,150 +310,6 @@ fn assert_no_secrets(output: &Output) {
 }
 
 // --- tests -------------------------------------------------------------------------------------
-
-#[test]
-fn with_write_the_process_asks_for_the_write_scopes_and_sends_only_what_it_is_told_to() {
-    let service = start(false);
-    let ops = json!([{"op": "set_text", "ref": "7C02", "text": "New wording.", "base": "b7a210", "why": "clearer"}]);
-    let (output, replies) = converse(
-        &service,
-        &["--write"],
-        &[],
-        &[
-            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-                "protocolVersion": "2025-11-25", "capabilities": {},
-                "clientInfo": {"name": "test", "version": "0"}}}),
-            list(2),
-            call(
-                3,
-                "propose",
-                json!({"file": "7034d450", "rev": 412, "ops": ops, "dry_run": true}),
-            ),
-            call(
-                4,
-                "propose",
-                json!({"file": "7034d450", "rev": 412, "ops": ops, "name": "Wording"}),
-            ),
-            call(5, "status", json!({"proposal": PROPOSAL})),
-            call(
-                6,
-                "submit",
-                json!({"proposal": PROPOSAL, "action": "submit", "note": "Ready."}),
-            ),
-            call(7, "status", json!({})),
-        ],
-    );
-    assert!(output.status.success(), "{}", text(&output.stderr));
-    assert_eq!(replies.len(), 7);
-    assert_eq!(
-        names(&replies[1]),
-        ["files", "outline", "read", "find", "diff", "propose", "submit", "status"]
-    );
-    assert!(replies[0]["result"]["instructions"]
-        .as_str()
-        .unwrap()
-        .contains("never edits the team version"));
-
-    // The dry run says nothing was stored; the propose says it is only a proposal.
-    assert!(result_text(&replies[2]).contains("note \"dry run: nothing was stored"));
-    let proposed = result_text(&replies[3]);
-    assert!(
-        proposed.contains(&format!("proposal={PROPOSAL}")),
-        "{proposed}"
-    );
-    assert!(
-        proposed.contains("note \"proposal only, still a private draft; nothing is live."),
-        "{proposed}"
-    );
-    assert!(result_text(&replies[4]).contains("state=draft"));
-    // The service said a person must submit: shown plainly, not as a failure.
-    assert!(replies[5]["result"].get("isError").is_none());
-    assert!(result_text(&replies[5])
-        .contains("note \"waiting for a person to submit; nothing is live."));
-    assert!(result_text(&replies[6]).contains("what=access"));
-
-    // One session, with the three scopes; then exactly the requests that were asked for, in
-    // order: the propose did not lead to a submit.
-    assert_eq!(
-        service.log(|l| l.challenges.clone()),
-        [["content:read", "content:propose", "content:submit"]]
-    );
-    let requests = service.log(|l| l.requests.clone());
-    let base = format!("/projects/{PROJECT}/agent");
-    let expected: Vec<(String, String, bool)> = [
-        ("POST", format!("{base}/files/7034d450/propose")),
-        ("POST", format!("{base}/files/7034d450/propose")),
-        ("GET", format!("{base}/proposals/{PROPOSAL}")),
-        ("POST", format!("{base}/proposals/{PROPOSAL}/submit")),
-        ("GET", format!("{base}/access")),
-    ]
-    .into_iter()
-    .map(|(m, p)| (m.to_owned(), p, true))
-    .collect();
-    assert_eq!(requests, expected);
-    let bodies = service.log(|l| l.bodies.clone());
-    assert_eq!(bodies[0]["dry_run"], true);
-    assert_ne!(
-        bodies[0]["request_id"], bodies[1]["request_id"],
-        "each call has its own request id"
-    );
-    assert_eq!(bodies[2], json!({"note": "Ready."}));
-    assert_no_secrets(&output);
-}
-
-#[test]
-fn a_refusal_of_the_write_scopes_leaves_a_working_read_session_and_plain_write_errors() {
-    let service = start(true);
-    let ops = json!([{"op": "delete", "ref": "7C02"}]);
-    let (output, replies) = converse(
-        &service,
-        &["--write"],
-        &[],
-        &[
-            call(
-                1,
-                "propose",
-                json!({"file": "7034d450", "rev": 412, "ops": ops}),
-            ),
-            call(
-                2,
-                "submit",
-                json!({"proposal": PROPOSAL, "action": "submit"}),
-            ),
-            call(3, "status", json!({})),
-            list(4),
-        ],
-    );
-    assert!(output.status.success(), "{}", text(&output.stderr));
-    assert_eq!(replies.len(), 4);
-    for reply in &replies[..2] {
-        assert_eq!(reply["result"]["isError"], true, "{reply}");
-        assert_eq!(
-            result_text(reply),
-            "dd/1 error code=forbidden policy=write_scope hint=\"No access to this file or scope.\"\n"
-        );
-    }
-    // Reads work on the fallback session.
-    assert!(replies[2]["result"].get("isError").is_none());
-    assert!(result_text(&replies[2]).contains("what=access"));
-    assert_eq!(
-        names(&replies[3]).len(),
-        8,
-        "the profile is the one asked for"
-    );
-    // The write set was asked for first, then the read scope alone; no write request was sent.
-    assert_eq!(
-        service.log(|l| l.challenges.clone()),
-        [
-            vec!["content:read", "content:propose", "content:submit"],
-            vec!["content:read"]
-        ]
-    );
-    let paths: Vec<String> = service.log(|l| l.requests.iter().map(|r| r.1.clone()).collect());
-    assert_eq!(paths, [format!("/projects/{PROJECT}/agent/access")]);
-    assert!(text(&output.stderr).contains("no session with the write scopes"));
-    assert_no_secrets(&output);
-}
 
 #[test]
 fn without_the_flag_nothing_asks_for_a_write_scope_and_the_write_tools_do_not_exist() {
@@ -497,84 +349,41 @@ fn without_the_flag_nothing_asks_for_a_write_scope_and_the_write_tools_do_not_ex
 }
 
 #[test]
-fn the_environment_variable_turns_writing_on_and_only_a_clear_yes_does() {
+fn write_mode_is_refused_before_any_key_or_network_use_and_only_a_clear_yes_asks_for_it() {
+    // The stock command has no per-request human confirmation surface, so it refuses write
+    // mode outright: from the flag and from DYNODOC_WRITE=on|1, before it reads the key or
+    // asks the service for anything. Every other value of the variable leaves a read-only
+    // session with the six read tools.
     let service = start(false);
-    for (value, tools) in [
-        ("on", 8),
-        ("1", 8),
-        ("off", 6),
-        ("0", 6),
-        ("", 6),
-        ("maybe", 6),
+    for (extra, environment) in [
+        (&["--write"][..], &[][..]),
+        (&[][..], &[("DYNODOC_WRITE", "on")][..]),
+        (&[][..], &[("DYNODOC_WRITE", "1")][..]),
+        (&["--write"][..], &[("DYNODOC_WRITE", "off")][..]),
     ] {
-        let (output, replies) = converse(&service, &[], &[("DYNODOC_WRITE", value)], &[list(1)]);
-        assert!(output.status.success(), "{}", text(&output.stderr));
-        assert_eq!(names(&replies[0]).len(), tools, "DYNODOC_WRITE={value:?}");
+        let (output, replies) = converse(&service, extra, environment, &[list(1)]);
+        assert!(!output.status.success(), "{extra:?} {environment:?}");
+        assert!(replies.is_empty(), "nothing on stdout: {replies:?}");
+        assert!(
+            text(&output.stderr).contains("human confirmation"),
+            "{}",
+            text(&output.stderr)
+        );
+        assert_no_secrets(&output);
     }
-    // The flag wins over a variable that says no.
-    let (_, replies) = converse(
-        &service,
-        &["--write"],
-        &[("DYNODOC_WRITE", "off")],
-        &[list(1)],
-    );
-    assert_eq!(names(&replies[0]).len(), 8);
-    assert!(
-        service.log(|l| l.challenges.is_empty()),
-        "listing tools needs no session"
-    );
-}
-
-#[test]
-fn a_write_call_with_bad_arguments_is_refused_in_the_process_and_stdout_stays_clean() {
-    let service = start(false);
-    let many: Vec<Value> = (0..201)
-        .map(|_| json!({"op": "delete", "ref": "7C02"}))
-        .collect();
-    let (output, replies) = converse(
-        &service,
-        &["--write"],
-        &[],
-        &[
-            call(
-                1,
-                "propose",
-                json!({"file": "7034d450", "rev": 1, "ops": many}),
-            ),
-            call(
-                2,
-                "propose",
-                json!({"file": "7034d450", "rev": 1, "ops": [{"op": "delete", "ref": "A", "surprise": 1}]}),
-            ),
-            call(
-                3,
-                "submit",
-                json!({"proposal": PROPOSAL, "action": "merge"}),
-            ),
-        ],
-    );
-    assert!(output.status.success(), "{}", text(&output.stderr));
-    let lines: Vec<&str> = replies.iter().map(result_text).collect();
-    assert!(
-        lines[0].starts_with("dd/1 error code=bad_request field=ops "),
-        "{}",
-        lines[0]
-    );
-    assert!(
-        lines[1].starts_with("dd/1 error code=bad_request field=surprise op=0 "),
-        "{}",
-        lines[1]
-    );
-    assert!(
-        lines[2].starts_with("dd/1 error code=bad_request field=action "),
-        "{}",
-        lines[2]
-    );
     assert!(
         service.log(|l| l.requests.is_empty() && l.challenges.is_empty()),
-        "nothing invalid reached the network, not even a session request"
+        "a refused write mode reaches nothing"
     );
-    assert_no_secrets(&output);
+    for value in ["off", "0", "", "maybe"] {
+        let (output, replies) = converse(&service, &[], &[("DYNODOC_WRITE", value)], &[list(1)]);
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        assert_eq!(
+            names(&replies[0]),
+            ["files", "outline", "read", "find", "diff", "status"],
+            "DYNODOC_WRITE={value:?}"
+        );
+    }
 }
 
 #[test]
