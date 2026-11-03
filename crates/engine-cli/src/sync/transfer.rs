@@ -322,3 +322,223 @@ pub(super) async fn upload(
     }
     Ok(())
 }
+
+use engine_core::repository::state_export::StateExportEnvelope;
+
+/// Private temporary scratch directory for remote export.
+/// Sets 0700 permissions on Unix and removes all contents recursively on Drop.
+struct PrivateExportDir {
+    path: PathBuf,
+}
+
+impl PrivateExportDir {
+    fn new() -> std::io::Result<Self> {
+        let path = std::env::temp_dir().join(format!("dynodoc-export-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateExportDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Bounded remote-reachable object store fetching directly from client endpoints into scratch.
+/// Never mutates or reads a local SQLite repository.
+struct RemoteExportStore<'a> {
+    client: &'a Client,
+    commit: &'a Address,
+    scratch_dir: PathBuf,
+    objects: usize,
+    bytes: usize,
+}
+
+impl<'a> RemoteExportStore<'a> {
+    fn new(client: &'a Client, commit: &'a Address, scratch_dir: PathBuf) -> Self {
+        Self {
+            client,
+            commit,
+            scratch_dir,
+            objects: 0,
+            bytes: 0,
+        }
+    }
+
+    async fn read(&mut self, document: DocumentId, address: &Address) -> anyhow::Result<Vec<u8>> {
+        ensure!(
+            self.objects < GRAPH_OBJECTS,
+            "commit graph object limit reached ({GRAPH_OBJECTS})"
+        );
+        self.objects += 1;
+
+        let scratch_file = self.scratch_dir.join(format!("{}.obj", address.as_str()));
+        if scratch_file.exists() {
+            let bytes = std::fs::read(&scratch_file)
+                .with_context(|| format!("reading scratch object {}", address.as_str()))?;
+            return Ok(bytes);
+        }
+
+        #[derive(Deserialize)]
+        struct Packet {
+            address: Address,
+            bytes: String,
+        }
+
+        let object: Packet = self
+            .client
+            .get(
+                &format!(
+                    "history/commits/{}/objects/{}/{}",
+                    self.commit.as_str(),
+                    document.0,
+                    address.as_str()
+                ),
+                &[],
+                1_500_000,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "fetching remote object {} for document {}",
+                    address.as_str(),
+                    document.0
+                )
+            })?;
+
+        ensure!(
+            object.address == *address,
+            "object response address mismatch: expected {}, got {}",
+            address.as_str(),
+            object.address.as_str()
+        );
+
+        let bytes = STANDARD
+            .decode(object.bytes)
+            .context("decoding base64 object payload")?;
+
+        shared_checkpoint::validate_stored(address, &bytes)
+            .with_context(|| format!("validating stored object {}", address.as_str()))?;
+
+        ensure!(
+            bytes.len() <= GRAPH_BYTES.saturating_sub(self.bytes),
+            "commit graph byte limit exceeded ({GRAPH_BYTES})"
+        );
+        self.bytes += bytes.len();
+
+        std::fs::write(&scratch_file, &bytes)
+            .with_context(|| format!("writing scratch object {}", address.as_str()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&scratch_file, std::fs::Permissions::from_mode(0o600));
+        }
+
+        Ok(bytes)
+    }
+}
+
+impl ObjectStore for RemoteExportStore<'_> {
+    async fn put(
+        &mut self,
+        _: DocumentId,
+        _: &Address,
+        _: &[u8],
+    ) -> Result<bool, shared_checkpoint::Error> {
+        Err(shared_checkpoint::Error::Invalid(
+            "remote export reader is read-only",
+        ))
+    }
+
+    async fn get(
+        &mut self,
+        document: DocumentId,
+        address: &Address,
+    ) -> Result<Vec<u8>, shared_checkpoint::Error> {
+        self.read(document, address)
+            .await
+            .map_err(|e| shared_checkpoint::Error::Io(std::io::Error::other(e.to_string())))
+    }
+}
+
+/// Export an exact historical file from authorized remote history as normalized state.
+///
+/// Fetches only the reachable graph into private temporary storage, never trusts arbitrary
+/// inventory, and never mutates a local repository. Validates every object and reconstructed root.
+pub(crate) async fn export_file(
+    client: &Client,
+    project: Uuid,
+    commit: &Address,
+    path: &str,
+    out: &Path,
+) -> anyhow::Result<()> {
+    ensure!(
+        !out.exists(),
+        "output file {} already exists; refusing overwrite",
+        out.display()
+    );
+
+    // 1. Fetch published commit manifest
+    let signed = client
+        .published(commit)
+        .await?
+        .ok_or_else(|| anyhow!("commit {} not found on remote", commit.as_str()))?;
+
+    // 2. Verify commit signature and address
+    let actual_commit_address = signed.verify()?;
+    ensure!(
+        actual_commit_address == *commit,
+        "commit address mismatch: expected {}, got {}",
+        commit.as_str(),
+        actual_commit_address.as_str()
+    );
+
+    // 3. Verify project match
+    ensure!(
+        signed.commit.project == project,
+        "commit does not match requested project"
+    );
+
+    // 4. Exact file path match (no rename guessing)
+    let file_entry = signed
+        .commit
+        .files
+        .get(path)
+        .ok_or_else(|| anyhow!("path '{}' not found in commit {}", path, commit.as_str()))?
+        .clone();
+
+    // 5. Create private temporary scratch directory with 0700 permissions
+    let scratch = PrivateExportDir::new().context("creating private temporary directory")?;
+
+    // 6. Fetch only reachable graph into scratch and reconstruct DocumentState
+    let mut store = RemoteExportStore::new(client, commit, scratch.path().to_path_buf());
+    let state = typed::read_state(
+        &mut store,
+        file_entry.document,
+        &file_entry.state,
+        Limits {
+            max_objects: GRAPH_OBJECTS,
+            max_bytes: GRAPH_BYTES,
+        },
+        Default::default(),
+    )
+    .await
+    .map_err(|e| anyhow!("reconstructing historical document state: {e}"))?;
+
+    // 7. Write normalized StateExportEnvelope to output path (fail-closed, 0600 mode)
+    let envelope = StateExportEnvelope::new(path.to_string(), signed, state);
+    envelope.write_to_path(out)?;
+
+    Ok(())
+}
