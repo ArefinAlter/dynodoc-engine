@@ -1507,3 +1507,366 @@ async fn incremental_publication_erasure_races_rejected(pool: PgPool) -> anyhow:
     ));
     Ok(())
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_v3_publication_happy_path_and_retries(pool: PgPool) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!("rev 2 edit"),
+        },
+        actor,
+    )
+    .await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node,
+            field: "label".into(),
+            value: json!("rev 3 edit"),
+        },
+        actor,
+    )
+    .await?;
+
+    // Initial incremental v3 publication at rev 1: no base exists -> fallback_ran is true
+    let p1 = postgres::take_incremental_v3(&pool, document, 1, Limits::default()).await?;
+    assert_eq!(p1.through_seq, 1);
+    assert!(p1.fallback_ran);
+    assert_eq!(p1.base_seq, None);
+
+    // Incremental v3 publication at rev 2: uses rev 1 as base -> fallback_ran is false
+    let p2 = postgres::take_incremental_v3(&pool, document, 2, Limits::default()).await?;
+    assert_eq!(p2.through_seq, 2);
+    assert!(!p2.fallback_ran);
+    assert_eq!(p2.base_seq, Some(1));
+    assert!(p2.stats.new_objects > 0);
+
+    // Duplicate retry at rev 2: same root, 0 new objects
+    let p2_retry = postgres::take_incremental_v3(&pool, document, 2, Limits::default()).await?;
+    assert_eq!(p2_retry.root, p2.root);
+    assert_eq!(p2_retry.stats.new_objects, 0);
+
+    // Incremental v3 publication at rev 3: uses rev 2 as base
+    let p3 = postgres::take_incremental_v3(&pool, document, 3, Limits::default()).await?;
+    assert_eq!(p3.through_seq, 3);
+    assert!(!p3.fallback_ran);
+    assert_eq!(p3.base_seq, Some(2));
+
+    // Reordered retry at rev 2: returns p2.root
+    let p2_reordered = postgres::take_incremental_v3(&pool, document, 2, Limits::default()).await?;
+    assert_eq!(p2_reordered.root, p2.root);
+
+    // Reordered retry at rev 1: returns p1.root
+    let p1_reordered = postgres::take_incremental_v3(&pool, document, 1, Limits::default()).await?;
+    assert_eq!(p1_reordered.root, p1.root);
+
+    // Verify all 3 load accurately
+    for seq in 1..=3 {
+        let loaded = postgres::load(&pool, document, seq, Limits::default()).await?;
+        let events: Vec<Event> =
+            sqlx::query_as("select * from event where document_id=$1 and seq <= $2 order by seq")
+                .bind(document.0)
+                .bind(seq)
+                .fetch_all(&pool)
+                .await?;
+        let expected = Materializer::fold(&events)?;
+        assert_eq!(loaded, expected);
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_v3_mixed_codec_history_and_base_isolation(pool: PgPool) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!("rev 2 edit"),
+        },
+        actor,
+    )
+    .await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!("rev 3 edit"),
+        },
+        actor,
+    )
+    .await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node,
+            field: "label".into(),
+            value: json!("rev 4 edit"),
+        },
+        actor,
+    )
+    .await?;
+
+    // Rev 1 published with Codec::V1
+    let p1 = postgres::take_with_codec(&pool, document, 1, Limits::default(), postgres::Codec::V1)
+        .await?;
+    assert_eq!(p1.through_seq, 1);
+
+    // Rev 2 published with Codec::V2 (incremental)
+    let p2 = postgres::take_incremental(&pool, document, 2, Limits::default()).await?;
+    assert_eq!(p2.through_seq, 2);
+    // V2 cannot use V1 as base -> fallback_ran
+    assert!(p2.fallback_ran);
+    assert_eq!(p2.base_seq, None);
+
+    // Rev 3 published with Codec::V3 (incremental)
+    // Auto-selects earlier V3 base: none exists! So fallback_ran is true
+    let p3 = postgres::take_incremental_v3(&pool, document, 3, Limits::default()).await?;
+    assert_eq!(p3.through_seq, 3);
+    assert!(p3.fallback_ran);
+    assert_eq!(p3.base_seq, None);
+
+    // Explicitly requesting rev 2 (Codec::V2) as base for V3 incremental at rev 4: rejected
+    let err =
+        postgres::take_incremental_v3_with_base(&pool, document, 4, Some(2), Limits::default())
+            .await
+            .unwrap_err();
+    assert!(matches!(err, Error::Invalid("base checkpoint not found")));
+
+    // Explicitly requesting rev 3 (Codec::V3) as base for V2 incremental at rev 4: rejected
+    let err = postgres::take_incremental_with_base(&pool, document, 4, Some(3), Limits::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Invalid("base checkpoint not found")));
+
+    // Rev 4 published with Codec::V3 (incremental)
+    // Auto-selects earlier V3 base: selects rev 3! (Ignores rev 2 V2 and rev 1 V1)
+    let p4 = postgres::take_incremental_v3(&pool, document, 4, Limits::default()).await?;
+    assert_eq!(p4.through_seq, 4);
+    assert!(!p4.fallback_ran);
+    assert_eq!(p4.base_seq, Some(3));
+
+    // Historical reads across all revisions succeed with their respective codecs
+    for seq in 1..=4 {
+        let loaded = postgres::load(&pool, document, seq, Limits::default()).await?;
+        let events: Vec<Event> =
+            sqlx::query_as("select * from event where document_id=$1 and seq <= $2 order by seq")
+                .bind(document.0)
+                .bind(seq)
+                .fetch_all(&pool)
+                .await?;
+        let expected = Materializer::fold(&events)?;
+        assert_eq!(loaded, expected);
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_v3_occupied_target_revision_rejects_conversion(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node,
+            field: "label".into(),
+            value: json!("rev 2 edit"),
+        },
+        actor,
+    )
+    .await?;
+
+    // Publish rev 2 with V2
+    let p2_v2 = postgres::take_incremental(&pool, document, 2, Limits::default()).await?;
+    assert_eq!(p2_v2.through_seq, 2);
+
+    // Attempting to publish at rev 2 with V3 incremental: rejected with "different checkpoint already published at revision"
+    let err = postgres::take_incremental_v3(&pool, document, 2, Limits::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Invalid("different checkpoint already published at revision")
+    ));
+
+    // Attempting to publish at rev 2 with full V3: rejected as well
+    let err = postgres::take_with_codec(&pool, document, 2, Limits::default(), postgres::Codec::V3)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Invalid("different checkpoint already published at revision")
+    ));
+
+    // Verify rev 2 in database remains Codec::V2
+    let (codec_version, state_root): (i16, String) = sqlx::query_as(
+        "select codec_version, state_root from shared_checkpoint where document_id=$1 and through_seq=2",
+    )
+    .bind(document.0)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(codec_version, 2);
+    assert_eq!(state_root, p2_v2.root.as_str());
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_v3_invalid_future_and_corrupt_base_fails_closed(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node,
+            field: "label".into(),
+            value: json!("rev 2 edit"),
+        },
+        actor,
+    )
+    .await?;
+
+    // Future explicit base requested (seq 999 > 2): rejected
+    let err =
+        postgres::take_incremental_v3_with_base(&pool, document, 2, Some(999), Limits::default())
+            .await
+            .unwrap_err();
+    assert!(matches!(err, Error::Invalid("base checkpoint not found")));
+
+    // Equal explicit base requested (seq 2 >= 2): rejected
+    let err =
+        postgres::take_incremental_v3_with_base(&pool, document, 2, Some(2), Limits::default())
+            .await
+            .unwrap_err();
+    assert!(matches!(err, Error::Invalid("base checkpoint not found")));
+
+    // Simulate corrupted base checkpoint object at rev 1
+    let dummy_root = "d".repeat(64);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(document.0)
+        .bind(&dummy_root)
+        .bind(b"corrupted_v3_bytes".as_slice())
+        .execute(&pool)
+        .await?;
+    let chain = postgres::chain_at(&mut *pool.acquire().await?, document, 1).await?;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,1,3,$2,$3)",
+    )
+    .bind(document.0)
+    .bind(&dummy_root)
+    .bind(&chain)
+    .execute(&pool)
+    .await?;
+
+    // Publishing rev 2 incrementally fails closed
+    let err = postgres::take_incremental_v3(&pool, document, 2, Limits::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Invalid(_) | Error::HashMismatch));
+
+    // Revision 2 was not published
+    let count_2: i64 = sqlx::query_scalar(
+        "select count(*) from shared_checkpoint where document_id=$1 and through_seq=2",
+    )
+    .bind(document.0)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count_2, 0);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_v3_quota_failure_rolls_back_atomically(pool: PgPool) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node,
+            field: "label".into(),
+            value: json!("New v3 label"),
+        },
+        actor,
+    )
+    .await?;
+
+    postgres::take_incremental_v3(&pool, document, 1, Limits::default()).await?;
+
+    let impossible = Limits {
+        max_objects: 1,
+        max_bytes: 5,
+    };
+    let err = postgres::take_incremental_v3(&pool, document, 2, impossible)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Limit(_)));
+
+    let count_2: i64 = sqlx::query_scalar(
+        "select count(*) from shared_checkpoint where document_id=$1 and through_seq=2",
+    )
+    .bind(document.0)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count_2, 0);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_v3_concurrent_same_revision(pool: PgPool) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node,
+            field: "label".into(),
+            value: json!("Concurrent v3 update"),
+        },
+        actor,
+    )
+    .await?;
+
+    postgres::take_incremental_v3(&pool, document, 1, Limits::default()).await?;
+
+    let pool1 = pool.clone();
+    let pool2 = pool.clone();
+    let h1 = tokio::spawn(async move {
+        postgres::take_incremental_v3(&pool1, document, 2, Limits::default()).await
+    });
+    let h2 = tokio::spawn(async move {
+        postgres::take_incremental_v3(&pool2, document, 2, Limits::default()).await
+    });
+
+    let (r1, r2) = tokio::join!(h1, h2);
+    let p1 = r1??;
+    let p2 = r2??;
+
+    assert_eq!(p1.root, p2.root);
+    assert_eq!(p1.through_seq, 2);
+    assert_eq!(p2.through_seq, 2);
+
+    let (codec_version, state_root): (i16, String) = sqlx::query_as(
+        "select codec_version, state_root from shared_checkpoint where document_id=$1 and through_seq=2",
+    )
+    .bind(document.0)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(codec_version, 3);
+    assert_eq!(state_root, p1.root.as_str());
+    Ok(())
+}
