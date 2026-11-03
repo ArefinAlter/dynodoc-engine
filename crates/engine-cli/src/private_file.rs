@@ -11,6 +11,9 @@
 //! same opt-out. These files hold unencrypted keys or tokens; encrypted key files
 //! (`dynodoc-key-v1`, see keyfile.rs) are written through the same functions.
 use anyhow::{anyhow, Context};
+use engine_core::repository::private_fs;
+#[cfg(test)]
+use engine_core::repository::private_fs::{acl_principals, icacls_apply_args, only_user};
 use std::{
     fs::{File, OpenOptions},
     io::Write,
@@ -61,153 +64,8 @@ pub fn create_new(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
-/// Unix creates the file with mode 0600 already (see [`options`]).
-#[cfg(not(windows))]
-fn restrict(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-/// `icacls` arguments that drop inherited entries and leave one entry for
-/// `principal` with full control. Built separately so it is testable everywhere.
-///
-/// A process with an elevated (Administrator) token creates files whose own access
-/// list already holds explicit entries for SYSTEM and the Administrators group, and
-/// those are not inherited ones, so dropping inheritance leaves them. They are
-/// removed by well-known SID (S-1-5-18, S-1-5-32-544: no language dependence)
-/// before the grant, so the grant stays even when the user is SYSTEM itself.
-#[cfg(any(windows, test))]
-fn icacls_apply_args(path: &Path, principal: &str) -> Vec<std::ffi::OsString> {
-    vec![
-        path.as_os_str().to_owned(),
-        "/inheritance:r".into(),
-        "/remove:g".into(),
-        "*S-1-5-18".into(),
-        "*S-1-5-32-544".into(),
-        "/grant:r".into(),
-        format!("{principal}:F").into(),
-    ]
-}
-
-/// The principals named in `icacls <path>` output. The first line starts with the
-/// path as given; later entries are indented; a blank line ends the list. `None`
-/// when the output has an unexpected shape (the caller then fails closed).
-#[cfg(any(windows, test))]
-fn acl_principals(output: &str, path: &Path) -> Option<Vec<String>> {
-    let path = path.to_string_lossy();
-    let mut principals = Vec::new();
-    for (index, line) in output.lines().enumerate() {
-        if line.trim().is_empty() {
-            break;
-        }
-        let entry = if index == 0 && path.is_ascii() {
-            let head = line.get(..path.len())?;
-            if !head.eq_ignore_ascii_case(&path) {
-                return None;
-            }
-            &line[path.len()..]
-        } else if index == 0 {
-            // icacls prints in the console code page, where letters outside it (a
-            // Bengali or accented folder name) arrive as `?`, so the printed path
-            // cannot be compared with ours. The whole line stays; the user name is
-            // still the text after its last backslash.
-            line
-        } else {
-            line
-        };
-        let entry = entry.trim();
-        let (principal, rights) = entry.split_once(":(")?;
-        if principal.is_empty() || rights.is_empty() {
-            return None;
-        }
-        principals.push(principal.to_owned());
-    }
-    (!principals.is_empty()).then_some(principals)
-}
-
-/// Exactly one entry and it is `username`'s (icacls prints `DOMAIN\name`).
-#[cfg(any(windows, test))]
-fn only_user(principals: &[String], username: &str) -> bool {
-    matches!(principals, [one] if one.rsplit('\\').next().is_some_and(|name| same_account_name(name, username)))
-}
-
-/// An ASCII name must match exactly (ignoring case). A name with letters outside
-/// the console code page is printed with `?` or U+FFFD in their place, so it is
-/// compared by its ASCII letters and the positions of the others.
-#[cfg(any(windows, test))]
-fn same_account_name(printed: &str, username: &str) -> bool {
-    if printed.eq_ignore_ascii_case(username) {
-        return true;
-    }
-    let shape = |text: &str| -> Vec<char> {
-        text.chars()
-            .map(|c| {
-                if c.is_ascii() && c != '?' {
-                    c.to_ascii_lowercase()
-                } else {
-                    '?'
-                }
-            })
-            .collect()
-    };
-    !username.is_ascii() && shape(printed) == shape(username)
-}
-
-#[cfg(windows)]
 fn restrict(path: &Path) -> Result<(), String> {
-    use std::process::Command;
-    let path =
-        std::path::absolute(path).map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
-    let username = std::env::var("USERNAME")
-        .ok()
-        .filter(|u| !u.is_empty())
-        .ok_or("cannot determine the current Windows user (USERNAME is not set)")?;
-    let principal = match std::env::var("USERDOMAIN").ok().filter(|d| !d.is_empty()) {
-        Some(domain) => format!("{domain}\\{username}"),
-        None => username.clone(),
-    };
-    // The system copy, not whatever a PATH or working directory lookup finds.
-    let root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    let icacls = root.join("System32").join("icacls.exe");
-    let fail = |what: &str, detail: String| {
-        format!(
-            "cannot restrict {} to the current user ({what}: {detail})",
-            path.display()
-        )
-    };
-    let applied = Command::new(&icacls)
-        .args(icacls_apply_args(&path, &principal))
-        .output()
-        .map_err(|e| fail("icacls did not start", e.to_string()))?;
-    if !applied.status.success() {
-        let text = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&applied.stdout),
-            String::from_utf8_lossy(&applied.stderr)
-        );
-        let first = text.lines().find(|l| !l.trim().is_empty());
-        return Err(fail(
-            "icacls failed",
-            first.unwrap_or("no message").trim().to_owned(),
-        ));
-    }
-    let shown = Command::new(&icacls)
-        .arg(&path)
-        .output()
-        .map_err(|e| fail("icacls did not start for verification", e.to_string()))?;
-    let text = String::from_utf8_lossy(&shown.stdout).into_owned();
-    match acl_principals(&text, &path) {
-        Some(found) if only_user(&found, &username) => Ok(()),
-        Some(found) => Err(fail(
-            "verification",
-            format!("access list is {}", found.join(", ")),
-        )),
-        None => Err(fail(
-            "verification",
-            "unrecognised icacls output".to_owned(),
-        )),
-    }
+    private_fs::restrict_windows(path)
 }
 
 /// Refuse a key file another local account can open (Unix: any group or other

@@ -656,32 +656,21 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                 out.display()
             );
 
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&out)
+            let file = engine_core::repository::private_fs::create_private_file(&out)
                 .with_context(|| format!("creating output archive at {}", out.display()))?;
 
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600));
-            }
+            let guard = engine_core::repository::private_fs::AutoRemoveFile::new(out.clone());
 
-            let summary = match engine_core::repository::archive::export_archive(
+            let summary = engine_core::repository::archive::export_archive(
                 &repo,
                 &head_addr,
                 file,
                 engine_core::repository::archive::ArchiveLimits::default(),
             )
             .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = std::fs::remove_file(&out);
-                    return Err(e).context("archive export failed");
-                }
-            };
+            .context("archive export failed")?;
+
+            guard.commit();
 
             serde_json::json!({
                 "out": out.display().to_string(),
