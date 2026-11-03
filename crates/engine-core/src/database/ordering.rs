@@ -142,10 +142,12 @@ pub async fn audit_ordering_connection(conn: &mut PgConnection) -> Result<Orderi
         String,
         Option<String>,
     ) = sqlx::query_as(
-        "select datname::text, datcollate::text, datctype::text,
-                datlocprovider::text, daticulocale::text
-         from pg_database
-         where datname = current_database()",
+        // PostgreSQL 17 renamed `daticulocale` to `datlocale`; read whichever exists.
+        "select d.datname::text, d.datcollate::text, d.datctype::text,
+                d.datlocprovider::text,
+                coalesce(to_jsonb(d)->>'datlocale', to_jsonb(d)->>'daticulocale')
+         from pg_database d
+         where d.datname = current_database()",
     )
     .fetch_one(&mut *conn)
     .await
