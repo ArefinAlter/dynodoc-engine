@@ -1959,6 +1959,25 @@ async fn export_file_equivalence_with_local_export_and_leaves_local_repo_unmodif
     let cli_envelope: StateExportEnvelope = serde_json::from_slice(&cli_bytes).unwrap();
     assert_eq!(local_envelope, cli_envelope);
 
+    // Verify both local and remote export files via state_export_verify CLI entrypoint
+    super::super::state_export_verify(
+        local_out.clone(),
+        project,
+        commit_addr.as_str().to_string(),
+        "Report.docx".into(),
+    )
+    .await
+    .unwrap();
+
+    super::super::state_export_verify(
+        cli_out.clone(),
+        project,
+        commit_addr.as_str().to_string(),
+        "Report.docx".into(),
+    )
+    .await
+    .unwrap();
+
     // Assert r2 and journal2 remain completely empty (no commits, no objects, no pins)
     assert!(r2.commit(&commit_addr).await.is_err());
     assert!(r2.head("main").await.unwrap().is_none());

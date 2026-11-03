@@ -134,6 +134,24 @@ enum Command {
         #[arg(long)]
         expect_head: String,
     },
+    /// Offline normalized state export verification (no repository required).
+    ///
+    /// An independently obtained expected commit address and path anchor integrity.
+    /// A self-contained state export envelope alone does not establish account authority,
+    /// timestamps, server freshness or native-format fidelity.
+    StateExportVerify {
+        /// Normalized state export JSON file (.json) to verify.
+        file: std::path::PathBuf,
+        /// Expected project id (UUID).
+        #[arg(long)]
+        project: Uuid,
+        /// Expected commit address (lowercase hex SHA-256).
+        #[arg(long)]
+        expect_commit: String,
+        /// Expected document file path in commit manifest.
+        #[arg(long, visible_alias = "expect-path")]
+        path: String,
+    },
     /// Independently verify the event chain and all legacy snapshots.
     Verify {
         /// Document id (UUID).
@@ -305,6 +323,12 @@ async fn run() -> anyhow::Result<()> {
             project,
             expect_head,
         } => archive_verify(file, project, expect_head).await,
+        Command::StateExportVerify {
+            file,
+            project,
+            expect_commit,
+            path,
+        } => state_export_verify(file, project, expect_commit, path).await,
         Command::Verify {
             document_id,
             expect_head,
@@ -378,6 +402,42 @@ async fn archive_verify(
         "bytes_before_footer": summary.bytes_before_footer,
         "total_bytes": summary.total_bytes,
         "sha256": summary.sha256,
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+/// Verify an offline normalized state export file without any database or target repository.
+async fn state_export_verify(
+    file: std::path::PathBuf,
+    project: Uuid,
+    expect_commit: String,
+    path: String,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        file.is_file(),
+        "state export file not found at {}",
+        file.display()
+    );
+    let expect_commit_addr = engine_core::shared_checkpoint::Address::try_from(expect_commit)
+        .context("invalid expect_commit address")?;
+
+    let report = engine_core::repository::state_export::verify_state_export_file(
+        &file,
+        project,
+        &expect_commit_addr,
+        &path,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("state export verification failed: {e}"))?;
+
+    let output = serde_json::json!({
+        "file": file.display().to_string(),
+        "project": report.project,
+        "commit": report.commit.as_str(),
+        "path": report.path,
+        "document": report.document.0,
+        "root": report.root.as_str(),
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
