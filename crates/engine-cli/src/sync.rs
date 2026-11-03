@@ -151,6 +151,15 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Export an exact historical file from authorized remote history as normalized state.
+    ExportFile {
+        #[arg(long)]
+        commit: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Inspect or create immutable named releases on the remote.
     Release {
         #[command(subcommand)]
@@ -468,6 +477,18 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
             }
             Action::AuthorityProof { out } => {
                 Ok(SyncOutput::Json(authority_proof(&client, &journal, &scope, &out).await?))
+            }
+            Action::ExportFile { commit, path, out } => {
+                let address = Address::try_from(commit.clone())
+                    .map_err(|e| anyhow!("invalid commit address: {e}"))?;
+                transfer::export_file(&client, options.project, &address, &path, &out).await?;
+                Ok(SyncOutput::Json(json!({
+                    "commit": commit,
+                    "path": path,
+                    "out": out.display().to_string(),
+                    "format": "dynodoc.state-export",
+                    "version": 1,
+                })))
             }
             Action::Release { .. } => unreachable!(),
             Action::Tracking => unreachable!(),

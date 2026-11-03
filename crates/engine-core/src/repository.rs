@@ -11,6 +11,7 @@ use ring::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod archive;
 pub mod attestation;
 pub mod authority_epoch;
 pub mod compare;
@@ -20,10 +21,12 @@ pub mod device_session;
 pub mod horizon;
 pub mod local;
 pub mod log;
+pub mod private_fs;
 pub mod project_merge;
 pub mod receipt_journal;
 pub mod recovery;
 pub mod server_authority;
+pub mod state_export;
 
 pub const MAX_FILES: usize = 4096;
 pub const MAX_COMMIT_BYTES: usize = 1024 * 1024;
@@ -221,7 +224,7 @@ impl Commit {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedCommit {
     pub commit: Commit,
