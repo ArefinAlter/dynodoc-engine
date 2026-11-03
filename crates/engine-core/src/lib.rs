@@ -10,6 +10,7 @@
 
 pub mod at_rest;
 pub mod database;
+pub mod event_merkle;
 pub mod expr;
 pub mod governance;
 pub mod integrity;

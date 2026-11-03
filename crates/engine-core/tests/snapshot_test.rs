@@ -246,6 +246,7 @@ fn materializes_large_document_from_snapshot_plus_tail() -> anyhow::Result<()> {
         state: snapshot_value,
         merkle_root: vec![0; 32],
         event_chain_hash: vec![0; 32],
+        event_merkle_root: None,
         created_at: chrono::Utc::now(),
     };
 
@@ -290,7 +291,7 @@ async fn legacy_fixture(
     let events = engine_core::log::read_range(pool, doc, 1, seq).await?;
     let state = Materializer::fold(&events)?;
     let chain = events.last().map_or(vec![0; 32], |e| e.chain_hash.clone());
-    Ok(sqlx::query_as("insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash) values($1,$2,$3,$4,$5) returning *")
+    Ok(sqlx::query_as("insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash) values($1,$2,$3,$4,$5) returning id,document_id,through_seq,state,merkle_root,event_chain_hash,created_at,null::bytea as event_merkle_root")
         .bind(doc.0).bind(seq).bind(json!(state)).bind(engine_core::snapshot::merkle_root(&state)?.as_slice())
         .bind(chain).fetch_one(pool).await?)
 }
@@ -732,7 +733,7 @@ async fn shared_named_snapshots_reuse_objects_and_preserve_mixed_history(
     .bind(doc.0)
     .fetch_all(&pool)
     .await?;
-    assert_eq!(versions, vec![1, 2, 2, 1]);
+    assert_eq!(versions, vec![3, 4, 4, 3]);
     assert_eq!(verify_document(&pool, doc, true).await?.snapshots, 4);
     Ok(())
 }
@@ -871,7 +872,7 @@ async fn concurrent_mixed_snapshot_writers_keep_one_format_and_receipt(
         .bind(doc.0).bind(a.id.0).fetch_one(&pool).await?;
     assert_eq!(
         objects == 0,
-        version == 1,
+        version == 3,
         "losing typed publication must not leave objects"
     );
     assert_eq!(verify_document(&pool, doc, false).await?.snapshots, 1);
