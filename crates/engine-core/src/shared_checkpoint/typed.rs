@@ -1440,6 +1440,267 @@ pub async fn read_state_v3<S: ObjectStore>(
     Ok(state)
 }
 
+struct EncoderV3<'a, S> {
+    writer: Writer<'a, S>,
+    semantic: SemanticLimits,
+}
+
+impl<S: ObjectStore> EncoderV3<'_, S> {
+    async fn object(&mut self, object: ObjectV3) -> Result<Address, Error> {
+        let (address, bytes) = encode_v3(&object)?;
+        self.writer.encoded(address, bytes).await
+    }
+
+    async fn text(&mut self, text: &[u8]) -> Result<Text, Error> {
+        self.semantic.bytes(text.len())?;
+        let root = content::write_with_writer(&mut self.writer, &mut &*text).await?;
+        Ok(Text {
+            root,
+            bytes: text.len(),
+        })
+    }
+
+    async fn value(&mut self, value: &Value, depth: usize) -> Result<Address, Error> {
+        self.semantic.value(depth)?;
+        let object = match value {
+            Value::String(text) => ObjectV3::Text(self.text(text.as_bytes()).await?),
+            Value::Array(values) => {
+                if values.len() > self.semantic.values {
+                    return Err(Error::Limit("semantic values"));
+                }
+                let mut entries = Vec::new();
+                for (i, value) in values.iter().enumerate() {
+                    let key = format!("{i:016x}");
+                    let address = Box::pin(self.value(value, depth + 1)).await?;
+                    entries.push((super::route(&key), Entry { key, address }));
+                }
+                ObjectV3::Array {
+                    entries: self.writer.entries(entries).await?,
+                    count: values.len(),
+                }
+            }
+            Value::Object(values) => {
+                if values.len() > self.semantic.values {
+                    return Err(Error::Limit("semantic values"));
+                }
+                let mut entries = Vec::new();
+                let mut keys: Vec<_> = values.keys().collect();
+                keys.sort_unstable();
+                for key in keys {
+                    if key.len() > MAX_KEY_BYTES {
+                        return Err(Error::Limit("property key bytes"));
+                    }
+                    self.semantic.bytes(key.len())?;
+                    let address = Box::pin(self.value(&values[key], depth + 1)).await?;
+                    entries.push((
+                        super::route(key),
+                        Entry {
+                            key: key.clone(),
+                            address,
+                        },
+                    ));
+                }
+                ObjectV3::Dictionary {
+                    entries: self.writer.entries(entries).await?,
+                    count: values.len(),
+                }
+            }
+            value => ObjectV3::Scalar(value.clone()),
+        };
+        self.object(object).await
+    }
+}
+
+/// Write a compact v3 typed state graph; caller owns authorization and atomic publication.
+pub async fn write_state_v3<S: ObjectStore>(
+    store: &mut S,
+    document: DocumentId,
+    state: &DocumentState,
+    limits: Limits,
+    semantic: SemanticLimits,
+) -> Result<(Address, WriteStats), Error> {
+    let mut encoder = EncoderV3 {
+        writer: Writer {
+            store,
+            document,
+            budget: limits,
+            stats: WriteStats::default(),
+            pending: Vec::new(),
+            pending_bytes: 0,
+        },
+        semantic,
+    };
+
+    let mut node_entries = Vec::new();
+    for (id, node) in &state.nodes {
+        encoder.semantic.value(0)?;
+        if id != &node.id {
+            return Err(Error::Invalid("node map key differs from logical id"));
+        }
+        node_metadata(&mut encoder.semantic, node)?;
+
+        let (fields, restore_block_id, restore_label) = match &node.current_fields {
+            Value::Object(map) => {
+                let restore_block_id =
+                    matches!(map.get("blockId"), Some(Value::String(b)) if b == &id.0);
+                let restore_label = matches!(
+                    (map.get("content"), map.get("label")),
+                    (Some(content), Some(Value::String(l)))
+                        if !content.is_null() && l == &crate::richtext::plain_text(content)
+                );
+
+                let fields = if !restore_block_id && !restore_label {
+                    encoder.value(&node.current_fields, 0).await?
+                } else {
+                    let mut keys: Vec<_> = map
+                        .keys()
+                        .filter(|&k| {
+                            !(restore_block_id && k == "blockId" || restore_label && k == "label")
+                        })
+                        .collect();
+                    keys.sort_unstable();
+
+                    if keys.len() > encoder.semantic.values {
+                        return Err(Error::Limit("semantic values"));
+                    }
+                    let mut entries = Vec::new();
+                    for key in keys {
+                        if key.len() > MAX_KEY_BYTES {
+                            return Err(Error::Limit("property key bytes"));
+                        }
+                        encoder.semantic.bytes(key.len())?;
+                        let address = Box::pin(encoder.value(&map[key], 1)).await?;
+                        entries.push((
+                            super::route(key),
+                            Entry {
+                                key: key.clone(),
+                                address,
+                            },
+                        ));
+                    }
+                    let entries_root = encoder.writer.entries(entries).await?;
+                    encoder
+                        .object(ObjectV3::Dictionary {
+                            entries: entries_root,
+                            count: map.len()
+                                - (restore_block_id as usize)
+                                - (restore_label as usize),
+                        })
+                        .await?
+                };
+                (fields, restore_block_id, restore_label)
+            }
+            _ => {
+                let fields = encoder.value(&node.current_fields, 0).await?;
+                (fields, false, false)
+            }
+        };
+
+        let address = encoder
+            .object(ObjectV3::Node {
+                parent_id: node.parent_id.clone(),
+                node_type: node.node_type.clone(),
+                pos: node.pos.clone(),
+                var_name: node.var_name.clone(),
+                deleted: node.deleted,
+                fields,
+                restore_block_id,
+                restore_label,
+            })
+            .await?;
+        node_entries.push((
+            super::route(&id.0),
+            Entry {
+                key: id.0.clone(),
+                address,
+            },
+        ));
+    }
+    let nodes = encoder.writer.entries(node_entries).await?;
+
+    let mut comment_entries = Vec::new();
+    for (i, comment) in state.comments.iter().enumerate() {
+        encoder.semantic.value(0)?;
+        if let Some(id) = &comment.node_id {
+            encoder.semantic.metadata(&id.0)?;
+        }
+        let body = encoder.text(comment.body.as_bytes()).await?;
+        let address = encoder
+            .object(ObjectV3::Comment {
+                node_id: comment.node_id.clone(),
+                body,
+            })
+            .await?;
+        let key = format!("{i:016x}");
+        comment_entries.push((super::route(&key), Entry { key, address }));
+    }
+    let comments = encoder.writer.entries(comment_entries).await?;
+
+    let mut sugg_entries = Vec::new();
+    for (key, suggestion) in &state.suggestions {
+        encoder.semantic.value(0)?;
+        if key.len() > MAX_KEY_BYTES {
+            return Err(Error::Limit("suggestion key bytes"));
+        }
+        encoder.semantic.metadata(key)?;
+        if let Some(id) = &suggestion.target_node_id {
+            encoder.semantic.metadata(&id.0)?;
+        }
+        let detail = encoder.value(&suggestion.detail, 0).await?;
+        let rejected_reason = match &suggestion.rejected_reason {
+            Some(reason) => Some(encoder.text(reason.as_bytes()).await?),
+            None => None,
+        };
+        let address = encoder
+            .object(ObjectV3::Suggestion {
+                target_node_id: suggestion.target_node_id.clone(),
+                detail,
+                accepted: suggestion.accepted,
+                rejected_reason,
+            })
+            .await?;
+        sugg_entries.push((
+            super::route(key),
+            Entry {
+                key: key.clone(),
+                address,
+            },
+        ));
+    }
+    let suggestions = encoder.writer.entries(sugg_entries).await?;
+
+    if state.removed_choices.len() > encoder.semantic.values {
+        return Err(Error::Limit("semantic values"));
+    }
+    let mut rc_entries = Vec::new();
+    let mut removed: Vec<_> = state.removed_choices.iter().collect();
+    removed.sort();
+    for id in removed {
+        encoder.semantic.value(0)?;
+        encoder.semantic.metadata(&id.0)?;
+        let address = encoder.object(ObjectV3::RemovedChoice(id.clone())).await?;
+        rc_entries.push((
+            super::route(&id.0),
+            Entry {
+                key: id.0.clone(),
+                address,
+            },
+        ));
+    }
+    let removed_choices = encoder.writer.entries(rc_entries).await?;
+
+    let root = encoder
+        .object(ObjectV3::State(StateRoots {
+            nodes,
+            comments,
+            suggestions,
+            removed_choices,
+        }))
+        .await?;
+    encoder.writer.flush().await?;
+    Ok((root, encoder.writer.stats))
+}
+
 /// Store an opaque asset manifest over preexisting content, verifying the full
 /// byte tree without buffering it. Native adapters must explicitly reference this
 /// manifest; it is not silently added to DocumentState or a checkpoint.
@@ -1504,7 +1765,7 @@ pub async fn read_asset<S: ObjectStore, W: AsyncWrite + Unpin + Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared_checkpoint::{route, MemoryStore, MAX_OBJECT_BYTES};
+    use crate::shared_checkpoint::{MemoryStore, MAX_OBJECT_BYTES};
     use serde_json::json;
 
     fn doc() -> DocumentId {
@@ -2494,226 +2755,6 @@ mod tests {
         }
     }
 
-    struct TestEncoderV3<'a, S> {
-        writer: Writer<'a, S>,
-        semantic: SemanticLimits,
-    }
-
-    impl<S: ObjectStore> TestEncoderV3<'_, S> {
-        async fn object(&mut self, object: ObjectV3) -> Result<Address, Error> {
-            let (address, bytes) = encode_v3(&object)?;
-            self.writer.encoded(address, bytes).await
-        }
-
-        async fn text(&mut self, text: &[u8]) -> Result<Text, Error> {
-            self.semantic.bytes(text.len())?;
-            let root = content::write_with_writer(&mut self.writer, &mut &*text).await?;
-            Ok(Text {
-                root,
-                bytes: text.len(),
-            })
-        }
-
-        async fn value(&mut self, value: &Value, depth: usize) -> Result<Address, Error> {
-            self.semantic.value(depth)?;
-            let object = match value {
-                Value::String(text) => ObjectV3::Text(self.text(text.as_bytes()).await?),
-                Value::Array(values) => {
-                    let mut entries = Vec::new();
-                    for (i, value) in values.iter().enumerate() {
-                        let key = format!("{i:016x}");
-                        let address = Box::pin(self.value(value, depth + 1)).await?;
-                        entries.push((route(&key), Entry { key, address }));
-                    }
-                    ObjectV3::Array {
-                        entries: self.writer.entries(entries).await?,
-                        count: values.len(),
-                    }
-                }
-                Value::Object(values) => {
-                    let mut entries = Vec::new();
-                    let mut keys: Vec<_> = values.keys().collect();
-                    keys.sort_unstable();
-                    for key in keys {
-                        self.semantic.bytes(key.len())?;
-                        let address = Box::pin(self.value(&values[key], depth + 1)).await?;
-                        entries.push((
-                            route(key),
-                            Entry {
-                                key: key.clone(),
-                                address,
-                            },
-                        ));
-                    }
-                    ObjectV3::Dictionary {
-                        entries: self.writer.entries(entries).await?,
-                        count: values.len(),
-                    }
-                }
-                value => ObjectV3::Scalar(value.clone()),
-            };
-            self.object(object).await
-        }
-    }
-
-    async fn write_v3_test<S: ObjectStore>(
-        store: &mut S,
-        document: DocumentId,
-        state: &DocumentState,
-    ) -> Result<Address, Error> {
-        let mut encoder = TestEncoderV3 {
-            writer: Writer {
-                store,
-                document,
-                budget: Limits::default(),
-                stats: WriteStats::default(),
-                pending: Vec::new(),
-                pending_bytes: 0,
-            },
-            semantic: SemanticLimits::default(),
-        };
-
-        let mut node_entries = Vec::new();
-        for (id, node) in &state.nodes {
-            encoder.semantic.value(0)?;
-            node_metadata(&mut encoder.semantic, node)?;
-
-            let (fields_val, restore_block_id, restore_label) = match &node.current_fields {
-                Value::Object(map) => {
-                    let mut m = map.clone();
-                    let r_block_id = if let Some(Value::String(b_id)) = m.get("blockId") {
-                        if b_id == &id.0 {
-                            m.remove("blockId");
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    let r_label = if let Some(content) = m.get("content") {
-                        if !content.is_null() {
-                            if let Some(Value::String(lbl)) = m.get("label") {
-                                if lbl == &crate::richtext::plain_text(content) {
-                                    m.remove("label");
-                                    true
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    (Value::Object(m), r_block_id, r_label)
-                }
-                other => (other.clone(), false, false),
-            };
-
-            let fields = encoder.value(&fields_val, 0).await?;
-            let address = encoder
-                .object(ObjectV3::Node {
-                    parent_id: node.parent_id.clone(),
-                    node_type: node.node_type.clone(),
-                    pos: node.pos.clone(),
-                    var_name: node.var_name.clone(),
-                    deleted: node.deleted,
-                    fields,
-                    restore_block_id,
-                    restore_label,
-                })
-                .await?;
-            node_entries.push((
-                route(&id.0),
-                Entry {
-                    key: id.0.clone(),
-                    address,
-                },
-            ));
-        }
-        let nodes = encoder.writer.entries(node_entries).await?;
-
-        let mut comment_entries = Vec::new();
-        for (i, comment) in state.comments.iter().enumerate() {
-            encoder.semantic.value(0)?;
-            if let Some(id) = &comment.node_id {
-                encoder.semantic.metadata(&id.0)?;
-            }
-            let body = encoder.text(comment.body.as_bytes()).await?;
-            let address = encoder
-                .object(ObjectV3::Comment {
-                    node_id: comment.node_id.clone(),
-                    body,
-                })
-                .await?;
-            let key = format!("{i:016x}");
-            comment_entries.push((route(&key), Entry { key, address }));
-        }
-        let comments = encoder.writer.entries(comment_entries).await?;
-
-        let mut sugg_entries = Vec::new();
-        for (key, suggestion) in &state.suggestions {
-            encoder.semantic.value(0)?;
-            encoder.semantic.metadata(key)?;
-            if let Some(id) = &suggestion.target_node_id {
-                encoder.semantic.metadata(&id.0)?;
-            }
-            let detail = encoder.value(&suggestion.detail, 0).await?;
-            let rejected_reason = match &suggestion.rejected_reason {
-                Some(reason) => Some(encoder.text(reason.as_bytes()).await?),
-                None => None,
-            };
-            let address = encoder
-                .object(ObjectV3::Suggestion {
-                    target_node_id: suggestion.target_node_id.clone(),
-                    detail,
-                    accepted: suggestion.accepted,
-                    rejected_reason,
-                })
-                .await?;
-            sugg_entries.push((
-                route(key),
-                Entry {
-                    key: key.clone(),
-                    address,
-                },
-            ));
-        }
-        let suggestions = encoder.writer.entries(sugg_entries).await?;
-
-        let mut rc_entries = Vec::new();
-        let mut removed: Vec<_> = state.removed_choices.iter().collect();
-        removed.sort();
-        for id in removed {
-            encoder.semantic.value(0)?;
-            encoder.semantic.metadata(&id.0)?;
-            let address = encoder.object(ObjectV3::RemovedChoice(id.clone())).await?;
-            rc_entries.push((
-                route(&id.0),
-                Entry {
-                    key: id.0.clone(),
-                    address,
-                },
-            ));
-        }
-        let removed_choices = encoder.writer.entries(rc_entries).await?;
-
-        let root = encoder
-            .object(ObjectV3::State(StateRoots {
-                nodes,
-                comments,
-                suggestions,
-                removed_choices,
-            }))
-            .await?;
-        encoder.writer.flush().await?;
-        Ok(root)
-    }
-
     #[test]
     fn typed_v3_canonical_vectors_and_noncanonical_rejection() {
         let (root, bytes) = encode_v3(&ObjectV3::Scalar(Value::Null)).unwrap();
@@ -2827,7 +2868,15 @@ mod tests {
         state.removed_choices.insert(NodeId("choice_1".into()));
 
         // Write v3
-        let root_v3 = write_v3_test(&mut store, document, &state).await.unwrap();
+        let (root_v3, _) = write_state_v3(
+            &mut store,
+            document,
+            &state,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
 
         // Read v3
         let reconstructed = read_state_v3(
@@ -2873,13 +2922,249 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v3_writer_comprehensive_cases_and_merkle_equality() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+
+        let mut state = DocumentState::default();
+
+        // Node 1: standard blockId and standard label (omitted & reconstructed)
+        state.nodes.insert(
+            NodeId("n1".into()),
+            MaterializedNode {
+                id: NodeId("n1".into()),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "a0".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: json!({
+                    "blockId": "n1",
+                    "content": {
+                        "type": "doc",
+                        "content": [{"text": "Hello world"}]
+                    },
+                    "label": "Hello world"
+                }),
+            },
+        );
+
+        // Node 2: null blockId, label absent
+        state.nodes.insert(
+            NodeId("n2".into()),
+            MaterializedNode {
+                id: NodeId("n2".into()),
+                parent_id: Some(NodeId("n1".into())),
+                node_type: "paragraph".into(),
+                pos: "a1".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: json!({
+                    "blockId": null,
+                    "content": {
+                        "type": "doc",
+                        "content": [{"text": "No label"}]
+                    }
+                }),
+            },
+        );
+
+        // Node 3: missing blockId, stale legacy label where label != plain_text(content)
+        state.nodes.insert(
+            NodeId("n3".into()),
+            MaterializedNode {
+                id: NodeId("n3".into()),
+                parent_id: None,
+                node_type: "heading".into(),
+                pos: "a2".into(),
+                var_name: Some("title".into()),
+                deleted: false,
+                current_fields: json!({
+                    "content": {
+                        "type": "doc",
+                        "content": [{"text": "New Heading Text"}]
+                    },
+                    "label": "Stale Legacy Heading"
+                }),
+            },
+        );
+
+        // Node 4: different blockId, no label
+        state.nodes.insert(
+            NodeId("n4".into()),
+            MaterializedNode {
+                id: NodeId("n4".into()),
+                parent_id: None,
+                node_type: "code_block".into(),
+                pos: "a3".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: json!({
+                    "blockId": "different_block_id_xyz",
+                    "language": "rust"
+                }),
+            },
+        );
+
+        // Node 5: Unicode and format-only content
+        state.nodes.insert(
+            NodeId("n5".into()),
+            MaterializedNode {
+                id: NodeId("n5".into()),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "a4".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: json!({
+                    "blockId": "n5",
+                    "content": {
+                        "type": "doc",
+                        "content": [{"text": "🦀 বাংলা 🚀"}]
+                    },
+                    "label": "🦀 বাংলা 🚀"
+                }),
+            },
+        );
+
+        // Node 6: empty values
+        state.nodes.insert(
+            NodeId("n6".into()),
+            MaterializedNode {
+                id: NodeId("n6".into()),
+                parent_id: None,
+                node_type: "empty_node".into(),
+                pos: "a5".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: json!({}),
+            },
+        );
+
+        // Node 7 & 8: duplicate bodies under distinct IDs
+        state.nodes.insert(
+            NodeId("n7".into()),
+            MaterializedNode {
+                id: NodeId("n7".into()),
+                parent_id: None,
+                node_type: "item".into(),
+                pos: "a6".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: json!({"count": 42, "status": "active"}),
+            },
+        );
+        state.nodes.insert(
+            NodeId("n8".into()),
+            MaterializedNode {
+                id: NodeId("n8".into()),
+                parent_id: None,
+                node_type: "item".into(),
+                pos: "a7".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: json!({"count": 42, "status": "active"}),
+            },
+        );
+
+        // Node 9: tombstone
+        state.nodes.insert(
+            NodeId("n9".into()),
+            MaterializedNode {
+                id: NodeId("n9".into()),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "a8".into(),
+                var_name: None,
+                deleted: true,
+                current_fields: Value::Null,
+            },
+        );
+
+        state.comments.push(CommentState {
+            node_id: Some(NodeId("n1".into())),
+            body: "A comment".into(),
+        });
+        state.suggestions.insert(
+            "s1".into(),
+            SuggestionState {
+                target_node_id: Some(NodeId("n1".into())),
+                detail: json!({"edit": "test"}),
+                accepted: true,
+                rejected_reason: None,
+            },
+        );
+        state.removed_choices.insert(NodeId("rc1".into()));
+
+        // Write with v2
+        let (root_v2, _) = write(&mut store, document, &state).await;
+
+        // Write with v3
+        let (root_v3, _stats_v3) = write_state_v3(
+            &mut store,
+            document,
+            &state,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        // The v3 STORAGE root intentionally differs; never claim equality with v2 addresses
+        assert_ne!(root_v3, root_v2);
+
+        // Read both and verify decoded DocumentState equality
+        let decoded_v3 = read_state_v3(
+            &mut store,
+            document,
+            &root_v3,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        let decoded_v2 = read_state(
+            &mut store,
+            document,
+            &root_v2,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(decoded_v3, state);
+        assert_eq!(decoded_v2, state);
+        assert_eq!(decoded_v2, decoded_v3);
+
+        // Compare legacy node Merkle root with v2
+        let merkle_v3 = crate::snapshot::merkle_root(&decoded_v3).unwrap();
+        let merkle_v2 = crate::snapshot::merkle_root(&decoded_v2).unwrap();
+        assert_eq!(merkle_v3, merkle_v2);
+
+        // Test deterministic round trips
+        let (root_v3_again, stats_again) = write_state_v3(
+            &mut store,
+            document,
+            &state,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(root_v3_again, root_v3);
+        assert_eq!(stats_again.new_objects, 0);
+    }
+
+    #[tokio::test]
     async fn v3_reconstruction_and_minimal_flag_rejections() {
         let mut store = MemoryStore::default();
         let document = doc();
 
         // 1. restore_block_id: true with existing blockId in fields
         {
-            let mut encoder = TestEncoderV3 {
+            let mut encoder = EncoderV3 {
                 writer: Writer {
                     store: &mut store,
                     document,
@@ -2946,7 +3231,7 @@ mod tests {
 
         // 2. restore_block_id: false with redundant blockId == id
         {
-            let mut encoder = TestEncoderV3 {
+            let mut encoder = EncoderV3 {
                 writer: Writer {
                     store: &mut store,
                     document,
@@ -3015,7 +3300,7 @@ mod tests {
 
         // 3. restore_label: true with existing label in fields
         {
-            let mut encoder = TestEncoderV3 {
+            let mut encoder = EncoderV3 {
                 writer: Writer {
                     store: &mut store,
                     document,
@@ -3082,7 +3367,7 @@ mod tests {
 
         // 4. restore_label: true with missing content
         {
-            let mut encoder = TestEncoderV3 {
+            let mut encoder = EncoderV3 {
                 writer: Writer {
                     store: &mut store,
                     document,
@@ -3146,7 +3431,7 @@ mod tests {
 
         // 5. restore_label: false with redundant label == plain_text(content)
         {
-            let mut encoder = TestEncoderV3 {
+            let mut encoder = EncoderV3 {
                 writer: Writer {
                     store: &mut store,
                     document,
