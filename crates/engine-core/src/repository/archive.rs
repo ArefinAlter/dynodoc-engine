@@ -10,7 +10,7 @@
 //! 4. Footer frame (object count, commit count, bytes before footer, running SHA-256)
 #![allow(clippy::manual_is_multiple_of)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -180,10 +180,20 @@ pub struct ArchiveWriter<W: Write> {
     seen_objects: HashSet<(DocumentId, Address)>,
     seen_commits: HashSet<Address>,
     last_commit: Option<Address>,
+    limits: ArchiveLimits,
 }
 
 impl<W: Write> ArchiveWriter<W> {
-    pub fn new(mut writer: W) -> Result<Self, ArchiveError> {
+    pub fn new(writer: W) -> Result<Self, ArchiveError> {
+        Self::with_limits(writer, ArchiveLimits::default())
+    }
+
+    pub fn with_limits(mut writer: W, limits: ArchiveLimits) -> Result<Self, ArchiveError> {
+        if MAGIC.len() as u64 > limits.max_total_bytes {
+            return Err(ArchiveError::Limit(
+                "archive exceeds total allowed bytes limit",
+            ));
+        }
         writer.write_all(&MAGIC)?;
         let mut hasher = digest::Context::new(&digest::SHA256);
         hasher.update(&MAGIC);
@@ -198,6 +208,7 @@ impl<W: Write> ArchiveWriter<W> {
             seen_objects: HashSet::new(),
             seen_commits: HashSet::new(),
             last_commit: None,
+            limits,
         })
     }
 
@@ -235,6 +246,9 @@ impl<W: Write> ArchiveWriter<W> {
                 "objects must be written after header and before any commits",
             ));
         }
+        if self.objects_count >= self.limits.max_objects as u64 {
+            return Err(ArchiveError::Limit("maximum object count exceeded"));
+        }
         crate::shared_checkpoint::validate_stored(&address, canonical_bytes)
             .map_err(|_| ArchiveError::InvalidFrame("invalid object bytes or address mismatch"))?;
         if !self.seen_objects.insert((document, address.clone())) {
@@ -258,6 +272,9 @@ impl<W: Write> ArchiveWriter<W> {
             ));
         }
         self.stage = WriterStage::WritingCommits;
+        if self.commits_count >= self.limits.max_commits as u64 {
+            return Err(ArchiveError::Limit("maximum commit count exceeded"));
+        }
 
         let address = signed
             .verify()
@@ -321,10 +338,19 @@ impl<W: Write> ArchiveWriter<W> {
         };
 
         let footer_bytes = canonical_frame_bytes(&footer_frame)?;
+        if footer_bytes.len() > self.limits.max_frame_bytes {
+            return Err(ArchiveError::Limit("frame length exceeds maximum limit"));
+        }
+        let footer_total = 4 + footer_bytes.len() as u64;
+        if self.bytes_written + footer_total > self.limits.max_total_bytes {
+            return Err(ArchiveError::Limit(
+                "archive exceeds total allowed bytes limit",
+            ));
+        }
         let len_prefix = (footer_bytes.len() as u32).to_le_bytes();
         self.writer.write_all(&len_prefix)?;
         self.writer.write_all(&footer_bytes)?;
-        self.bytes_written += 4 + footer_bytes.len() as u64;
+        self.bytes_written += footer_total;
         self.writer.flush()?;
 
         self.stage = WriterStage::Finished;
@@ -341,15 +367,21 @@ impl<W: Write> ArchiveWriter<W> {
 
     fn write_frame(&mut self, frame: &Frame) -> Result<(), ArchiveError> {
         let payload = canonical_frame_bytes(frame)?;
-        if payload.len() > MAX_FRAME_BYTES {
-            return Err(ArchiveError::Limit("frame length exceeds 2 MiB limit"));
+        if payload.len() > self.limits.max_frame_bytes {
+            return Err(ArchiveError::Limit("frame length exceeds maximum limit"));
+        }
+        let frame_bytes = 4 + payload.len() as u64;
+        if self.bytes_written + frame_bytes > self.limits.max_total_bytes {
+            return Err(ArchiveError::Limit(
+                "archive exceeds total allowed bytes limit",
+            ));
         }
         let len = (payload.len() as u32).to_le_bytes();
         self.writer.write_all(&len)?;
         self.writer.write_all(&payload)?;
         self.hasher.update(&len);
         self.hasher.update(&payload);
-        self.bytes_written += 4 + payload.len() as u64;
+        self.bytes_written += frame_bytes;
         Ok(())
     }
 }
@@ -676,123 +708,150 @@ pub async fn export_archive<W: Write>(
     writer: W,
     limits: ArchiveLimits,
 ) -> Result<ArchiveSummary, ArchiveError> {
-    let mut pending = vec![head.clone()];
-    let mut visited_commits = HashSet::new();
-    let mut commits_by_addr: BTreeMap<Address, SignedCommit> = BTreeMap::new();
-    let mut dep_graph: BTreeMap<Address, Vec<Address>> = BTreeMap::new();
+    // 1. Dependency-first iterative traversal with explicit visiting / done states
+    enum Step {
+        Expand(Address),
+        Emit(Address),
+    }
 
-    while let Some(addr) = pending.pop() {
-        if visited_commits.insert(addr.clone()) {
-            if visited_commits.len() > limits.max_commits {
-                return Err(ArchiveError::Limit("exceeded maximum commit limit"));
-            }
-            let signed = repo
-                .commit(&addr)
-                .await
-                .map_err(|_| ArchiveError::InvalidFrame("commit in dependency closure missing"))?;
-            let deps = signed.commit.dependencies();
-            for dep in &deps {
-                if !visited_commits.contains(dep) {
-                    pending.push(dep.clone());
+    let mut stack = vec![Step::Expand(head.clone())];
+    let mut visiting = HashSet::new();
+    let mut done = HashSet::new();
+    let mut ordered_commits = Vec::new();
+    let mut file_roots: HashMap<DocumentId, BTreeSet<Address>> = HashMap::new();
+
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Expand(addr) => {
+                if done.contains(&addr) {
+                    continue;
+                }
+                if visiting.contains(&addr) {
+                    return Err(ArchiveError::InvalidFrame(
+                        "cycle detected in commit dependencies",
+                    ));
+                }
+                if done.len() + visiting.len() >= limits.max_commits {
+                    return Err(ArchiveError::Limit("exceeded maximum commit limit"));
+                }
+                visiting.insert(addr.clone());
+                stack.push(Step::Emit(addr.clone()));
+
+                let signed = repo.commit(&addr).await.map_err(|_| {
+                    ArchiveError::InvalidFrame("commit in dependency closure missing")
+                })?;
+                let verified_addr = signed.verify().map_err(|_| {
+                    ArchiveError::InvalidFrame("commit signature verification failed")
+                })?;
+                if verified_addr != addr {
+                    return Err(ArchiveError::InvalidFrame("commit address mismatch"));
+                }
+                if signed.commit.project != repo.project() {
+                    return Err(ArchiveError::InvalidFrame(
+                        "commit project mismatch with repository project",
+                    ));
+                }
+
+                for file_entry in signed.commit.files.values() {
+                    file_roots
+                        .entry(file_entry.document)
+                        .or_default()
+                        .insert(file_entry.state.clone());
+                }
+
+                let mut deps = signed.commit.dependencies();
+                deps.sort();
+                for dep in deps.into_iter().rev() {
+                    if !done.contains(&dep) {
+                        stack.push(Step::Expand(dep));
+                    }
                 }
             }
-            dep_graph.insert(addr.clone(), deps);
-            commits_by_addr.insert(addr, signed);
-        }
-    }
-
-    // Topological sort (dependency-first): dependencies before children, head is last
-    let mut ordered_commits = Vec::with_capacity(commits_by_addr.len());
-    let mut visited_for_sort = HashSet::new();
-    fn sort_visit(
-        addr: &Address,
-        dep_graph: &BTreeMap<Address, Vec<Address>>,
-        commits_by_addr: &BTreeMap<Address, SignedCommit>,
-        visited: &mut HashSet<Address>,
-        ordered: &mut Vec<SignedCommit>,
-    ) {
-        if visited.insert(addr.clone()) {
-            if let Some(deps) = dep_graph.get(addr) {
-                for dep in deps {
-                    sort_visit(dep, dep_graph, commits_by_addr, visited, ordered);
+            Step::Emit(addr) => {
+                visiting.remove(&addr);
+                if done.insert(addr.clone()) {
+                    ordered_commits.push(addr);
                 }
             }
-            if let Some(c) = commits_by_addr.get(addr) {
-                ordered.push(c.clone());
-            }
-        }
-    }
-    sort_visit(
-        head,
-        &dep_graph,
-        &commits_by_addr,
-        &mut visited_for_sort,
-        &mut ordered_commits,
-    );
-
-    // Collect file roots across all commits in the closure
-    let mut file_roots: std::collections::HashMap<DocumentId, BTreeSet<Address>> =
-        std::collections::HashMap::new();
-    for c in &ordered_commits {
-        for file_entry in c.commit.files.values() {
-            file_roots
-                .entry(file_entry.document)
-                .or_default()
-                .insert(file_entry.state.clone());
         }
     }
 
-    // Traverse each file root's object graph
+    // 2. Collect scoped object keys using bounded iterative reference walks.
+    // Retain only bounded (DocumentId, Address) keys, not object payloads.
     let mut visited_objects: HashSet<(DocumentId, Address)> = HashSet::new();
-    let mut objects_to_export: Vec<(DocumentId, Address, Vec<u8>)> = Vec::new();
+    let mut scoped_object_keys: Vec<(DocumentId, Address)> = Vec::new();
 
-    for (doc_id, roots) in file_roots {
+    let mut sorted_docs: Vec<_> = file_roots.into_iter().collect();
+    sorted_docs.sort_by_key(|(doc, _)| doc.0);
+
+    for (doc_id, roots) in sorted_docs {
         for root in roots {
-            let mut stack = vec![root];
-            while let Some(addr) = stack.pop() {
-                if visited_objects.insert((doc_id, addr.clone())) {
-                    if visited_objects.len() > limits.max_objects {
-                        return Err(ArchiveError::Limit("exceeded maximum object count"));
-                    }
-                    let packet = repo
-                        .object(&ObjectKey {
-                            document: doc_id,
-                            address: addr.clone(),
-                        })
-                        .await
-                        .map_err(|_| {
-                            ArchiveError::InvalidFrame("object in graph missing or corrupt")
-                        })?;
+            let mut queue = VecDeque::new();
+            if visited_objects.insert((doc_id, root.clone())) {
+                if visited_objects.len() > limits.max_objects {
+                    return Err(ArchiveError::Limit("exceeded maximum object count"));
+                }
+                scoped_object_keys.push((doc_id, root.clone()));
+                queue.push_back(root);
+            }
 
-                    crate::shared_checkpoint::validate_stored(&addr, &packet.bytes).map_err(
-                        |_| ArchiveError::InvalidFrame("object hash mismatch or invalid"),
-                    )?;
+            while let Some(addr) = queue.pop_front() {
+                let packet = repo
+                    .object(&ObjectKey {
+                        document: doc_id,
+                        address: addr.clone(),
+                    })
+                    .await
+                    .map_err(|_| {
+                        ArchiveError::InvalidFrame("object in graph missing or corrupt")
+                    })?;
 
-                    let children = crate::shared_checkpoint::references(&addr, &packet.bytes)
-                        .map_err(|_| ArchiveError::InvalidFrame("malformed object references"))?;
+                crate::shared_checkpoint::validate_stored(&addr, &packet.bytes)
+                    .map_err(|_| ArchiveError::InvalidFrame("object hash mismatch or invalid"))?;
 
-                    for child in children {
-                        if !visited_objects.contains(&(doc_id, child.clone())) {
-                            stack.push(child);
+                let mut children = crate::shared_checkpoint::references(&addr, &packet.bytes)
+                    .map_err(|_| ArchiveError::InvalidFrame("malformed object references"))?;
+                children.sort();
+
+                for child in children {
+                    if visited_objects.insert((doc_id, child.clone())) {
+                        if visited_objects.len() > limits.max_objects {
+                            return Err(ArchiveError::Limit("exceeded maximum object count"));
                         }
+                        scoped_object_keys.push((doc_id, child.clone()));
+                        queue.push_back(child);
                     }
-
-                    objects_to_export.push((doc_id, addr, packet.bytes));
                 }
             }
         }
     }
 
-    // Stream out to ArchiveWriter
-    let mut writer = ArchiveWriter::new(writer)?;
+    // 3. Stream out frames via ArchiveWriter with limits.
+    // Read and validate one payload at a time when emitting frames.
+    let mut writer = ArchiveWriter::with_limits(writer, limits)?;
     writer.write_header(ARCHIVE_VERSION_1, DocumentId(repo.project()), head.clone())?;
 
-    for (doc, addr, bytes) in objects_to_export {
-        writer.write_object(doc, addr, &bytes)?;
+    for (doc_id, addr) in scoped_object_keys {
+        let packet = repo
+            .object(&ObjectKey {
+                document: doc_id,
+                address: addr.clone(),
+            })
+            .await
+            .map_err(|_| ArchiveError::InvalidFrame("object in graph missing or corrupt"))?;
+
+        crate::shared_checkpoint::validate_stored(&addr, &packet.bytes)
+            .map_err(|_| ArchiveError::InvalidFrame("object hash mismatch or invalid"))?;
+
+        writer.write_object(doc_id, addr, &packet.bytes)?;
     }
 
-    for commit in ordered_commits {
-        writer.write_commit(&commit)?;
+    for addr in ordered_commits {
+        let signed = repo
+            .commit(&addr)
+            .await
+            .map_err(|_| ArchiveError::InvalidFrame("commit in dependency closure missing"))?;
+        writer.write_commit(&signed)?;
     }
 
     writer.finish()
@@ -1036,7 +1095,10 @@ pub fn validate_and_stage_archive_in<R: Read>(
     }
 
     let mut reachable_objects: HashSet<(DocumentId, Address)> = HashSet::new();
-    for (doc_id, roots) in file_roots {
+    let mut sorted_docs: Vec<_> = file_roots.into_iter().collect();
+    sorted_docs.sort_by_key(|(doc, _)| doc.0);
+
+    for (doc_id, roots) in sorted_docs {
         let mut obj_stack: Vec<Address> = roots.into_iter().collect();
         while let Some(addr) = obj_stack.pop() {
             if reachable_objects.insert((doc_id, addr.clone())) {

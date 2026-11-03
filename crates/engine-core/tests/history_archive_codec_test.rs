@@ -445,3 +445,119 @@ async fn head_commit_mismatch_rejected() {
     let err = writer.finish().unwrap_err();
     assert!(matches!(err, ArchiveError::InvalidFrame(_)));
 }
+
+#[tokio::test]
+async fn writer_enforces_exact_byte_limits() {
+    let project = DocumentId(uuid::Uuid::new_v4());
+    let key = generate_key();
+    let c1 = create_genesis_commit(project, &key);
+    let head = c1.verify().unwrap();
+    let (doc_id, obj_addr, obj_bytes) = create_sample_object().await;
+
+    // First measure the exact size of a valid archive
+    let mut baseline_buf = Vec::new();
+    let mut baseline_writer = ArchiveWriter::new(&mut baseline_buf).unwrap();
+    baseline_writer
+        .write_header(1, project, head.clone())
+        .unwrap();
+    baseline_writer
+        .write_object(doc_id, obj_addr.clone(), &obj_bytes)
+        .unwrap();
+    baseline_writer.write_commit(&c1).unwrap();
+    let summary = baseline_writer.finish().unwrap();
+    let exact_bytes = summary.total_bytes;
+    assert_eq!(baseline_buf.len() as u64, exact_bytes);
+
+    // With limit == exact_bytes, writer succeeds
+    let mut ok_buf = Vec::new();
+    let mut ok_writer = ArchiveWriter::with_limits(
+        &mut ok_buf,
+        ArchiveLimits {
+            max_total_bytes: exact_bytes,
+            ..ArchiveLimits::default()
+        },
+    )
+    .unwrap();
+    ok_writer.write_header(1, project, head.clone()).unwrap();
+    ok_writer
+        .write_object(doc_id, obj_addr.clone(), &obj_bytes)
+        .unwrap();
+    ok_writer.write_commit(&c1).unwrap();
+    let ok_summary = ok_writer.finish().unwrap();
+    assert_eq!(ok_summary.total_bytes, exact_bytes);
+
+    // With limit == exact_bytes - 1, writer fails on the final frame
+    let mut fail_buf = Vec::new();
+    let mut fail_writer = ArchiveWriter::with_limits(
+        &mut fail_buf,
+        ArchiveLimits {
+            max_total_bytes: exact_bytes - 1,
+            ..ArchiveLimits::default()
+        },
+    )
+    .unwrap();
+    fail_writer.write_header(1, project, head).unwrap();
+    fail_writer
+        .write_object(doc_id, obj_addr, &obj_bytes)
+        .unwrap();
+    fail_writer.write_commit(&c1).unwrap();
+    let err = fail_writer.finish().unwrap_err();
+    assert!(matches!(err, ArchiveError::Limit(_)));
+}
+
+#[tokio::test]
+async fn writer_enforces_max_commits_and_objects_and_frame_limits() {
+    let project = DocumentId(uuid::Uuid::new_v4());
+    let key = generate_key();
+    let c1 = create_genesis_commit(project, &key);
+    let a1 = c1.verify().unwrap();
+    let c2 = create_child_commit(project, a1.clone(), &key, 2);
+    let (doc_id, obj_addr, obj_bytes) = create_sample_object().await;
+
+    // max_commits = 1
+    let mut buf = Vec::new();
+    let mut writer = ArchiveWriter::with_limits(
+        &mut buf,
+        ArchiveLimits {
+            max_commits: 1,
+            ..ArchiveLimits::default()
+        },
+    )
+    .unwrap();
+    writer.write_header(1, project, a1.clone()).unwrap();
+    writer.write_commit(&c1).unwrap();
+    let err_commit = writer.write_commit(&c2).unwrap_err();
+    assert!(matches!(err_commit, ArchiveError::Limit(_)));
+
+    // max_objects = 0
+    let mut buf2 = Vec::new();
+    let mut writer2 = ArchiveWriter::with_limits(
+        &mut buf2,
+        ArchiveLimits {
+            max_objects: 0,
+            ..ArchiveLimits::default()
+        },
+    )
+    .unwrap();
+    writer2.write_header(1, project, a1.clone()).unwrap();
+    let err_obj = writer2
+        .write_object(doc_id, obj_addr.clone(), &obj_bytes)
+        .unwrap_err();
+    assert!(matches!(err_obj, ArchiveError::Limit(_)));
+
+    // max_frame_bytes = 200 (enough for header frame ~160 bytes, but too small for object frame)
+    let mut buf3 = Vec::new();
+    let mut writer3 = ArchiveWriter::with_limits(
+        &mut buf3,
+        ArchiveLimits {
+            max_frame_bytes: 200,
+            ..ArchiveLimits::default()
+        },
+    )
+    .unwrap();
+    writer3.write_header(1, project, a1).unwrap();
+    let err_frame = writer3
+        .write_object(doc_id, obj_addr, &obj_bytes)
+        .unwrap_err();
+    assert!(matches!(err_frame, ArchiveError::Limit(_)));
+}
