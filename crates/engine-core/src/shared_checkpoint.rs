@@ -17,6 +17,7 @@ pub mod content;
 pub mod postgres;
 pub mod typed;
 use canonical::ObjectRef;
+pub use typed::read_state_v3;
 
 pub const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 /// Maximum values fetched together. PostgreSQL retains at most this many encoded
@@ -206,11 +207,11 @@ struct Entry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StateRoots {
-    nodes: Address,
-    comments: Address,
-    suggestions: Address,
-    removed_choices: Address,
+pub(crate) struct StateRoots {
+    pub(crate) nodes: Address,
+    pub(crate) comments: Address,
+    pub(crate) suggestions: Address,
+    pub(crate) removed_choices: Address,
 }
 
 impl StateRoots {
@@ -308,8 +309,14 @@ fn decode(expected: &Address, bytes: &[u8]) -> Result<Object, Error> {
 pub fn validate_stored(expected: &Address, bytes: &[u8]) -> Result<(), Error> {
     if bytes.starts_with(content::MAGIC) {
         content::validate(expected, bytes)
-    } else if bytes.starts_with(typed::MAGIC) {
-        typed::validate(expected, bytes)
+    } else if bytes.starts_with(b"DYNOTYP\0") {
+        if bytes.len() > 8 && bytes[8] == 2 {
+            typed::validate(expected, bytes)
+        } else if bytes.len() > 8 && bytes[8] == 3 {
+            typed::validate_v3(expected, bytes)
+        } else {
+            Err(Error::Invalid("typed header/version"))
+        }
     } else {
         decode(expected, bytes).map(|_| ())
     }
@@ -322,8 +329,14 @@ pub fn validate_stored(expected: &Address, bytes: &[u8]) -> Result<(), Error> {
 pub fn references(expected: &Address, bytes: &[u8]) -> Result<Vec<Address>, Error> {
     if bytes.starts_with(content::MAGIC) {
         content::references(expected, bytes)
-    } else if bytes.starts_with(typed::MAGIC) {
-        typed::references(expected, bytes)
+    } else if bytes.starts_with(b"DYNOTYP\0") {
+        if bytes.len() > 8 && bytes[8] == 2 {
+            typed::references(expected, bytes)
+        } else if bytes.len() > 8 && bytes[8] == 3 {
+            typed::references_v3(expected, bytes)
+        } else {
+            Err(Error::Invalid("typed header/version"))
+        }
     } else {
         Ok(match decode(expected, bytes)? {
             Object::MapLeaf(entries) => entries.into_iter().map(|entry| entry.address).collect(),

@@ -21,6 +21,8 @@ use crate::materializer::{CommentState, DocumentState, MaterializedNode, Suggest
 
 pub(super) const MAGIC: &[u8] = b"DYNOTYP\0\x02";
 const DOMAIN: &[u8] = b"dynodoc.typed-checkpoint\0v2\0";
+pub(super) const MAGIC_V3: &[u8] = b"DYNOTYP\0\x03";
+const DOMAIN_V3: &[u8] = b"dynodoc.typed-checkpoint\0v3\0";
 pub const MAX_KEY_BYTES: usize = 1024;
 pub const MAX_METADATA_BYTES: usize = 4096;
 const MAX_TYPED_BYTES: usize = 32 * 1024;
@@ -71,11 +73,11 @@ impl SemanticLimits {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Text {
-    root: Address,
-    bytes: usize,
+pub struct Text {
+    pub root: Address,
+    pub bytes: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -104,6 +106,52 @@ enum Object {
         var_name: Option<String>,
         deleted: bool,
         fields: Address,
+    },
+    Comment {
+        node_id: Option<NodeId>,
+        body: Text,
+    },
+    Suggestion {
+        target_node_id: Option<NodeId>,
+        detail: Address,
+        accepted: bool,
+        rejected_reason: Option<Text>,
+    },
+    RemovedChoice(NodeId),
+    State(StateRoots),
+    Asset {
+        media_type: String,
+        content: Text,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub(crate) enum ObjectV3 {
+    Scalar(Value),
+    Text(Text),
+    Array {
+        entries: Address,
+        count: usize,
+    },
+    Dictionary {
+        entries: Address,
+        count: usize,
+    },
+    Node {
+        parent_id: Option<NodeId>,
+        node_type: String,
+        pos: String,
+        var_name: Option<String>,
+        deleted: bool,
+        fields: Address,
+        restore_block_id: bool,
+        restore_label: bool,
     },
     Comment {
         node_id: Option<NodeId>,
@@ -186,6 +234,69 @@ pub(super) fn references(expected: &Address, bytes: &[u8]) -> Result<Vec<Address
             .collect(),
         Object::State(roots) => roots.addresses(),
         Object::Asset { content, .. } => vec![content.root],
+    })
+}
+
+pub fn address_v3(bytes: &[u8]) -> Address {
+    let mut hash = HashContext::new(&SHA256);
+    hash.update(DOMAIN_V3);
+    hash.update(bytes);
+    Address(super::hex(hash.finish().as_ref()))
+}
+
+pub(crate) fn encode_v3(object: &ObjectV3) -> Result<(Address, Vec<u8>), Error> {
+    let mut bytes = MAGIC_V3.to_vec();
+    let value = serde_json::to_value(object)?;
+    serde_json::to_writer(&mut bytes, &super::canonical::CanonicalValue(&value))?;
+    if bytes.len() > MAX_TYPED_BYTES {
+        return Err(Error::Limit("typed object bytes"));
+    }
+    Ok((address_v3(&bytes), bytes))
+}
+
+pub(crate) fn decode_v3(expected: &Address, bytes: &[u8]) -> Result<ObjectV3, Error> {
+    if bytes.len() > MAX_TYPED_BYTES {
+        return Err(Error::Limit("typed object bytes"));
+    }
+    if !bytes.starts_with(MAGIC_V3) {
+        return Err(Error::Invalid("typed header/version"));
+    }
+    if address_v3(bytes) != *expected {
+        return Err(Error::HashMismatch);
+    }
+    let object: ObjectV3 = serde_json::from_slice(&bytes[MAGIC_V3.len()..])?;
+    if matches!(
+        &object,
+        ObjectV3::Scalar(Value::Array(_) | Value::Object(_) | Value::String(_))
+    ) {
+        return Err(Error::Invalid("expected primitive scalar"));
+    }
+    if encode_v3(&object)?.1 != bytes {
+        return Err(Error::Invalid("noncanonical typed object"));
+    }
+    Ok(object)
+}
+
+pub(super) fn validate_v3(expected: &Address, bytes: &[u8]) -> Result<(), Error> {
+    decode_v3(expected, bytes).map(|_| ())
+}
+
+pub(super) fn references_v3(expected: &Address, bytes: &[u8]) -> Result<Vec<Address>, Error> {
+    Ok(match decode_v3(expected, bytes)? {
+        ObjectV3::Scalar(_) | ObjectV3::RemovedChoice(_) => Vec::new(),
+        ObjectV3::Text(text) => vec![text.root],
+        ObjectV3::Array { entries, .. } | ObjectV3::Dictionary { entries, .. } => vec![entries],
+        ObjectV3::Node { fields, .. } => vec![fields],
+        ObjectV3::Comment { body, .. } => vec![body.root],
+        ObjectV3::Suggestion {
+            detail,
+            rejected_reason,
+            ..
+        } => std::iter::once(detail)
+            .chain(rejected_reason.map(|reason| reason.root))
+            .collect(),
+        ObjectV3::State(roots) => roots.addresses(),
+        ObjectV3::Asset { content, .. } => vec![content.root],
     })
 }
 
@@ -1073,6 +1184,262 @@ pub async fn read_state<S: ObjectStore>(
     Ok(state)
 }
 
+struct DecoderV3<'a, S> {
+    reader: Reader<'a, S>,
+    semantic: SemanticLimits,
+}
+
+impl<S: ObjectStore> DecoderV3<'_, S> {
+    async fn object(&mut self, root: &Address) -> Result<ObjectV3, Error> {
+        if self.reader.budget.max_objects == 0 {
+            return Err(Error::Limit("objects"));
+        }
+        let bytes = self.reader.store.get(self.reader.document, root).await?;
+        self.reader.budget.consume(bytes.len())?;
+        decode_v3(root, &bytes)
+    }
+
+    async fn bytes(&mut self, text: Text) -> Result<Vec<u8>, Error> {
+        self.semantic.bytes(text.bytes)?;
+        let mut sink = BoundedBytes {
+            bytes: Vec::new(),
+            limit: text.bytes,
+        };
+        let length = content::read_with_budget(
+            self.reader.store,
+            self.reader.document,
+            &text.root,
+            &mut sink,
+            &mut self.reader.budget,
+        )
+        .await?;
+        if length != text.bytes as u64 {
+            return Err(Error::Invalid("declared content length"));
+        }
+        Ok(sink.bytes)
+    }
+
+    async fn text(&mut self, text: Text) -> Result<String, Error> {
+        String::from_utf8(self.bytes(text).await?).map_err(|_| Error::Invalid("text UTF-8"))
+    }
+
+    async fn entries(
+        &mut self,
+        root: &Address,
+        count: usize,
+        key_limit: usize,
+    ) -> Result<BTreeMap<String, Address>, Error> {
+        if count > self.semantic.values {
+            return Err(Error::Limit("semantic values"));
+        }
+        let entries = self.reader.entries_limited(root, count, key_limit).await?;
+        if entries.len() != count {
+            return Err(Error::Invalid("container count"));
+        }
+        Ok(entries)
+    }
+
+    async fn value(&mut self, root: &Address, depth: usize) -> Result<Value, Error> {
+        self.semantic.value(depth)?;
+        match self.object(root).await? {
+            ObjectV3::Scalar(value) => Ok(value),
+            ObjectV3::Text(text) => Ok(Value::String(self.text(text).await?)),
+            ObjectV3::Array { entries, count } => {
+                let entries = self.entries(&entries, count, 16).await?;
+                let mut values = Vec::new();
+                for (i, (key, root)) in entries.into_iter().enumerate() {
+                    if key != format!("{i:016x}") {
+                        return Err(Error::Invalid("array ordinal"));
+                    }
+                    values.push(Box::pin(self.value(&root, depth + 1)).await?);
+                }
+                Ok(Value::Array(values))
+            }
+            ObjectV3::Dictionary { entries, count } => {
+                let entries = self.entries(&entries, count, MAX_KEY_BYTES).await?;
+                let mut values = serde_json::Map::new();
+                for (key, root) in entries {
+                    self.semantic.bytes(key.len())?;
+                    values.insert(key, Box::pin(self.value(&root, depth + 1)).await?);
+                }
+                Ok(Value::Object(values))
+            }
+            _ => Err(Error::Invalid("expected typed value")),
+        }
+    }
+
+    async fn records(&mut self, root: &Address) -> Result<BTreeMap<String, Address>, Error> {
+        self.reader
+            .entries_limited(root, self.semantic.values, MAX_METADATA_BYTES)
+            .await
+    }
+}
+
+/// Verify the entire v3 typed graph and reconstruct state under semantic and I/O
+/// budgets. Missing/corrupt/wrongly typed content fails closed, including tombstones.
+pub async fn read_state_v3<S: ObjectStore>(
+    store: &mut S,
+    document: DocumentId,
+    root: &Address,
+    limits: Limits,
+    semantic: SemanticLimits,
+) -> Result<DocumentState, Error> {
+    let mut decoder = DecoderV3 {
+        reader: Reader {
+            store,
+            document,
+            budget: limits,
+        },
+        semantic,
+    };
+    let ObjectV3::State(roots) = decoder.object(root).await? else {
+        return Err(Error::Invalid("expected typed state"));
+    };
+    let mut state = DocumentState::default();
+    for (key, root) in decoder.records(&roots.nodes).await? {
+        decoder.semantic.value(0)?;
+        let ObjectV3::Node {
+            parent_id,
+            node_type,
+            pos,
+            var_name,
+            deleted,
+            fields,
+            restore_block_id,
+            restore_label,
+        } = decoder.object(&root).await?
+        else {
+            return Err(Error::Invalid("expected typed node"));
+        };
+        let id = NodeId(key.clone());
+        let mut node = MaterializedNode {
+            id: id.clone(),
+            parent_id,
+            node_type,
+            pos,
+            var_name,
+            deleted,
+            current_fields: Value::Null,
+        };
+        node_metadata(&mut decoder.semantic, &node)?;
+        let mut fields_val = decoder.value(&fields, 0).await?;
+
+        if restore_block_id || restore_label {
+            let Value::Object(ref mut map) = fields_val else {
+                return Err(Error::Invalid("expected object fields for restore flag"));
+            };
+            if restore_block_id {
+                if map.contains_key("blockId") {
+                    return Err(Error::Invalid("restore_block_id with existing blockId"));
+                }
+                decoder.semantic.metadata("blockId")?;
+                decoder.semantic.metadata(&key)?;
+                map.insert("blockId".into(), Value::String(key.clone()));
+            }
+            if restore_label {
+                if map.contains_key("label") {
+                    return Err(Error::Invalid("restore_label with existing label"));
+                }
+                let Some(content) = map.get("content") else {
+                    return Err(Error::Invalid("restore_label requires content field"));
+                };
+                if content.is_null() {
+                    return Err(Error::Invalid("restore_label requires content field"));
+                }
+                let label = crate::richtext::plain_text(content);
+                decoder.semantic.metadata("label")?;
+                decoder.semantic.metadata(&label)?;
+                map.insert("label".into(), Value::String(label));
+            }
+        }
+
+        if let Value::Object(ref map) = fields_val {
+            if !restore_block_id {
+                if let Some(Value::String(b_id)) = map.get("blockId") {
+                    if b_id == &key {
+                        return Err(Error::Invalid(
+                            "non-minimal blockId; must be omitted when equal to node id",
+                        ));
+                    }
+                }
+            }
+            if !restore_label {
+                if let Some(content) = map.get("content") {
+                    if !content.is_null() {
+                        if let Some(Value::String(lbl)) = map.get("label") {
+                            if lbl == &crate::richtext::plain_text(content) {
+                                return Err(Error::Invalid(
+                                    "non-minimal label; must be omitted when equal to plain_text(content)",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        node.current_fields = fields_val;
+        state.nodes.insert(node.id.clone(), node);
+    }
+    for (key, root) in decoder.records(&roots.comments).await? {
+        decoder.semantic.value(0)?;
+        if key != format!("{:016x}", state.comments.len()) {
+            return Err(Error::Invalid("comment ordinal"));
+        }
+        let ObjectV3::Comment { node_id, body } = decoder.object(&root).await? else {
+            return Err(Error::Invalid("expected typed comment"));
+        };
+        if let Some(id) = &node_id {
+            decoder.semantic.metadata(&id.0)?;
+        }
+        state.comments.push(CommentState {
+            node_id,
+            body: decoder.text(body).await?,
+        });
+    }
+    for (key, root) in decoder.records(&roots.suggestions).await? {
+        decoder.semantic.value(0)?;
+        decoder.semantic.metadata(&key)?;
+        let ObjectV3::Suggestion {
+            target_node_id,
+            detail,
+            accepted,
+            rejected_reason,
+        } = decoder.object(&root).await?
+        else {
+            return Err(Error::Invalid("expected typed suggestion"));
+        };
+        if let Some(id) = &target_node_id {
+            decoder.semantic.metadata(&id.0)?;
+        }
+        let rejected_reason = match rejected_reason {
+            Some(reason) => Some(decoder.text(reason).await?),
+            None => None,
+        };
+        let detail = decoder.value(&detail, 0).await?;
+        state.suggestions.insert(
+            key,
+            SuggestionState {
+                target_node_id,
+                detail,
+                accepted,
+                rejected_reason,
+            },
+        );
+    }
+    for (key, root) in decoder.records(&roots.removed_choices).await? {
+        decoder.semantic.value(0)?;
+        decoder.semantic.metadata(&key)?;
+        match decoder.object(&root).await? {
+            ObjectV3::RemovedChoice(id) if id.0 == key => {
+                state.removed_choices.insert(id);
+            }
+            _ => return Err(Error::Invalid("removed choice key/id")),
+        }
+    }
+    Ok(state)
+}
+
 /// Store an opaque asset manifest over preexisting content, verifying the full
 /// byte tree without buffering it. Native adapters must explicitly reference this
 /// manifest; it is not silently added to DocumentState or a checkpoint.
@@ -1137,7 +1504,7 @@ pub async fn read_asset<S: ObjectStore, W: AsyncWrite + Unpin + Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared_checkpoint::{MemoryStore, MAX_OBJECT_BYTES};
+    use crate::shared_checkpoint::{route, MemoryStore, MAX_OBJECT_BYTES};
     use serde_json::json;
 
     fn doc() -> DocumentId {
@@ -2124,6 +2491,752 @@ mod tests {
 
             current_state = target_state;
             current_root = new_root;
+        }
+    }
+
+    struct TestEncoderV3<'a, S> {
+        writer: Writer<'a, S>,
+        semantic: SemanticLimits,
+    }
+
+    impl<S: ObjectStore> TestEncoderV3<'_, S> {
+        async fn object(&mut self, object: ObjectV3) -> Result<Address, Error> {
+            let (address, bytes) = encode_v3(&object)?;
+            self.writer.encoded(address, bytes).await
+        }
+
+        async fn text(&mut self, text: &[u8]) -> Result<Text, Error> {
+            self.semantic.bytes(text.len())?;
+            let root = content::write_with_writer(&mut self.writer, &mut &*text).await?;
+            Ok(Text {
+                root,
+                bytes: text.len(),
+            })
+        }
+
+        async fn value(&mut self, value: &Value, depth: usize) -> Result<Address, Error> {
+            self.semantic.value(depth)?;
+            let object = match value {
+                Value::String(text) => ObjectV3::Text(self.text(text.as_bytes()).await?),
+                Value::Array(values) => {
+                    let mut entries = Vec::new();
+                    for (i, value) in values.iter().enumerate() {
+                        let key = format!("{i:016x}");
+                        let address = Box::pin(self.value(value, depth + 1)).await?;
+                        entries.push((route(&key), Entry { key, address }));
+                    }
+                    ObjectV3::Array {
+                        entries: self.writer.entries(entries).await?,
+                        count: values.len(),
+                    }
+                }
+                Value::Object(values) => {
+                    let mut entries = Vec::new();
+                    let mut keys: Vec<_> = values.keys().collect();
+                    keys.sort_unstable();
+                    for key in keys {
+                        self.semantic.bytes(key.len())?;
+                        let address = Box::pin(self.value(&values[key], depth + 1)).await?;
+                        entries.push((
+                            route(key),
+                            Entry {
+                                key: key.clone(),
+                                address,
+                            },
+                        ));
+                    }
+                    ObjectV3::Dictionary {
+                        entries: self.writer.entries(entries).await?,
+                        count: values.len(),
+                    }
+                }
+                value => ObjectV3::Scalar(value.clone()),
+            };
+            self.object(object).await
+        }
+    }
+
+    async fn write_v3_test<S: ObjectStore>(
+        store: &mut S,
+        document: DocumentId,
+        state: &DocumentState,
+    ) -> Result<Address, Error> {
+        let mut encoder = TestEncoderV3 {
+            writer: Writer {
+                store,
+                document,
+                budget: Limits::default(),
+                stats: WriteStats::default(),
+                pending: Vec::new(),
+                pending_bytes: 0,
+            },
+            semantic: SemanticLimits::default(),
+        };
+
+        let mut node_entries = Vec::new();
+        for (id, node) in &state.nodes {
+            encoder.semantic.value(0)?;
+            node_metadata(&mut encoder.semantic, node)?;
+
+            let (fields_val, restore_block_id, restore_label) = match &node.current_fields {
+                Value::Object(map) => {
+                    let mut m = map.clone();
+                    let r_block_id = if let Some(Value::String(b_id)) = m.get("blockId") {
+                        if b_id == &id.0 {
+                            m.remove("blockId");
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    let r_label = if let Some(content) = m.get("content") {
+                        if !content.is_null() {
+                            if let Some(Value::String(lbl)) = m.get("label") {
+                                if lbl == &crate::richtext::plain_text(content) {
+                                    m.remove("label");
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    (Value::Object(m), r_block_id, r_label)
+                }
+                other => (other.clone(), false, false),
+            };
+
+            let fields = encoder.value(&fields_val, 0).await?;
+            let address = encoder
+                .object(ObjectV3::Node {
+                    parent_id: node.parent_id.clone(),
+                    node_type: node.node_type.clone(),
+                    pos: node.pos.clone(),
+                    var_name: node.var_name.clone(),
+                    deleted: node.deleted,
+                    fields,
+                    restore_block_id,
+                    restore_label,
+                })
+                .await?;
+            node_entries.push((
+                route(&id.0),
+                Entry {
+                    key: id.0.clone(),
+                    address,
+                },
+            ));
+        }
+        let nodes = encoder.writer.entries(node_entries).await?;
+
+        let mut comment_entries = Vec::new();
+        for (i, comment) in state.comments.iter().enumerate() {
+            encoder.semantic.value(0)?;
+            if let Some(id) = &comment.node_id {
+                encoder.semantic.metadata(&id.0)?;
+            }
+            let body = encoder.text(comment.body.as_bytes()).await?;
+            let address = encoder
+                .object(ObjectV3::Comment {
+                    node_id: comment.node_id.clone(),
+                    body,
+                })
+                .await?;
+            let key = format!("{i:016x}");
+            comment_entries.push((route(&key), Entry { key, address }));
+        }
+        let comments = encoder.writer.entries(comment_entries).await?;
+
+        let mut sugg_entries = Vec::new();
+        for (key, suggestion) in &state.suggestions {
+            encoder.semantic.value(0)?;
+            encoder.semantic.metadata(key)?;
+            if let Some(id) = &suggestion.target_node_id {
+                encoder.semantic.metadata(&id.0)?;
+            }
+            let detail = encoder.value(&suggestion.detail, 0).await?;
+            let rejected_reason = match &suggestion.rejected_reason {
+                Some(reason) => Some(encoder.text(reason.as_bytes()).await?),
+                None => None,
+            };
+            let address = encoder
+                .object(ObjectV3::Suggestion {
+                    target_node_id: suggestion.target_node_id.clone(),
+                    detail,
+                    accepted: suggestion.accepted,
+                    rejected_reason,
+                })
+                .await?;
+            sugg_entries.push((
+                route(key),
+                Entry {
+                    key: key.clone(),
+                    address,
+                },
+            ));
+        }
+        let suggestions = encoder.writer.entries(sugg_entries).await?;
+
+        let mut rc_entries = Vec::new();
+        let mut removed: Vec<_> = state.removed_choices.iter().collect();
+        removed.sort();
+        for id in removed {
+            encoder.semantic.value(0)?;
+            encoder.semantic.metadata(&id.0)?;
+            let address = encoder.object(ObjectV3::RemovedChoice(id.clone())).await?;
+            rc_entries.push((
+                route(&id.0),
+                Entry {
+                    key: id.0.clone(),
+                    address,
+                },
+            ));
+        }
+        let removed_choices = encoder.writer.entries(rc_entries).await?;
+
+        let root = encoder
+            .object(ObjectV3::State(StateRoots {
+                nodes,
+                comments,
+                suggestions,
+                removed_choices,
+            }))
+            .await?;
+        encoder.writer.flush().await?;
+        Ok(root)
+    }
+
+    #[test]
+    fn typed_v3_canonical_vectors_and_noncanonical_rejection() {
+        let (root, bytes) = encode_v3(&ObjectV3::Scalar(Value::Null)).unwrap();
+        assert_eq!(
+            &bytes[MAGIC_V3.len()..],
+            br#"{"kind":"scalar","value":null}"#
+        );
+        assert_eq!(
+            root.as_str(),
+            "24a4c5329aad519af2cf28e2500cf9eb75c5f372f4ebd366e382e236fd6713d1"
+        );
+        assert!(decode_v3(&root, &bytes).is_ok());
+
+        // Validate stored and references dispatch for v3
+        assert!(super::super::validate_stored(&root, &bytes).is_ok());
+        assert_eq!(
+            super::super::references(&root, &bytes).unwrap(),
+            Vec::<Address>::new()
+        );
+
+        // Noncanonical rejections
+        for tail in [
+            br#"{"kind":"scalar","value":null,"extra":true}"#.as_slice(),
+            br#"{"kind":"scalar","value":[],"value":null}"#,
+            br#"{"kind":"scalar","value":{}}"#,
+            br#"{ "kind":"scalar","value":null}"#,
+        ] {
+            let mut bad = MAGIC_V3.to_vec();
+            bad.extend_from_slice(tail);
+            assert!(decode_v3(&address_v3(&bad), &bad).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_roundtrip_reconstruction_and_isolation() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+
+        let mut state = DocumentState::default();
+        // Node 1: standard blockId and standard label (both reconstructed)
+        state.nodes.insert(
+            NodeId("node_1".into()),
+            MaterializedNode {
+                id: NodeId("node_1".into()),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "a0".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: json!({
+                    "blockId": "node_1",
+                    "content": {
+                        "type": "doc",
+                        "content": [{"text": "Hello world"}]
+                    },
+                    "label": "Hello world"
+                }),
+            },
+        );
+
+        // Node 2: custom blockId and custom label (both preserved when flags false)
+        state.nodes.insert(
+            NodeId("node_2".into()),
+            MaterializedNode {
+                id: NodeId("node_2".into()),
+                parent_id: Some(NodeId("node_1".into())),
+                node_type: "heading".into(),
+                pos: "a1".into(),
+                var_name: Some("h1".into()),
+                deleted: false,
+                current_fields: json!({
+                    "blockId": "custom_block_id",
+                    "content": {
+                        "type": "doc",
+                        "content": [{"text": "Hello world"}]
+                    },
+                    "label": "Custom Heading Label"
+                }),
+            },
+        );
+
+        // Node 3: tombstone with no blockId/label
+        state.nodes.insert(
+            NodeId("node_3".into()),
+            MaterializedNode {
+                id: NodeId("node_3".into()),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "a2".into(),
+                var_name: None,
+                deleted: true,
+                current_fields: Value::Null,
+            },
+        );
+
+        state.comments.push(CommentState {
+            node_id: Some(NodeId("node_1".into())),
+            body: "Great paragraph".into(),
+        });
+
+        state.suggestions.insert(
+            "sugg_1".into(),
+            SuggestionState {
+                target_node_id: Some(NodeId("node_1".into())),
+                detail: json!({"text": "suggestion"}),
+                accepted: false,
+                rejected_reason: Some("Not needed".into()),
+            },
+        );
+
+        state.removed_choices.insert(NodeId("choice_1".into()));
+
+        // Write v3
+        let root_v3 = write_v3_test(&mut store, document, &state).await.unwrap();
+
+        // Read v3
+        let reconstructed = read_state_v3(
+            &mut store,
+            document,
+            &root_v3,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reconstructed, state);
+
+        // Verify isolation: v2 reader rejects v3 root
+        let v2_read = read_state(
+            &mut store,
+            document,
+            &root_v3,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await;
+        assert!(matches!(
+            v2_read,
+            Err(Error::Invalid("typed header/version"))
+        ));
+
+        // Write v2 and check v3 reader rejects v2 root
+        let (root_v2, _) = write(&mut store, document, &state).await;
+        let v3_read = read_state_v3(
+            &mut store,
+            document,
+            &root_v2,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await;
+        assert!(matches!(
+            v3_read,
+            Err(Error::Invalid("typed header/version"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn v3_reconstruction_and_minimal_flag_rejections() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+
+        // 1. restore_block_id: true with existing blockId in fields
+        {
+            let mut encoder = TestEncoderV3 {
+                writer: Writer {
+                    store: &mut store,
+                    document,
+                    budget: Limits::default(),
+                    stats: WriteStats::default(),
+                    pending: Vec::new(),
+                    pending_bytes: 0,
+                },
+                semantic: SemanticLimits::default(),
+            };
+            let fields = encoder
+                .value(&json!({"blockId": "node_1"}), 0)
+                .await
+                .unwrap();
+            let node_addr = encoder
+                .object(ObjectV3::Node {
+                    parent_id: None,
+                    node_type: "paragraph".into(),
+                    pos: "a0".into(),
+                    var_name: None,
+                    deleted: false,
+                    fields,
+                    restore_block_id: true,
+                    restore_label: false,
+                })
+                .await
+                .unwrap();
+            let nodes = encoder
+                .writer
+                .entries(vec![(
+                    super::super::route("node_1"),
+                    Entry {
+                        key: "node_1".into(),
+                        address: node_addr,
+                    },
+                )])
+                .await
+                .unwrap();
+            let empty_map = encoder.writer.entries(vec![]).await.unwrap();
+            let root = encoder
+                .object(ObjectV3::State(StateRoots {
+                    nodes,
+                    comments: empty_map.clone(),
+                    suggestions: empty_map.clone(),
+                    removed_choices: empty_map,
+                }))
+                .await
+                .unwrap();
+            encoder.writer.flush().await.unwrap();
+
+            let res = read_state_v3(
+                &mut store,
+                document,
+                &root,
+                Limits::default(),
+                SemanticLimits::default(),
+            )
+            .await;
+            assert!(matches!(
+                res,
+                Err(Error::Invalid("restore_block_id with existing blockId"))
+            ));
+        }
+
+        // 2. restore_block_id: false with redundant blockId == id
+        {
+            let mut encoder = TestEncoderV3 {
+                writer: Writer {
+                    store: &mut store,
+                    document,
+                    budget: Limits::default(),
+                    stats: WriteStats::default(),
+                    pending: Vec::new(),
+                    pending_bytes: 0,
+                },
+                semantic: SemanticLimits::default(),
+            };
+            let fields = encoder
+                .value(&json!({"blockId": "node_1"}), 0)
+                .await
+                .unwrap();
+            let node_addr = encoder
+                .object(ObjectV3::Node {
+                    parent_id: None,
+                    node_type: "paragraph".into(),
+                    pos: "a0".into(),
+                    var_name: None,
+                    deleted: false,
+                    fields,
+                    restore_block_id: false,
+                    restore_label: false,
+                })
+                .await
+                .unwrap();
+            let nodes = encoder
+                .writer
+                .entries(vec![(
+                    super::super::route("node_1"),
+                    Entry {
+                        key: "node_1".into(),
+                        address: node_addr,
+                    },
+                )])
+                .await
+                .unwrap();
+            let empty_map = encoder.writer.entries(vec![]).await.unwrap();
+            let root = encoder
+                .object(ObjectV3::State(StateRoots {
+                    nodes,
+                    comments: empty_map.clone(),
+                    suggestions: empty_map.clone(),
+                    removed_choices: empty_map,
+                }))
+                .await
+                .unwrap();
+            encoder.writer.flush().await.unwrap();
+
+            let res = read_state_v3(
+                &mut store,
+                document,
+                &root,
+                Limits::default(),
+                SemanticLimits::default(),
+            )
+            .await;
+            assert!(matches!(
+                res,
+                Err(Error::Invalid(
+                    "non-minimal blockId; must be omitted when equal to node id"
+                ))
+            ));
+        }
+
+        // 3. restore_label: true with existing label in fields
+        {
+            let mut encoder = TestEncoderV3 {
+                writer: Writer {
+                    store: &mut store,
+                    document,
+                    budget: Limits::default(),
+                    stats: WriteStats::default(),
+                    pending: Vec::new(),
+                    pending_bytes: 0,
+                },
+                semantic: SemanticLimits::default(),
+            };
+            let fields = encoder
+                .value(&json!({"label": "foo", "content": {"text": "foo"}}), 0)
+                .await
+                .unwrap();
+            let node_addr = encoder
+                .object(ObjectV3::Node {
+                    parent_id: None,
+                    node_type: "paragraph".into(),
+                    pos: "a0".into(),
+                    var_name: None,
+                    deleted: false,
+                    fields,
+                    restore_block_id: false,
+                    restore_label: true,
+                })
+                .await
+                .unwrap();
+            let nodes = encoder
+                .writer
+                .entries(vec![(
+                    super::super::route("node_1"),
+                    Entry {
+                        key: "node_1".into(),
+                        address: node_addr,
+                    },
+                )])
+                .await
+                .unwrap();
+            let empty_map = encoder.writer.entries(vec![]).await.unwrap();
+            let root = encoder
+                .object(ObjectV3::State(StateRoots {
+                    nodes,
+                    comments: empty_map.clone(),
+                    suggestions: empty_map.clone(),
+                    removed_choices: empty_map,
+                }))
+                .await
+                .unwrap();
+            encoder.writer.flush().await.unwrap();
+
+            let res = read_state_v3(
+                &mut store,
+                document,
+                &root,
+                Limits::default(),
+                SemanticLimits::default(),
+            )
+            .await;
+            assert!(matches!(
+                res,
+                Err(Error::Invalid("restore_label with existing label"))
+            ));
+        }
+
+        // 4. restore_label: true with missing content
+        {
+            let mut encoder = TestEncoderV3 {
+                writer: Writer {
+                    store: &mut store,
+                    document,
+                    budget: Limits::default(),
+                    stats: WriteStats::default(),
+                    pending: Vec::new(),
+                    pending_bytes: 0,
+                },
+                semantic: SemanticLimits::default(),
+            };
+            let fields = encoder.value(&json!({}), 0).await.unwrap();
+            let node_addr = encoder
+                .object(ObjectV3::Node {
+                    parent_id: None,
+                    node_type: "paragraph".into(),
+                    pos: "a0".into(),
+                    var_name: None,
+                    deleted: false,
+                    fields,
+                    restore_block_id: false,
+                    restore_label: true,
+                })
+                .await
+                .unwrap();
+            let nodes = encoder
+                .writer
+                .entries(vec![(
+                    super::super::route("node_1"),
+                    Entry {
+                        key: "node_1".into(),
+                        address: node_addr,
+                    },
+                )])
+                .await
+                .unwrap();
+            let empty_map = encoder.writer.entries(vec![]).await.unwrap();
+            let root = encoder
+                .object(ObjectV3::State(StateRoots {
+                    nodes,
+                    comments: empty_map.clone(),
+                    suggestions: empty_map.clone(),
+                    removed_choices: empty_map,
+                }))
+                .await
+                .unwrap();
+            encoder.writer.flush().await.unwrap();
+
+            let res = read_state_v3(
+                &mut store,
+                document,
+                &root,
+                Limits::default(),
+                SemanticLimits::default(),
+            )
+            .await;
+            assert!(matches!(
+                res,
+                Err(Error::Invalid("restore_label requires content field"))
+            ));
+        }
+
+        // 5. restore_label: false with redundant label == plain_text(content)
+        {
+            let mut encoder = TestEncoderV3 {
+                writer: Writer {
+                    store: &mut store,
+                    document,
+                    budget: Limits::default(),
+                    stats: WriteStats::default(),
+                    pending: Vec::new(),
+                    pending_bytes: 0,
+                },
+                semantic: SemanticLimits::default(),
+            };
+            let fields = encoder
+                .value(&json!({"label": "foo", "content": {"text": "foo"}}), 0)
+                .await
+                .unwrap();
+            let node_addr = encoder
+                .object(ObjectV3::Node {
+                    parent_id: None,
+                    node_type: "paragraph".into(),
+                    pos: "a0".into(),
+                    var_name: None,
+                    deleted: false,
+                    fields,
+                    restore_block_id: false,
+                    restore_label: false,
+                })
+                .await
+                .unwrap();
+            let nodes = encoder
+                .writer
+                .entries(vec![(
+                    super::super::route("node_1"),
+                    Entry {
+                        key: "node_1".into(),
+                        address: node_addr,
+                    },
+                )])
+                .await
+                .unwrap();
+            let empty_map = encoder.writer.entries(vec![]).await.unwrap();
+            let root = encoder
+                .object(ObjectV3::State(StateRoots {
+                    nodes,
+                    comments: empty_map.clone(),
+                    suggestions: empty_map.clone(),
+                    removed_choices: empty_map,
+                }))
+                .await
+                .unwrap();
+            encoder.writer.flush().await.unwrap();
+
+            let res = read_state_v3(
+                &mut store,
+                document,
+                &root,
+                Limits::default(),
+                SemanticLimits::default(),
+            )
+            .await;
+            assert!(matches!(
+                res,
+                Err(Error::Invalid(
+                    "non-minimal label; must be omitted when equal to plain_text(content)"
+                ))
+            ));
+        }
+
+        // 6. Node with id field in JSON rejected by noncanonical check / deny_unknown_fields
+        {
+            let raw_node = json!({
+                "kind": "node",
+                "value": {
+                    "id": "node_1",
+                    "deleted": false,
+                    "fields": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "node_type": "paragraph",
+                    "parent_id": null,
+                    "pos": "a0",
+                    "restore_block_id": false,
+                    "restore_label": false,
+                    "var_name": null
+                }
+            });
+            let mut bytes = MAGIC_V3.to_vec();
+            serde_json::to_writer(
+                &mut bytes,
+                &super::super::canonical::CanonicalValue(&raw_node),
+            )
+            .unwrap();
+            let addr = address_v3(&bytes);
+            assert!(decode_v3(&addr, &bytes).is_err());
         }
     }
 }
