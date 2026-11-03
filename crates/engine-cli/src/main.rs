@@ -163,6 +163,9 @@ enum Command {
         /// Use typed chunked state objects (requires schema 30).
         #[arg(long)]
         typed: bool,
+        /// Reuses unchanged components from an eligible earlier typed checkpoint (requires --typed).
+        #[arg(long)]
+        incremental: bool,
     },
     /// Emit the generated OpenAPI document. With `--out`, write it there; otherwise
     /// print to stdout. CI compares the committed `openapi.yaml` against `--out -` to
@@ -297,7 +300,8 @@ async fn run() -> anyhow::Result<()> {
             document_id,
             through_seq,
             typed,
-        } => shared_snapshot(document_id, through_seq, typed).await,
+            incremental,
+        } => shared_snapshot(document_id, through_seq, typed, incremental).await,
         Command::Openapi { out } => openapi(out),
     }
 }
@@ -518,9 +522,48 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-async fn shared_snapshot(document_id: String, through_seq: i64, typed: bool) -> anyhow::Result<()> {
+async fn shared_snapshot(
+    document_id: String,
+    through_seq: i64,
+    typed: bool,
+    incremental: bool,
+) -> anyhow::Result<()> {
+    if incremental && !typed {
+        anyhow::bail!("--incremental requires --typed");
+    }
     let doc = parse_document_id(&document_id)?;
     let pool = connect().await?;
+
+    if incremental {
+        let result = engine_core::shared_checkpoint::postgres::take_incremental(
+            &pool,
+            doc,
+            through_seq,
+            engine_core::shared_checkpoint::Limits::default(),
+        )
+        .await
+        .context("publishing shared checkpoint failed")?;
+        println!(
+            "shared checkpoint V2 (incremental) at revision {}: {}",
+            result.through_seq,
+            result.root.as_str()
+        );
+        match result.base_seq {
+            Some(base) => println!("selected base: revision {base}"),
+            None => println!("selected base: none"),
+        }
+        println!("fallback ran: {}", result.fallback_ran);
+        println!(
+            "new objects: {}; new canonical bytes: {}",
+            result.stats.new_objects, result.stats.new_bytes
+        );
+        println!(
+            "read queries: {}; write queries: {}",
+            result.object_read_queries, result.object_write_queries
+        );
+        return Ok(());
+    }
+
     use engine_core::shared_checkpoint::postgres::Codec;
     let codec = if typed { Codec::V2 } else { Codec::V1 };
     let result = engine_core::shared_checkpoint::postgres::take_with_codec(
