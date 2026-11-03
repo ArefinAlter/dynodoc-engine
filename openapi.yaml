@@ -4542,6 +4542,100 @@ paths:
       - paseto: []
       - device_session:
         - history:write
+  /projects/{id}/history/releases:
+    get:
+      tags:
+      - project history
+      operationId: project_history_releases
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: after
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: Keyset page of project releases; requires current access to every historical file in release scopes
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
+    post:
+      tags:
+      - project history
+      operationId: project_history_create_release
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Pin accepted protected main head as an immutable named release; current project and file merge authority required
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid release name or commit does not equal accepted main head
+        '403':
+          description: Current project/file merge authority required
+        '409':
+          description: Release name already exists with a different commit, or storage quota exceeded
+      security:
+      - paseto: []
+      - device_session:
+        - history:write
+  /projects/{id}/history/releases/{name}:
+    get:
+      tags:
+      - project history
+      operationId: project_history_release
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Single project release details with file scope verification
+          content:
+            application/json:
+              schema: {}
+        '404':
+          description: Release not found or unavailable after erasure
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
   /projects/{id}/history/reviews:
     get:
       tags:
