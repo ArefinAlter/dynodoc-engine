@@ -8,6 +8,7 @@ use engine_core::{
         attestation::{Scope, SignedReceipt},
         authority_epoch::{Kind, Refusal, SignedTransition},
         local::{LocalRepository, ObjectKey, ObjectPacket},
+        log::CommitLogEntry,
         receipt_journal::ReceiptJournal,
         Head, SignedCommit, MAX_COMMIT_BYTES,
     },
@@ -72,8 +73,30 @@ pub struct Options {
     #[command(subcommand)]
     action: Action,
 }
+fn parse_address(s: &str) -> Result<Address, String> {
+    Address::try_from(s.to_string()).map_err(|e| e.to_string())
+}
+
 #[derive(Subcommand)]
 pub enum Action {
+    /// Retrieve a bounded page or full chain of first-parent commit history.
+    Log {
+        /// Explicit starting commit address (required unless --cursor is supplied).
+        #[arg(long, value_parser = parse_address)]
+        head: Option<Address>,
+        /// Page limit (1..=50, default 20).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Continuation cursor for pagination.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Retrieve all remaining first-parent commits across pages under budgets.
+        #[arg(long)]
+        all: bool,
+        /// Format output as stable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Preview every newly visible commit (including ancestry/recovery sources).
     Plan {
         candidate: String,
@@ -250,6 +273,7 @@ fn read(path: &Path, cap: usize) -> anyhow::Result<Vec<u8>> {
     ensure!(bytes.len() <= cap, "input exceeds byte limit");
     Ok(bytes)
 }
+
 pub async fn run(options: Options) -> anyhow::Result<()> {
     ensure!(
         engine_core::repository::valid_branch(&options.branch),
@@ -274,7 +298,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
     // Open the repository first so the journal refuses aliases to it, even on first use.
     let repo = LocalRepository::open(&options.repository, options.project).await?;
     let journal = ReceiptJournal::open(&options.journal).await?;
-    let result = async {
+    let result: anyhow::Result<SyncOutput> = async {
         if matches!(options.action, Action::Tracking) {
             return Ok(SyncOutput::Json(serde_json::to_value(
                 journal.pin(&scope).await?,
@@ -288,6 +312,20 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
             client.authority().await?;
         }
         match options.action {
+            Action::Log {
+                head,
+                limit,
+                cursor,
+                all,
+                json,
+            } => {
+                let log_res = log(&client, head.as_ref(), limit, cursor.as_deref(), all).await?;
+                if json {
+                    Ok(SyncOutput::Json(format_log_json(&log_res)?))
+                } else {
+                    Ok(SyncOutput::Text(format_log_text(&log_res)))
+                }
+            }
             Action::Plan {
                 candidate,
                 out,
@@ -1018,4 +1056,191 @@ fn format_release_list_text(items: &[http::ReleaseItem], next_cursor: Option<&st
         out.push_str(&format!("Next cursor: {cursor}\n"));
     }
     out.trim_end().to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteLogResult {
+    pub project: Uuid,
+    pub head: Address,
+    pub entries: Vec<CommitLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub more: bool,
+}
+
+pub async fn log(
+    client: &Client,
+    head: Option<&Address>,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+    all: bool,
+) -> anyhow::Result<RemoteLogResult> {
+    ensure!(
+        head.is_some() || cursor.is_some(),
+        "--head is required when --cursor is not provided"
+    );
+    if let Some(l) = limit {
+        ensure!(l > 0 && l <= 50, "limit must be between 1 and 50");
+    }
+
+    let mut current_cursor = cursor.map(|s| s.to_string());
+    let mut seen_cursors = BTreeSet::new();
+    let mut seen_addresses = BTreeSet::new();
+    let mut initial_head = head.cloned();
+    let mut all_entries = Vec::new();
+    let mut pages_fetched = 0usize;
+
+    loop {
+        let page = client
+            .log_page(initial_head.as_ref(), limit, current_cursor.as_deref())
+            .await?;
+
+        ensure!(
+            page.project == client.project,
+            "remote report project mismatch: expected {}, got {}",
+            client.project,
+            page.project
+        );
+
+        if let Some(ref expected_head) = initial_head {
+            ensure!(
+                &page.head == expected_head,
+                "remote report head mismatch: expected {}, got {}",
+                expected_head.as_str(),
+                page.head.as_str()
+            );
+        } else {
+            initial_head = Some(page.head.clone());
+        }
+
+        for entry in page.entries {
+            ensure!(
+                seen_addresses.insert(entry.address.clone()),
+                "duplicate commit address encountered across pages: {}",
+                entry.address.as_str()
+            );
+            all_entries.push(entry);
+        }
+
+        pages_fetched += 1;
+
+        if !all {
+            return Ok(RemoteLogResult {
+                project: page.project,
+                head: initial_head.unwrap_or(page.head),
+                entries: all_entries,
+                next_cursor: page.next_cursor,
+                more: page.more,
+            });
+        }
+
+        match page.next_cursor {
+            Some(next_cursor) => {
+                ensure!(
+                    page.more,
+                    "remote returned continuation cursor but marked more=false"
+                );
+                ensure!(
+                    seen_cursors.insert(next_cursor.clone()),
+                    "cursor loop detected in remote history log"
+                );
+                ensure!(
+                    pages_fetched < 10_000,
+                    "exceeded maximum pagination limit (10000 pages)"
+                );
+                current_cursor = Some(next_cursor);
+            }
+            None => {
+                ensure!(
+                    !page.more,
+                    "remote indicated more commits exist but provided no continuation cursor"
+                );
+                return Ok(RemoteLogResult {
+                    project: page.project,
+                    head: initial_head.unwrap_or(page.head),
+                    entries: all_entries,
+                    next_cursor: None,
+                    more: false,
+                });
+            }
+        }
+    }
+}
+
+pub fn format_log_text(result: &RemoteLogResult) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "First-parent history for project {} at commit {}:\n\n",
+        result.project,
+        result.head.as_str()
+    ));
+
+    if result.entries.is_empty() {
+        out.push_str("No commits found.\n");
+    } else {
+        for (i, entry) in result.entries.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&format!("commit {}\n", entry.address.as_str()));
+            if entry.parents.len() > 1 {
+                let parents_str = entry
+                    .parents
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                out.push_str(&format!("Merge: {}\n", parents_str));
+            } else if let Some(parent) = entry.parents.first() {
+                out.push_str(&format!("Parent: {}\n", parent.as_str()));
+            }
+            out.push_str(&format!("Author: {}\n", entry.author_key));
+            out.push_str(&format!("Date:   {}\n", entry.authored_at_ms));
+            out.push('\n');
+            match &entry.message {
+                engine_core::repository::log::BoundedMessage::Value(msg) => {
+                    for line in msg.lines() {
+                        out.push_str(&format!("    {}\n", line));
+                    }
+                    if msg.is_empty() {
+                        out.push('\n');
+                    }
+                }
+                engine_core::repository::log::BoundedMessage::Omitted(omitted) => {
+                    out.push_str(&format!(
+                        "    [omitted: {} bytes, sha256: {}]\n",
+                        omitted.bytes, omitted.sha256
+                    ));
+                }
+            }
+        }
+    }
+
+    if result.more {
+        if let Some(ref cursor) = result.next_cursor {
+            out.push_str(&format!(
+                "\nMore commits available. Next cursor: {}\n",
+                cursor
+            ));
+        }
+    }
+
+    out.push_str(
+        "\nNote: First-parent history is not an exhaustive DAG traversal or independent proof of completeness.\n",
+    );
+    out
+}
+
+pub fn format_log_json(result: &RemoteLogResult) -> anyhow::Result<Value> {
+    let mut value = serde_json::to_value(result)?;
+    if let Value::Object(ref mut map) = value {
+        map.insert("first_parent_history".into(), Value::Bool(true));
+        map.insert(
+            "disclaimer".into(),
+            Value::String(
+                "First-parent history is not an exhaustive DAG traversal or independent proof of completeness.".into(),
+            ),
+        );
+    }
+    Ok(value)
 }
