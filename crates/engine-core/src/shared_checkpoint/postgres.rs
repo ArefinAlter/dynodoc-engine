@@ -252,13 +252,15 @@ pub struct PublishedCheckpoint {
     pub stats: WriteStats,
     pub object_read_queries: usize,
     pub object_write_queries: usize,
+    pub base_seq: Option<i64>,
+    pub fallback_ran: bool,
 }
 
 pub(crate) fn publication_lock_key(document: DocumentId) -> String {
     format!("dynodoc.periodic-checkpoint:{}", document.0)
 }
 
-pub(crate) async fn chain_at(
+pub async fn chain_at(
     connection: &mut PgConnection,
     document: DocumentId,
     seq: i64,
@@ -391,6 +393,213 @@ pub(crate) async fn publish_in_connection(
         stats,
         object_read_queries,
         object_write_queries,
+        base_seq: None,
+        fallback_ran: false,
+    })
+}
+
+/// Atomically publish an incremental typed checkpoint using NEXT-07 delta writing.
+/// Automatically selects the latest earlier verified typed checkpoint for the same document.
+/// Falls back to a full typed write if no eligible earlier base checkpoint exists.
+pub async fn take_incremental(
+    pool: &PgPool,
+    document: DocumentId,
+    through_seq: i64,
+    limits: Limits,
+) -> Result<PublishedCheckpoint, Error> {
+    take_incremental_with_base(pool, document, through_seq, None, limits).await
+}
+
+/// Atomically publish an incremental typed checkpoint from an optional explicit base checkpoint.
+pub async fn take_incremental_with_base(
+    pool: &PgPool,
+    document: DocumentId,
+    through_seq: i64,
+    base_through_seq: Option<i64>,
+    limits: Limits,
+) -> Result<PublishedCheckpoint, Error> {
+    if through_seq < 0 {
+        return Err(Error::Invalid("negative revision"));
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(publication_lock_key(document))
+        .execute(&mut *tx)
+        .await?;
+    protect_document(&mut tx, document).await?;
+    let event_chain_hash = chain_at(&mut tx, document, through_seq).await?;
+
+    let state = read_legacy_state_at(&mut tx, document, through_seq)
+        .await?
+        .state;
+
+    // Check if an identical checkpoint is already published at this revision
+    let existing: Option<(String, Vec<u8>, i16)> = sqlx::query_as(
+        "select state_root,event_chain_hash,codec_version from shared_checkpoint where document_id=$1 and through_seq=$2",
+    )
+    .bind(document.0)
+    .bind(through_seq)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((existing_root, existing_chain, existing_codec)) = existing {
+        if existing_codec == Codec::V2 as i16 && existing_chain == event_chain_hash {
+            let root = Address::try_from(existing_root)?;
+            let mut store = PgStore::new(&mut tx);
+            if Codec::V2.read(&mut store, document, &root, limits).await? != state {
+                return Err(Error::Invalid(
+                    "checkpoint reconstruction differs from history",
+                ));
+            }
+            let object_read_queries = store.read_queries();
+            let object_write_queries = store.write_queries();
+            drop(store);
+            tx.commit().await?;
+            return Ok(PublishedCheckpoint {
+                through_seq,
+                root,
+                event_chain_hash,
+                stats: WriteStats::default(),
+                object_read_queries,
+                object_write_queries,
+                base_seq: None,
+                fallback_ran: false,
+            });
+        }
+    }
+
+    let base_row: Option<(i64, String, Vec<u8>)> = if let Some(base_seq) = base_through_seq {
+        sqlx::query_as(
+            "select through_seq,state_root,event_chain_hash from shared_checkpoint
+             where document_id=$1 and through_seq=$2 and codec_version=2",
+        )
+        .bind(document.0)
+        .bind(base_seq)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(Error::Invalid("base checkpoint not found"))
+        .map(Some)?
+    } else {
+        sqlx::query_as(
+            "select through_seq,state_root,event_chain_hash from shared_checkpoint
+             where document_id=$1 and through_seq < $2 and codec_version=2
+             order by through_seq desc limit 1",
+        )
+        .bind(document.0)
+        .bind(through_seq)
+        .fetch_optional(&mut *tx)
+        .await?
+    };
+
+    let published = match base_row {
+        None => {
+            let mut p = publish_in_connection(
+                &mut tx,
+                document,
+                through_seq,
+                &state,
+                event_chain_hash,
+                limits,
+                Codec::V2,
+            )
+            .await?;
+            p.fallback_ran = true;
+            p
+        }
+        Some((base_seq, base_root_str, base_chain)) => {
+            if base_chain != chain_at(&mut tx, document, base_seq).await? {
+                return Err(Error::Invalid("checkpoint version or chain position"));
+            }
+            let base_root = Address::try_from(base_root_str)?;
+            let base_state = Codec::V2
+                .read(&mut PgStore::new(&mut tx), document, &base_root, limits)
+                .await?;
+
+            publish_incremental_in_connection(
+                &mut tx,
+                document,
+                through_seq,
+                base_seq,
+                &base_root,
+                &base_state,
+                &state,
+                event_chain_hash,
+                limits,
+            )
+            .await?
+        }
+    };
+
+    tx.commit().await?;
+    Ok(published)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_incremental_in_connection(
+    connection: &mut PgConnection,
+    document: DocumentId,
+    through_seq: i64,
+    base_seq: i64,
+    base_root: &Address,
+    base_state: &DocumentState,
+    state: &DocumentState,
+    event_chain_hash: Vec<u8>,
+    limits: Limits,
+) -> Result<PublishedCheckpoint, Error> {
+    let mut store = PgStore::new(connection);
+    let (root, stats) = super::typed::update_state(
+        &mut store,
+        document,
+        base_root,
+        base_state,
+        state,
+        limits,
+        Default::default(),
+    )
+    .await?;
+
+    if Codec::V2.read(&mut store, document, &root, limits).await? != *state {
+        return Err(Error::Invalid(
+            "checkpoint reconstruction differs from history",
+        ));
+    }
+    let object_read_queries = store.read_queries();
+    let object_write_queries = store.write_queries();
+
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,$2,2,$3,$4) on conflict(document_id,through_seq) do nothing",
+    )
+    .bind(document.0)
+    .bind(through_seq)
+    .bind(root.as_str())
+    .bind(&event_chain_hash)
+    .execute(&mut *connection)
+    .await?;
+
+    let stored: (String, Vec<u8>, i16) = sqlx::query_as(
+        "select state_root,event_chain_hash,codec_version from shared_checkpoint where document_id=$1 and through_seq=$2",
+    )
+    .bind(document.0)
+    .bind(through_seq)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    if stored.0 != root.as_str() || stored.1 != event_chain_hash || stored.2 != 2 {
+        return Err(Error::Invalid(
+            "different checkpoint already published at revision",
+        ));
+    }
+
+    Ok(PublishedCheckpoint {
+        through_seq,
+        root,
+        event_chain_hash,
+        stats,
+        object_read_queries,
+        object_write_queries,
+        base_seq: Some(base_seq),
+        fallback_ran: false,
     })
 }
 
