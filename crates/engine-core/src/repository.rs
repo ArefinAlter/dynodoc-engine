@@ -24,6 +24,7 @@ pub mod project_merge;
 pub mod receipt_journal;
 pub mod recovery;
 pub mod server_authority;
+pub mod state_export;
 
 pub const MAX_FILES: usize = 4096;
 pub const MAX_COMMIT_BYTES: usize = 1024 * 1024;
