@@ -5,7 +5,7 @@
 //! provider that talks to a network service (Vault Transit, a cloud KMS) will need an
 //! asynchronous form or a blocking adapter; none is built. Two providers exist here:
 //! [`FileKeyProvider`], which reads KEK versions from owner-only local files and is
-//! documented as the weakest option, and [`TestKeyProvider`] for tests.
+//! documented as the weakest option, and `TestKeyProvider` for tests.
 //!
 //! Wrapped form produced by both (a provider-specific, opaque value to its caller):
 //!
@@ -28,12 +28,13 @@ use ring::{
     aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM},
     rand::{SecureRandom, SystemRandom},
 };
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::BTreeMap,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
 use uuid::Uuid;
 
@@ -498,11 +499,13 @@ fn parse_kek_text(raw: &[u8], shown: &str) -> Result<Kek, ProviderError> {
 /// A provider for tests: KEKs are given in memory and every nonce comes from a counter,
 /// so the same sequence of calls gives the same wrapped bytes. **Never use it outside
 /// tests**: the counter restarts with the process, which repeats nonces under one KEK.
+#[cfg(any(test, feature = "test-support"))]
 pub struct TestKeyProvider {
     keys: Keys,
     counter: AtomicU64,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl std::fmt::Debug for TestKeyProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TestKeyProvider")
@@ -511,6 +514,7 @@ impl std::fmt::Debug for TestKeyProvider {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl TestKeyProvider {
     pub fn new(keks: impl IntoIterator<Item = (u32, [u8; 32])>) -> Self {
         Self {
@@ -539,6 +543,7 @@ impl TestKeyProvider {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl KeyProvider for TestKeyProvider {
     fn wrap(&self, dek: &Dek, ctx: &WrapContext) -> Result<Wrapped, ProviderError> {
         let (version, _) = self.keys.newest()?;

@@ -49,14 +49,16 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format check
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Install Task
+        uses: go-task/setup-task@v2
+        with:
+          version: 3.54.0
+      - name: Lint
+        run: task lint
       - name: Build
         run: cargo build --locked --workspace
       - name: Test
-        run: cargo test --locked --workspace
+        run: task test
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings

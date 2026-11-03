@@ -44,10 +44,28 @@ fn server() -> (Server<Scripted>, Scripted) {
     (Server::new(backend.clone(), Profile::read_only()), backend)
 }
 
+struct TestConfirmation(bool);
+impl engine_mcp::server::HumanConfirmation for TestConfirmation {
+    fn confirm<'a>(
+        &'a self,
+        _: Tool,
+        _: &'a serde_json::Map<String, Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move { self.0 })
+    }
+}
+
 /// The profile of `engine-cli mcp --write`.
 fn full_server() -> (Server<Scripted>, Scripted) {
     let backend = Scripted::default();
-    (Server::new(backend.clone(), Profile::full()), backend)
+    (
+        Server::with_human_confirmation(
+            backend.clone(),
+            Profile::full(),
+            Arc::new(TestConfirmation(true)),
+        ),
+        backend,
+    )
 }
 
 /// Feed `input` and return every line the server wrote.
@@ -483,6 +501,44 @@ async fn the_loop_ends_cleanly_at_end_of_input() {
     let (server, _) = server();
     assert!(run(&server, "").await.is_empty());
     assert!(run(&server, "\n\n").await.is_empty());
+}
+
+#[tokio::test]
+async fn write_tools_need_a_trusted_per_request_confirmation() {
+    let backend = Scripted::default();
+    let no_sink = Server::new(backend.clone(), Profile::full());
+    let listed = one(&no_sink, request(1, "tools/list", json!({}))).await;
+    assert!(!listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["name"] == "propose"));
+    let refused = one(
+        &no_sink,
+        request(
+            2,
+            "tools/call",
+            json!({"name":"propose", "arguments": propose_call(json!([{ "op": "delete", "ref": "7C02" }]))}),
+        ),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], -32602);
+    let deny = Server::with_human_confirmation(
+        backend.clone(),
+        Profile::full(),
+        Arc::new(TestConfirmation(false)),
+    );
+    let refused = one(
+        &deny,
+        request(
+            3,
+            "tools/call",
+            json!({"name":"propose", "arguments": propose_call(json!([{ "op": "delete", "ref": "7C02" }]))}),
+        ),
+    )
+    .await;
+    assert_eq!(refused["result"]["isError"], true);
+    assert!(backend.seen.lock().unwrap().is_empty());
 }
 
 // --- the full profile (`--write`) ---------------------------------------------------------------
