@@ -212,6 +212,12 @@ enum Command {
         /// Use typed chunked state objects (requires schema 30).
         #[arg(long)]
         typed: bool,
+        /// Reuses unchanged components from an eligible earlier typed checkpoint (requires --typed).
+        #[arg(long)]
+        incremental: bool,
+        /// Explicit codec selection (e.g. 'compact-v3').
+        #[arg(long)]
+        codec: Option<String>,
     },
     /// Emit the generated OpenAPI document. With `--out`, write it there; otherwise
     /// print to stdout. CI compares the committed `openapi.yaml` against `--out -` to
@@ -359,7 +365,9 @@ async fn run() -> anyhow::Result<()> {
             document_id,
             through_seq,
             typed,
-        } => shared_snapshot(document_id, through_seq, typed).await,
+            incremental,
+            codec,
+        } => shared_snapshot(document_id, through_seq, typed, incremental, codec).await,
         Command::Openapi { out } => openapi(out),
     }
 }
@@ -655,11 +663,85 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-async fn shared_snapshot(document_id: String, through_seq: i64, typed: bool) -> anyhow::Result<()> {
+async fn shared_snapshot(
+    document_id: String,
+    through_seq: i64,
+    typed: bool,
+    incremental: bool,
+    codec_arg: Option<String>,
+) -> anyhow::Result<()> {
+    if let Some(ref c) = codec_arg {
+        if c != "compact-v3" {
+            anyhow::bail!("unsupported codec '{c}', expected 'compact-v3'");
+        }
+        if typed {
+            anyhow::bail!("--codec {c} cannot be combined with --typed");
+        }
+    } else if incremental && !typed {
+        anyhow::bail!("--incremental requires --typed");
+    }
+
+    if through_seq < 0 {
+        anyhow::bail!("through_seq must be non-negative");
+    }
+
     let doc = parse_document_id(&document_id)?;
     let pool = connect().await?;
+
+    if incremental {
+        let is_v3 = matches!(codec_arg.as_deref(), Some("compact-v3"));
+        let result = if is_v3 {
+            engine_core::shared_checkpoint::postgres::take_incremental_v3(
+                &pool,
+                doc,
+                through_seq,
+                engine_core::shared_checkpoint::Limits::default(),
+            )
+            .await
+            .context("publishing shared checkpoint failed")?
+        } else {
+            engine_core::shared_checkpoint::postgres::take_incremental(
+                &pool,
+                doc,
+                through_seq,
+                engine_core::shared_checkpoint::Limits::default(),
+            )
+            .await
+            .context("publishing shared checkpoint failed")?
+        };
+
+        let codec_name = if is_v3 { "V3" } else { "V2" };
+        println!(
+            "shared checkpoint {codec_name} (incremental) at revision {}: {}",
+            result.through_seq,
+            result.root.as_str()
+        );
+        match result.base_seq {
+            Some(base) => println!("selected base: revision {base}"),
+            None => println!("selected base: none"),
+        }
+        println!("fallback ran: {}", result.fallback_ran);
+        println!(
+            "encoded objects: {}; encoded bytes: {}",
+            result.stats.visited_objects, result.stats.encoded_bytes
+        );
+        println!(
+            "new objects: {}; new canonical bytes: {}",
+            result.stats.new_objects, result.stats.new_bytes
+        );
+        println!(
+            "read queries: {}; write queries: {}",
+            result.object_read_queries, result.object_write_queries
+        );
+        return Ok(());
+    }
+
     use engine_core::shared_checkpoint::postgres::Codec;
-    let codec = if typed { Codec::V2 } else { Codec::V1 };
+    let codec = match codec_arg.as_deref() {
+        Some("compact-v3") => Codec::V3,
+        _ if typed => Codec::V2,
+        _ => Codec::V1,
+    };
     let result = engine_core::shared_checkpoint::postgres::take_with_codec(
         &pool,
         doc,
@@ -673,6 +755,10 @@ async fn shared_snapshot(document_id: String, through_seq: i64, typed: bool) -> 
         "shared checkpoint {codec:?} at revision {}: {}",
         result.through_seq,
         result.root.as_str()
+    );
+    println!(
+        "encoded objects: {}; encoded bytes: {}",
+        result.stats.visited_objects, result.stats.encoded_bytes
     );
     println!(
         "new objects: {}; new canonical bytes: {}",
