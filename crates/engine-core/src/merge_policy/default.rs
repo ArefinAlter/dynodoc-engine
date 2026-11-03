@@ -50,6 +50,7 @@ pub const POLICY_JSON: &str = r#"{
 }"#;
 
 /// The default policy.
+#[allow(clippy::expect_used, reason = "the built-in default policy is valid")]
 pub fn policy() -> &'static MergePolicy {
     static POLICY: OnceLock<MergePolicy> = OnceLock::new();
     POLICY.get_or_init(|| {

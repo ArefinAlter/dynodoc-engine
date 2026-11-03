@@ -206,7 +206,7 @@ fn restoration_preserves_a_legacy_label_that_differs_from_derived_text() {
     target.nodes.get_mut(&id).unwrap().current_fields["label"] =
         original.nodes[&id].current_fields["label"].clone();
     let mut replay = original.clone();
-    for op in workspace_merge::diff(&original, &target) {
+    for op in workspace_merge::diff(&original, &target).unwrap() {
         apply_payload(&mut replay, &op).unwrap();
     }
     assert_eq!(replay, target);

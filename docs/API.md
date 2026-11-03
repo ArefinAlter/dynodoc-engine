@@ -49,6 +49,23 @@ canonical historical state/hash. Current membership and credential checks apply;
 negative/future revisions return 400. Omitted selector returns the current head.
 Proposal statuses remain current, including in historical checkpoints.
 
+## Event diffs that cannot represent a state
+
+Event-backed draft sharing, review merging and history recovery return HTTP 409
+when the proposed state requires a new unsupported node kind or changes an existing
+node's kind. These cases previously risked omitting a node from the generated event
+plan. A conflict leaves canonical events and document projections unchanged.
+An explicit team-side resolution can reject the unsupported draft addition while
+retaining unrelated representable edits; unresolved structure still needs review.
+
+The Rust `workspace_merge::diff` function now returns `Result<Vec<EventPayload>,
+DiffError>` instead of a vector. Direct library callers must handle failure. Existing
+historical unsupported nodes remain readable when unchanged. Signed v1 portable
+state convergence retains its original state semantics, including policy selection
+and decision evidence; it does not acquire an event-diff representability gate.
+This does not add node kinds, rewrite stored events, or resolve the separate root
+selection policy decision.
+
 ## Member profiles and test uploads (schema 26)
 
 `GET /profile` reads the signed-in account profile; `POST /profile` updates its
@@ -78,6 +95,26 @@ Event pages are bounded in SQL (up to 1,000 rows plus lookahead). SSE catches up
 in 100-row pages before live delivery, supports Last-Event-ID and rejects negative
 or future positions. Byte/tenant/time limits and expensive search remain open.
 
+
+## Event roots in snapshot metadata (schema 45)
+
+Snapshot metadata from schema 45 includes optional `event_merkle_root` for new rows.
+It covers the ordered event prefix through `through_seq` using the audit endpoint's
+zero-padded event tree. `merkle_root` retains its node-tree meaning. Immutable old rows
+remain NULL and omit the new JSON field; receipt versions 1/2 keep their exact envelopes.
+New inline/shared snapshots use receipt versions 3/4, which also bind the event root.
+Upgrade readers and coordinate migration 0045 with the application before rollout.
+
+The event tree uses SHA-256 leaves `H(0x00 || content_hash)` and parents
+`H(0x01 || left || right)`, with a raw 32-zero sibling at each odd layer and
+a 32-zero root for an empty prefix. It is not the RFC 6962 transparency tree.
+The HTTP proof root must match a stored event root when present; later events
+are excluded. Existing v1 event-hash metadata exclusions remain unchanged.
+
+Rust callers constructing `Snapshot` literals must supply the new optional field
+(`None` for a historical envelope). Older readers cannot verify receipt versions
+3/4 and must be upgraded before new snapshots are written. This root adds an
+internal commitment; it does not provide an independent witness of database history.
 
 ## Legacy snapshot verification (schema 28)
 

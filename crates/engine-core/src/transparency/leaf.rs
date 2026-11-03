@@ -46,13 +46,21 @@ impl TagKey {
         Self(key)
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "configured SHA-256 HMAC returns 32 bytes"
+    )]
     fn mac(&self, parts: &[&[u8]]) -> Tag {
         let key = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
         let mut context = hmac::Context::with_key(&key);
         for part in parts {
             context.update(part);
         }
-        context.sign().as_ref().try_into().expect("32 bytes")
+        context
+            .sign()
+            .as_ref()
+            .try_into()
+            .expect("configured SHA-256 HMAC returns 32 bytes")
     }
 
     /// `ref-receipt` tag, keyed with `k_project`.

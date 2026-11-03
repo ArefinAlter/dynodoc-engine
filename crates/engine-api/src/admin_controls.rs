@@ -249,6 +249,9 @@ async fn erase_one(
     if target.kind == "documents" {
         // Derived content of the erased document must not outlive it in memory.
         state.agent_cache.purge_document(target.id);
+        if let Some(cache) = &state.write_cache {
+            cache.purge_document(engine_shared::DocumentId(target.id));
+        }
     }
     Ok(())
 }

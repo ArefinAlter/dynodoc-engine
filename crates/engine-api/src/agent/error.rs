@@ -86,12 +86,18 @@ fn api_agent_code(error: &ApiError) -> &'static str {
 }
 
 /// `details` of a protocol error: typed values only.
+#[allow(
+    clippy::expect_used,
+    reason = "details is the JSON object literal constructed above"
+)]
 fn agent_details(error: &AgentError) -> Value {
     let refs = |refs: &[engine_agent::refs::Ref]| -> Value {
         refs.iter().map(|r| r.as_str()).collect::<Vec<_>>().into()
     };
     let mut details = json!({ "agent_code": error.agent_code() });
-    let map = details.as_object_mut().expect("object literal");
+    let map = details
+        .as_object_mut()
+        .expect("details is the JSON object literal constructed above");
     match error {
         AgentError::PolicyDenied { policy } => {
             map.insert("policy".into(), (*policy).into());
