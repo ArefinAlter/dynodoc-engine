@@ -118,6 +118,14 @@ pub enum Action {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Import a verified history archive without moving any branch.
+    ArchiveImport {
+        /// Archive file to import.
+        file: PathBuf,
+        /// Expected head commit address.
+        #[arg(long)]
+        expect_head: String,
+    },
     /// Import a private staging upload JSON batch, without moving any branch.
     ImportObjects { input: PathBuf },
     /// Read-only retention plan: what no branch head or recovery source reaches.
@@ -661,6 +669,38 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                 "sha256": summary.sha256,
             })
         }
+        Action::ArchiveImport { file, expect_head } => {
+            let expect_head_addr = address(expect_head)?;
+            anyhow::ensure!(
+                file.is_file(),
+                "archive file not found at {}",
+                file.display()
+            );
+
+            let file_handle = std::fs::File::open(&file)
+                .with_context(|| format!("failed to open archive at {}", file.display()))?;
+
+            let staged = engine_core::repository::archive::validate_and_stage_archive(
+                file_handle,
+                engine_core::repository::archive::ArchiveLimits::default(),
+                Some(&expect_head_addr),
+                Some(DocumentId(project)),
+            )
+            .map_err(|e| anyhow::anyhow!("archive validation failed: {e}"))?;
+
+            let summary = engine_core::repository::archive::import_archive(&repo, &staged)
+                .await
+                .map_err(|e| anyhow::anyhow!("archive import failed: {e}"))?;
+
+            serde_json::json!({
+                "file": file.display().to_string(),
+                "head": summary.head,
+                "objects_imported": summary.objects_imported,
+                "commits_imported": summary.commits_imported,
+                "total_objects": summary.total_objects,
+                "total_commits": summary.total_commits,
+            })
+        }
         Action::ImportObjects { input } => {
             let batch: TransferBatch = read_json(&input, 1_500_000)?;
             anyhow::ensure!(batch.objects.len() <= 64, "import at most 64 objects");
@@ -1005,6 +1045,18 @@ mod tests {
                 uuid::Uuid::new_v4()
             ));
             let project = uuid::Uuid::new_v4();
+            let repo = LocalRepository::open(&path, project).await.unwrap();
+            Self {
+                path,
+                project,
+                repo,
+            }
+        }
+        async fn with_project(project: uuid::Uuid) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "dynodoc-cli-repository-test-{}.sqlite",
+                uuid::Uuid::new_v4()
+            ));
             let repo = LocalRepository::open(&path, project).await.unwrap();
             Self {
                 path,
@@ -2201,5 +2253,412 @@ mod tests {
 
         let _ = std::fs::remove_file(&archive_path);
         f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_success_leaves_refs_and_pins_unchanged() {
+        let f1 = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1_v1 = f1.file(doc1, &[(0, "Genesis content")]).await;
+        let c1 = f1
+            .commit(&[], vec![("doc.docx", f1_v1.clone())], "Genesis")
+            .await;
+
+        let f1_v2 = f1.file(doc1, &[(0, "Updated content")]).await;
+        let c2 = f1
+            .commit(&[&c1], vec![("doc.docx", f1_v2.clone())], "Edit")
+            .await;
+
+        let archive_path = std::env::temp_dir().join(format!(
+            "test-import-success-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&archive_path);
+
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Target repository with same project
+        let f2 = Fixture::with_project(f1.project).await;
+        assert_eq!(f2.repo.head("main").await.unwrap(), None);
+
+        run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: archive_path.clone(),
+                expect_head: c2.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Verify commits are in f2
+        let read_c1 = f2.repo.commit(&c1).await.unwrap();
+        assert_eq!(read_c1.commit.message, "Genesis");
+        let read_c2 = f2.repo.commit(&c2).await.unwrap();
+        assert_eq!(read_c2.commit.message, "Edit");
+
+        // Verify files' content is readable in f2
+        let state1 = f2.repo.read_state(doc1, &f1_v1.state).await.unwrap();
+        assert_eq!(state1, paragraphs(&[(0, "Genesis content")]));
+        let state2 = f2.repo.read_state(doc1, &f1_v2.state).await.unwrap();
+        assert_eq!(state2, paragraphs(&[(0, "Updated content")]));
+
+        // Verify refs and pins were NOT moved or created
+        assert_eq!(f2.repo.head("main").await.unwrap(), None);
+
+        let _ = std::fs::remove_file(&archive_path);
+        f1.finish().await;
+        f2.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_truncated_footer_leaves_target_untouched() {
+        let f1 = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1_v1 = f1.file(doc1, &[(0, "Some content")]).await;
+        let c1 = f1.commit(&[], vec![("doc.docx", f1_v1)], "Genesis").await;
+
+        let archive_path = std::env::temp_dir().join(format!(
+            "test-import-trunc-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&archive_path);
+
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Truncate archive (remove last 30 bytes to chop footer)
+        let bytes = std::fs::read(&archive_path).unwrap();
+        assert!(bytes.len() > 30);
+        let truncated = &bytes[..bytes.len() - 30];
+        std::fs::write(&archive_path, truncated).unwrap();
+
+        let f2 = Fixture::with_project(f1.project).await;
+        let err = run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: archive_path.clone(),
+                expect_head: c1.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("archive validation failed"));
+        // Target repository has 0 objects and 0 commits
+        assert!(f2.repo.inventory(None, 10).await.unwrap().is_empty());
+        assert!(f2.repo.commit(&c1).await.is_err());
+
+        let _ = std::fs::remove_file(&archive_path);
+        f1.finish().await;
+        f2.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_capacity_exhaustion_mid_copy_and_retry() {
+        use engine_core::repository::local::StorageLimits;
+
+        let f1 = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1_v1 = f1.file(doc1, &[(0, "Content 1")]).await;
+        let c1 = f1.commit(&[], vec![("doc.docx", f1_v1)], "Genesis").await;
+
+        let f1_v2 = f1.file(doc1, &[(0, "Content 2")]).await;
+        let c2 = f1.commit(&[&c1], vec![("doc.docx", f1_v2)], "Edit").await;
+
+        let archive_path =
+            std::env::temp_dir().join(format!("test-import-cap-{}.dynoarc", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&archive_path);
+
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let f2 = Fixture::with_project(f1.project).await;
+        // Limit f2 to 1 object so import cannot complete all objects
+        f2.repo
+            .set_storage_limits(StorageLimits {
+                objects: 1,
+                bytes: 10_000_000,
+                commits: 100,
+                branches: 10,
+            })
+            .await
+            .unwrap();
+
+        let err = run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: archive_path.clone(),
+                expect_head: c2.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("archive import failed"));
+        assert!(
+            err_msg.contains("target copy failed after importing")
+                || err_msg.contains("capacity exceeded")
+        );
+
+        // Refs and pins unchanged
+        assert_eq!(f2.repo.head("main").await.unwrap(), None);
+
+        // Raise storage limits and retry with the exact same archive
+        f2.repo
+            .set_storage_limits(StorageLimits {
+                objects: 100,
+                bytes: 10_000_000,
+                commits: 100,
+                branches: 10,
+            })
+            .await
+            .unwrap();
+
+        run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: archive_path.clone(),
+                expect_head: c2.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(f2.repo.commit(&c2).await.is_ok());
+
+        let _ = std::fs::remove_file(&archive_path);
+        f1.finish().await;
+        f2.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_existing_object_corruption_fails() {
+        let f1 = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1_v1 = f1.file(doc1, &[(0, "Genesis content")]).await;
+        let c1 = f1
+            .commit(&[], vec![("doc.docx", f1_v1.clone())], "Genesis")
+            .await;
+
+        let archive_path = std::env::temp_dir().join(format!(
+            "test-import-corrupt-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&archive_path);
+
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let f2 = Fixture::with_project(f1.project).await;
+        // Pre-insert the object into f2, but with corrupted bytes in sqlite
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", f2.path.display()))
+            .await
+            .unwrap();
+        sqlx::query(
+            "insert into objects(document, address, bytes, codec, size) values(?, ?, x'deadbeef', 0, 4)",
+        )
+        .bind(doc1.0.to_string())
+        .bind(f1_v1.state.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let err = run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: archive_path.clone(),
+                expect_head: c1.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("archive import failed"));
+
+        let _ = std::fs::remove_file(&archive_path);
+        f1.finish().await;
+        f2.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_rejects_head_or_project_mismatch() {
+        let f1 = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1_v1 = f1.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f1
+            .commit(&[], vec![("doc.docx", f1_v1.clone())], "Genesis")
+            .await;
+
+        let f1_v2 = f1.file(doc1, &[(0, "Edit")]).await;
+        let c2 = f1.commit(&[&c1], vec![("doc.docx", f1_v2)], "Edit").await;
+
+        let archive_path = std::env::temp_dir().join(format!(
+            "test-import-mismatch-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&archive_path);
+
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let f2 = Fixture::with_project(f1.project).await;
+        // Head mismatch
+        let err = run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: archive_path.clone(),
+                expect_head: c1.as_str().to_string(), // wrong head
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("archive validation failed"));
+        assert!(err.to_string().contains("head mismatch"));
+
+        // Project mismatch (f3 has different project)
+        let f3 = Fixture::new().await;
+        let err2 = run(
+            f3.path.clone(),
+            f3.project,
+            Action::ArchiveImport {
+                file: archive_path.clone(),
+                expect_head: c2.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err2.to_string().contains("archive validation failed"));
+        assert!(err2.to_string().contains("project mismatch"));
+
+        let _ = std::fs::remove_file(&archive_path);
+        f1.finish().await;
+        f2.finish().await;
+        f3.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_rejects_extra_unrelated_payloads() {
+        use engine_core::repository::archive::ArchiveWriter;
+
+        let f1 = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1_v1 = f1.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f1
+            .commit(&[], vec![("doc.docx", f1_v1.clone())], "Genesis")
+            .await;
+
+        let doc_extra = DocumentId(uuid::Uuid::new_v4());
+        let f_extra = f1.file(doc_extra, &[(0, "Unrelated object")]).await;
+
+        let archive_path = std::env::temp_dir().join(format!(
+            "test-extra-payload-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut writer = ArchiveWriter::new(file).unwrap();
+        writer
+            .write_header(1, DocumentId(f1.project), c1.clone())
+            .unwrap();
+
+        // Write all objects for doc1 (Genesis)
+        let keys = f1.repo.inventory(None, 100).await.unwrap();
+        for key in &keys {
+            if key.document == doc1 {
+                let p = f1.repo.object(key).await.unwrap();
+                writer
+                    .write_object(doc1, key.address.clone(), &p.bytes)
+                    .unwrap();
+            }
+        }
+
+        // Write Extra unrelated object
+        let p_extra = f1
+            .repo
+            .object(&ObjectKey {
+                document: doc_extra,
+                address: f_extra.state.clone(),
+            })
+            .await
+            .unwrap();
+        writer
+            .write_object(doc_extra, f_extra.state.clone(), &p_extra.bytes)
+            .unwrap();
+
+        // Write commit c1
+        let signed_c1 = f1.repo.commit(&c1).await.unwrap();
+        writer.write_commit(&signed_c1).unwrap();
+        writer.finish().unwrap();
+
+        let f2 = Fixture::with_project(f1.project).await;
+        let err = run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: archive_path.clone(),
+                expect_head: c1.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("archive validation failed"));
+        assert!(err
+            .to_string()
+            .contains("extra objects outside the selected object closure"));
+        assert!(f2.repo.inventory(None, 10).await.unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&archive_path);
+        f1.finish().await;
+        f2.finish().await;
     }
 }
