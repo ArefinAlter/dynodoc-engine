@@ -7,6 +7,7 @@ use engine_core::{
     repository::{
         attestation::{Scope, SignedReceipt},
         authority_epoch::{Kind, Refusal, SignedTransition},
+        compare::{DiffKind, DiffTotals, ProjectDiffReport},
         local::{LocalRepository, ObjectKey, ObjectPacket},
         log::{BoundedMessage, CommitLogEntry},
         receipt_journal::ReceiptJournal,
@@ -134,6 +135,16 @@ pub enum Action {
     AuthorityProof {
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Compare two published remote commits across manifest paths.
+    Compare {
+        #[arg(long, value_parser = parse_address)]
+        from: Address,
+        #[arg(long, value_parser = parse_address)]
+        to: Address,
+        /// Format output as stable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect or create immutable named releases on the remote.
     Release {
@@ -318,6 +329,14 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
             client.authority().await?;
         }
         match options.action {
+            Action::Compare { from, to, json } => {
+                let report = compare(&client, &from, &to).await?;
+                if json {
+                    Ok(SyncOutput::Json(format_compare_json(&report)?))
+                } else {
+                    Ok(SyncOutput::Text(format_compare_text(&report)))
+                }
+            }
             Action::Log {
                 head,
                 limit,
@@ -1488,6 +1507,157 @@ pub fn format_log_json(result: &RemoteLogResult) -> anyhow::Result<Value> {
                 ),
             );
         }
+    }
+    Ok(value)
+}
+
+pub async fn compare(
+    client: &Client,
+    from: &Address,
+    to: &Address,
+) -> anyhow::Result<ProjectDiffReport> {
+    let mut all_changes = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut totals: Option<DiffTotals> = None;
+    let mut last_path: Option<String> = None;
+
+    loop {
+        let page = client
+            .compare_page(from, to, None, cursor.as_deref())
+            .await?;
+
+        ensure!(
+            page.project == client.project,
+            "remote report project mismatch: expected {}, got {}",
+            client.project,
+            page.project
+        );
+        ensure!(
+            &page.from == from,
+            "remote report from-address mismatch: expected {}, got {}",
+            from.as_str(),
+            page.from.as_str()
+        );
+        ensure!(
+            &page.to == to,
+            "remote report to-address mismatch: expected {}, got {}",
+            to.as_str(),
+            page.to.as_str()
+        );
+
+        if let Some(expected_totals) = &totals {
+            ensure!(
+                expected_totals == &page.totals,
+                "remote report totals changed across pages"
+            );
+        } else {
+            totals = Some(page.totals.clone());
+        }
+
+        for change in page.changes {
+            if let Some(last) = &last_path {
+                ensure!(
+                    change.path.as_str() > last.as_str(),
+                    "remote report changes out of order"
+                );
+            }
+            last_path = Some(change.path.clone());
+            all_changes.push(change);
+        }
+
+        if !page.more {
+            ensure!(
+                page.next_cursor.is_none(),
+                "terminal page must not include next_cursor"
+            );
+            break;
+        }
+
+        let next = page.next_cursor.ok_or_else(|| {
+            anyhow!("remote report indicated more changes but omitted next_cursor")
+        })?;
+        ensure!(!next.is_empty(), "empty cursor");
+        ensure!(seen_cursors.insert(next.clone()), "cursor loop detected");
+        ensure!(seen_cursors.len() <= 10_000, "exceeded maximum page count");
+        cursor = Some(next);
+    }
+
+    let totals = totals.unwrap_or(DiffTotals {
+        added: 0,
+        removed: 0,
+        modified: 0,
+        unchanged: 0,
+        total_changes: 0,
+    });
+    ensure!(
+        all_changes.len() == totals.total_changes,
+        "retrieved changes count ({}) does not match report totals ({})",
+        all_changes.len(),
+        totals.total_changes
+    );
+
+    Ok(ProjectDiffReport {
+        project: client.project,
+        from: from.clone(),
+        to: to.clone(),
+        totals,
+        changes: all_changes,
+        next_cursor: None,
+        more: false,
+    })
+}
+
+pub fn format_compare_text(report: &ProjectDiffReport) -> String {
+    let mut out = String::new();
+    out.push_str("Server-produced metadata (unverified by receipt journal)\n");
+    out.push_str(&format!("Project: {}\n", report.project));
+    out.push_str(&format!("From:    {}\n", report.from.as_str()));
+    out.push_str(&format!("To:      {}\n", report.to.as_str()));
+    out.push_str(&format!(
+        "Totals:  {} change(s) ({} added, {} removed, {} modified, {} unchanged)\n",
+        report.totals.total_changes,
+        report.totals.added,
+        report.totals.removed,
+        report.totals.modified,
+        report.totals.unchanged,
+    ));
+    if !report.changes.is_empty() {
+        out.push('\n');
+        for change in &report.changes {
+            let symbol = match change.kind {
+                DiffKind::Added => "+",
+                DiffKind::Removed => "-",
+                DiffKind::Modified => "~",
+                DiffKind::Unchanged => "=",
+            };
+            let doc_info = match (&change.from, &change.to) {
+                (Some(from), Some(to)) if from.document != to.document => {
+                    format!(" (document {} -> {})", from.document.0, to.document.0)
+                }
+                (_, Some(to)) => format!(" (document {})", to.document.0),
+                (Some(from), None) => format!(" (document {})", from.document.0),
+                (None, None) => String::new(),
+            };
+            out.push_str(&format!("  {} {}{}\n", symbol, change.path, doc_info));
+        }
+    }
+    out.push_str(
+        "\nNote: Server-produced metadata; does not independently verify document content.",
+    );
+    out
+}
+
+pub fn format_compare_json(report: &ProjectDiffReport) -> anyhow::Result<Value> {
+    let mut value = serde_json::to_value(report)?;
+    if let Value::Object(ref mut map) = value {
+        map.insert("server_metadata".into(), Value::Bool(true));
+        map.insert(
+            "disclaimer".into(),
+            Value::String(
+                "Server-produced metadata; does not independently verify document content or cryptographic receipts.".into(),
+            ),
+        );
     }
     Ok(value)
 }
