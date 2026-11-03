@@ -3,9 +3,11 @@
 //! (atomic rotation) or by signing a project-device challenge with an enrolled key.
 //! Access tokens are held in memory only and marked sensitive.
 use super::*;
+use chrono::{DateTime, Utc};
 use engine_core::repository::{
     authority_epoch::{Chain, Revocation, Served, SignedTransition},
     device_session::{SessionChallenge, SessionProof, TOKEN_TTL_SECONDS},
+    log::CommitLogEntry,
 };
 use reqwest::{header, Method, StatusCode, Url};
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -32,6 +34,16 @@ pub struct Remote {
     pub authority: Uuid,
     /// Obtain this key independently of the server's authority endpoint.
     pub public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteHistoryLogPage {
+    pub project: Uuid,
+    pub head: Address,
+    pub entries: Vec<CommitLogEntry>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    pub more: bool,
 }
 
 /// Where the bearer comes from and how it is renewed.
@@ -92,6 +104,52 @@ fn lower_hex(bytes: &[u8]) -> String {
 
 fn is_secret(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseItem {
+    pub name: String,
+    pub commit: String,
+    pub actor: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseListPage {
+    pub items: Vec<ReleaseItem>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseDetails {
+    pub project_id: Uuid,
+    pub name: String,
+    pub commit: String,
+    pub actor: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub scope: Vec<Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseCreated {
+    pub project_id: Uuid,
+    pub name: String,
+    pub commit: String,
+    pub created_at: DateTime<Utc>,
+}
+
+pub fn valid_release_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 100 {
+        return false;
+    }
+    let first = bytes[0];
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
 impl Client {
@@ -524,6 +582,74 @@ impl Client {
         }
         Ok(result)
     }
+    pub async fn log_page(
+        &self,
+        head: Option<&Address>,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+    ) -> anyhow::Result<RemoteHistoryLogPage> {
+        let mut query = Vec::new();
+        if let Some(head) = head {
+            query.push(("head", head.as_str().to_string()));
+        }
+        let limit_str;
+        if let Some(limit) = limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str));
+        }
+        if let Some(cursor) = cursor {
+            query.push(("cursor", cursor.to_string()));
+        }
+        self.get("history/log", &query, 512 * 1024).await
+    }
+    pub async fn compare_page(
+        &self,
+        from: &Address,
+        to: &Address,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+    ) -> anyhow::Result<engine_core::repository::compare::ProjectDiffReport> {
+        let mut query = vec![
+            ("from", from.as_str().to_string()),
+            ("to", to.as_str().to_string()),
+        ];
+        let limit_str;
+        if let Some(limit) = limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str));
+        }
+        if let Some(cursor) = cursor {
+            query.push(("cursor", cursor.to_string()));
+        }
+        self.get("history/compare", &query, 512 * 1024).await
+    }
+    pub async fn compare_file_page(
+        &self,
+        from: &Address,
+        to: &Address,
+        path: &str,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+        include_unchanged: bool,
+    ) -> anyhow::Result<engine_core::repository::compare::FileCompareReport> {
+        let mut query = vec![
+            ("from", from.as_str().to_string()),
+            ("to", to.as_str().to_string()),
+            ("path", path.to_string()),
+        ];
+        let limit_str;
+        if let Some(limit) = limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str));
+        }
+        if let Some(cursor) = cursor {
+            query.push(("cursor", cursor.to_string()));
+        }
+        if include_unchanged {
+            query.push(("include_unchanged", "true".to_string()));
+        }
+        self.get("history/compare/file", &query, 512 * 1024).await
+    }
     pub async fn post(&self, path: &str, body: Value) -> anyhow::Result<Value> {
         Ok(self
             .request(Method::POST, path, &[], Some(&body), 64 * 1024, false)
@@ -693,5 +819,159 @@ impl Client {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn release_url(&self, name: Option<&str>) -> anyhow::Result<Url> {
+        let mut url = self.project_url("history/releases")?;
+        if let Some(name) = name {
+            url.path_segments_mut()
+                .map_err(|_| anyhow!("cannot modify path segments on URL"))?
+                .push(name);
+        }
+        Ok(url)
+    }
+
+    pub async fn create_release(
+        &self,
+        name: &str,
+        expected_commit: &Address,
+    ) -> anyhow::Result<ReleaseCreated> {
+        ensure!(
+            valid_release_name(name),
+            "invalid release name; must be 1-100 characters starting with alphanumeric and containing only alphanumeric, dot, underscore, or hyphen"
+        );
+        let url = self.release_url(None)?;
+        let body = json!({
+            "name": name,
+            "commit": expected_commit.as_str(),
+        });
+        let created: ReleaseCreated = self
+            .exchange(
+                Method::POST,
+                url,
+                "history/releases",
+                Some(&body),
+                65536,
+                false,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("missing response from create_release"))?;
+        ensure!(
+            created.project_id == self.project,
+            "release project_id mismatch: expected {}, got {}",
+            self.project,
+            created.project_id
+        );
+        ensure!(
+            created.name == name,
+            "release name mismatch: expected {name}, got {}",
+            created.name
+        );
+        let commit_addr = Address::try_from(created.commit.clone())
+            .map_err(|e| anyhow!("invalid release commit address: {e}"))?;
+        ensure!(
+            &commit_addr == expected_commit,
+            "release created with unexpected commit: expected {}, got {}",
+            expected_commit.as_str(),
+            commit_addr.as_str()
+        );
+        Ok(created)
+    }
+
+    pub async fn show_release(&self, name: &str) -> anyhow::Result<Option<ReleaseDetails>> {
+        ensure!(
+            valid_release_name(name),
+            "invalid release name; must be 1-100 characters starting with alphanumeric and containing only alphanumeric, dot, underscore, or hyphen"
+        );
+        let url = self.release_url(Some(name))?;
+        let label = format!("history/releases/{name}");
+        let details: Option<ReleaseDetails> = self
+            .exchange(Method::GET, url, &label, None, 1024 * 1024, true)
+            .await?;
+        if let Some(ref d) = details {
+            ensure!(
+                d.project_id == self.project,
+                "release project_id mismatch: expected {}, got {}",
+                self.project,
+                d.project_id
+            );
+            ensure!(
+                d.name == name,
+                "release name mismatch: expected {name}, got {}",
+                d.name
+            );
+            let _addr = Address::try_from(d.commit.clone())
+                .map_err(|e| anyhow!("invalid release commit address: {e}"))?;
+        }
+        Ok(details)
+    }
+
+    pub async fn list_releases(
+        &self,
+        after: Option<&str>,
+        limit: Option<usize>,
+    ) -> anyhow::Result<ReleaseListPage> {
+        if let Some(after_name) = after {
+            ensure!(
+                valid_release_name(after_name),
+                "invalid 'after' cursor: must be a valid release name"
+            );
+        }
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(after) = after {
+            query.push(("after", after.to_string()));
+        }
+        if let Some(limit) = limit {
+            ensure!(
+                limit > 0 && limit <= 1000,
+                "limit must be between 1 and 1000"
+            );
+            query.push(("limit", limit.to_string()));
+        }
+        let mut url = self.release_url(None)?;
+        if !query.is_empty() {
+            url.query_pairs_mut()
+                .extend_pairs(query.iter().map(|(k, v)| (*k, v)));
+        }
+        let page: ReleaseListPage = self
+            .exchange(
+                Method::GET,
+                url,
+                "history/releases",
+                None,
+                1024 * 1024,
+                false,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("missing response from list_releases"))?;
+
+        let mut prev_name: Option<&str> = after;
+        for item in &page.items {
+            ensure!(
+                valid_release_name(&item.name),
+                "server returned invalid release name: {}",
+                item.name
+            );
+            let _addr = Address::try_from(item.commit.clone())
+                .map_err(|e| anyhow!("server returned invalid release commit address: {e}"))?;
+            if let Some(prev) = prev_name {
+                ensure!(
+                    item.name.as_str() > prev,
+                    "server returned out-of-order release items: {} is not strictly greater than previous {}",
+                    item.name,
+                    prev
+                );
+            }
+            prev_name = Some(&item.name);
+        }
+        if let Some(ref cursor) = page.next_cursor {
+            let last_name = page.items.last().map(|i| i.name.as_str());
+            ensure!(
+                Some(cursor.as_str()) == last_name,
+                "server next_cursor '{cursor}' does not match last item '{:?}'",
+                last_name
+            );
+        }
+        Ok(page)
     }
 }

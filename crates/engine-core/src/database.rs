@@ -7,6 +7,8 @@
 use anyhow::{bail, Context};
 use sqlx::{PgConnection, PgPool};
 
+pub mod ordering;
+
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 const HISTORY: &[&str] = &[
@@ -30,6 +32,7 @@ const HISTORY: &[&str] = &[
     "project_history_review",
     "project_ref_event",
     "project_issue_comment",
+    "project_release",
     "device_key_class",
     "agent_call",
     "agent_proposal_receipt",
@@ -84,6 +87,7 @@ const INSERT_UPDATE: &[&str] = &[
     "project_agent_policy",
     "file_agent_policy",
     "agent_identity",
+    "export_node_token",
 ];
 const FUNCTIONS: &[&str] = &[
     "access_role_rank(text)",

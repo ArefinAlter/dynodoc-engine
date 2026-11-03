@@ -28,6 +28,7 @@ mod discussions;
 pub mod documents;
 mod draft_storage;
 pub mod error;
+pub mod export_tokens;
 mod history;
 pub mod idempotency;
 pub mod notifications;
@@ -159,7 +160,8 @@ pub fn app(state: AppState) -> Router {
         .merge(discussions::router())
         .merge(notifications::router())
         .merge(copies::router())
-        .merge(people::router());
+        .merge(people::router())
+        .merge(export_tokens::router());
     // Off (the default): the agent routes are not mounted at all, so they answer exactly
     // as a path that never existed.
     let routes = if state.agent_gateway {
@@ -288,6 +290,7 @@ impl utoipa::Modify for WorkspaceDocs {
         api.merge(projects::ProjectsApi::openapi());
         api.merge(project_activity::ProjectActivityApi::openapi());
         api.merge(provenance::ProvenanceApi::openapi());
+        api.merge(export_tokens::ExportTokensApi::openapi());
         api.merge(admin::AdminApi::openapi());
         api.merge(admin_controls::AdminControlsApi::openapi());
         api.merge(discussions::DiscussionApi::openapi());
