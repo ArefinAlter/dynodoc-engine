@@ -5,6 +5,7 @@
 //! deletion, or automatic merge of shared constraints.
 
 use super::{Address, Commit, Error, FileEntry, SignedCommit};
+use engine_shared::{DocumentId, NodeId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -265,6 +266,443 @@ pub fn compare_manifests(
         changes: page_changes,
         next_cursor,
         more,
+    })
+}
+
+pub const DEFAULT_NODE_DIFF_LIMIT: usize = 50;
+pub const MAX_NODE_DIFF_LIMIT: usize = 100;
+pub const MAX_NODE_DIFF_RESPONSE_BYTES: usize = 256 * 1024;
+pub const NODE_DIFF_CURSOR_VERSION: u8 = 1;
+pub const MAX_INLINE_FIELD_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeDiffKind {
+    Added,
+    Removed,
+    Modified,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmittedValue {
+    pub omitted: bool,
+    pub sha256: String,
+    pub bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BoundedValue {
+    Omitted(OmittedValue),
+    Value(serde_json::Value),
+}
+
+impl BoundedValue {
+    pub fn bound(val: &serde_json::Value) -> Self {
+        let canonical_bytes = serde_json::to_vec(val).unwrap_or_default();
+        if canonical_bytes.len() > MAX_INLINE_FIELD_BYTES {
+            let hash = ring::digest::digest(&ring::digest::SHA256, &canonical_bytes);
+            BoundedValue::Omitted(OmittedValue {
+                omitted: true,
+                sha256: super::hex(hash.as_ref()),
+                bytes: canonical_bytes.len(),
+            })
+        } else {
+            BoundedValue::Value(val.clone())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldDiff {
+    pub field: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<BoundedValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<BoundedValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeAttributes {
+    pub node_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<NodeId>,
+    pub pos: String,
+    pub deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub var_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeDiff {
+    pub node_id: NodeId,
+    pub kind: NodeDiffKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<NodeAttributes>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<NodeAttributes>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_changes: Vec<FieldDiff>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub structural_change: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentChanges {
+    pub comments_changed: bool,
+    pub comments_from_count: usize,
+    pub comments_to_count: usize,
+    pub suggestions_changed: bool,
+    pub suggestions_from_count: usize,
+    pub suggestions_to_count: usize,
+    pub removed_choices_changed: bool,
+    pub removed_choices_from_count: usize,
+    pub removed_choices_to_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeDiffTotals {
+    pub added: usize,
+    pub removed: usize,
+    pub modified: usize,
+    pub unchanged: usize,
+    pub total_changes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCompareCursor {
+    pub v: u8,
+    pub doc: DocumentId,
+    pub from: Address,
+    pub to: Address,
+    pub last: String,
+}
+
+impl NodeCompareCursor {
+    pub fn encode(&self) -> String {
+        super::hex(&serde_json::to_vec(self).expect("valid cursor serialization"))
+    }
+
+    pub fn decode(
+        raw: &str,
+        expected_doc: DocumentId,
+        expected_from: &Address,
+        expected_to: &Address,
+    ) -> Result<Self, Error> {
+        if !raw.len().is_multiple_of(2) || raw.len() > 4096 {
+            return Err(Error::Invalid("invalid cursor encoding"));
+        }
+        let bytes =
+            super::unhex(raw, raw.len() / 2).map_err(|_| Error::Invalid("invalid cursor hex"))?;
+        let cursor: Self =
+            serde_json::from_slice(&bytes).map_err(|_| Error::Invalid("invalid cursor payload"))?;
+        if cursor.v != NODE_DIFF_CURSOR_VERSION {
+            return Err(Error::Invalid("unsupported cursor version"));
+        }
+        if cursor.doc != expected_doc || &cursor.from != expected_from || &cursor.to != expected_to
+        {
+            return Err(Error::Invalid("cursor document or root mismatch"));
+        }
+        Ok(cursor)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NodeDiffOptions<'a> {
+    pub limit: Option<usize>,
+    pub cursor: Option<&'a str>,
+    pub include_unchanged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentNodeDiffReport {
+    pub document_id: DocumentId,
+    pub from_root: Address,
+    pub to_root: Address,
+    pub whole_state_identical: bool,
+    pub totals: NodeDiffTotals,
+    pub components: ComponentChanges,
+    pub changes: Vec<NodeDiff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub more: bool,
+    pub limits: &'static str,
+}
+
+/// Bounded comparison of two materialized document states.
+///
+/// Compares node identity, type, parent, position, deletion, var_name, and exact stored fields
+/// in stable node-ID order. Distinguishes missing fields from JSON null. Oversized values
+/// are represented by an explicit omitted marker with hash and byte count.
+pub fn compare_nodes(
+    document_id: DocumentId,
+    from_root: &Address,
+    to_root: &Address,
+    from: &crate::materializer::DocumentState,
+    to: &crate::materializer::DocumentState,
+    options: NodeDiffOptions<'_>,
+) -> Result<DocumentNodeDiffReport, Error> {
+    let cursor = match options.cursor {
+        Some(raw) => Some(NodeCompareCursor::decode(
+            raw,
+            document_id,
+            from_root,
+            to_root,
+        )?),
+        None => None,
+    };
+
+    let limit = options
+        .limit
+        .unwrap_or(DEFAULT_NODE_DIFF_LIMIT)
+        .clamp(1, MAX_NODE_DIFF_LIMIT);
+
+    let whole_state_identical = from == to;
+
+    let components = ComponentChanges {
+        comments_changed: from.comments != to.comments,
+        comments_from_count: from.comments.len(),
+        comments_to_count: to.comments.len(),
+        suggestions_changed: from.suggestions != to.suggestions,
+        suggestions_from_count: from.suggestions.len(),
+        suggestions_to_count: to.suggestions.len(),
+        removed_choices_changed: from.removed_choices != to.removed_choices,
+        removed_choices_from_count: from.removed_choices.len(),
+        removed_choices_to_count: to.removed_choices.len(),
+    };
+
+    let all_node_ids: BTreeSet<&NodeId> = from.nodes.keys().chain(to.nodes.keys()).collect();
+
+    let mut totals = NodeDiffTotals {
+        added: 0,
+        removed: 0,
+        modified: 0,
+        unchanged: 0,
+        total_changes: 0,
+    };
+
+    let mut all_diffs = Vec::with_capacity(all_node_ids.len());
+
+    for &node_id in &all_node_ids {
+        let f = from.nodes.get(node_id);
+        let t = to.nodes.get(node_id);
+
+        let diff = match (f, t) {
+            (None, Some(node)) => {
+                totals.added += 1;
+                let attrs = NodeAttributes {
+                    node_type: node.node_type.clone(),
+                    parent_id: node.parent_id.clone(),
+                    pos: node.pos.clone(),
+                    deleted: node.deleted,
+                    var_name: node.var_name.clone(),
+                };
+                let mut field_changes = Vec::new();
+                if let serde_json::Value::Object(map) = &node.current_fields {
+                    let mut keys: Vec<_> = map.keys().collect();
+                    keys.sort_unstable();
+                    for k in keys {
+                        field_changes.push(FieldDiff {
+                            field: k.clone(),
+                            from: None,
+                            to: Some(BoundedValue::bound(&map[k])),
+                        });
+                    }
+                }
+                Some(NodeDiff {
+                    node_id: node_id.clone(),
+                    kind: NodeDiffKind::Added,
+                    from: None,
+                    to: Some(attrs),
+                    field_changes,
+                    structural_change: true,
+                })
+            }
+            (Some(node), None) => {
+                totals.removed += 1;
+                let attrs = NodeAttributes {
+                    node_type: node.node_type.clone(),
+                    parent_id: node.parent_id.clone(),
+                    pos: node.pos.clone(),
+                    deleted: node.deleted,
+                    var_name: node.var_name.clone(),
+                };
+                let mut field_changes = Vec::new();
+                if let serde_json::Value::Object(map) = &node.current_fields {
+                    let mut keys: Vec<_> = map.keys().collect();
+                    keys.sort_unstable();
+                    for k in keys {
+                        field_changes.push(FieldDiff {
+                            field: k.clone(),
+                            from: Some(BoundedValue::bound(&map[k])),
+                            to: None,
+                        });
+                    }
+                }
+                Some(NodeDiff {
+                    node_id: node_id.clone(),
+                    kind: NodeDiffKind::Removed,
+                    from: Some(attrs),
+                    to: None,
+                    field_changes,
+                    structural_change: true,
+                })
+            }
+            (Some(fn_node), Some(to_node)) => {
+                let structural = fn_node.node_type != to_node.node_type
+                    || fn_node.parent_id != to_node.parent_id
+                    || fn_node.pos != to_node.pos
+                    || fn_node.deleted != to_node.deleted
+                    || fn_node.var_name != to_node.var_name;
+
+                let mut field_changes = Vec::new();
+                let f_map = fn_node.current_fields.as_object();
+                let t_map = to_node.current_fields.as_object();
+
+                let empty = serde_json::Map::new();
+                let f_keys = f_map.unwrap_or(&empty);
+                let t_keys = t_map.unwrap_or(&empty);
+
+                let all_keys: BTreeSet<&String> = f_keys.keys().chain(t_keys.keys()).collect();
+                for &key in &all_keys {
+                    let f_val = f_keys.get(key);
+                    let t_val = t_keys.get(key);
+                    if f_val != t_val {
+                        field_changes.push(FieldDiff {
+                            field: key.clone(),
+                            from: f_val.map(BoundedValue::bound),
+                            to: t_val.map(BoundedValue::bound),
+                        });
+                    }
+                }
+
+                if !structural && field_changes.is_empty() {
+                    totals.unchanged += 1;
+                    if options.include_unchanged {
+                        let from_attrs = NodeAttributes {
+                            node_type: fn_node.node_type.clone(),
+                            parent_id: fn_node.parent_id.clone(),
+                            pos: fn_node.pos.clone(),
+                            deleted: fn_node.deleted,
+                            var_name: fn_node.var_name.clone(),
+                        };
+                        let to_attrs = NodeAttributes {
+                            node_type: to_node.node_type.clone(),
+                            parent_id: to_node.parent_id.clone(),
+                            pos: to_node.pos.clone(),
+                            deleted: to_node.deleted,
+                            var_name: to_node.var_name.clone(),
+                        };
+                        Some(NodeDiff {
+                            node_id: node_id.clone(),
+                            kind: NodeDiffKind::Unchanged,
+                            from: Some(from_attrs),
+                            to: Some(to_attrs),
+                            field_changes: Vec::new(),
+                            structural_change: false,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    totals.modified += 1;
+                    let from_attrs = NodeAttributes {
+                        node_type: fn_node.node_type.clone(),
+                        parent_id: fn_node.parent_id.clone(),
+                        pos: fn_node.pos.clone(),
+                        deleted: fn_node.deleted,
+                        var_name: fn_node.var_name.clone(),
+                    };
+                    let to_attrs = NodeAttributes {
+                        node_type: to_node.node_type.clone(),
+                        parent_id: to_node.parent_id.clone(),
+                        pos: to_node.pos.clone(),
+                        deleted: to_node.deleted,
+                        var_name: to_node.var_name.clone(),
+                    };
+                    Some(NodeDiff {
+                        node_id: node_id.clone(),
+                        kind: NodeDiffKind::Modified,
+                        from: Some(from_attrs),
+                        to: Some(to_attrs),
+                        field_changes,
+                        structural_change: structural,
+                    })
+                }
+            }
+            (None, None) => None,
+        };
+
+        if let Some(d) = diff {
+            all_diffs.push(d);
+        }
+    }
+
+    totals.total_changes = totals.added + totals.removed + totals.modified;
+
+    let candidate_diffs: Vec<NodeDiff> = match &cursor {
+        Some(c) => all_diffs
+            .into_iter()
+            .filter(|d| d.node_id.0 > c.last)
+            .collect(),
+        None => all_diffs,
+    };
+
+    let mut page_changes = Vec::new();
+    let mut last_node_id = None;
+    let mut more = false;
+
+    let base_estimate = 512;
+    let mut current_bytes = base_estimate;
+
+    for diff in &candidate_diffs {
+        if page_changes.len() >= limit {
+            more = true;
+            break;
+        }
+
+        let item_bytes = serde_json::to_vec(diff).map_err(Error::Json)?.len() + 2;
+        if current_bytes + item_bytes > MAX_NODE_DIFF_RESPONSE_BYTES && !page_changes.is_empty() {
+            more = true;
+            break;
+        }
+
+        current_bytes += item_bytes;
+        last_node_id = Some(diff.node_id.0.clone());
+        page_changes.push(diff.clone());
+    }
+
+    if !more && candidate_diffs.len() > page_changes.len() {
+        more = true;
+    }
+
+    let next_cursor = if more {
+        last_node_id.map(|last| {
+            NodeCompareCursor {
+                v: NODE_DIFF_CURSOR_VERSION,
+                doc: document_id,
+                from: from_root.clone(),
+                to: to_root.clone(),
+                last,
+            }
+            .encode()
+        })
+    } else {
+        None
+    };
+
+    Ok(DocumentNodeDiffReport {
+        document_id,
+        from_root: from_root.clone(),
+        to_root: to_root.clone(),
+        whole_state_identical,
+        totals,
+        components,
+        changes: page_changes,
+        next_cursor,
+        more,
+        limits: "Annotation bodies and word-level attribution are outside this report; see docs/PRODUCT-SPEC.md.",
     })
 }
 
@@ -615,5 +1053,518 @@ mod tests {
         let p2 = signed_commit_project(2, BTreeMap::new());
         let err = compare_manifests(&p1, &p2, DiffOptions::default()).unwrap_err();
         assert!(matches!(err, Error::Invalid("compare project scope")));
+    }
+
+    use crate::materializer::{CommentState, DocumentState, MaterializedNode, SuggestionState};
+
+    fn dummy_roots() -> (DocumentId, Address, Address) {
+        (
+            DocumentId(uuid::Uuid::new_v4()),
+            Address::try_from("1".repeat(64)).unwrap(),
+            Address::try_from("2".repeat(64)).unwrap(),
+        )
+    }
+
+    #[test]
+    fn compare_nodes_identical_states_report_zero_changes() {
+        let (doc, from_root, to_root) = dummy_roots();
+        let mut state = DocumentState::default();
+        let node_id = NodeId("01NODEAAA".into());
+        state.nodes.insert(
+            node_id.clone(),
+            MaterializedNode {
+                id: node_id,
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "a0".into(),
+                current_fields: serde_json::json!({"text": "Hello world"}),
+                var_name: None,
+                deleted: false,
+            },
+        );
+
+        let report = compare_nodes(
+            doc,
+            &from_root,
+            &to_root,
+            &state,
+            &state,
+            NodeDiffOptions::default(),
+        )
+        .unwrap();
+        assert!(report.whole_state_identical);
+        assert_eq!(report.totals.total_changes, 0);
+        assert_eq!(report.totals.unchanged, 1);
+        assert!(report.changes.is_empty());
+    }
+
+    #[test]
+    fn compare_nodes_add_remove_modify_moves_and_tombstones() {
+        let (doc, from_root, to_root) = dummy_roots();
+        let mut from = DocumentState::default();
+        let mut to = DocumentState::default();
+
+        let removed_id = NodeId("01REMOVED".into());
+        from.nodes.insert(
+            removed_id.clone(),
+            MaterializedNode {
+                id: removed_id.clone(),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "a0".into(),
+                current_fields: serde_json::json!({"field": "old"}),
+                var_name: None,
+                deleted: false,
+            },
+        );
+
+        let added_id = NodeId("02ADDED".into());
+        to.nodes.insert(
+            added_id.clone(),
+            MaterializedNode {
+                id: added_id.clone(),
+                parent_id: None,
+                node_type: "section".into(),
+                pos: "b0".into(),
+                current_fields: serde_json::json!({"field": "new"}),
+                var_name: Some("sec_var".into()),
+                deleted: false,
+            },
+        );
+
+        // Moved & tombstoned node
+        let moved_id = NodeId("03MOVED".into());
+        from.nodes.insert(
+            moved_id.clone(),
+            MaterializedNode {
+                id: moved_id.clone(),
+                parent_id: None,
+                node_type: "item".into(),
+                pos: "a1".into(),
+                current_fields: serde_json::json!({"content": "Stay"}),
+                var_name: None,
+                deleted: false,
+            },
+        );
+        to.nodes.insert(
+            moved_id.clone(),
+            MaterializedNode {
+                id: moved_id.clone(),
+                parent_id: Some(added_id.clone()),
+                node_type: "item".into(),
+                pos: "z9".into(),
+                current_fields: serde_json::json!({"content": "Stay"}),
+                var_name: None,
+                deleted: true, // tombstoned
+            },
+        );
+
+        let report = compare_nodes(
+            doc,
+            &from_root,
+            &to_root,
+            &from,
+            &to,
+            NodeDiffOptions::default(),
+        )
+        .unwrap();
+
+        assert!(!report.whole_state_identical);
+        assert_eq!(report.totals.added, 1);
+        assert_eq!(report.totals.removed, 1);
+        assert_eq!(report.totals.modified, 1);
+        assert_eq!(report.totals.total_changes, 3);
+
+        let moved_diff = report
+            .changes
+            .iter()
+            .find(|d| d.node_id == moved_id)
+            .unwrap();
+        assert!(moved_diff.structural_change);
+        assert_eq!(moved_diff.kind, NodeDiffKind::Modified);
+        assert_eq!(moved_diff.from.as_ref().unwrap().pos, "a1");
+        assert_eq!(moved_diff.to.as_ref().unwrap().pos, "z9");
+        assert!(!moved_diff.from.as_ref().unwrap().deleted);
+        assert!(moved_diff.to.as_ref().unwrap().deleted);
+        assert_eq!(moved_diff.to.as_ref().unwrap().parent_id, Some(added_id));
+    }
+
+    #[test]
+    fn compare_nodes_formatting_and_unicode_edits() {
+        let (doc, from_root, to_root) = dummy_roots();
+        let mut from = DocumentState::default();
+        let mut to = DocumentState::default();
+
+        let unicode_id = NodeId("01বাংলা_নথি".into());
+        from.nodes.insert(
+            unicode_id.clone(),
+            MaterializedNode {
+                id: unicode_id.clone(),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "a0".into(),
+                current_fields: serde_json::json!({
+                    "text": "শুরু",
+                    "formatting": {"bold": false, "italic": true}
+                }),
+                var_name: None,
+                deleted: false,
+            },
+        );
+        to.nodes.insert(
+            unicode_id.clone(),
+            MaterializedNode {
+                id: unicode_id.clone(),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "a0".into(),
+                current_fields: serde_json::json!({
+                    "text": "শুরু এবং শেষ",
+                    "formatting": {"bold": true, "italic": true}
+                }),
+                var_name: None,
+                deleted: false,
+            },
+        );
+
+        let report = compare_nodes(
+            doc,
+            &from_root,
+            &to_root,
+            &from,
+            &to,
+            NodeDiffOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.totals.modified, 1);
+        let diff = &report.changes[0];
+        assert_eq!(diff.node_id, unicode_id);
+        assert!(!diff.structural_change);
+        assert_eq!(diff.field_changes.len(), 2);
+    }
+
+    #[test]
+    fn compare_nodes_distinguishes_null_from_missing() {
+        let (doc, from_root, to_root) = dummy_roots();
+        let mut from = DocumentState::default();
+        let mut to = DocumentState::default();
+
+        let id = NodeId("01NULLCHECK".into());
+        // In from: field_a is missing, field_b is null, field_c is "val"
+        from.nodes.insert(
+            id.clone(),
+            MaterializedNode {
+                id: id.clone(),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "a0".into(),
+                current_fields: serde_json::json!({
+                    "field_b": null,
+                    "field_c": "val",
+                }),
+                var_name: None,
+                deleted: false,
+            },
+        );
+        // In to: field_a is null, field_b is missing, field_c is null
+        to.nodes.insert(
+            id.clone(),
+            MaterializedNode {
+                id: id.clone(),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "a0".into(),
+                current_fields: serde_json::json!({
+                    "field_a": null,
+                    "field_c": null,
+                }),
+                var_name: None,
+                deleted: false,
+            },
+        );
+
+        let report = compare_nodes(
+            doc,
+            &from_root,
+            &to_root,
+            &from,
+            &to,
+            NodeDiffOptions::default(),
+        )
+        .unwrap();
+
+        let diff = &report.changes[0];
+        assert_eq!(diff.field_changes.len(), 3);
+
+        let fa = diff
+            .field_changes
+            .iter()
+            .find(|f| f.field == "field_a")
+            .unwrap();
+        assert_eq!(fa.from, None); // was missing
+        assert_eq!(fa.to, Some(BoundedValue::Value(serde_json::Value::Null))); // now null
+
+        let fb = diff
+            .field_changes
+            .iter()
+            .find(|f| f.field == "field_b")
+            .unwrap();
+        assert_eq!(fb.from, Some(BoundedValue::Value(serde_json::Value::Null))); // was null
+        assert_eq!(fb.to, None); // now missing
+
+        let fc = diff
+            .field_changes
+            .iter()
+            .find(|f| f.field == "field_c")
+            .unwrap();
+        assert_eq!(fc.from, Some(BoundedValue::Value(serde_json::json!("val"))));
+        assert_eq!(fc.to, Some(BoundedValue::Value(serde_json::Value::Null)));
+    }
+
+    #[test]
+    fn compare_nodes_oversized_values_are_bounded() {
+        let (doc, from_root, to_root) = dummy_roots();
+        let mut from = DocumentState::default();
+        let mut to = DocumentState::default();
+
+        let id = NodeId("01BIGTEXT".into());
+        let huge_string = "a".repeat(10_000);
+        from.nodes.insert(
+            id.clone(),
+            MaterializedNode {
+                id: id.clone(),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "a0".into(),
+                current_fields: serde_json::json!({"content": huge_string}),
+                var_name: None,
+                deleted: false,
+            },
+        );
+        to.nodes.insert(
+            id.clone(),
+            MaterializedNode {
+                id: id.clone(),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "a0".into(),
+                current_fields: serde_json::json!({"content": "small"}),
+                var_name: None,
+                deleted: false,
+            },
+        );
+
+        let report = compare_nodes(
+            doc,
+            &from_root,
+            &to_root,
+            &from,
+            &to,
+            NodeDiffOptions::default(),
+        )
+        .unwrap();
+
+        let diff = &report.changes[0];
+        let fc = &diff.field_changes[0];
+        match &fc.from {
+            Some(BoundedValue::Omitted(omitted)) => {
+                assert!(omitted.omitted);
+                assert!(omitted.bytes > 10_000);
+                assert_eq!(omitted.sha256.len(), 64);
+            }
+            other => panic!("expected omitted marker, got {other:?}"),
+        }
+        assert_eq!(fc.to, Some(BoundedValue::Value(serde_json::json!("small"))));
+    }
+
+    #[test]
+    fn compare_nodes_annotation_only_changes() {
+        let (doc, from_root, to_root) = dummy_roots();
+        let mut from = DocumentState::default();
+        let mut to = DocumentState::default();
+
+        let id = NodeId("01STATIC".into());
+        let node = MaterializedNode {
+            id: id.clone(),
+            parent_id: None,
+            node_type: "paragraph".into(),
+            pos: "a0".into(),
+            current_fields: serde_json::json!({"text": "Static"}),
+            var_name: None,
+            deleted: false,
+        };
+        from.nodes.insert(id.clone(), node.clone());
+        to.nodes.insert(id, node);
+
+        from.comments.push(CommentState {
+            node_id: None,
+            body: "First comment".into(),
+        });
+        to.comments.push(CommentState {
+            node_id: None,
+            body: "First comment".into(),
+        });
+        to.comments.push(CommentState {
+            node_id: None,
+            body: "Second comment".into(),
+        });
+
+        to.suggestions.insert(
+            "sug1".into(),
+            SuggestionState {
+                target_node_id: None,
+                detail: serde_json::json!({"fix": true}),
+                accepted: false,
+                rejected_reason: None,
+            },
+        );
+
+        let report = compare_nodes(
+            doc,
+            &from_root,
+            &to_root,
+            &from,
+            &to,
+            NodeDiffOptions::default(),
+        )
+        .unwrap();
+
+        assert!(!report.whole_state_identical);
+        assert_eq!(report.totals.total_changes, 0); // zero node changes!
+        assert!(report.changes.is_empty());
+        assert!(report.components.comments_changed);
+        assert_eq!(report.components.comments_from_count, 1);
+        assert_eq!(report.components.comments_to_count, 2);
+        assert!(report.components.suggestions_changed);
+        assert_eq!(report.components.suggestions_from_count, 0);
+        assert_eq!(report.components.suggestions_to_count, 1);
+    }
+
+    #[test]
+    fn compare_nodes_pagination_and_cursor_validation() {
+        let (doc, from_root, to_root) = dummy_roots();
+        let mut from = DocumentState::default();
+        let mut to = DocumentState::default();
+
+        for i in 0..15 {
+            let id = NodeId(format!("01NODE_{i:02}"));
+            from.nodes.insert(
+                id.clone(),
+                MaterializedNode {
+                    id: id.clone(),
+                    parent_id: None,
+                    node_type: "paragraph".into(),
+                    pos: format!("p{i:02}"),
+                    current_fields: serde_json::json!({"val": i}),
+                    var_name: None,
+                    deleted: false,
+                },
+            );
+            to.nodes.insert(
+                id.clone(),
+                MaterializedNode {
+                    id: id.clone(),
+                    parent_id: None,
+                    node_type: "paragraph".into(),
+                    pos: format!("p{i:02}"),
+                    current_fields: serde_json::json!({"val": i + 100}),
+                    var_name: None,
+                    deleted: false,
+                },
+            );
+        }
+
+        // Page 1: limit 5
+        let p1 = compare_nodes(
+            doc,
+            &from_root,
+            &to_root,
+            &from,
+            &to,
+            NodeDiffOptions {
+                limit: Some(5),
+                cursor: None,
+                include_unchanged: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(p1.changes.len(), 5);
+        assert!(p1.more);
+        assert!(p1.next_cursor.is_some());
+        let c1 = p1.next_cursor.unwrap();
+
+        // Page 2: limit 5
+        let p2 = compare_nodes(
+            doc,
+            &from_root,
+            &to_root,
+            &from,
+            &to,
+            NodeDiffOptions {
+                limit: Some(5),
+                cursor: Some(&c1),
+                include_unchanged: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(p2.changes.len(), 5);
+        assert!(p2.more);
+        let c2 = p2.next_cursor.unwrap();
+
+        // Page 3: limit 5 (last page)
+        let p3 = compare_nodes(
+            doc,
+            &from_root,
+            &to_root,
+            &from,
+            &to,
+            NodeDiffOptions {
+                limit: Some(5),
+                cursor: Some(&c2),
+                include_unchanged: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(p3.changes.len(), 5);
+        assert!(!p3.more);
+        assert_eq!(p3.next_cursor, None);
+
+        // Verify distinct items across pages
+        let mut seen = std::collections::BTreeSet::new();
+        for diff in p1.changes.iter().chain(&p2.changes).chain(&p3.changes) {
+            assert!(seen.insert(diff.node_id.clone()));
+        }
+        assert_eq!(seen.len(), 15);
+
+        // Cursor tampering / mismatch rejection
+        let other_doc = DocumentId(uuid::Uuid::new_v4());
+        assert!(compare_nodes(
+            other_doc,
+            &from_root,
+            &to_root,
+            &from,
+            &to,
+            NodeDiffOptions {
+                limit: Some(5),
+                cursor: Some(&c1),
+                include_unchanged: false,
+            },
+        )
+        .is_err());
+
+        assert!(compare_nodes(
+            doc,
+            &from_root,
+            &to_root,
+            &from,
+            &to,
+            NodeDiffOptions {
+                limit: Some(5),
+                cursor: Some("corrupted_hex"),
+                include_unchanged: false,
+            },
+        )
+        .is_err());
     }
 }
