@@ -493,27 +493,6 @@ async fn cli_compact_v3_flag_conflicts_rejected(pool: PgPool) {
         "{out_typed}"
     );
 
-    // Conflict with --incremental
-    let (ok_inc, out_inc) = run_cli(
-        &url,
-        &[
-            "shared-snapshot",
-            &doc.0.to_string(),
-            "--through-seq",
-            "1",
-            "--codec",
-            "compact-v3",
-            "--incremental",
-        ],
-    );
-    assert!(!ok_inc, "{out_inc}");
-    assert!(
-        out_inc.contains(
-            "--codec compact-v3 cannot be combined with --incremental (compact v3 uses the full writer only)"
-        ),
-        "{out_inc}"
-    );
-
     // Unsupported codec
     let (ok_bad, out_bad) = run_cli(
         &url,
@@ -531,6 +510,269 @@ async fn cli_compact_v3_flag_conflicts_rejected(pool: PgPool) {
         out_bad.contains("unsupported codec 'invalid-codec', expected 'compact-v3'"),
         "{out_bad}"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn cli_compact_v3_incremental_publication_and_flag_matrix(pool: PgPool) {
+    let (actor, doc, node) = seed_document(&pool).await;
+    let url = owner_url(&pool);
+
+    // Rev 1 with --codec compact-v3 --incremental: no base exists -> fallback ran
+    let (ok1, out1) = run_cli(
+        &url,
+        &[
+            "shared-snapshot",
+            &doc.0.to_string(),
+            "--through-seq",
+            "1",
+            "--codec",
+            "compact-v3",
+            "--incremental",
+        ],
+    );
+    assert!(ok1, "{out1}");
+    assert!(
+        out1.contains("shared checkpoint V3 (incremental) at revision 1:"),
+        "{out1}"
+    );
+    assert!(out1.contains("selected base: none"), "{out1}");
+    assert!(out1.contains("fallback ran: true"), "{out1}");
+    assert!(out1.contains("read queries:"), "{out1}");
+    assert!(out1.contains("write queries:"), "{out1}");
+
+    let (codec_ver1, root1): (i16, String) = sqlx::query_as(
+        "select codec_version, state_root from shared_checkpoint where document_id = $1 and through_seq = 1",
+    )
+    .bind(doc.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(codec_ver1, 3);
+    assert!(out1.contains(&root1));
+
+    // Append edit for rev 2
+    engine_core::log::append(
+        &pool,
+        doc,
+        &EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!("rev 2 edit"),
+        },
+        actor,
+    )
+    .await
+    .unwrap();
+
+    // Rev 2 with --codec compact-v3 --incremental: uses rev 1 base
+    let (ok2, out2) = run_cli(
+        &url,
+        &[
+            "shared-snapshot",
+            &doc.0.to_string(),
+            "--through-seq",
+            "2",
+            "--codec",
+            "compact-v3",
+            "--incremental",
+        ],
+    );
+    assert!(ok2, "{out2}");
+    assert!(
+        out2.contains("shared checkpoint V3 (incremental) at revision 2:"),
+        "{out2}"
+    );
+    assert!(out2.contains("selected base: revision 1"), "{out2}");
+    assert!(out2.contains("fallback ran: false"), "{out2}");
+
+    let (codec_ver2, root2): (i16, String) = sqlx::query_as(
+        "select codec_version, state_root from shared_checkpoint where document_id = $1 and through_seq = 2",
+    )
+    .bind(doc.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(codec_ver2, 3);
+    assert!(out2.contains(&root2));
+
+    // Duplicate publication at rev 2: returns same root, 0 new objects
+    let (ok2_retry, out2_retry) = run_cli(
+        &url,
+        &[
+            "shared-snapshot",
+            &doc.0.to_string(),
+            "--through-seq",
+            "2",
+            "--codec",
+            "compact-v3",
+            "--incremental",
+        ],
+    );
+    assert!(ok2_retry, "{out2_retry}");
+    assert!(out2_retry.contains(&root2), "{out2_retry}");
+    assert!(
+        out2_retry.contains("new objects: 0; new canonical bytes: 0"),
+        "{out2_retry}"
+    );
+
+    // Verify default-off matrix:
+    // 1. Without flags -> Codec::V1
+    engine_core::log::append(
+        &pool,
+        doc,
+        &EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!("rev 3 edit"),
+        },
+        actor,
+    )
+    .await
+    .unwrap();
+    let (ok3, out3) = run_cli(
+        &url,
+        &["shared-snapshot", &doc.0.to_string(), "--through-seq", "3"],
+    );
+    assert!(ok3, "{out3}");
+    assert!(
+        out3.contains("shared checkpoint V1 at revision 3:"),
+        "{out3}"
+    );
+
+    // 2. With --typed only -> Codec::V2 full
+    engine_core::log::append(
+        &pool,
+        doc,
+        &EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!("rev 4 edit"),
+        },
+        actor,
+    )
+    .await
+    .unwrap();
+    let (ok4, out4) = run_cli(
+        &url,
+        &[
+            "shared-snapshot",
+            &doc.0.to_string(),
+            "--through-seq",
+            "4",
+            "--typed",
+        ],
+    );
+    assert!(ok4, "{out4}");
+    assert!(
+        out4.contains("shared checkpoint V2 at revision 4:"),
+        "{out4}"
+    );
+
+    // 3. With --codec compact-v3 alone -> Codec::V3 full
+    engine_core::log::append(
+        &pool,
+        doc,
+        &EventPayload::FieldEdited {
+            node_id: node,
+            field: "label".into(),
+            value: json!("rev 5 edit"),
+        },
+        actor,
+    )
+    .await
+    .unwrap();
+    let (ok5, out5) = run_cli(
+        &url,
+        &[
+            "shared-snapshot",
+            &doc.0.to_string(),
+            "--through-seq",
+            "5",
+            "--codec",
+            "compact-v3",
+        ],
+    );
+    assert!(ok5, "{out5}");
+    assert!(
+        out5.contains("shared checkpoint V3 at revision 5:"),
+        "{out5}"
+    );
+    assert!(!out5.contains("(incremental)"), "{out5}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn cli_compact_v3_incremental_corrupt_base_fails_closed(pool: PgPool) {
+    let (actor, doc, node) = seed_document(&pool).await;
+    let url = owner_url(&pool);
+
+    engine_core::log::append(
+        &pool,
+        doc,
+        &EventPayload::FieldEdited {
+            node_id: node,
+            field: "label".into(),
+            value: json!("Edit for rev 2"),
+        },
+        actor,
+    )
+    .await
+    .unwrap();
+
+    // Insert corrupt base checkpoint at rev 1
+    let dummy_root = "d".repeat(64);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(doc.0)
+        .bind(&dummy_root)
+        .bind(b"corrupted_v3_bytes".as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let chain = engine_core::shared_checkpoint::postgres::chain_at(
+        &mut pool.acquire().await.unwrap(),
+        doc,
+        1,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,1,3,$2,$3)",
+    )
+    .bind(doc.0)
+    .bind(&dummy_root)
+    .bind(&chain)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // CLI invocation for rev 2 must fail closed
+    let (ok2, out2) = run_cli(
+        &url,
+        &[
+            "shared-snapshot",
+            &doc.0.to_string(),
+            "--through-seq",
+            "2",
+            "--codec",
+            "compact-v3",
+            "--incremental",
+        ],
+    );
+    assert!(!ok2, "expected failure on corrupt base, got: {out2}");
+    assert!(
+        out2.contains("publishing shared checkpoint failed"),
+        "{out2}"
+    );
+
+    // Checkpoint at revision 2 must not have been created
+    let count: i64 = sqlx::query_scalar(
+        "select count(*) from shared_checkpoint where document_id=$1 and through_seq=2",
+    )
+    .bind(doc.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

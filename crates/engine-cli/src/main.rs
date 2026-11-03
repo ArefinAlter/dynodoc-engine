@@ -540,9 +540,6 @@ async fn shared_snapshot(
         if typed {
             anyhow::bail!("--codec {c} cannot be combined with --typed");
         }
-        if incremental {
-            anyhow::bail!("--codec {c} cannot be combined with --incremental (compact v3 uses the full writer only)");
-        }
     } else if incremental && !typed {
         anyhow::bail!("--incremental requires --typed");
     }
@@ -555,16 +552,30 @@ async fn shared_snapshot(
     let pool = connect().await?;
 
     if incremental {
-        let result = engine_core::shared_checkpoint::postgres::take_incremental(
-            &pool,
-            doc,
-            through_seq,
-            engine_core::shared_checkpoint::Limits::default(),
-        )
-        .await
-        .context("publishing shared checkpoint failed")?;
+        let is_v3 = matches!(codec_arg.as_deref(), Some("compact-v3"));
+        let result = if is_v3 {
+            engine_core::shared_checkpoint::postgres::take_incremental_v3(
+                &pool,
+                doc,
+                through_seq,
+                engine_core::shared_checkpoint::Limits::default(),
+            )
+            .await
+            .context("publishing shared checkpoint failed")?
+        } else {
+            engine_core::shared_checkpoint::postgres::take_incremental(
+                &pool,
+                doc,
+                through_seq,
+                engine_core::shared_checkpoint::Limits::default(),
+            )
+            .await
+            .context("publishing shared checkpoint failed")?
+        };
+
+        let codec_name = if is_v3 { "V3" } else { "V2" };
         println!(
-            "shared checkpoint V2 (incremental) at revision {}: {}",
+            "shared checkpoint {codec_name} (incremental) at revision {}: {}",
             result.through_seq,
             result.root.as_str()
         );
