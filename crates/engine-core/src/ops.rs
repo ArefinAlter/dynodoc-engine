@@ -947,4 +947,81 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn multiple_valid_roots_are_permitted_and_invalid_root_types_rejected() {
+        // 1. Initial state with a Form root.
+        let s = state(vec![
+            n("01ROOT1", NodeType::Form, None, None),
+            n("01CHILD1", NodeType::Clause, Some("01ROOT1"), None),
+            n("01ITEM1", NodeType::Item, Some("01ROOT1"), None),
+        ]);
+
+        // 2. Creating a second root (Clause or Form with parent_id: None) is accepted.
+        let create_second_clause_root = EventPayload::NodeCreated {
+            node_id: NodeId("01ROOT2".into()),
+            node_type: NodeType::Clause,
+            parent_id: None,
+            pos: "a1".into(),
+            fields: json!({"label": "Second Root Clause"}),
+            var_name: None,
+        };
+        assert!(validate_op(&s, &create_second_clause_root).is_ok());
+
+        let create_second_form_root = EventPayload::NodeCreated {
+            node_id: NodeId("01ROOT3".into()),
+            node_type: NodeType::Form,
+            parent_id: None,
+            pos: "a2".into(),
+            fields: json!({"label": "Second Root Form"}),
+            var_name: None,
+        };
+        assert!(validate_op(&s, &create_second_form_root).is_ok());
+
+        // 3. Creating a non-root-eligible node (Item, Paragraph, Choice) at top level (parent_id: None) is rejected.
+        let create_illegal_item_root = EventPayload::NodeCreated {
+            node_id: NodeId("01BAD".into()),
+            node_type: NodeType::Item,
+            parent_id: None,
+            pos: "a3".into(),
+            fields: json!({}),
+            var_name: None,
+        };
+        assert_eq!(
+            validate_op(&s, &create_illegal_item_root),
+            Err(OpError::InvalidRoot("item".into()))
+        );
+
+        let create_illegal_choice_root = EventPayload::NodeCreated {
+            node_id: NodeId("01BAD2".into()),
+            node_type: NodeType::Choice,
+            parent_id: None,
+            pos: "a4".into(),
+            fields: json!({}),
+            var_name: None,
+        };
+        assert_eq!(
+            validate_op(&s, &create_illegal_choice_root),
+            Err(OpError::InvalidRoot("choice".into()))
+        );
+
+        // 4. Moving an existing root-eligible node (Clause) to top-level (new_parent_id: None) is accepted.
+        let move_clause_to_root = EventPayload::NodeMoved {
+            node_id: NodeId("01CHILD1".into()),
+            new_parent_id: None,
+            new_pos: "a1".into(),
+        };
+        assert!(validate_op(&s, &move_clause_to_root).is_ok());
+
+        // 5. Moving a non-root-eligible node (Item) to top-level (new_parent_id: None) is rejected with InvalidRoot.
+        let move_item_to_root = EventPayload::NodeMoved {
+            node_id: NodeId("01ITEM1".into()),
+            new_parent_id: None,
+            new_pos: "a5".into(),
+        };
+        assert_eq!(
+            validate_op(&s, &move_item_to_root),
+            Err(OpError::InvalidRoot("item".into()))
+        );
+    }
 }
