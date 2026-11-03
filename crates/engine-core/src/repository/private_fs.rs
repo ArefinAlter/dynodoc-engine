@@ -103,6 +103,11 @@ pub fn restrict_windows(_path: &Path) -> Result<(), String> {
 #[cfg(windows)]
 pub fn restrict_windows(path: &Path) -> Result<(), String> {
     use std::process::Command;
+    // An absolute path (drive letter first) is never read as an icacls switch such
+    // as `/T` and does not depend on the working directory.
+    let path =
+        std::path::absolute(path).map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
+    let path = path.as_path();
     let username = std::env::var("USERNAME")
         .ok()
         .filter(|u| !u.is_empty())
@@ -156,6 +161,12 @@ pub fn restrict_windows(path: &Path) -> Result<(), String> {
 }
 
 /// `icacls` arguments that drop inherited entries and leave one entry for `principal` with full control.
+///
+/// A process with an elevated (Administrator) token creates files whose own access
+/// list already holds explicit entries for SYSTEM and the Administrators group, and
+/// those are not inherited ones, so dropping inheritance leaves them. They are
+/// removed by well-known SID (S-1-5-18, S-1-5-32-544: no language dependence)
+/// before the grant, so the grant stays even when the user is SYSTEM itself.
 pub fn icacls_apply_args(path: &Path, principal: &str) -> Vec<std::ffi::OsString> {
     vec![
         path.as_os_str().to_owned(),
@@ -178,6 +189,10 @@ pub fn acl_principals(output: &str, path: &Path) -> Option<Vec<String>> {
             break;
         }
         let line = line.strip_prefix(r"\\?\").unwrap_or(line);
+        // icacls prints in the console code page, where letters outside it (a Bengali
+        // or accented folder name) arrive as `?`, so a non-ASCII path cannot be
+        // compared with ours. The whole line stays; the user name is still the text
+        // after its last backslash.
         let entry = if index == 0 && path.is_ascii() {
             let head = line.get(..path.len())?;
             if !head.eq_ignore_ascii_case(path) {
@@ -211,7 +226,9 @@ pub fn only_user(principals: &[String], username: &str) -> bool {
         })
 }
 
-/// Case-insensitive ASCII account name comparison.
+/// An ASCII name must match exactly (ignoring case). A name with letters outside
+/// the console code page is printed with `?` or U+FFFD in their place, so it is
+/// compared by its ASCII letters and the positions of the others.
 pub fn same_account_name(printed: &str, username: &str) -> bool {
     if printed.eq_ignore_ascii_case(username) {
         return true;

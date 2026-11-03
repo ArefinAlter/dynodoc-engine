@@ -396,6 +396,14 @@ pub async fn verify_state_export_limited<R: std::io::Read>(
         .map_err(|e| anyhow::anyhow!("deserializing state export envelope: {e}"))?;
     de.end()
         .map_err(|e| anyhow::anyhow!("trailing characters in state export input: {e}"))?;
+    // `DocumentState` and its parts ignore unknown fields; reject them so nothing in
+    // the file rides along unverified.
+    let input: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("parsing state export input: {e}"))?;
+    anyhow::ensure!(
+        serde_json::to_value(&envelope)? == input,
+        "state export contains fields outside the verified envelope"
+    );
 
     // 3. Format and version validation
     anyhow::ensure!(
@@ -1172,6 +1180,32 @@ mod tests {
             .await
             .expect_err("trailing characters must fail");
         assert!(err.to_string().contains("trailing characters"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_state_export_unknown_nested_fields_rejected() {
+        let project = uuid::Uuid::new_v4();
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let path = "docs/report.docx";
+        let (envelope, commit_addr, _) =
+            make_signed_export(project, doc, path, sample_full_state()).await;
+        let mut buf = Vec::new();
+        envelope.write_to_writer(&mut buf).unwrap();
+        verify_state_export(&buf[..], project, &commit_addr, path)
+            .await
+            .expect("untouched export verifies");
+
+        // An extra field inside the state, which serde would otherwise ignore.
+        let mut value: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        value["state"]["unverified_note"] = json!("injected");
+        let tampered = serde_json::to_vec_pretty(&value).unwrap();
+        let err = verify_state_export(&tampered[..], project, &commit_addr, path)
+            .await
+            .expect_err("unknown nested field must fail");
+        assert!(
+            err.to_string().contains("outside the verified envelope"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

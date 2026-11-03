@@ -729,8 +729,10 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                         out.display()
                     );
 
-                    let file = engine_core::repository::private_fs::create_private_file(&out)
-                        .with_context(|| format!("creating output archive at {}", out.display()))?;
+                    let mut file = engine_core::repository::private_fs::create_private_file(&out)
+                        .with_context(|| {
+                        format!("creating output archive at {}", out.display())
+                    })?;
 
                     let guard =
                         engine_core::repository::private_fs::AutoRemoveFile::new(out.clone());
@@ -738,11 +740,15 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     let summary = engine_core::repository::archive::export_archive(
                         &repo,
                         &head_addr,
-                        file,
+                        std::io::BufWriter::new(&mut file),
                         engine_core::repository::archive::ArchiveLimits::default(),
                     )
                     .await
                     .context("archive export failed")?;
+                    // Report success only once the complete archive is on disk.
+                    file.sync_all()
+                        .with_context(|| format!("syncing output archive {}", out.display()))?;
+                    drop(file);
 
                     guard.commit();
 

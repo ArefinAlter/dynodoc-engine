@@ -64,10 +64,15 @@ Any trailing bytes after the footer payload are rejected.
 ## Bounds and streaming guarantees
 
 - Readers validate base64 length estimates before allocating decoded buffers.
-- Readers must not buffer the entire archive in memory; streaming validation operates
-  frame-by-frame with bounded memory $O(\text{commit count})$.
+- `ArchiveReader` reads frame by frame and keeps only the seen object and commit keys.
+  The closure checks behind `archive-verify` and `archive-import` write each object to
+  private temporary disk but keep the parsed commit envelopes in memory, so their
+  memory grows with the commit bytes in the archive (at most the total byte limit).
 - Total objects, total commits, total archive bytes, and per-frame bytes are governed by
-  configurable `ArchiveLimits`.
+  configurable `ArchiveLimits`. Defaults: 100,000 objects, 10,000 commits, 2 MiB per
+  frame and 512 MiB per archive.
+- The format has no compression and carries no file names: staged objects are named by
+  their position, so archive content never chooses a path on disk.
 
 ## Versioning and scope boundaries
 
@@ -91,3 +96,52 @@ The offline verifier (`engine-cli archive-verify FILE --project UUID --expect-he
 - Rejects extraneous commits, unreferenced objects, duplicate frame keys (even identical),
   tampered signatures/payloads, and truncated or trailing data.
 - Returns nonzero on any integrity or closure failure, or emits JSON summary with verified counts on success.
+
+The same check is available as `engine-cli repository DATABASE PROJECT archive-verify FILE
+--expect-head ADDRESS`, which does not open the database.
+
+## Export and import
+
+`engine-cli repository DATABASE PROJECT archive-export HEAD --out FILE` opens the database
+read-only and writes the dependency closure of `HEAD` (parents and recovery sources) and
+every object those commits reference. Other branches and staged objects outside that
+closure are not included. The archive does include every file of every commit in the
+closure, with commit messages and author keys: share it only with readers allowed to see
+that whole history. The output is a new owner-only file (an existing path is refused); it is
+removed if the export fails and synced to disk before success is reported.
+
+`engine-cli repository DATABASE PROJECT archive-import FILE --expect-head ADDRESS` runs the
+complete offline verification first, including a semantic import into a disposable private
+repository, before it creates, opens or upgrades the target database. It then copies the
+objects in transfer batches (at most 64 objects / 1 MiB each) and the commits in dependency
+order. It never creates or moves a branch and never raises storage limits. If the target
+fails part way, for example at its capacity limit, the error reports how many objects and
+commits were already imported; those rows stay, like any committed transfer batch, and
+are charged to capacity. A retry is idempotent. Moving a branch to the imported head is a
+separate, explicit step.
+
+## Normalized state export
+
+`engine-cli repository DATABASE PROJECT export-file --commit ADDRESS --path PATH --out FILE`
+(local, read-only) and `engine-cli sync ... export-file --commit ADDRESS --path PATH --out FILE`
+(remote, `history:read`; fetched objects go to a private temporary directory that is
+removed afterwards, never to the local repository) write one historical file as a
+`dynodoc.state-export` version 1 JSON envelope: `format`, `version`, `path`, the complete
+signed commit and the reconstructed `DocumentState`. It is the normalized document model,
+not a DOCX, XLSX or PPTX file. The signed commit is needed for verification and names
+every path, document id and state root in the project at that commit, with its message
+and author key. The output is a new owner-only file of at most 64 MiB.
+
+`engine-cli state-export-verify FILE --project UUID --expect-commit ADDRESS --path PATH`
+works offline. It rejects duplicate JSON keys, trailing data, unknown fields, another
+format or version, and a file over 64 MiB. It checks that the commit signature is valid
+for the key inside the commit, that the commit address equals the expected address and
+the project the expected project, and that re-encoding the supplied state with the
+typed-v2 rules gives exactly the state root the signed commit lists for `PATH`.
+
+What this proves: the state is exactly the one that commit records for that path. The
+anchor is the expected commit address, which you must obtain independently (for example
+from a branch head you trust or a server receipt). The signature alone only proves that
+someone holding the embedded key signed it; it does not identify an account or device,
+prove the timestamp, or show that the commit is still current on any server. It also
+does not prove that a native Office file opened from this state matches the original.
