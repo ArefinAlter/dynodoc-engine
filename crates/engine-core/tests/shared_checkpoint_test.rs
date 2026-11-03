@@ -154,6 +154,140 @@ async fn typed_publication_replays_large_values_and_mixed_history(
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn compact_v3_postgres_publication_mixed_history_and_rejection(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    use postgres::Codec;
+    let (actor, document, node) = seed(&pool).await?;
+
+    // Seq 1: publish v1
+    let _v1 = postgres::take_with_codec(&pool, document, 1, Limits::default(), Codec::V1).await?;
+
+    // Seq 2: edit field and publish v2
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!("Seq 2 label"),
+        },
+        actor,
+    )
+    .await?;
+    let _v2 = postgres::take_with_codec(&pool, document, 2, Limits::default(), Codec::V2).await?;
+
+    // Seq 3: edit field and publish compact v3
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!("Seq 3 label"),
+        },
+        actor,
+    )
+    .await?;
+
+    let events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id=$1 order by seq")
+            .bind(document.0)
+            .fetch_all(&pool)
+            .await?;
+    let expected_state_seq3 = Materializer::fold(&events)?;
+
+    let published_v3 =
+        postgres::take_with_codec(&pool, document, 3, Limits::default(), Codec::V3).await?;
+    let repeat_v3 =
+        postgres::take_with_codec(&pool, document, 3, Limits::default(), Codec::V3).await?;
+    assert_eq!(published_v3.root, repeat_v3.root);
+    assert_eq!(repeat_v3.stats.new_objects, 0);
+
+    // Verify loading via postgres::load
+    assert_eq!(
+        postgres::load(&pool, document, 3, Limits::default()).await?,
+        expected_state_seq3
+    );
+
+    // Verify read_state_at detects CheckpointFormat::SharedV3
+    let mut connection = pool.acquire().await?;
+    let history_seq3 = read_state_at(&mut connection, document, 3).await?;
+    assert_eq!(history_seq3.checkpoint_format, CheckpointFormat::SharedV3);
+    assert_eq!(history_seq3.replayed_events, 0);
+    assert_eq!(history_seq3.state, expected_state_seq3);
+
+    // Verify historical readers over mixed history
+    let history_seq2 = read_state_at(&mut connection, document, 2).await?;
+    assert_eq!(history_seq2.checkpoint_format, CheckpointFormat::SharedV2);
+    let history_seq1 = read_state_at(&mut connection, document, 1).await?;
+    assert_eq!(history_seq1.checkpoint_format, CheckpointFormat::SharedV1);
+
+    // Seq 4: event replay on top of v3 checkpoint
+    drop(connection);
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!("Seq 4 label"),
+        },
+        actor,
+    )
+    .await?;
+    let mut connection = pool.acquire().await?;
+    let history_seq4 = read_state_at(&mut connection, document, 4).await?;
+    assert_eq!(history_seq4.checkpoint_format, CheckpointFormat::SharedV3);
+    assert_eq!(history_seq4.replayed_events, 1);
+    let all_events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id=$1 order by seq")
+            .bind(document.0)
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(history_seq4.state, Materializer::fold(&all_events)?);
+
+    // At an already-published revision (seq 3), reject different codec/root
+    assert!(
+        postgres::take_with_codec(&pool, document, 3, Limits::default(), Codec::V2)
+            .await
+            .is_err()
+    );
+    assert!(
+        postgres::take_with_codec(&pool, document, 3, Limits::default(), Codec::V1)
+            .await
+            .is_err()
+    );
+
+    // Corrupt v3 object fails closed
+    let corrupt_root = "d".repeat(64);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(document.0)
+        .bind(&corrupt_root)
+        .bind(b"corrupted_v3_bytes".as_slice())
+        .execute(&pool)
+        .await?;
+    let chain5 = postgres::chain_at(&mut *pool.acquire().await?, document, 4).await?;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,5,3,$2,$3)",
+    )
+    .bind(document.0)
+    .bind(&corrupt_root)
+    .bind(&chain5)
+    .execute(&pool)
+    .await?;
+
+    let mut connection = pool.acquire().await?;
+    assert!(read_state_at(&mut connection, document, 5).await.is_err());
+    assert!(postgres::load(&pool, document, 5, Limits::default())
+        .await
+        .is_err());
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn chunked_content_reuses_objects_and_rolls_back_without_publishing(
     pool: PgPool,
 ) -> anyhow::Result<()> {
