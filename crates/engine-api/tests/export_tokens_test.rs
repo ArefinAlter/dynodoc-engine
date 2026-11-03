@@ -677,3 +677,138 @@ async fn runtime_database_grants_and_privileges_pass(pool: PgPool) {
         .unwrap();
     runtime.close().await;
 }
+
+/// Resolving through a project device token applies the project-route rules: a person
+/// read scope (never the agent scope), the key's reach, the current session generation,
+/// and read access to this file.
+#[sqlx::test(migrations = "../../migrations")]
+async fn device_tokens_resolve_only_with_reach_generation_and_file_access(pool: PgPool) {
+    let router = app(test_state(pool.clone()));
+    let owner = seed_identity(&pool, "device-owner@example.com").await;
+    let login = bearer(owner);
+    let (status, project) = send(
+        &router,
+        auth_post(
+            "/projects",
+            &login,
+            &json!({"name": "Device Export Project"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{project}");
+    let project = Uuid::parse_str(project["id"].as_str().unwrap()).unwrap();
+    let doc: Uuid = sqlx::query_scalar(
+        "insert into document(title,created_by,space_id) values('Device Doc',$1,$2) returning id",
+    )
+    .bind(owner)
+    .bind(project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let root = ulid::Ulid::generate().to_string();
+    let (status, created) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/batch"),
+            &login,
+            &json!({"base_seq": 0, "ops": [
+                {"type": "NodeCreated", "node_id": root, "node_type": "form", "pos": "a0", "fields": {"label": "Root"}}
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let (status, minted) = send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc}/export-tokens"),
+            &login,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{minted}");
+    let export_id = minted["export_id"].as_str().unwrap().to_owned();
+
+    // A device key for a person: in `all` mode it reaches every project of the person.
+    async fn device(pool: &PgPool, identity: Uuid) -> Uuid {
+        let key: Uuid = sqlx::query_scalar(
+            "insert into device_signing_key(id,identity_id,public_key,proof) values(gen_random_uuid(),$1,encode(gen_random_bytes(32),'hex'),'{}'::jsonb) returning id",
+        )
+        .bind(identity)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into device_key_access(key_id,project_access) values($1,'all')")
+            .bind(key)
+            .execute(pool)
+            .await
+            .unwrap();
+        key
+    }
+    let mint = |identity: Uuid, key: Uuid, scopes: &[&str], generation: i64| {
+        token::mint_project_device(
+            &KEY,
+            &token::DeviceClaims {
+                identity,
+                key,
+                project,
+                session: Uuid::new_v4(),
+                scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                generation,
+            },
+            3600,
+        )
+        .unwrap()
+    };
+    let resolve = |bearer: String| {
+        let router = router.clone();
+        let body = json!({"format": CARRIER_FORMAT, "version": CARRIER_VERSION, "export_id": export_id, "tokens": []});
+        async move {
+            send(
+                &router,
+                auth_post(
+                    &format!("/documents/{doc}/export-tokens/resolve"),
+                    &bearer,
+                    &body,
+                ),
+            )
+            .await
+            .0
+        }
+    };
+
+    let owner_key = device(&pool, owner).await;
+    assert_eq!(
+        resolve(mint(owner, owner_key, &["history:read"], 0)).await,
+        StatusCode::OK
+    );
+    // The agent scope is refused here even for the owner's own key.
+    assert_eq!(
+        resolve(mint(owner, owner_key, &["content:read"], 0)).await,
+        StatusCode::FORBIDDEN
+    );
+    // A token from before a sign-out everywhere no longer works.
+    assert_eq!(
+        resolve(mint(owner, owner_key, &["history:read"], 7)).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // A key that is not in `all` mode and has no grant for the project.
+    sqlx::query("update device_key_access set project_access='granted' where key_id=$1")
+        .bind(owner_key)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolve(mint(owner, owner_key, &["history:read"], 0)).await,
+        StatusCode::FORBIDDEN
+    );
+
+    // A person with a reaching key but no access to the project's file.
+    let outsider = seed_identity(&pool, "device-outsider@example.com").await;
+    let outsider_key = device(&pool, outsider).await;
+    assert_eq!(
+        resolve(mint(outsider, outsider_key, &["history:read"], 0)).await,
+        StatusCode::FORBIDDEN
+    );
+}

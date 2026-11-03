@@ -718,16 +718,18 @@ async fn authenticate_reader(
         return Err(ApiError::Unauthorized);
     }
 
-    // 2. Project device session
+    // 2. Project device session: the same checks as the project-route extractor
+    // (`auth::device::ProjectAuth`), which cannot be used here because the path names
+    // a document, not a project. Person read scopes only: `content:read` belongs to
+    // AI-agent keys, whose reads go through the agent gateway and its project policy.
     if token::is_project_device_token(raw) {
         let claims = token::verify_project_device(&state.auth.paseto_key, raw)?;
-        let has_read_scope = claims
+        let scope = claims
             .scopes
             .iter()
-            .any(|s| s == "history:read" || s == "project:read" || s == "content:read");
-        if !has_read_scope {
-            return Err(ApiError::Forbidden);
-        }
+            .find(|s| *s == "history:read" || *s == "project:read")
+            .cloned()
+            .ok_or(ApiError::Forbidden)?;
 
         let doc_project: Option<Uuid> = sqlx::query_scalar("select document_project($1)")
             .bind(document_id)
@@ -737,22 +739,30 @@ async fn authenticate_reader(
             return Err(ApiError::Forbidden);
         }
 
-        let key_active: bool = sqlx::query_scalar(
-            "select exists(
-                 select 1 from identity i
-                 join device_signing_key k on k.identity_id = i.id
-                 where i.id = $1 and k.id = $2 and i.disabled_at is null and i.erased_at is null
-                   and not exists(select 1 from device_key_revocation r where r.key_id = k.id)
-             )",
-        )
+        // Read again on every request: a revoked key, a sign-out everywhere (new
+        // session generation) or a narrowed grant applies to the next call.
+        let current: Option<(i64, bool)> = sqlx::query_as(&format!(
+            "select i.session_generation,{} from identity i join device_signing_key k on k.identity_id=i.id where i.id=$1 and k.id=$2 and i.disabled_at is null and i.erased_at is null and not exists(select 1 from device_key_revocation r where r.key_id=k.id)",
+            crate::auth::device::key_reaches("$3", "$4::text[]")
+        ))
         .bind(claims.identity)
         .bind(claims.key)
-        .fetch_one(&mut *db)
+        .bind(claims.project)
+        .bind(vec![scope])
+        .fetch_optional(&mut *db)
         .await?;
-
-        if !key_active {
+        let Some((generation, reaches)) = current else {
+            return Err(ApiError::Unauthorized);
+        };
+        if generation != claims.generation {
             return Err(ApiError::Unauthorized);
         }
+        if !reaches {
+            return Err(ApiError::Forbidden);
+        }
+        // The person must still be able to read this file (membership or a file role
+        // can be removed while a token is live).
+        access::require_member(db, document_id, claims.identity).await?;
         return Ok(());
     }
 
