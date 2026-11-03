@@ -7,6 +7,7 @@
 use super::{Address, Commit, Error, FileEntry, SignedCommit};
 use engine_shared::{DocumentId, NodeId};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const DEFAULT_DIFF_LIMIT: usize = 50;
@@ -427,7 +428,27 @@ pub struct DocumentNodeDiffReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     pub more: bool,
-    pub limits: &'static str,
+    pub limits: Cow<'static, str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileCompareReport {
+    pub project: uuid::Uuid,
+    pub from: Address,
+    pub to: Address,
+    pub path: String,
+    pub kind: DiffKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_file: Option<FileEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_file: Option<FileEntry>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub document_replaced: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_diff: Option<DocumentNodeDiffReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub more: bool,
 }
 
 /// Bounded comparison of two materialized document states.
@@ -702,7 +723,7 @@ pub fn compare_nodes(
         changes: page_changes,
         next_cursor,
         more,
-        limits: "Annotation bodies and word-level attribution are outside this report; see docs/PRODUCT-SPEC.md.",
+        limits: "Annotation bodies and word-level attribution are outside this report; see docs/PRODUCT-SPEC.md.".into(),
     })
 }
 
