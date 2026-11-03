@@ -4,8 +4,13 @@
 
 Every open pull request by `happinessisreal` in `ArefinAlter/dynodoc-engine` (#39, #56, #59, #60, #62, #66, #74 to #82, #84 to #119)
 was reviewed and merged with `--no-ff` merge commits, contributor commits intact, review patches as separate commits. The private
-repository received the same crate, migration and OpenAPI changes. Dependabot #69 to #73 and the owner's own #83 were not part of this
-and stay open.
+repository received the same crate, migration and OpenAPI changes. Dependabot #69 to #73 were not part of this and stay open.
+The owner's security pull request #83 was reviewed and merged first, because its `mcp-boundary` check is required on `main`. Its
+review patch replaces four CLI tests that still expected write mode with one that proves the stock `engine-cli mcp` refuses write mode,
+from the flag and from `DYNODOC_WRITE=on|1`, before any key or network use. The private repository received the engine part of #83
+(MCP write gating, the `test-support` feature for the deterministic key provider, keystore and test cleanup, credential `.gitignore`
+rules with `/data/` anchored so `apps/desktop/client/src/data/` stays tracked); its paired pull request #9 (demo-service hardening, MSRV
+workflow) is still a draft and is not merged.
 
 **What landed.** Write-path robustness: no `unwrap`/`expect` outside tests in engine-core and engine-api (#62, gate in `lib.rs`,
 proofs in `PANIC-AUDIT.md`), poisoned-lock recovery for live subscriptions, explicit errors for unrepresentable event diffs (#59), an
