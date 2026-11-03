@@ -197,14 +197,14 @@ impl ObjectStore for MemoryStore {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry {
     key: String,
     address: Address,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StateRoots {
     nodes: Address,
@@ -224,7 +224,7 @@ impl StateRoots {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     content = "value",
@@ -426,6 +426,369 @@ impl<S: ObjectStore + Send> Writer<'_, S> {
         entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.key.cmp(&b.1.key)));
         self.map(&entries, 0).await
     }
+
+    async fn read_object(&mut self, address: &Address) -> Result<Object, Error> {
+        if self.budget.max_objects == 0 {
+            return Err(Error::Limit("objects"));
+        }
+        let bytes = self.store.get(self.document, address).await?;
+        self.budget.consume(bytes.len())?;
+        decode(address, &bytes)
+    }
+
+    async fn update_node(
+        &mut self,
+        current: Option<&Address>,
+        depth: usize,
+        prefix: &str,
+        edits: &[PreparedEdit],
+    ) -> Result<NodeOutcome, Error> {
+        if depth > 64 {
+            return Err(Error::Limit("radix depth"));
+        }
+
+        if let Some(curr_addr) = current {
+            let obj = self.read_object(curr_addr).await?;
+            match obj {
+                Object::MapLeaf(mut leaf) => {
+                    let original_leaf = leaf.clone();
+                    for edit in edits {
+                        match &edit.address {
+                            Some(new_addr) => {
+                                match leaf.binary_search_by(|e| e.key.as_str().cmp(&edit.key)) {
+                                    Ok(idx) => {
+                                        leaf[idx].address = new_addr.clone();
+                                    }
+                                    Err(idx) => {
+                                        leaf.insert(
+                                            idx,
+                                            Entry {
+                                                key: edit.key.clone(),
+                                                address: new_addr.clone(),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                if let Ok(idx) =
+                                    leaf.binary_search_by(|e| e.key.as_str().cmp(&edit.key))
+                                {
+                                    leaf.remove(idx);
+                                }
+                            }
+                        }
+                    }
+
+                    if leaf.len() <= LEAF_ENTRIES {
+                        if leaf.is_empty() {
+                            if depth == 0 {
+                                if original_leaf.is_empty() {
+                                    return Ok(NodeOutcome {
+                                        address: Some(curr_addr.clone()),
+                                        count: SubtreeCount::Exact(Vec::new()),
+                                    });
+                                }
+                                let addr = self.object(Object::MapLeaf(Vec::new())).await?;
+                                return Ok(NodeOutcome {
+                                    address: Some(addr),
+                                    count: SubtreeCount::Exact(Vec::new()),
+                                });
+                            }
+                            return Ok(NodeOutcome {
+                                address: None,
+                                count: SubtreeCount::Exact(Vec::new()),
+                            });
+                        }
+                        if leaf == original_leaf {
+                            return Ok(NodeOutcome {
+                                address: Some(curr_addr.clone()),
+                                count: SubtreeCount::Exact(leaf),
+                            });
+                        }
+                        let addr = self.object(Object::MapLeaf(leaf.clone())).await?;
+                        return Ok(NodeOutcome {
+                            address: Some(addr),
+                            count: SubtreeCount::Exact(leaf),
+                        });
+                    }
+
+                    // leaf.len() > LEAF_ENTRIES: leaf must split
+                    let mut routed: Vec<(String, Entry)> =
+                        leaf.into_iter().map(|e| (route(&e.key), e)).collect();
+                    routed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.key.cmp(&b.1.key)));
+                    let addr = self.map(&routed, depth).await?;
+                    Ok(NodeOutcome {
+                        address: Some(addr),
+                        count: SubtreeCount::Many,
+                    })
+                }
+                Object::MapBranch(mut children) => {
+                    let original_children = children.clone();
+                    let mut start = 0;
+                    let mut child_outcomes: BTreeMap<String, NodeOutcome> = BTreeMap::new();
+                    while start < edits.len() {
+                        let nibble = &edits[start].route[depth..depth + 1];
+                        let length = edits[start..]
+                            .partition_point(|e| &e.route[depth..depth + 1] == nibble);
+                        let slice = &edits[start..start + length];
+                        start += length;
+
+                        let child_curr = children.get(nibble);
+                        let outcome = Box::pin(self.update_node(
+                            child_curr,
+                            depth + 1,
+                            &format!("{prefix}{nibble}"),
+                            slice,
+                        ))
+                        .await?;
+                        child_outcomes.insert(nibble.to_owned(), outcome);
+                    }
+
+                    for (nibble, outcome) in &child_outcomes {
+                        match &outcome.address {
+                            Some(addr) => {
+                                children.insert(nibble.clone(), addr.clone());
+                            }
+                            None => {
+                                children.remove(nibble);
+                            }
+                        }
+                    }
+
+                    // Check for collapse
+                    if children.is_empty() {
+                        if depth == 0 {
+                            let addr = self.object(Object::MapLeaf(Vec::new())).await?;
+                            return Ok(NodeOutcome {
+                                address: Some(addr),
+                                count: SubtreeCount::Exact(Vec::new()),
+                            });
+                        }
+                        return Ok(NodeOutcome {
+                            address: None,
+                            count: SubtreeCount::Exact(Vec::new()),
+                        });
+                    }
+
+                    let mut can_collapse = true;
+                    let mut total_entries = Vec::new();
+
+                    for (nibble, child_addr) in &children {
+                        if let Some(outcome) = child_outcomes.get(nibble) {
+                            match &outcome.count {
+                                SubtreeCount::Exact(entries) => {
+                                    total_entries.extend(entries.iter().cloned());
+                                    if total_entries.len() > LEAF_ENTRIES {
+                                        can_collapse = false;
+                                        break;
+                                    }
+                                }
+                                SubtreeCount::Many => {
+                                    can_collapse = false;
+                                    break;
+                                }
+                            }
+                        } else {
+                            let child_obj = self.read_object(child_addr).await?;
+                            match child_obj {
+                                Object::MapLeaf(entries) => {
+                                    total_entries.extend(entries);
+                                    if total_entries.len() > LEAF_ENTRIES {
+                                        can_collapse = false;
+                                        break;
+                                    }
+                                }
+                                Object::MapBranch(_) => {
+                                    can_collapse = false;
+                                    break;
+                                }
+                                _ => return Err(Error::Invalid("expected map child")),
+                            }
+                        }
+                    }
+
+                    if can_collapse && total_entries.len() <= LEAF_ENTRIES {
+                        total_entries.sort_by(|a, b| a.key.cmp(&b.key));
+                        let addr = self.object(Object::MapLeaf(total_entries.clone())).await?;
+                        return Ok(NodeOutcome {
+                            address: Some(addr),
+                            count: SubtreeCount::Exact(total_entries),
+                        });
+                    }
+
+                    if children == original_children {
+                        return Ok(NodeOutcome {
+                            address: Some(curr_addr.clone()),
+                            count: SubtreeCount::Many,
+                        });
+                    }
+
+                    let addr = self.object(Object::MapBranch(children)).await?;
+                    Ok(NodeOutcome {
+                        address: Some(addr),
+                        count: SubtreeCount::Many,
+                    })
+                }
+                _ => Err(Error::Invalid("expected bounded map")),
+            }
+        } else {
+            // New subtree from edits
+            let insertions: Vec<Entry> = edits
+                .iter()
+                .filter_map(|e| {
+                    e.address.as_ref().map(|addr| Entry {
+                        key: e.key.clone(),
+                        address: addr.clone(),
+                    })
+                })
+                .collect();
+
+            if insertions.is_empty() {
+                return Ok(NodeOutcome {
+                    address: None,
+                    count: SubtreeCount::Exact(Vec::new()),
+                });
+            }
+
+            if insertions.len() <= LEAF_ENTRIES {
+                let mut leaf = insertions;
+                leaf.sort_by(|a, b| a.key.cmp(&b.key));
+                let addr = self.object(Object::MapLeaf(leaf.clone())).await?;
+                return Ok(NodeOutcome {
+                    address: Some(addr),
+                    count: SubtreeCount::Exact(leaf),
+                });
+            }
+
+            let mut routed: Vec<(String, Entry)> =
+                insertions.into_iter().map(|e| (route(&e.key), e)).collect();
+            routed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.key.cmp(&b.1.key)));
+            let addr = self.map(&routed, depth).await?;
+            Ok(NodeOutcome {
+                address: Some(addr),
+                count: SubtreeCount::Many,
+            })
+        }
+    }
+
+    pub async fn update_map(
+        &mut self,
+        base_root: &Address,
+        edits: impl IntoIterator<Item = (String, Option<Address>)>,
+    ) -> Result<Address, Error> {
+        let mut prepared: Vec<PreparedEdit> = edits
+            .into_iter()
+            .map(|(key, address)| {
+                let r = route(&key);
+                PreparedEdit {
+                    route: r,
+                    key,
+                    address,
+                }
+            })
+            .collect();
+        prepared.sort_by(|a, b| a.route.cmp(&b.route).then(a.key.cmp(&b.key)));
+        let mut deduped: Vec<PreparedEdit> = Vec::with_capacity(prepared.len());
+        for edit in prepared {
+            if let Some(last) = deduped.last_mut() {
+                if last.key == edit.key {
+                    *last = edit;
+                    continue;
+                }
+            }
+            deduped.push(edit);
+        }
+        if deduped.is_empty() {
+            let obj = self.read_object(base_root).await?;
+            match obj {
+                Object::MapLeaf(_) | Object::MapBranch(_) => return Ok(base_root.clone()),
+                _ => return Err(Error::Invalid("expected bounded map root")),
+            }
+        }
+        let outcome = self.update_node(Some(base_root), 0, "", &deduped).await?;
+        let root = outcome
+            .address
+            .unwrap_or_else(|| unreachable!("depth 0 must always return Some address"));
+        Ok(root)
+    }
+}
+
+enum SubtreeCount {
+    Exact(Vec<Entry>),
+    Many,
+}
+
+struct NodeOutcome {
+    address: Option<Address>,
+    count: SubtreeCount,
+}
+
+struct PreparedEdit {
+    route: String,
+    key: String,
+    address: Option<Address>,
+}
+
+/// Write a canonical radix map from entries, producing the full writer's canonical layout.
+pub async fn write_map<S: ObjectStore + Send>(
+    store: &mut S,
+    document: DocumentId,
+    entries: impl IntoIterator<Item = (String, Address)>,
+    limits: Limits,
+) -> Result<(Address, WriteStats), Error> {
+    let mut writer = Writer {
+        store,
+        document,
+        budget: limits,
+        stats: WriteStats::default(),
+        pending: Vec::new(),
+        pending_bytes: 0,
+    };
+    let routed: Vec<(String, Entry)> = entries
+        .into_iter()
+        .map(|(key, address)| (route(&key), Entry { key, address }))
+        .collect();
+    let root = writer.entries(routed).await?;
+    writer.flush().await?;
+    Ok((root, writer.stats))
+}
+
+/// Incrementally update an existing verified map root with insert, replace, and delete operations.
+/// Reuses unchanged child subtrees while strictly reproducing the canonical layout.
+pub async fn update_map<S: ObjectStore + Send>(
+    store: &mut S,
+    document: DocumentId,
+    base_root: &Address,
+    edits: impl IntoIterator<Item = (String, Option<Address>)>,
+    limits: Limits,
+) -> Result<(Address, WriteStats), Error> {
+    let mut writer = Writer {
+        store,
+        document,
+        budget: limits,
+        stats: WriteStats::default(),
+        pending: Vec::new(),
+        pending_bytes: 0,
+    };
+    let root = writer.update_map(base_root, edits).await?;
+    writer.flush().await?;
+    Ok((root, writer.stats))
+}
+
+/// Read all entries from a canonical radix map root into an in-memory map.
+pub async fn read_map<S: ObjectStore + Send>(
+    store: &mut S,
+    document: DocumentId,
+    root: &Address,
+    limits: Limits,
+) -> Result<BTreeMap<String, Address>, Error> {
+    let mut reader = Reader {
+        store,
+        document,
+        budget: limits,
+    };
+    reader.entries(root).await
 }
 
 /// Write a deterministic shared state graph. The store's caller controls atomic
@@ -1021,6 +1384,324 @@ mod tests {
         assert!(matches!(
             store.put(doc, &duplicate, &bytes).await,
             Err(Error::Invalid("map leaf order or size"))
+        ));
+    }
+
+    #[derive(Default)]
+    struct TrackingStore {
+        inner: MemoryStore,
+        gets: std::sync::atomic::AtomicUsize,
+        puts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ObjectStore for TrackingStore {
+        async fn put(
+            &mut self,
+            document: DocumentId,
+            address: &Address,
+            bytes: &[u8],
+        ) -> Result<bool, Error> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.put(document, address, bytes).await
+        }
+
+        async fn get(&mut self, document: DocumentId, address: &Address) -> Result<Vec<u8>, Error> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.get(document, address).await
+        }
+    }
+
+    struct SimpleRng(u64);
+    impl SimpleRng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            self.0
+        }
+        fn range(&mut self, max: usize) -> usize {
+            (self.next_u64() as usize) % max
+        }
+    }
+
+    #[tokio::test]
+    async fn randomized_incremental_updates_match_full_writer_exactly() {
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let mut store = MemoryStore::default();
+        let mut rng = SimpleRng(42);
+
+        let mut oracle: BTreeMap<String, Address> = BTreeMap::new();
+        let (mut current_root, _) = write_map(&mut store, doc, oracle.clone(), Limits::default())
+            .await
+            .unwrap();
+
+        for round in 0..100 {
+            let mut edits = Vec::new();
+            let num_edits = 1 + rng.range(10);
+            for _ in 0..num_edits {
+                let action = rng.range(3);
+                match action {
+                    0 | 1 => {
+                        // Insert or update
+                        let key = format!("key_{:04x}", rng.range(200));
+                        let val = Address(format!("{:064x}", rng.next_u64()));
+                        oracle.insert(key.clone(), val.clone());
+                        edits.push((key, Some(val)));
+                    }
+                    _ => {
+                        // Delete
+                        let key = if !oracle.is_empty() && (rng.range(10) < 7) {
+                            let keys: Vec<_> = oracle.keys().cloned().collect();
+                            keys[rng.range(keys.len())].clone()
+                        } else {
+                            format!("nonexistent_{:04x}", rng.range(50))
+                        };
+                        oracle.remove(&key);
+                        edits.push((key, None));
+                    }
+                }
+            }
+
+            let (updated_root, _) =
+                update_map(&mut store, doc, &current_root, edits, Limits::default())
+                    .await
+                    .unwrap();
+
+            let (expected_root, _) = write_map(&mut store, doc, oracle.clone(), Limits::default())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                updated_root, expected_root,
+                "round {round} mismatch between incremental and full writer"
+            );
+
+            let read_back = read_map(&mut store, doc, &updated_root, Limits::default())
+                .await
+                .unwrap();
+            assert_eq!(read_back, oracle, "round {round} oracle mismatch");
+
+            current_root = updated_root;
+        }
+    }
+
+    #[tokio::test]
+    async fn untouched_subtrees_are_reused_without_redundant_gets_or_puts() {
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let mut store = TrackingStore::default();
+
+        let mut initial_map = BTreeMap::new();
+        for i in 0..300 {
+            initial_map.insert(format!("node_{i:04}"), Address(format!("{i:064x}")));
+        }
+
+        let (root, _) = write_map(&mut store, doc, initial_map.clone(), Limits::default())
+            .await
+            .unwrap();
+
+        // Reset tracking counters
+        store.gets.store(0, std::sync::atomic::Ordering::Relaxed);
+        store.puts.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Edit a single key
+        let new_addr = Address("f".repeat(64));
+        let edits = vec![("node_0050".to_string(), Some(new_addr.clone()))];
+        let (new_root, stats) = update_map(&mut store, doc, &root, edits, Limits::default())
+            .await
+            .unwrap();
+
+        let gets = store.gets.load(std::sync::atomic::Ordering::Relaxed);
+        let puts = store.puts.load(std::sync::atomic::Ordering::Relaxed);
+
+        // 300 entries span around 10-15 leaves and multiple branch levels.
+        // Updating 1 key touches only the nodes along its root-to-leaf path.
+        assert!(gets < 5, "expected O(depth) gets, got {gets}");
+        assert!(puts < 5, "expected O(depth) puts, got {puts}");
+        assert!(stats.visited_objects < 5);
+
+        // Verify result matches full writer
+        initial_map.insert("node_0050".to_string(), new_addr);
+        let (expected_root, _) = write_map(&mut store, doc, initial_map, Limits::default())
+            .await
+            .unwrap();
+        assert_eq!(new_root, expected_root);
+    }
+
+    #[tokio::test]
+    async fn no_op_updates_produce_exact_same_root_without_creating_objects() {
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let mut store = MemoryStore::default();
+
+        let mut initial = BTreeMap::new();
+        for i in 0..50 {
+            initial.insert(format!("item_{i}"), Address(format!("{i:064x}")));
+        }
+        let (root, _) = write_map(&mut store, doc, initial.clone(), Limits::default())
+            .await
+            .unwrap();
+
+        // No-ops: update existing item with identical address, and delete nonexistent key
+        let no_ops = vec![
+            ("item_5".to_string(), Some(Address(format!("{:064x}", 5)))),
+            ("nonexistent".to_string(), None),
+        ];
+
+        let (same_root, stats) = update_map(&mut store, doc, &root, no_ops, Limits::default())
+            .await
+            .unwrap();
+
+        assert_eq!(same_root, root);
+        assert_eq!(stats.new_objects, 0);
+    }
+
+    #[tokio::test]
+    async fn leaf_split_and_branch_collapse_transitions() {
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let mut store = MemoryStore::default();
+
+        // 1. Build exactly 32 entries -> must be a MapLeaf
+        let mut map_32 = BTreeMap::new();
+        for i in 0..32 {
+            map_32.insert(format!("k_{i:02}"), Address(format!("{i:064x}")));
+        }
+        let (root_32, _) = write_map(&mut store, doc, map_32.clone(), Limits::default())
+            .await
+            .unwrap();
+        let obj = decode(&root_32, &store.get(doc, &root_32).await.unwrap()).unwrap();
+        assert!(
+            matches!(obj, Object::MapLeaf(_)),
+            "32 entries must be a MapLeaf"
+        );
+
+        // 2. Insert 1 more entry -> 33 entries -> must split into MapBranch
+        let (root_33, _) = update_map(
+            &mut store,
+            doc,
+            &root_32,
+            vec![("k_32".to_string(), Some(Address(format!("{:064x}", 32))))],
+            Limits::default(),
+        )
+        .await
+        .unwrap();
+        let obj = decode(&root_33, &store.get(doc, &root_33).await.unwrap()).unwrap();
+        assert!(
+            matches!(obj, Object::MapBranch(_)),
+            "33 entries must split into a MapBranch"
+        );
+
+        // 3. Delete 1 entry -> 32 entries -> must collapse back into MapLeaf
+        let (root_collapsed, _) = update_map(
+            &mut store,
+            doc,
+            &root_33,
+            vec![("k_32".to_string(), None)],
+            Limits::default(),
+        )
+        .await
+        .unwrap();
+        let obj = decode(
+            &root_collapsed,
+            &store.get(doc, &root_collapsed).await.unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(obj, Object::MapLeaf(_)),
+            "32 entries must collapse into a MapLeaf"
+        );
+        assert_eq!(
+            root_collapsed, root_32,
+            "collapsed root must match original 32-entry leaf"
+        );
+
+        // 4. Delete all remaining entries -> empty map
+        let all_deletes: Vec<_> = (0..32).map(|i| (format!("k_{i:02}"), None)).collect();
+        let (root_empty, _) = update_map(
+            &mut store,
+            doc,
+            &root_collapsed,
+            all_deletes,
+            Limits::default(),
+        )
+        .await
+        .unwrap();
+        let (expected_empty, _) = write_map(&mut store, doc, BTreeMap::new(), Limits::default())
+            .await
+            .unwrap();
+        assert_eq!(root_empty, expected_empty);
+    }
+
+    #[tokio::test]
+    async fn invalid_roots_and_budget_limits_fail_closed() {
+        let doc = DocumentId(uuid::Uuid::new_v4());
+        let mut store = MemoryStore::default();
+
+        // Nonexistent root
+        let missing = Address("e".repeat(64));
+        assert!(update_map(
+            &mut store,
+            doc,
+            &missing,
+            vec![("k".into(), Some(Address("1".repeat(64))))],
+            Limits::default(),
+        )
+        .await
+        .is_err());
+
+        // Corrupt object
+        store
+            .objects
+            .insert((doc.0, missing.clone()), b"corrupt".to_vec());
+        assert!(matches!(
+            update_map(
+                &mut store,
+                doc,
+                &missing,
+                vec![("k".into(), Some(Address("1".repeat(64))))],
+                Limits::default(),
+            )
+            .await,
+            Err(Error::HashMismatch)
+        ));
+
+        // Wrong object type (e.g. State root instead of map root)
+        let (leaf, leaf_bytes) = encode(Object::MapLeaf(vec![])).unwrap();
+        store.put(doc, &leaf, &leaf_bytes).await.unwrap();
+        let (state_root, state_bytes) = encode(Object::State(StateRoots {
+            nodes: leaf.clone(),
+            comments: leaf.clone(),
+            suggestions: leaf.clone(),
+            removed_choices: leaf.clone(),
+        }))
+        .unwrap();
+        store.put(doc, &state_root, &state_bytes).await.unwrap();
+
+        assert!(matches!(
+            update_map(
+                &mut store,
+                doc,
+                &state_root,
+                vec![("k".into(), Some(leaf.clone()))],
+                Limits::default(),
+            )
+            .await,
+            Err(Error::Invalid("expected bounded map"))
+        ));
+
+        // Budget exceeded
+        let (valid_root, _) = write_map(&mut store, doc, BTreeMap::new(), Limits::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            update_map(
+                &mut store,
+                doc,
+                &valid_root,
+                vec![("k".into(), Some(leaf))],
+                Limits {
+                    max_objects: 0,
+                    max_bytes: usize::MAX,
+                },
+            )
+            .await,
+            Err(Error::Limit("objects"))
         ));
     }
 
