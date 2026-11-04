@@ -102,9 +102,12 @@ The same check is available as `engine-cli repository DATABASE PROJECT archive-v
 
 ## Export and import
 
-`engine-cli repository DATABASE PROJECT archive-export HEAD --out FILE` opens the database
+`engine-cli repository DATABASE PROJECT archive-export HEAD [--since BASE] --out FILE` opens the database
 read-only and writes the dependency closure of `HEAD` (parents and recovery sources) and
-every object those commits reference. Other branches and staged objects outside that
+every object those commits reference. When `--since BASE` is provided, graph traversal stops at
+the base closure, emitting only newly added commits and referenced objects not present in the
+base closure. `HEAD` must be a direct or indirect descendant of `BASE` (or equal, yielding an
+empty delta archive). Other branches and staged objects outside that
 closure are not included. The archive does include every file of every commit in the
 closure, with commit messages and author keys: share it only with readers allowed to see
 that whole history. The output is a new owner-only file (an existing path is refused); it is

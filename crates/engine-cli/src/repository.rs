@@ -117,6 +117,9 @@ pub enum Action {
     ArchiveExport {
         /// Head commit address to export.
         head: String,
+        /// Optional base commit address for incremental export.
+        #[arg(long)]
+        since: Option<String>,
         /// File path for the output archive (refuses overwrite).
         #[arg(long)]
         out: PathBuf,
@@ -742,8 +745,9 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                         .await?;
                     serde_json::json!({"address":packet.key.address,"bytes":STANDARD.encode(packet.bytes)})
                 }
-                Action::ArchiveExport { head, out } => {
+                Action::ArchiveExport { head, since, out } => {
                     let head_addr = address(head)?;
+                    let since_addr = since.map(address).transpose()?;
                     anyhow::ensure!(
                         !out.exists(),
                         "output file {} already exists; refusing overwrite",
@@ -758,9 +762,10 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     let guard =
                         engine_core::repository::private_fs::AutoRemoveFile::new(out.clone());
 
-                    let summary = engine_core::repository::archive::export_archive(
+                    let summary = engine_core::repository::archive::export_archive_incremental(
                         &repo,
                         &head_addr,
+                        since_addr.as_ref(),
                         std::io::BufWriter::new(&mut file),
                         engine_core::repository::archive::ArchiveLimits::default(),
                     )
@@ -773,7 +778,7 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
 
                     guard.commit();
 
-                    serde_json::json!({
+                    let mut res = serde_json::json!({
                         "out": out.display().to_string(),
                         "head": summary.head,
                         "objects": summary.objects,
@@ -781,7 +786,11 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                         "bytes": summary.total_bytes,
                         "bytes_before_footer": summary.bytes_before_footer,
                         "sha256": summary.sha256,
-                    })
+                    });
+                    if let Some(since) = &summary.since {
+                        res["since"] = serde_json::json!(since);
+                    }
+                    res
                 }
                 Action::ExportFile {
                     commit,
@@ -2464,6 +2473,7 @@ mod tests {
             f.project,
             Action::ArchiveExport {
                 head: c2.as_str().to_string(),
+                since: None,
                 out: archive_path.clone(),
             },
         )
@@ -2529,6 +2539,7 @@ mod tests {
             f.project,
             Action::ArchiveExport {
                 head: c1.as_str().to_string(),
+                since: None,
                 out: archive_path.clone(),
             },
         )
@@ -2578,6 +2589,7 @@ mod tests {
             f.project,
             Action::ArchiveExport {
                 head: c1.as_str().to_string(),
+                since: None,
                 out: archive_path.clone(),
             },
         )
@@ -2630,6 +2642,7 @@ mod tests {
             f.project,
             Action::ArchiveExport {
                 head: c4.as_str().to_string(),
+                since: None,
                 out: archive_path.clone(),
             },
         )
@@ -2678,6 +2691,7 @@ mod tests {
             f1.project,
             Action::ArchiveExport {
                 head: c2.as_str().to_string(),
+                since: None,
                 out: archive_path.clone(),
             },
         )
@@ -2737,6 +2751,7 @@ mod tests {
             f1.project,
             Action::ArchiveExport {
                 head: c1.as_str().to_string(),
+                since: None,
                 out: archive_path.clone(),
             },
         )
@@ -2792,6 +2807,7 @@ mod tests {
             f1.project,
             Action::ArchiveExport {
                 head: c2.as_str().to_string(),
+                since: None,
                 out: archive_path.clone(),
             },
         )
@@ -2880,6 +2896,7 @@ mod tests {
             f1.project,
             Action::ArchiveExport {
                 head: c1.as_str().to_string(),
+                since: None,
                 out: archive_path.clone(),
             },
         )
@@ -2942,6 +2959,7 @@ mod tests {
             f1.project,
             Action::ArchiveExport {
                 head: c2.as_str().to_string(),
+                since: None,
                 out: archive_path.clone(),
             },
         )
@@ -3097,6 +3115,7 @@ mod tests {
             f.project,
             Action::ArchiveExport {
                 head: c4.as_str().to_string(),
+                since: None,
                 out: archive_path.clone(),
             },
         )
@@ -3142,6 +3161,7 @@ mod tests {
             f.project,
             Action::ArchiveExport {
                 head: c1.as_str().to_string(),
+                since: None,
                 out: archive_path.clone(),
             },
         )
@@ -3227,6 +3247,7 @@ mod tests {
             f.project,
             Action::ArchiveExport {
                 head: c1.as_str().to_string(),
+                since: None,
                 out: archive_altered.clone(),
             },
         )
@@ -3299,6 +3320,7 @@ mod tests {
             f.project,
             Action::ArchiveExport {
                 head: c1.as_str().to_string(),
+                since: None,
                 out: archive_appended.clone(),
             },
         )
@@ -3331,6 +3353,7 @@ mod tests {
             f.project,
             Action::ArchiveExport {
                 head: c1.as_str().to_string(),
+                since: None,
                 out: archive_trunc.clone(),
             },
         )
@@ -3823,6 +3846,7 @@ mod tests {
             f.project,
             Action::ArchiveExport {
                 head: head.as_str().to_string(),
+                since: None,
                 out: archive_path.clone(),
             },
         )
@@ -3899,6 +3923,7 @@ mod tests {
             f.project,
             Action::ArchiveExport {
                 head: c3.as_str().to_string(),
+                since: None,
                 out: archive_path.clone(),
             },
         )
@@ -3970,6 +3995,7 @@ mod tests {
             f.project,
             Action::ArchiveExport {
                 head: c2.as_str().to_string(),
+                since: None,
                 out: archive_fail_commit.clone(),
             },
         )
@@ -4019,6 +4045,7 @@ mod tests {
             f_b.project,
             Action::ArchiveExport {
                 head: cb1.as_str().to_string(),
+                since: None,
                 out: archive_fail_obj.clone(),
             },
         )
@@ -4073,6 +4100,7 @@ mod tests {
             f.project,
             Action::ArchiveExport {
                 head: c1.as_str().to_string(),
+                since: None,
                 out: archive_out.clone(),
             },
         )
@@ -4097,6 +4125,281 @@ mod tests {
         assert!(summary.objects >= 1);
 
         let _ = std::fs::remove_file(&archive_out);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_export_incremental_size_reduction_and_omitted_objects() {
+        use engine_core::repository::archive::{
+            verify_archive_stream, ArchiveEntry, ArchiveLimits, ArchiveReader,
+        };
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let doc2 = DocumentId(uuid::Uuid::new_v4());
+
+        // c1: Genesis with doc1 and doc2 (sizable payloads)
+        let large_doc2 = "Large doc2 content for archive base. ".repeat(200);
+        let f1_v1 = f.file(doc1, &[(0, "Doc 1 Genesis content")]).await;
+        let f2_v1 = f.file(doc2, &[(0, &large_doc2)]).await;
+        let c1 = f
+            .commit(
+                &[],
+                vec![("doc1.docx", f1_v1.clone()), ("doc2.docx", f2_v1.clone())],
+                "Genesis c1",
+            )
+            .await;
+
+        // c2: Edit doc1, keep doc2 untouched
+        let f1_v2 = f.file(doc1, &[(0, "Doc 1 Second version")]).await;
+        let c2 = f
+            .commit(
+                &[&c1],
+                vec![("doc1.docx", f1_v2.clone()), ("doc2.docx", f2_v1.clone())],
+                "Edit doc1 c2",
+            )
+            .await;
+
+        // c3: Edit doc1 again, keep doc2 untouched
+        let f1_v3 = f.file(doc1, &[(0, "Doc 1 Third version")]).await;
+        let c3 = f
+            .commit(
+                &[&c2],
+                vec![("doc1.docx", f1_v3.clone()), ("doc2.docx", f2_v1.clone())],
+                "Edit doc1 c3",
+            )
+            .await;
+
+        // 1. Full export of c3
+        let full_out = std::env::temp_dir().join(format!(
+            "test-archive-full-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&full_out);
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c3.as_str().to_string(),
+                since: None,
+                out: full_out.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let full_summary = verify_archive_stream(
+            std::fs::File::open(&full_out).unwrap(),
+            ArchiveLimits::default(),
+            Some(&c3),
+            Some(DocumentId(f.project)),
+        )
+        .unwrap();
+        assert_eq!(full_summary.commits, 3);
+        assert_eq!(full_summary.since, None);
+
+        // 2. Incremental export of c3 since c1
+        let incr_out = std::env::temp_dir().join(format!(
+            "test-archive-incr-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&incr_out);
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c3.as_str().to_string(),
+                since: Some(c1.as_str().to_string()),
+                out: incr_out.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let incr_summary = verify_archive_stream(
+            std::fs::File::open(&incr_out).unwrap(),
+            ArchiveLimits::default(),
+            Some(&c3),
+            Some(DocumentId(f.project)),
+        )
+        .unwrap();
+        assert_eq!(incr_summary.commits, 2); // c2 and c3 only
+        assert_eq!(incr_summary.since, Some(c1.clone()));
+
+        // Assert size reduction
+        let full_len = std::fs::metadata(&full_out).unwrap().len();
+        let incr_len = std::fs::metadata(&incr_out).unwrap().len();
+        assert!(
+            incr_len < full_len,
+            "incremental export ({incr_len} bytes) should be smaller than full export ({full_len} bytes)"
+        );
+
+        // Verify stream of incremental archive
+        let file = std::fs::File::open(&incr_out).unwrap();
+        let summary = verify_archive_stream(
+            file,
+            ArchiveLimits::default(),
+            Some(&c3),
+            Some(DocumentId(f.project)),
+        )
+        .unwrap();
+        assert_eq!(summary.head, c3);
+        assert_eq!(summary.since, Some(c1.clone()));
+        assert_eq!(summary.commits, 2);
+
+        // Inspect frame-by-frame: doc2 objects must NOT appear in incremental archive
+        let file2 = std::fs::File::open(&incr_out).unwrap();
+        let mut reader = ArchiveReader::new(file2, ArchiveLimits::default());
+        let mut seen_commits = Vec::new();
+        let mut seen_docs = std::collections::HashSet::new();
+
+        while let Some(entry) = reader.next_entry().unwrap() {
+            match entry {
+                ArchiveEntry::Header { since, .. } => {
+                    assert_eq!(since, Some(c1.clone()));
+                }
+                ArchiveEntry::Object { document, .. } => {
+                    seen_docs.insert(document);
+                }
+                ArchiveEntry::Commit { address, .. } => {
+                    seen_commits.push(address);
+                }
+                ArchiveEntry::Footer(s) => {
+                    assert_eq!(s.since, Some(c1.clone()));
+                }
+            }
+        }
+
+        assert_eq!(seen_commits, vec![c2, c3]);
+        assert!(
+            !seen_docs.contains(&doc2),
+            "doc2 objects are completely in base closure and must NOT be emitted"
+        );
+
+        let _ = std::fs::remove_file(&full_out);
+        let _ = std::fs::remove_file(&incr_out);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_export_incremental_empty_delta() {
+        use engine_core::repository::archive::{verify_archive_stream, ArchiveLimits};
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f.commit(&[], vec![("doc.docx", f1)], "Genesis").await;
+
+        let empty_out = std::env::temp_dir().join(format!(
+            "test-archive-empty-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&empty_out);
+
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                since: Some(c1.as_str().to_string()),
+                out: empty_out.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Verify stream
+        let file = std::fs::File::open(&empty_out).unwrap();
+        let summary = verify_archive_stream(
+            file,
+            ArchiveLimits::default(),
+            Some(&c1),
+            Some(DocumentId(f.project)),
+        )
+        .unwrap();
+        assert_eq!(summary.commits, 0);
+        assert_eq!(summary.objects, 0);
+        assert_eq!(summary.head, c1);
+        assert_eq!(summary.since, Some(c1));
+
+        let _ = std::fs::remove_file(&empty_out);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_export_incremental_disjoint_and_missing_since_fail_closed() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+
+        // Forking branches: c1 -> c2_a (branch A) and c1 -> c2_b (branch B)
+        let f1 = f.file(doc1, &[(0, "Base")]).await;
+        let c1 = f.commit(&[], vec![("doc.docx", f1)], "Genesis").await;
+
+        let f2_a = f.file(doc1, &[(0, "Branch A")]).await;
+        let c2_a = f.commit(&[&c1], vec![("doc.docx", f2_a)], "Branch A").await;
+
+        let f2_b = f.file(doc1, &[(0, "Branch B")]).await;
+        let c2_b = f.commit(&[&c1], vec![("doc.docx", f2_b)], "Branch B").await;
+
+        // 1. Disjoint ancestry: c2_b is NOT a descendant of c2_a
+        let disjoint_out = std::env::temp_dir().join(format!(
+            "test-archive-disjoint-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&disjoint_out);
+
+        let err1 = run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c2_b.as_str().to_string(),
+                since: Some(c2_a.as_str().to_string()),
+                out: disjoint_out.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let err1_msg = format!("{err1:#}");
+        assert!(
+            err1_msg.contains("head is not a descendant of since"),
+            "unexpected error message: {err1_msg}"
+        );
+        assert!(
+            !disjoint_out.exists(),
+            "incomplete output file must be removed on failure"
+        );
+
+        // 2. Missing since commit
+        let missing_out = std::env::temp_dir().join(format!(
+            "test-archive-missing-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&missing_out);
+
+        let fake_since = "9999999999999999999999999999999999999999999999999999999999999999";
+        let err2 = run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                since: Some(fake_since.to_string()),
+                out: missing_out.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let err2_msg = format!("{err2:#}");
+        assert!(
+            err2_msg.contains("since commit missing"),
+            "unexpected error message: {err2_msg}"
+        );
+        assert!(
+            !missing_out.exists(),
+            "incomplete output file must be removed on failure"
+        );
+
         f.finish().await;
     }
 
