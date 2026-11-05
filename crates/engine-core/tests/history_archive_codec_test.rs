@@ -113,10 +113,12 @@ async fn roundtrip_single_commit_archive() {
             version,
             project: p,
             head: h,
+            since,
         }) => {
             assert_eq!(version, 1);
             assert_eq!(p, project);
             assert_eq!(h, head);
+            assert_eq!(since, None);
         }
         other => panic!("expected header, got {other:?}"),
     }
@@ -560,4 +562,186 @@ async fn writer_enforces_max_commits_and_objects_and_frame_limits() {
         .write_object(doc_id, obj_addr, &obj_bytes)
         .unwrap_err();
     assert!(matches!(err_frame, ArchiveError::Limit(_)));
+}
+
+#[tokio::test]
+async fn incremental_archive_writer_reader_roundtrip() {
+    let project = DocumentId(uuid::Uuid::new_v4());
+    let key = generate_key();
+
+    let genesis = create_genesis_commit(project, &key);
+    let genesis_addr = genesis.verify().unwrap();
+
+    let child = create_child_commit(project, genesis_addr.clone(), &key, 2);
+    let child_addr = child.verify().unwrap();
+
+    let (doc_id, obj_addr, obj_bytes) = create_sample_object().await;
+
+    let mut buf = Vec::new();
+    let mut writer = ArchiveWriter::new(&mut buf).unwrap();
+    writer
+        .write_header_with_since(1, project, child_addr.clone(), Some(genesis_addr.clone()))
+        .unwrap();
+    writer
+        .write_object(doc_id, obj_addr.clone(), &obj_bytes)
+        .unwrap();
+    // Child commit depends on genesis_addr (which is `since`). Should succeed!
+    let written_commit = writer.write_commit(&child).unwrap();
+    assert_eq!(written_commit, child_addr);
+    let summary = writer.finish().unwrap();
+
+    assert_eq!(summary.head, child_addr);
+    assert_eq!(summary.since, Some(genesis_addr.clone()));
+    assert_eq!(summary.commits, 1);
+    assert_eq!(summary.objects, 1);
+
+    // Read back and verify
+    let mut reader = ArchiveReader::new(Cursor::new(&buf), ArchiveLimits::default());
+    match reader.next_entry().unwrap() {
+        Some(ArchiveEntry::Header {
+            version,
+            project: p,
+            head: h,
+            since,
+        }) => {
+            assert_eq!(version, 1);
+            assert_eq!(p, project);
+            assert_eq!(h, child_addr);
+            assert_eq!(since, Some(genesis_addr.clone()));
+        }
+        other => panic!("expected header, got {other:?}"),
+    }
+
+    match reader.next_entry().unwrap() {
+        Some(ArchiveEntry::Object {
+            document,
+            address,
+            bytes,
+        }) => {
+            assert_eq!(document, doc_id);
+            assert_eq!(address, obj_addr);
+            assert_eq!(bytes, obj_bytes);
+        }
+        other => panic!("expected object, got {other:?}"),
+    }
+
+    match reader.next_entry().unwrap() {
+        Some(ArchiveEntry::Commit {
+            address, signed, ..
+        }) => {
+            assert_eq!(address, child_addr);
+            assert_eq!(signed.verify().unwrap(), child_addr);
+        }
+        other => panic!("expected commit, got {other:?}"),
+    }
+
+    match reader.next_entry().unwrap() {
+        Some(ArchiveEntry::Footer(s)) => {
+            assert_eq!(s, summary);
+            assert_eq!(s.since, Some(genesis_addr.clone()));
+        }
+        other => panic!("expected footer, got {other:?}"),
+    }
+
+    assert!(reader.next_entry().unwrap().is_none());
+
+    // Stream verification
+    let verified = verify_archive_stream(
+        Cursor::new(&buf),
+        ArchiveLimits::default(),
+        Some(&child_addr),
+        Some(project),
+    )
+    .unwrap();
+    assert_eq!(verified.since, Some(genesis_addr));
+}
+
+#[tokio::test]
+async fn incremental_archive_empty_delta_writer_reader_roundtrip() {
+    let project = DocumentId(uuid::Uuid::new_v4());
+    let key = generate_key();
+    let genesis = create_genesis_commit(project, &key);
+    let head = genesis.verify().unwrap();
+
+    let mut buf = Vec::new();
+    let mut writer = ArchiveWriter::new(&mut buf).unwrap();
+    writer
+        .write_header_with_since(1, project, head.clone(), Some(head.clone()))
+        .unwrap();
+    // 0 objects, 0 commits
+    let summary = writer.finish().unwrap();
+
+    assert_eq!(summary.head, head);
+    assert_eq!(summary.since, Some(head.clone()));
+    assert_eq!(summary.commits, 0);
+    assert_eq!(summary.objects, 0);
+
+    // Read back
+    let mut reader = ArchiveReader::new(Cursor::new(&buf), ArchiveLimits::default());
+    match reader.next_entry().unwrap() {
+        Some(ArchiveEntry::Header {
+            version,
+            project: p,
+            head: h,
+            since,
+        }) => {
+            assert_eq!(version, 1);
+            assert_eq!(p, project);
+            assert_eq!(h, head);
+            assert_eq!(since, Some(head.clone()));
+        }
+        other => panic!("expected header, got {other:?}"),
+    }
+
+    match reader.next_entry().unwrap() {
+        Some(ArchiveEntry::Footer(s)) => {
+            assert_eq!(s, summary);
+            assert_eq!(s.commits, 0);
+            assert_eq!(s.objects, 0);
+            assert_eq!(s.since, Some(head.clone()));
+        }
+        other => panic!("expected footer, got {other:?}"),
+    }
+
+    assert!(reader.next_entry().unwrap().is_none());
+
+    // Stream verification
+    let verified = verify_archive_stream(
+        Cursor::new(&buf),
+        ArchiveLimits::default(),
+        Some(&head),
+        Some(project),
+    )
+    .unwrap();
+    assert_eq!(verified.commits, 0);
+    assert_eq!(verified.objects, 0);
+    assert_eq!(verified.since, Some(head));
+}
+
+#[tokio::test]
+async fn incremental_archive_disjoint_dependency_rejected() {
+    let project = DocumentId(uuid::Uuid::new_v4());
+    let key = generate_key();
+
+    let genesis = create_genesis_commit(project, &key);
+    let genesis_addr = genesis.verify().unwrap();
+
+    let child = create_child_commit(project, genesis_addr.clone(), &key, 2);
+    let child_addr = child.verify().unwrap();
+
+    // Base declared as some OTHER commit
+    let other_base = Address::try_from(
+        "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+    )
+    .unwrap();
+
+    let mut buf = Vec::new();
+    let mut writer = ArchiveWriter::new(&mut buf).unwrap();
+    writer
+        .write_header_with_since(1, project, child_addr.clone(), Some(other_base))
+        .unwrap();
+
+    // child depends on genesis_addr, which is neither in seen_commits nor is it `since`
+    let err = writer.write_commit(&child).unwrap_err();
+    assert!(matches!(err, ArchiveError::MissingDependency(_, _)));
 }

@@ -86,6 +86,8 @@ pub enum Frame {
         version: u32,
         project: DocumentId,
         head: Address,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<Address>,
     },
     Object {
         document: DocumentId,
@@ -114,6 +116,8 @@ pub struct ArchiveSummary {
     pub sha256: String,
     pub head: Address,
     pub project: DocumentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<Address>,
 }
 
 /// An entry yielded by [`ArchiveReader`].
@@ -123,6 +127,7 @@ pub enum ArchiveEntry {
         version: u32,
         project: DocumentId,
         head: Address,
+        since: Option<Address>,
     },
     Object {
         document: DocumentId,
@@ -176,7 +181,7 @@ pub struct ArchiveWriter<W: Write> {
     objects_count: u64,
     commits_count: u64,
     stage: WriterStage,
-    header_info: Option<(DocumentId, Address)>,
+    header_info: Option<(DocumentId, Address, Option<Address>)>,
     seen_objects: HashSet<(DocumentId, Address)>,
     seen_commits: HashSet<Address>,
     last_commit: Option<Address>,
@@ -218,6 +223,16 @@ impl<W: Write> ArchiveWriter<W> {
         project: DocumentId,
         head: Address,
     ) -> Result<(), ArchiveError> {
+        self.write_header_with_since(version, project, head, None)
+    }
+
+    pub fn write_header_with_since(
+        &mut self,
+        version: u32,
+        project: DocumentId,
+        head: Address,
+        since: Option<Address>,
+    ) -> Result<(), ArchiveError> {
         if self.stage != WriterStage::ExpectHeader {
             return Err(ArchiveError::OrderViolation("header must be written first"));
         }
@@ -228,9 +243,13 @@ impl<W: Write> ArchiveWriter<W> {
             version,
             project,
             head: head.clone(),
+            since: since.clone(),
         };
         self.write_frame(&frame)?;
-        self.header_info = Some((project, head));
+        self.header_info = Some((project, head, since.clone()));
+        if let Some(s) = since {
+            self.seen_commits.insert(s);
+        }
         self.stage = WriterStage::WritingObjectsOrCommits;
         Ok(())
     }
@@ -279,7 +298,7 @@ impl<W: Write> ArchiveWriter<W> {
         let address = signed
             .verify()
             .map_err(|_| ArchiveError::InvalidFrame("commit signature verification failed"))?;
-        if let Some((proj, _)) = self.header_info {
+        if let Some((proj, _, _)) = self.header_info {
             if signed.commit.project != proj.0 {
                 return Err(ArchiveError::InvalidFrame(
                     "commit project mismatch with archive header",
@@ -311,19 +330,23 @@ impl<W: Write> ArchiveWriter<W> {
     }
 
     pub fn finish(mut self) -> Result<ArchiveSummary, ArchiveError> {
-        if self.stage != WriterStage::WritingCommits {
-            return Err(ArchiveError::OrderViolation(
-                "archive must contain at least one commit",
-            ));
-        }
-        let (project, head) = self
+        let (project, head, since) = self
             .header_info
             .clone()
             .ok_or(ArchiveError::OrderViolation("missing header"))?;
-        if self.last_commit.as_ref() != Some(&head) {
-            return Err(ArchiveError::InvalidFrame(
-                "last commit does not match header head",
-            ));
+        let is_empty_delta =
+            since.as_ref() == Some(&head) && self.commits_count == 0 && self.objects_count == 0;
+        if !is_empty_delta {
+            if self.stage != WriterStage::WritingCommits {
+                return Err(ArchiveError::OrderViolation(
+                    "archive must contain at least one commit",
+                ));
+            }
+            if self.last_commit.as_ref() != Some(&head) {
+                return Err(ArchiveError::InvalidFrame(
+                    "last commit does not match header head",
+                ));
+            }
         }
 
         let bytes_before_footer = self.bytes_written;
@@ -362,6 +385,7 @@ impl<W: Write> ArchiveWriter<W> {
             sha256: digest_hex,
             head,
             project,
+            since,
         })
     }
 
@@ -405,7 +429,7 @@ pub struct ArchiveReader<R: Read> {
     objects_count: u64,
     commits_count: u64,
     stage: ReaderStage,
-    header_info: Option<(DocumentId, Address)>,
+    header_info: Option<(DocumentId, Address, Option<Address>)>,
     seen_objects: HashSet<(DocumentId, Address)>,
     seen_commits: HashSet<Address>,
     last_commit: Option<Address>,
@@ -466,6 +490,7 @@ impl<R: Read> ArchiveReader<R> {
                 version,
                 project,
                 head,
+                since,
             } => {
                 if self.stage != ReaderStage::ExpectHeader {
                     return Err(ArchiveError::OrderViolation("header frame must be first"));
@@ -475,12 +500,16 @@ impl<R: Read> ArchiveReader<R> {
                 }
                 self.hasher.update(&frame_len_bytes);
                 self.hasher.update(&payload_bytes);
-                self.header_info = Some((project, head.clone()));
+                self.header_info = Some((project, head.clone(), since.clone()));
+                if let Some(s) = &since {
+                    self.seen_commits.insert(s.clone());
+                }
                 self.stage = ReaderStage::ReadingObjectsOrCommits;
                 Ok(Some(ArchiveEntry::Header {
                     version,
                     project,
                     head,
+                    since,
                 }))
             }
             Frame::Object {
@@ -532,7 +561,7 @@ impl<R: Read> ArchiveReader<R> {
                 if verified_addr != address {
                     return Err(ArchiveError::InvalidFrame("commit address mismatch"));
                 }
-                if let Some((proj, _)) = self.header_info {
+                if let Some((proj, _, _)) = self.header_info {
                     if signed.commit.project != proj.0 {
                         return Err(ArchiveError::InvalidFrame(
                             "commit project mismatch with archive header",
@@ -567,21 +596,31 @@ impl<R: Read> ArchiveReader<R> {
                 bytes_before_footer,
                 sha256: expected_hash,
             } => {
-                if self.stage != ReaderStage::ReadingCommits {
-                    return Err(ArchiveError::OrderViolation(
-                        "footer requires at least one commit and must be the final frame",
-                    ));
-                }
-                let (project, head) = self
+                let (project, head, since) = self
                     .header_info
                     .clone()
                     .ok_or(ArchiveError::OrderViolation("missing header"))?;
 
-                if self.last_commit.as_ref() != Some(&head) {
-                    return Err(ArchiveError::InvalidFrame(
-                        "last commit does not match header head",
+                let is_empty_delta = since.as_ref() == Some(&head)
+                    && self.commits_count == 0
+                    && self.objects_count == 0;
+                if !is_empty_delta {
+                    if self.stage != ReaderStage::ReadingCommits {
+                        return Err(ArchiveError::OrderViolation(
+                            "footer requires at least one commit and must be the final frame",
+                        ));
+                    }
+                    if self.last_commit.as_ref() != Some(&head) {
+                        return Err(ArchiveError::InvalidFrame(
+                            "last commit does not match header head",
+                        ));
+                    }
+                } else if self.stage != ReaderStage::ReadingObjectsOrCommits {
+                    return Err(ArchiveError::OrderViolation(
+                        "footer must be the final frame",
                     ));
                 }
+
                 if objects != self.objects_count {
                     return Err(ArchiveError::FooterMismatch("object count mismatch"));
                 }
@@ -612,6 +651,7 @@ impl<R: Read> ArchiveReader<R> {
                     sha256: actual_hash,
                     head,
                     project,
+                    since,
                 };
                 Ok(Some(ArchiveEntry::Footer(summary)))
             }
@@ -668,6 +708,11 @@ impl<R: Read> ArchiveReader<R> {
 }
 
 /// Verify an archive stream offline against an expected head and limits without buffering.
+///
+/// For an incremental archive (`summary.since` is `Some`) this checks only the frames the
+/// archive contains: the base and its history are absent, and the header's `since` is a
+/// claim. Callers must not present such a result as a verified complete history; the
+/// staged verifier ([`verify_archive`]) refuses incremental archives without a repository.
 pub fn verify_archive_stream<R: Read>(
     reader: R,
     limits: ArchiveLimits,
@@ -708,7 +753,131 @@ pub async fn export_archive<W: Write>(
     writer: W,
     limits: ArchiveLimits,
 ) -> Result<ArchiveSummary, ArchiveError> {
-    // 1. Dependency-first iterative traversal with explicit visiting / done states
+    export_archive_incremental(repo, head, None, writer, limits).await
+}
+
+/// Export incremental history closure from `head` stopping at `since`.
+///
+/// When `since` is `Some(base)`, traverses commits from `head` and stops graph traversal
+/// at any commit in the base closure. Streams only newly added commits and referenced objects
+/// not present in the base closure. Enforces that `head` is a direct or indirect descendant
+/// of `since`; fails closed with an error if disjoint. If `head == since`, streams an empty
+/// delta archive with 0 commits and 0 objects.
+pub async fn export_archive_incremental<W: Write>(
+    repo: &LocalRepository,
+    head: &Address,
+    since: Option<&Address>,
+    writer: W,
+    limits: ArchiveLimits,
+) -> Result<ArchiveSummary, ArchiveError> {
+    // 0. Base validation & closure computation if since is specified
+    let (base_commits, base_objects) = if let Some(since_addr) = since {
+        let signed_since = repo
+            .commit(since_addr)
+            .await
+            .map_err(|_| ArchiveError::InvalidFrame("since commit missing from repository"))?;
+        let verified_since = signed_since.verify().map_err(|_| {
+            ArchiveError::InvalidFrame("since commit signature verification failed")
+        })?;
+        if verified_since != *since_addr {
+            return Err(ArchiveError::InvalidFrame("since commit address mismatch"));
+        }
+        if signed_since.commit.project != repo.project() {
+            return Err(ArchiveError::InvalidFrame(
+                "since commit project mismatch with repository project",
+            ));
+        }
+
+        // Empty delta case: head == since
+        if head == since_addr {
+            let mut writer = ArchiveWriter::with_limits(writer, limits)?;
+            writer.write_header_with_since(
+                ARCHIVE_VERSION_1,
+                DocumentId(repo.project()),
+                head.clone(),
+                Some(since_addr.clone()),
+            )?;
+            return writer.finish();
+        }
+
+        // Collect all commits in the since closure
+        let mut b_commits = HashSet::new();
+        let mut b_stack = vec![since_addr.clone()];
+        let mut b_file_roots: HashMap<DocumentId, BTreeSet<Address>> = HashMap::new();
+
+        while let Some(addr) = b_stack.pop() {
+            if !b_commits.insert(addr.clone()) {
+                continue;
+            }
+            if b_commits.len() > limits.max_commits {
+                return Err(ArchiveError::Limit("exceeded maximum commit limit"));
+            }
+            let signed = repo.commit(&addr).await.map_err(|_| {
+                ArchiveError::InvalidFrame("commit in since dependency closure missing")
+            })?;
+            for file_entry in signed.commit.files.values() {
+                b_file_roots
+                    .entry(file_entry.document)
+                    .or_default()
+                    .insert(file_entry.state.clone());
+            }
+            for dep in signed.commit.dependencies() {
+                if !b_commits.contains(&dep) {
+                    b_stack.push(dep);
+                }
+            }
+        }
+
+        // Collect all objects in the since closure
+        let mut b_objects: HashSet<(DocumentId, Address)> = HashSet::new();
+        let mut sorted_b_docs: Vec<_> = b_file_roots.into_iter().collect();
+        sorted_b_docs.sort_by_key(|(doc, _)| doc.0);
+
+        for (doc_id, roots) in sorted_b_docs {
+            for root in roots {
+                let mut queue = VecDeque::new();
+                if b_objects.insert((doc_id, root.clone())) {
+                    if b_objects.len() > limits.max_objects {
+                        return Err(ArchiveError::Limit("exceeded maximum object count"));
+                    }
+                    queue.push_back(root);
+                }
+                while let Some(addr) = queue.pop_front() {
+                    let packet = repo
+                        .object(&ObjectKey {
+                            document: doc_id,
+                            address: addr.clone(),
+                        })
+                        .await
+                        .map_err(|_| {
+                            ArchiveError::InvalidFrame("object in graph missing or corrupt")
+                        })?;
+                    crate::shared_checkpoint::validate_stored(&addr, &packet.bytes).map_err(
+                        |_| ArchiveError::InvalidFrame("object hash mismatch or invalid"),
+                    )?;
+                    let mut children = crate::shared_checkpoint::references(&addr, &packet.bytes)
+                        .map_err(|_| {
+                        ArchiveError::InvalidFrame("malformed object references")
+                    })?;
+                    children.sort();
+                    for child in children {
+                        if b_objects.insert((doc_id, child.clone())) {
+                            if b_objects.len() > limits.max_objects {
+                                return Err(ArchiveError::Limit("exceeded maximum object count"));
+                            }
+                            queue.push_back(child);
+                        }
+                    }
+                }
+            }
+        }
+
+        (b_commits, b_objects)
+    } else {
+        (HashSet::new(), HashSet::new())
+    };
+
+    // 1. Dependency-first iterative traversal from head, stopping at any commit in base_commits
     enum Step {
         Expand(Address),
         Emit(Address),
@@ -719,10 +888,20 @@ pub async fn export_archive<W: Write>(
     let mut done = HashSet::new();
     let mut ordered_commits = Vec::new();
     let mut file_roots: HashMap<DocumentId, BTreeSet<Address>> = HashMap::new();
+    let mut since_encountered = false;
 
     while let Some(step) = stack.pop() {
         match step {
             Step::Expand(addr) => {
+                if let Some(since_addr) = since {
+                    if addr == *since_addr {
+                        since_encountered = true;
+                        continue;
+                    }
+                }
+                if base_commits.contains(&addr) {
+                    continue;
+                }
                 if done.contains(&addr) {
                     continue;
                 }
@@ -762,7 +941,12 @@ pub async fn export_archive<W: Write>(
                 let mut deps = signed.commit.dependencies();
                 deps.sort();
                 for dep in deps.into_iter().rev() {
-                    if !done.contains(&dep) {
+                    if let Some(since_addr) = since {
+                        if dep == *since_addr {
+                            since_encountered = true;
+                        }
+                    }
+                    if !base_commits.contains(&dep) && !done.contains(&dep) {
                         stack.push(Step::Expand(dep));
                     }
                 }
@@ -776,8 +960,13 @@ pub async fn export_archive<W: Write>(
         }
     }
 
-    // 2. Collect scoped object keys using bounded iterative reference walks.
-    // Retain only bounded (DocumentId, Address) keys, not object payloads.
+    if since.is_some() && !since_encountered {
+        return Err(ArchiveError::InvalidFrame(
+            "head is not a descendant of since",
+        ));
+    }
+
+    // 2. Collect scoped object keys not present in base_objects
     let mut visited_objects: HashSet<(DocumentId, Address)> = HashSet::new();
     let mut scoped_object_keys: Vec<(DocumentId, Address)> = Vec::new();
 
@@ -786,6 +975,9 @@ pub async fn export_archive<W: Write>(
 
     for (doc_id, roots) in sorted_docs {
         for root in roots {
+            if base_objects.contains(&(doc_id, root.clone())) {
+                continue;
+            }
             let mut queue = VecDeque::new();
             if visited_objects.insert((doc_id, root.clone())) {
                 if visited_objects.len() > limits.max_objects {
@@ -814,6 +1006,9 @@ pub async fn export_archive<W: Write>(
                 children.sort();
 
                 for child in children {
+                    if base_objects.contains(&(doc_id, child.clone())) {
+                        continue;
+                    }
                     if visited_objects.insert((doc_id, child.clone())) {
                         if visited_objects.len() > limits.max_objects {
                             return Err(ArchiveError::Limit("exceeded maximum object count"));
@@ -829,7 +1024,16 @@ pub async fn export_archive<W: Write>(
     // 3. Stream out frames via ArchiveWriter with limits.
     // Read and validate one payload at a time when emitting frames.
     let mut writer = ArchiveWriter::with_limits(writer, limits)?;
-    writer.write_header(ARCHIVE_VERSION_1, DocumentId(repo.project()), head.clone())?;
+    if let Some(since_addr) = since {
+        writer.write_header_with_since(
+            ARCHIVE_VERSION_1,
+            DocumentId(repo.project()),
+            head.clone(),
+            Some(since_addr.clone()),
+        )?;
+    } else {
+        writer.write_header(ARCHIVE_VERSION_1, DocumentId(repo.project()), head.clone())?;
+    }
 
     for (doc_id, addr) in scoped_object_keys {
         let packet = repo
@@ -985,6 +1189,7 @@ pub async fn validate_and_stage_archive_in<R: Read>(
                 version: _,
                 project,
                 head,
+                ..
             } => {
                 if let Some(exp_proj) = expected_project {
                     if project != exp_proj {
@@ -1046,6 +1251,12 @@ pub async fn validate_and_stage_archive_in<R: Read>(
     }
 
     let summary = footer_summary.ok_or(ArchiveError::UnexpectedEof)?;
+
+    if summary.since.is_some() {
+        return Err(ArchiveError::InvalidFrame(
+            "staged validation of incremental archive requires target repository",
+        ));
+    }
 
     if let Some(exp_head) = expected_head {
         if &summary.head != exp_head {

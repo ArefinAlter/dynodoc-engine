@@ -352,6 +352,40 @@ paths:
               schema: {}
       security:
       - connector_key: []
+  /connector/documents/{id}/changes:
+    get:
+      tags: []
+      operationId: connector_changes
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: since_seq
+        in: query
+        description: Revision the client holds
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: since_chain_hash
+        in: query
+        description: Chain hash of that revision as the client holds it
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Only the blocks changed after since_seq, at the current head
+          content:
+            application/json:
+              schema: {}
+        '409':
+          description: The client's base is not this history
+      security:
+      - connector_key: []
   /connector/documents/{id}/checkpoint:
     get:
       tags: []
@@ -378,6 +412,171 @@ paths:
               schema: {}
         '400':
           description: Revision outside history
+      security:
+      - connector_key: []
+  /connector/documents/{id}/media:
+    post:
+      tags: []
+      operationId: connector_media_put
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/octet-stream:
+            schema:
+              type: array
+              items:
+                type: integer
+                format: int32
+                minimum: 0
+        required: true
+      responses:
+        '200':
+          description: Stored once per document by SHA-256
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Unsupported type, mismatched bytes, too large, or the document's image quota is used up
+      security:
+      - connector_key: []
+  /connector/documents/{id}/media/missing:
+    post:
+      tags: []
+      operationId: connector_media_missing
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MissingInput'
+        required: true
+      responses:
+        '200':
+          description: The hashes this document does not store yet
+          content:
+            application/json:
+              schema: {}
+      security:
+      - connector_key: []
+  /connector/documents/{id}/media/{sha}:
+    get:
+      tags: []
+      operationId: connector_media_get
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: sha
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Image bytes as an attachment; the type is in x-dynodoc-media-type
+      security:
+      - connector_key: []
+  /connector/documents/{id}/nodes/{node}/history:
+    get:
+      tags: []
+      operationId: connector_node_history
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: node
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: 'Newest first: each event of the block with who appended it and, for merged change requests, the contributor and message'
+          content:
+            application/json:
+              schema: {}
+      security:
+      - connector_key: []
+  /connector/documents/{id}/requests/{draft}/merge:
+    post:
+      tags: []
+      operationId: connector_merge
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: draft
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectorMergeInput'
+        required: true
+      responses:
+        '200':
+          description: Merged through the same human-only rules as the web review
+        '403':
+          description: Not your request or not permitted
+        '409':
+          description: 'Overlapping team changes: resolve them in the review screens'
+      security:
+      - connector_key: []
+  /connector/documents/{id}/requests/{draft}/withdraw:
+    post:
+      tags: []
+      operationId: connector_withdraw
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: draft
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectorMergeInput'
+        required: true
+      responses:
+        '200':
+          description: The person's own connector request is closed as withdrawn and kept as history
+        '403':
+          description: Not your connector request
+        '409':
+          description: Already closed
       security:
       - connector_key: []
   /copies/{match_id}:
@@ -7490,6 +7689,12 @@ components:
           items:
             $ref: '#/components/schemas/ConflictOption'
           description: The competing proposals (≥2, each a distinct value).
+    ConnectorMergeInput:
+      type: object
+      properties:
+        note:
+          type: string
+      additionalProperties: false
     CreateDocumentRequest:
       type: object
       description: Body for `POST /documents`.
@@ -8138,6 +8343,16 @@ components:
         open_issue_count:
           type: integer
           format: int64
+    MissingInput:
+      type: object
+      required:
+      - hashes
+      properties:
+        hashes:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
     Mode:
       type: string
       enum:

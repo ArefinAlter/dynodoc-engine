@@ -39,6 +39,32 @@ pub fn router() -> Router<AppState> {
             "/connector/documents/{id}/bundles",
             post(connector_push).layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
+        .route("/connector/documents/{id}/changes", get(connector_changes))
+        .route(
+            "/connector/documents/{id}/media",
+            post(connector_media_put)
+                .layer(axum::extract::DefaultBodyLimit::max(MEDIA_MAX_BYTES + 1024)),
+        )
+        .route(
+            "/connector/documents/{id}/media/missing",
+            post(connector_media_missing),
+        )
+        .route(
+            "/connector/documents/{id}/media/{sha}",
+            get(connector_media_get),
+        )
+        .route(
+            "/connector/documents/{id}/nodes/{node}/history",
+            get(connector_node_history),
+        )
+        .route(
+            "/connector/documents/{id}/requests/{draft}/merge",
+            post(connector_merge),
+        )
+        .route(
+            "/connector/documents/{id}/requests/{draft}/withdraw",
+            post(connector_withdraw),
+        )
 }
 fn bad(reason: &str) -> ApiError {
     ApiError::BadRequest {
@@ -477,6 +503,332 @@ async fn connector_push(
     }
     propose(s, id, c.auth, p, Some(c.grant)).await
 }
+/// Largest single image a block may reference (decision 024). Below the 16 MiB request
+/// limit of the API and of the web tier (BODY_SIZE_LIMIT), so the limit users see is this one.
+const MEDIA_MAX_BYTES: usize = 15 * 1024 * 1024;
+/// Images stored for one document across all its blocks.
+const MEDIA_QUOTA_BYTES: i64 = 512 * 1024 * 1024;
+/// The type is accepted only when the bytes start the way that format starts.
+fn media_matches(content_type: &str, b: &[u8]) -> bool {
+    match content_type {
+        "image/png" => b.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => b.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/gif" => b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a"),
+        "image/bmp" => b.starts_with(b"BM"),
+        "image/tiff" => b.starts_with(b"II*\0") || b.starts_with(b"MM\0*"),
+        "image/x-emf" => b.len() > 44 && b.starts_with(&[1, 0, 0, 0]) && &b[40..44] == b" EMF",
+        "image/x-wmf" => {
+            b.starts_with(&[0xD7, 0xCD, 0xC6, 0x9A])
+                || b.starts_with(&[1, 0, 9, 0])
+                || b.starts_with(&[2, 0, 9, 0])
+        }
+        "image/svg+xml" => {
+            let head = String::from_utf8_lossy(&b[..b.len().min(2048)]).to_ascii_lowercase();
+            head.trim_start_matches('\u{feff}')
+                .trim_start()
+                .starts_with('<')
+                && head.contains("<svg")
+                && !head.contains("<!doctype")
+                && !head.contains("<!entity")
+        }
+        _ => false,
+    }
+}
+fn sha_hex(v: &str) -> Result<Vec<u8>, ApiError> {
+    if v.len() != 64
+        || !v
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(bad("Use a lowercase SHA-256 hex digest"));
+    }
+    hex::decode(v).map_err(|_| bad("Use a lowercase SHA-256 hex digest"))
+}
+/// Opens a scoped connector transaction: the credential's document, membership and
+/// live grant, checked as the checkpoint read checks them.
+async fn connector_tx(
+    s: &AppState,
+    c: &Connector,
+    id: Uuid,
+) -> Result<Transaction<'static, Postgres>, ApiError> {
+    if c.document != id {
+        return Err(ApiError::Forbidden);
+    }
+    let mut tx = s.pool.begin().await?;
+    sqlx::query("select id from document where id=$1 for share")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    crate::projects::lock_document_project(&mut tx, id).await?;
+    access::require_member(&mut tx, id, c.auth.identity_id).await?;
+    check_grant(&mut tx, c.grant, id, c.auth.identity_id).await?;
+    Ok(tx)
+}
+#[derive(Deserialize)]
+struct ChangesQuery {
+    since_seq: i64,
+    /// Chain hash of `since_seq` as the client holds it; a different value means the
+    /// client's base is not this document's history.
+    since_chain_hash: String,
+}
+#[utoipa::path(get,path="/connector/documents/{id}/changes",params(("id"=Uuid,Path),("since_seq"=i64,Query,description="Revision the client holds"),("since_chain_hash"=String,Query,description="Chain hash of that revision as the client holds it")),security(("connector_key"=[])),responses((status=200,description="Only the blocks changed after since_seq, at the current head",body=Value),(status=409,description="The client's base is not this history")))]
+async fn connector_changes(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    c: Connector,
+    Query(q): Query<ChangesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let mut tx = connector_tx(&s, &c, id).await?;
+    let _budget = s
+        .workloads
+        .document(&mut tx, c.auth.identity_id, id)
+        .await?;
+    let head: i64 =
+        sqlx::query_scalar("select coalesce(max(seq),0) from event where document_id=$1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if q.since_seq < 0 || q.since_seq > head {
+        return Err(bad(
+            "The starting revision is outside this document's history",
+        ));
+    }
+    if anchor(&mut tx, id, q.since_seq).await? != q.since_chain_hash {
+        return Err(ApiError::Conflict {
+            reason: "This file's starting revision is not part of this document's history. Reconnect it; do not guess.".into(),
+        });
+    }
+    let changed: Vec<String> = sqlx::query_scalar("select distinct target_node_id from event where document_id=$1 and seq>$2 and target_node_id is not null")
+        .bind(id)
+        .bind(q.since_seq)
+        .fetch_all(&mut *tx)
+        .await?;
+    let state = serde_json::to_value(reviews::state_through(&mut tx, id, head).await?)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let all = state
+        .get("nodes")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let nodes: serde_json::Map<String, Value> = changed
+        .into_iter()
+        .filter_map(|n| all.get(&n).map(|v| (n, v.clone())))
+        .collect();
+    let hash = anchor(&mut tx, id, head).await?;
+    let proposals: Vec<Value> = sqlx::query_scalar("select jsonb_build_object('id',d.id,'status',case when d.merged_at is not null then 'merged' when d.review_outcome is not null then d.review_outcome when d.submitted_at is null then 'draft' else 'open' end) from workspace_draft d where d.document_id=$1 and d.created_by=$2 and d.source->>'kind'='provenance' order by d.created_at desc limit 100")
+        .bind(id).bind(c.auth.identity_id).fetch_all(&mut *tx).await?;
+    Ok(Json(
+        json!({"format":"dynodoc.changes","version":1,"document_id":id,"since_seq":q.since_seq,"through_seq":head,"chain_hash":hash,"nodes":nodes,"proposals":proposals}),
+    ))
+}
+#[utoipa::path(post,path="/connector/documents/{id}/media",params(("id"=Uuid,Path)),request_body(content=Vec<u8>,content_type="application/octet-stream"),security(("connector_key"=[])),responses((status=200,description="Stored once per document by SHA-256",body=Value),(status=400,description="Unsupported type, mismatched bytes, too large, or the document's image quota is used up")))]
+async fn connector_media_put(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    c: Connector,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let content_type = headers
+        .get("x-dynodoc-media-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if body.is_empty() || body.len() > MEDIA_MAX_BYTES || !media_matches(&content_type, &body) {
+        return Err(bad("Use a PNG, JPEG, GIF, BMP, TIFF, EMF, WMF or SVG image up to 15 MB whose bytes match its type"));
+    }
+    let mut tx = connector_tx(&s, &c, id).await?;
+    if access::require_member(&mut tx, id, c.auth.identity_id).await? < MemberRole::Contributor {
+        return Err(ApiError::Forbidden);
+    }
+    let digest = sha256(&body);
+    // One upload at a time per document, so concurrent uploads cannot both pass the quota.
+    sqlx::query(
+        "select pg_advisory_xact_lock(hashtextextended('connector_media:' || $1::text, 0))",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    let exists: bool = sqlx::query_scalar(
+        "select exists(select 1 from connector_media where document_id=$1 and sha256=$2)",
+    )
+    .bind(id)
+    .bind(&digest)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !exists {
+        let used: i64 = sqlx::query_scalar(
+            "select coalesce(sum(size),0)::bigint from connector_media where document_id=$1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if used + body.len() as i64 > MEDIA_QUOTA_BYTES {
+            return Err(bad("This document's images already use the 512 MB limit"));
+        }
+        sqlx::query("insert into connector_media(document_id,sha256,content_type,bytes,size,created_by) values($1,$2,$3,$4,$5,$6) on conflict do nothing")
+            .bind(id).bind(&digest).bind(&content_type).bind(body.as_ref()).bind(body.len() as i32).bind(c.auth.identity_id)
+            .execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(Json(
+        json!({"sha256":hex::encode(&digest),"size":body.len(),"stored":!exists}),
+    ))
+}
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct MissingInput {
+    hashes: Vec<String>,
+}
+#[utoipa::path(post,path="/connector/documents/{id}/media/missing",params(("id"=Uuid,Path)),request_body=MissingInput,security(("connector_key"=[])),responses((status=200,description="The hashes this document does not store yet",body=Value)))]
+async fn connector_media_missing(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    c: Connector,
+    Json(p): Json<MissingInput>,
+) -> Result<Json<Value>, ApiError> {
+    if p.hashes.len() > 1000 {
+        return Err(bad("Ask about at most 1,000 images at once"));
+    }
+    let wanted = p
+        .hashes
+        .iter()
+        .map(|h| sha_hex(h))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut tx = connector_tx(&s, &c, id).await?;
+    let have: Vec<Vec<u8>> = sqlx::query_scalar(
+        "select sha256 from connector_media where document_id=$1 and sha256=any($2)",
+    )
+    .bind(id)
+    .bind(&wanted)
+    .fetch_all(&mut *tx)
+    .await?;
+    let missing: Vec<&String> = p
+        .hashes
+        .iter()
+        .zip(&wanted)
+        .filter(|(_, w)| !have.contains(w))
+        .map(|(h, _)| h)
+        .collect();
+    Ok(Json(json!({"missing":missing})))
+}
+#[utoipa::path(get,path="/connector/documents/{id}/media/{sha}",params(("id"=Uuid,Path),("sha"=String,Path)),security(("connector_key"=[])),responses((status=200,description="Image bytes as an attachment; the type is in x-dynodoc-media-type")))]
+async fn connector_media_get(
+    State(s): State<AppState>,
+    Path((id, sha)): Path<(Uuid, String)>,
+    c: Connector,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    let digest = sha_hex(&sha)?;
+    let mut tx = connector_tx(&s, &c, id).await?;
+    let (content_type, bytes): (String, Vec<u8>) = sqlx::query_as(
+        "select content_type,bytes from connector_media where document_id=$1 and sha256=$2",
+    )
+    .bind(id)
+    .bind(&digest)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    // Never rendered by the browser: SVG and other images stay inert on this origin.
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_DISPOSITION, "attachment".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "sandbox; default-src 'none'".to_string(),
+            ),
+            (
+                header::CACHE_CONTROL,
+                "private, max-age=31536000, immutable".to_string(),
+            ),
+            (
+                header::HeaderName::from_static("x-dynodoc-media-type"),
+                content_type,
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+#[utoipa::path(get,path="/connector/documents/{id}/nodes/{node}/history",params(("id"=Uuid,Path),("node"=String,Path)),security(("connector_key"=[])),responses((status=200,description="Newest first: each event of the block with who appended it and, for merged change requests, the contributor and message",body=Value)))]
+async fn connector_node_history(
+    State(s): State<AppState>,
+    Path((id, node)): Path<(Uuid, String)>,
+    c: Connector,
+) -> Result<Json<Value>, ApiError> {
+    if node.len() != 26 || !node.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(bad("Use a block identifier"));
+    }
+    let mut tx = connector_tx(&s, &c, id).await?;
+    let items: Vec<Value> = sqlx::query_scalar("select jsonb_build_object('seq',e.seq,'type',e.type,'at',e.created_at,'field',e.payload->>'field','actor',jsonb_build_object('id',i.id,'name',case when i.erased_at is null then i.display_name end),'request',(select jsonb_build_object('id',d.id,'name',d.name,'note',d.submission_note,'host',d.source->>'host','author',jsonb_build_object('id',au.id,'name',case when au.erased_at is null then au.display_name end),'agent',exists(select 1 from agent_identity ai where ai.identity_id=au.id)) from operation_audit a join workspace_draft d on d.id::text=a.detail->>'draft_id' and d.document_id=e.document_id join identity au on au.id=d.created_by where a.resource_id=e.document_id and a.action='document.change_request_merged' and a.detail->>'from_seq' ~ '^[0-9]{1,18}$' and a.detail->>'through_seq' ~ '^[0-9]{1,18}$' and (a.detail->>'from_seq')::bigint<=e.seq and (a.detail->>'through_seq')::bigint>=e.seq order by a.created_at limit 1)) from event e join identity i on i.id=e.actor_id where e.document_id=$1 and e.target_node_id=$2 order by e.seq desc limit 200")
+        .bind(id)
+        .bind(&node)
+        .fetch_all(&mut *tx)
+        .await?;
+    Ok(Json(json!({"node_id":node,"events":items})))
+}
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct ConnectorMergeInput {
+    #[serde(default)]
+    note: String,
+}
+#[utoipa::path(post,path="/connector/documents/{id}/requests/{draft}/merge",params(("id"=Uuid,Path),("draft"=Uuid,Path)),request_body=ConnectorMergeInput,security(("connector_key"=[])),responses((status=200,description="Merged through the same human-only rules as the web review"),(status=403,description="Not your request or not permitted"),(status=409,description="Overlapping team changes: resolve them in the review screens")))]
+async fn connector_merge(
+    State(s): State<AppState>,
+    Path((id, draft)): Path<(Uuid, Uuid)>,
+    c: Connector,
+    Json(p): Json<ConnectorMergeInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (team_seq, revision) = {
+        let mut tx = connector_tx(&s, &c, id).await?;
+        // The editor pane merges only the person's own, just-sent connector request;
+        // reviewing other people's requests stays in the web review screens.
+        let revision: Option<i64> = sqlx::query_scalar("select revision from workspace_draft where id=$1 and document_id=$2 and created_by=$3 and source->>'kind'='provenance'")
+            .bind(draft)
+            .bind(id)
+            .bind(c.auth.identity_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let revision = revision.ok_or(ApiError::Forbidden)?;
+        let head: i64 =
+            sqlx::query_scalar("select coalesce(max(seq),0) from event where document_id=$1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        (head, revision)
+    };
+    // The same merge as the web review: approvals, merge roles, agent refusal and the
+    // three-way plan (overlaps are refused, never auto-resolved) all apply.
+    let request: reviews::MergeRequest =
+        serde_json::from_value(json!({"team_seq":team_seq,"revision":revision,"note":p.note}))
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    reviews::merge(State(s), Path((id, draft)), c.auth, Json(request)).await
+}
+#[utoipa::path(post,path="/connector/documents/{id}/requests/{draft}/withdraw",params(("id"=Uuid,Path),("draft"=Uuid,Path)),request_body=ConnectorMergeInput,security(("connector_key"=[])),responses((status=200,description="The person's own connector request is closed as withdrawn and kept as history"),(status=403,description="Not your connector request"),(status=409,description="Already closed")))]
+async fn connector_withdraw(
+    State(s): State<AppState>,
+    Path((id, draft)): Path<(Uuid, Uuid)>,
+    c: Connector,
+    Json(p): Json<ConnectorMergeInput>,
+) -> Result<Json<Value>, ApiError> {
+    {
+        let mut tx = connector_tx(&s, &c, id).await?;
+        let own: bool = sqlx::query_scalar("select exists(select 1 from workspace_draft where id=$1 and document_id=$2 and created_by=$3 and source->>'kind'='provenance')")
+            .bind(draft)
+            .bind(id)
+            .bind(c.auth.identity_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !own {
+            return Err(ApiError::Forbidden);
+        }
+    }
+    reviews::close_request(&s, id, draft, &c.auth, "withdrawn", &p.note).await
+}
 #[derive(utoipa::OpenApi)]
 #[openapi(
     paths(
@@ -488,8 +840,15 @@ async fn connector_push(
         revoke,
         connection,
         connector_checkpoint,
-        connector_push
+        connector_push,
+        connector_changes,
+        connector_media_put,
+        connector_media_missing,
+        connector_media_get,
+        connector_node_history,
+        connector_merge,
+        connector_withdraw
     ),
-    components(schemas(GrantInput))
+    components(schemas(GrantInput, MissingInput, ConnectorMergeInput))
 )]
 pub struct ProvenanceApi;
