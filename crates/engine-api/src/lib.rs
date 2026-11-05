@@ -195,12 +195,52 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
         .layer(cors)
         .layer(CompressionLayer::new())
-        // The span records the path only: a query can hold search text.
+        // The span records the path only (a query can hold search text), and capability
+        // tokens inside the path are redacted (audit finding F-03).
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
-                tracing::info_span!("http", method = %request.method(), path = %request.uri().path())
+                tracing::info_span!("http", method = %request.method(), path = %redact_path(request.uri().path()))
             }),
         )
+}
+
+/// The request path as logged: segments of 40 or more token characters (public-link and
+/// export tokens, content digests) are replaced, so a log line never carries a secret.
+/// UUIDs (36) and ULIDs (26) stay, so requests remain traceable.
+pub fn redact_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            if segment.len() >= 40
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                "{redacted}"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[cfg(test)]
+mod redact_tests {
+    #[test]
+    fn tokens_in_paths_are_redacted_and_ids_kept() {
+        let token = "a".repeat(64);
+        assert_eq!(
+            super::redact_path(&format!("/public/documents/{token}")),
+            "/public/documents/{redacted}"
+        );
+        let doc = "0b6a1d6e-6c0a-4a64-9a43-1f2b7d0a0001";
+        let node = "01JABCDEFGHJKMNPQRSTVWXYZ0";
+        assert_eq!(
+            super::redact_path(&format!("/connector/documents/{doc}/nodes/{node}/history")),
+            format!("/connector/documents/{doc}/nodes/{node}/history")
+        );
+        assert_eq!(super::redact_path("/healthz"), "/healthz");
+    }
 }
 
 /// Liveness probe. Returns 200 with a small JSON body.
