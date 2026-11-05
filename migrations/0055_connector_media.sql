@@ -1,7 +1,8 @@
 -- Content-addressed media for host-native blocks (decision 024). A block's Word or
 -- Google Docs form names its images by SHA-256; each image is stored once per
 -- document, so editing the text of a paragraph never re-sends its picture. Rows are
--- created and pruned (when no block references them), never edited.
+-- created and never edited; they go with their document. Pruning images no block
+-- references any more is not implemented yet (the per-document quota bounds them).
 create table connector_media (
     document_id  uuid        not null references document (id) on delete cascade,
     sha256       bytea       not null check (octet_length(sha256) = 32),
@@ -9,7 +10,7 @@ create table connector_media (
                      'image/png', 'image/jpeg', 'image/gif', 'image/bmp', 'image/tiff',
                      'image/x-emf', 'image/x-wmf', 'image/svg+xml')),
     bytes        bytea       not null,
-    size         integer     not null check (size between 1 and 20971520 and size = octet_length(bytes)),
+    size         integer     not null check (size between 1 and 15728640 and size = octet_length(bytes)),
     created_by   uuid        not null references identity (id),
     created_at   timestamptz not null default now(),
     primary key (document_id, sha256)

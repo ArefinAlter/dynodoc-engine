@@ -503,8 +503,9 @@ async fn connector_push(
     }
     propose(s, id, c.auth, p, Some(c.grant)).await
 }
-/// Largest single image a block may reference (decision 024).
-const MEDIA_MAX_BYTES: usize = 20 * 1024 * 1024;
+/// Largest single image a block may reference (decision 024). Below the 16 MiB request
+/// limit of the API and of the web tier (BODY_SIZE_LIMIT), so the limit users see is this one.
+const MEDIA_MAX_BYTES: usize = 15 * 1024 * 1024;
 /// Images stored for one document across all its blocks.
 const MEDIA_QUOTA_BYTES: i64 = 512 * 1024 * 1024;
 /// The type is accepted only when the bytes start the way that format starts.
@@ -635,13 +636,20 @@ async fn connector_media_put(
         .unwrap_or_default()
         .to_string();
     if body.is_empty() || body.len() > MEDIA_MAX_BYTES || !media_matches(&content_type, &body) {
-        return Err(bad("Use a PNG, JPEG, GIF, BMP, TIFF, EMF, WMF or SVG image up to 20 MB whose bytes match its type"));
+        return Err(bad("Use a PNG, JPEG, GIF, BMP, TIFF, EMF, WMF or SVG image up to 15 MB whose bytes match its type"));
     }
     let mut tx = connector_tx(&s, &c, id).await?;
     if access::require_member(&mut tx, id, c.auth.identity_id).await? < MemberRole::Contributor {
         return Err(ApiError::Forbidden);
     }
     let digest = sha256(&body);
+    // One upload at a time per document, so concurrent uploads cannot both pass the quota.
+    sqlx::query(
+        "select pg_advisory_xact_lock(hashtextextended('connector_media:' || $1::text, 0))",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
     let exists: bool = sqlx::query_scalar(
         "select exists(select 1 from connector_media where document_id=$1 and sha256=$2)",
     )
@@ -755,7 +763,7 @@ async fn connector_node_history(
         return Err(bad("Use a block identifier"));
     }
     let mut tx = connector_tx(&s, &c, id).await?;
-    let items: Vec<Value> = sqlx::query_scalar("select jsonb_build_object('seq',e.seq,'type',e.type,'at',e.created_at,'field',e.payload->>'field','actor',jsonb_build_object('id',i.id,'name',i.display_name),'request',(select jsonb_build_object('id',d.id,'name',d.name,'note',d.submission_note,'host',d.source->>'host','author',jsonb_build_object('id',au.id,'name',au.display_name),'agent',exists(select 1 from agent_identity ai where ai.identity_id=au.id)) from operation_audit a join workspace_draft d on d.id::text=a.detail->>'draft_id' join identity au on au.id=d.created_by where a.resource_id=e.document_id and a.action='document.change_request_merged' and (a.detail->>'from_seq')::bigint<=e.seq and (a.detail->>'through_seq')::bigint>=e.seq order by a.created_at limit 1)) from event e join identity i on i.id=e.actor_id where e.document_id=$1 and e.target_node_id=$2 order by e.seq desc limit 200")
+    let items: Vec<Value> = sqlx::query_scalar("select jsonb_build_object('seq',e.seq,'type',e.type,'at',e.created_at,'field',e.payload->>'field','actor',jsonb_build_object('id',i.id,'name',case when i.erased_at is null then i.display_name end),'request',(select jsonb_build_object('id',d.id,'name',d.name,'note',d.submission_note,'host',d.source->>'host','author',jsonb_build_object('id',au.id,'name',case when au.erased_at is null then au.display_name end),'agent',exists(select 1 from agent_identity ai where ai.identity_id=au.id)) from operation_audit a join workspace_draft d on d.id::text=a.detail->>'draft_id' and d.document_id=e.document_id join identity au on au.id=d.created_by where a.resource_id=e.document_id and a.action='document.change_request_merged' and a.detail->>'from_seq' ~ '^[0-9]{1,18}$' and a.detail->>'through_seq' ~ '^[0-9]{1,18}$' and (a.detail->>'from_seq')::bigint<=e.seq and (a.detail->>'through_seq')::bigint>=e.seq order by a.created_at limit 1)) from event e join identity i on i.id=e.actor_id where e.document_id=$1 and e.target_node_id=$2 order by e.seq desc limit 200")
         .bind(id)
         .bind(&node)
         .fetch_all(&mut *tx)

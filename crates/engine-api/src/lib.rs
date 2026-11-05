@@ -204,17 +204,24 @@ pub fn app(state: AppState) -> Router {
         )
 }
 
-/// The request path as logged: segments of 40 or more token characters (public-link and
-/// export tokens, content digests) are replaced, so a log line never carries a secret.
-/// UUIDs (36) and ULIDs (26) stay, so requests remain traceable.
+/// The request path as logged: any segment of 32 or more characters that is not a UUID
+/// (public-link and export tokens, PASETO-like tokens with dots, content digests) is
+/// replaced, so a log line never carries a secret. UUIDs and ULIDs (26) stay, so requests
+/// remain traceable.
 pub fn redact_path(path: &str) -> String {
+    let uuid = |s: &str| {
+        s.len() == 36
+            && s.bytes().enumerate().all(|(i, b)| {
+                if [8, 13, 18, 23].contains(&i) {
+                    b == b'-'
+                } else {
+                    b.is_ascii_hexdigit()
+                }
+            })
+    };
     path.split('/')
         .map(|segment| {
-            if segment.len() >= 40
-                && segment
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-            {
+            if segment.len() >= 32 && !uuid(segment) {
                 "{redacted}"
             } else {
                 segment
@@ -240,6 +247,8 @@ mod redact_tests {
             format!("/connector/documents/{doc}/nodes/{node}/history")
         );
         assert_eq!(super::redact_path("/healthz"), "/healthz");
+        let paseto = "v4.local.abcdefghijklmnopqrstuvwxyz0123456789";
+        assert_eq!(super::redact_path(&format!("/x/{paseto}")), "/x/{redacted}");
     }
 }
 
