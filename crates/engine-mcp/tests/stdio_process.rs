@@ -99,7 +99,7 @@ fn parent() {
             .unwrap();
         assert!(text.starts_with("dd/1 error code=internal "), "{text}");
     }
-    assert_eq!(messages[6]["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(messages[6]["result"]["tools"].as_array().unwrap().len(), 7);
     // The panic is reported where a person can see it, and only there.
     assert!(
         stderr.contains("recognisable-panic-text"),

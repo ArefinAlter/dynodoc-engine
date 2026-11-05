@@ -16,6 +16,8 @@
 //! | `propose` | `POST files/{file}/propose` (the service's name; the spec says `proposals`) |
 //! | `submit` | `POST proposals/{proposal}/submit`, or `.../withdraw` for `action=withdraw` |
 //! | `status` | `GET proposals/{proposal}` for a proposal, else `GET access` |
+//! | `memory` | `GET memory` |
+//! | `remember` | `POST memory` |
 //!
 //! The sheet-profile route (6) is not used: the outline route answers a sheet's profile
 //! for `under=<sheet>`, which is what the `outline` tool's `under` argument carries.
@@ -216,6 +218,27 @@ pub fn plan(tool: Tool, args: &Args, project: Uuid) -> Result<Plan, ToolError> {
             Ok(plan)
         }
         Tool::Read => read(args, &root),
+        Tool::Memory => Ok(get(
+            format!("{root}/memory"),
+            pairs(args, &["mode", "q", "since"]),
+        )),
+        Tool::Remember => {
+            let mut body = Map::new();
+            for key in ["kind", "body", "citations"] {
+                if let Some(value) = args.get(key) {
+                    body.insert(key.into(), value.clone());
+                }
+            }
+            Ok(Plan {
+                method: Method::Post,
+                path: format!("{root}/memory"),
+                query: Vec::new(),
+                body: Some(Value::Object(body)),
+                if_none_match: None,
+                request_id: None,
+                file: None,
+            })
+        }
     }
 }
 
@@ -567,5 +590,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(url(&ok), format!("projects/{PROJECT}/agent/files?q=Q3"));
+    }
+
+    #[test]
+    fn memory_reads_and_remember_posts_only_its_own_fields() {
+        let read = plan(
+            Tool::Memory,
+            &args(json!({"mode": "search", "q": "style"})),
+            PROJECT,
+        )
+        .unwrap();
+        assert_eq!(
+            url(&read),
+            format!("projects/{PROJECT}/agent/memory?mode=search&q=style")
+        );
+        let write = plan(
+            Tool::Remember,
+            &args(json!({"kind": "fact", "body": "Euros.", "citations": [{"file": "7034d450", "ref": "7C02"}]})),
+            PROJECT,
+        )
+        .unwrap();
+        assert_eq!(write.method, Method::Post);
+        assert_eq!(write.path, format!("projects/{PROJECT}/agent/memory"));
+        assert_eq!(
+            write.body,
+            Some(
+                json!({"kind": "fact", "body": "Euros.", "citations": [{"file": "7034d450", "ref": "7C02"}]})
+            )
+        );
     }
 }

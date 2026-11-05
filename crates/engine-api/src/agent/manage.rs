@@ -64,6 +64,11 @@ pub fn router() -> Router<AppState> {
         .route("/projects/{id}/agent-policy/kill", post(kill))
         .route("/projects/{id}/agent-usage", get(usage))
         .route("/documents/{id}/agent-policy", put(put_file_policy))
+        .route(
+            "/projects/{id}/agent-capture",
+            get(get_capture).put(put_capture),
+        )
+        .merge(super::memory::people_routes())
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
 }
 
@@ -827,9 +832,116 @@ async fn put_file_policy(
     }))
 }
 
+// --- capture policy of agent sessions (decision 026) -----------------------------------
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct CaptureBody {
+    /// `off` (no agent sessions), `actions` (sessions and tool calls, no text) or `full`.
+    capture: String,
+    /// Who may read stored prompts: `author` (the person the agent acted for), `reviewers`
+    /// (also the document's reviewers, editors and managers) or `members`.
+    prompt_visibility: String,
+}
+
+async fn capture_view(db: &mut PgConnection, project: Uuid) -> Result<Value, ApiError> {
+    let row: Option<(String, String, i64, DateTime<Utc>)> = sqlx::query_as("select capture,prompt_visibility,revision,updated_at from project_agent_capture where project_id=$1")
+        .bind(project)
+        .fetch_optional(db)
+        .await?;
+    Ok(match row {
+        Some((capture, visibility, revision, at)) => {
+            json!({"capture":capture,"prompt_visibility":visibility,"revision":revision,"configured":true,"updated_at":at})
+        }
+        None => {
+            json!({"capture":"full","prompt_visibility":"author","revision":0,"configured":false})
+        }
+    })
+}
+
+#[utoipa::path(operation_id="agent_capture_get", get, path="/projects/{id}/agent-capture", tag="agent policy", params(("id"=Uuid,Path,description="Project")), security(("paseto"=[])), responses((status=200, description="What agent sessions record in this project (default: full capture, prompts visible to their author). Sets ETag to the revision", body=Value),(status=403, description="Not a project owner or manager")))]
+async fn get_capture(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(project): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let mut db = state.pool.acquire().await?;
+    require_manager(&mut db, project, auth.identity_id).await?;
+    let view = capture_view(&mut db, project).await?;
+    Ok((
+        [
+            (header::ETAG, format!("\"{}\"", view["revision"])),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        Json(view),
+    ))
+}
+
+#[utoipa::path(operation_id="agent_capture_put", put, path="/projects/{id}/agent-capture", tag="agent policy", params(("id"=Uuid,Path,description="Project")), request_body=CaptureBody, security(("paseto"=[])), responses((status=200, description="Saved; audited", body=Value),(status=403, description="Not a project owner or manager"),(status=409, description="The capture policy changed since the revision in If-Match")))]
+async fn put_capture(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(project): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<CaptureBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    if !["off", "actions", "full"].contains(&body.capture.as_str())
+        || !["author", "reviewers", "members"].contains(&body.prompt_visibility.as_str())
+    {
+        return Err(bad(
+            "capture is off, actions or full; prompt_visibility is author, reviewers or members",
+        ));
+    }
+    let expected = if_match(&headers)?;
+    let mut tx = begin(&state).await?;
+    lock_project(&mut tx, project).await?;
+    require_manager(&mut tx, project, auth.identity_id).await?;
+    let _permit = charge(&state, auth.identity_id)?;
+    let before: Option<(String, String, i64)> = sqlx::query_as("select capture,prompt_visibility,revision from project_agent_capture where project_id=$1 for update")
+        .bind(project)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let revision = before.as_ref().map_or(0, |b| b.2);
+    if expected != revision {
+        return Err(ApiError::Conflict {
+            reason: "The capture policy changed since you read it. Reload and try again.".into(),
+        });
+    }
+    sqlx::query("insert into project_agent_capture(project_id,capture,prompt_visibility,updated_by) values($1,$2,$3,$4) on conflict(project_id) do update set capture=excluded.capture,prompt_visibility=excluded.prompt_visibility,revision=project_agent_capture.revision+1,updated_by=excluded.updated_by,updated_at=now()")
+        .bind(project)
+        .bind(&body.capture)
+        .bind(&body.prompt_visibility)
+        .bind(auth.identity_id)
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        auth.identity_id,
+        "project.agent_capture.changed",
+        project,
+        json!({"before":before.map(|b| json!({"capture":b.0,"prompt_visibility":b.1})),"after":{"capture":body.capture,"prompt_visibility":body.prompt_visibility}}),
+    )
+    .await?;
+    let view = capture_view(&mut tx, project).await?;
+    tx.commit().await?;
+    Ok(Json(view))
+}
+
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(get_policy, put_policy, kill, usage, put_file_policy),
+    paths(
+        get_policy,
+        put_policy,
+        kill,
+        usage,
+        put_file_policy,
+        get_capture,
+        put_capture,
+        super::memory::people_list,
+        super::memory::people_write,
+        super::memory::people_edit,
+        super::memory::people_action
+    ),
     components(schemas(
         PolicyBody,
         PolicyView,
@@ -838,7 +950,8 @@ async fn put_file_policy(
         UsageRow,
         UsageView,
         FilePolicyBody,
-        FilePolicyView
+        FilePolicyView,
+        CaptureBody
     ))
 )]
 pub struct AgentManageApi;

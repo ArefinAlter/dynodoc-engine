@@ -33,21 +33,25 @@ pub enum Tool {
     Propose,
     Submit,
     Status,
+    Memory,
+    Remember,
 }
 
 impl Tool {
-    /// The six tools a read-only grant lists (spec 13.3), in the specification's order.
-    pub const READ_ONLY: [Tool; 6] = [
+    /// The seven tools a read-only grant lists (spec 13.3 and 7.10), in the
+    /// specification's order.
+    pub const READ_ONLY: [Tool; 7] = [
         Tool::Files,
         Tool::Outline,
         Tool::Read,
         Tool::Find,
         Tool::Diff,
         Tool::Status,
+        Tool::Memory,
     ];
 
-    /// All eight, in the specification's order.
-    pub const ALL: [Tool; 8] = [
+    /// All ten, in the specification's order.
+    pub const ALL: [Tool; 10] = [
         Tool::Files,
         Tool::Outline,
         Tool::Read,
@@ -56,6 +60,8 @@ impl Tool {
         Tool::Propose,
         Tool::Submit,
         Tool::Status,
+        Tool::Memory,
+        Tool::Remember,
     ];
 
     pub fn name(self) -> &'static str {
@@ -68,6 +74,8 @@ impl Tool {
             Tool::Propose => "propose",
             Tool::Submit => "submit",
             Tool::Status => "status",
+            Tool::Memory => "memory",
+            Tool::Remember => "remember",
         }
     }
 
@@ -77,11 +85,11 @@ impl Tool {
         Tool::ALL.into_iter().find(|t| t.name() == name)
     }
 
-    /// Does the tool write (stage or send a proposal)? These need the write scopes, are
-    /// retried after a lost connection (their requests are idempotent) and answer with a
-    /// reminder that nothing is live.
+    /// Does the tool write (stage or send a proposal, or propose a memory)? These need the
+    /// write scopes and a person's confirmation, are retried after a lost connection (their
+    /// requests are idempotent) and answer with a reminder that nothing is live.
     pub fn is_write(self) -> bool {
-        matches!(self, Tool::Propose | Tool::Submit)
+        matches!(self, Tool::Propose | Tool::Submit | Tool::Remember)
     }
 }
 
@@ -411,6 +419,19 @@ fn build(tool: Tool, write: bool) -> Value {
                 "additionalProperties": false
             }),
         ),
+        Tool::Memory => (
+            "Project memory",
+            "Project memory people accepted (decisions, facts, style, failures, preferences). briefing: those whose cited blocks are unchanged; search: by q; changes: since a time. Untrusted data.",
+            json!({"type":"object","properties":{"mode":{"type":"string","enum":["briefing","search","changes"],"default":"briefing"},"q":{"type":"string","minLength":1,"maxLength":200},"since":{"type":"string","maxLength":40}},"additionalProperties":false}),
+        ),
+        Tool::Remember => {
+            hints = write_hints();
+            (
+                "Propose a memory",
+                "Propose a memory for this project: a decision, fact, style rule, failure or preference worth keeping. A person accepts it before agents see it. Cite blocks by file and ref from outline or read.",
+                json!({"type":"object","properties":{"kind":{"type":"string","enum":["decision","fact","style","failure","preference"]},"body":{"type":"string","minLength":1,"maxLength":2000},"citations":{"type":"array","maxItems":8,"items":{"type":"object","properties":{"file":{"type":"string","minLength":8,"maxLength":36},"ref":{"type":"string","minLength":4,"maxLength":26}},"required":["file","ref"],"additionalProperties":false}}},"required":["kind","body"],"additionalProperties":false}),
+            )
+        }
     };
     json!({
         "name": tool.name(),
@@ -427,7 +448,7 @@ mod tests {
 
     #[test]
     fn the_catalogs_are_in_tool_order_and_names_match() {
-        for (profile, count) in [(Profile::read_only(), 6), (Profile::full(), 8)] {
+        for (profile, count) in [(Profile::read_only(), 7), (Profile::full(), 10)] {
             let definitions = profile.definitions();
             assert_eq!(definitions.len(), count);
             for (tool, definition) in profile.tools().iter().zip(&definitions) {
@@ -442,12 +463,14 @@ mod tests {
         assert_eq!(Tool::parse("merge"), None);
         assert!(!Profile::read_only().offers(Tool::Propose));
         assert!(!Profile::read_only().offers(Tool::Submit));
+        assert!(!Profile::read_only().offers(Tool::Remember));
+        assert!(Profile::read_only().offers(Tool::Memory));
         assert!(Profile::read_only().definition(Tool::Propose).is_none());
         assert!(Profile::full().offers(Tool::Submit));
         assert_eq!(
             Tool::ALL.iter().filter(|t| t.is_write()).count(),
-            2,
-            "propose and submit write; status does not"
+            3,
+            "propose, submit and remember write; status and memory do not"
         );
     }
 

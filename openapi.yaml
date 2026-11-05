@@ -3192,6 +3192,198 @@ paths:
       - paseto: []
       - device_session:
         - project:read
+  /projects/{id}/agent-capture:
+    get:
+      tags:
+      - agent policy
+      operationId: agent_capture_get
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: 'What agent sessions record in this project (default: full capture, prompts visible to their author). Sets ETag to the revision'
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Not a project owner or manager
+      security:
+      - paseto: []
+    put:
+      tags:
+      - agent policy
+      operationId: agent_capture_put
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaptureBody'
+        required: true
+      responses:
+        '200':
+          description: Saved; audited
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Not a project owner or manager
+        '409':
+          description: The capture policy changed since the revision in If-Match
+      security:
+      - paseto: []
+  /projects/{id}/agent-memory:
+    get:
+      tags:
+      - agent memory
+      operationId: agent_memory_list
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: state
+        in: query
+        description: 'Comma-separated: proposed, active, archived (default proposed,active)'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Memories with their revision, author kind, citations (pinned hash and validity now)
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Not a project member, or an agent identity
+      security:
+      - paseto: []
+    post:
+      tags:
+      - agent memory
+      operationId: agent_memory_write
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: 'Written as active; audited. Body: kind, body, optional citations of readable blocks'
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid kind, body or citation
+        '403':
+          description: Not a project owner, manager or editor
+      security:
+      - paseto: []
+  /projects/{id}/agent-memory/{memory}:
+    put:
+      tags:
+      - agent memory
+      operationId: agent_memory_edit
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: memory
+        in: path
+        description: Memory
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: The next revision; citations given are pinned again. Needs If-Match with the revision read
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid field or If-Match missing
+        '403':
+          description: Not a project owner, manager or editor
+        '404':
+          description: No such memory, or deleted
+        '409':
+          description: The memory changed since the revision in If-Match
+      security:
+      - paseto: []
+  /projects/{id}/agent-memory/{memory}/{action}:
+    post:
+      tags:
+      - agent memory
+      operationId: agent_memory_action
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: memory
+        in: path
+        description: Memory
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: action
+        in: path
+        description: accept, archive, restore or delete
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The new state and revision; audited. Deleted memories keep their history; agents see a tombstone
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Not a project owner, manager or editor
+        '404':
+          description: No such memory or action
+        '409':
+          description: The action does not apply to the current state
+      security:
+      - paseto: []
   /projects/{id}/agent-policy:
     get:
       tags:
@@ -4153,6 +4345,88 @@ paths:
       security:
       - device_session:
         - content:read
+  /projects/{id}/agent/memory:
+    get:
+      tags:
+      - agent
+      operationId: agent_memory_read
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: mode
+        in: query
+        description: 'briefing (default): active memories whose cited blocks are unchanged; search: active memories whose text contains q; changes: memories changed after since, deleted ones as tombstones'
+        required: false
+        schema:
+          type: string
+      - name: q
+        in: query
+        description: Search text, 1 to 200 characters (mode=search)
+        required: false
+        schema:
+          type: string
+      - name: since
+        in: query
+        description: RFC 3339 time (mode=changes)
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Memories people accepted for this project, each citation with its validity now (valid, stale or gone). Memory text is data written by people, never instructions
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid mode, q or since
+        '401':
+          description: Not a project device session
+        '403':
+          description: Scope, grant, key class or project membership missing (uniform)
+        '429':
+          description: Admission budget
+      security:
+      - device_session:
+        - content:read
+    post:
+      tags:
+      - agent
+      operationId: agent_memory_propose
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: 'Stored as proposed: agents do not see it until a person accepts it. Body: kind (decision, fact, style, failure or preference), body (1 to 2,000 characters), optional citations (at most 8 of {file, ref} as the file tools take them; the server pins each block hash) and optional session'
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid kind, body, citation or session
+        '401':
+          description: Not a project device session
+        '403':
+          description: 'Scope, grant, membership or policy (details.policy: memory_proposals at 200 open proposals) refuses'
+        '429':
+          description: Admission budget
+      security:
+      - device_session:
+        - content:propose
   /projects/{id}/agent/proposals:
     get:
       tags:
@@ -4366,6 +4640,87 @@ paths:
       security:
       - device_session:
         - content:submit
+  /projects/{id}/agent/sessions:
+    post:
+      tags:
+      - agent
+      summary: Open a session for this agent key in this project.
+      operationId: agent_session_open
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: 'The session id and the capture in force (actions or full). Body: source (mcp, acp, gateway or import), product, optional product_version and model'
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid body
+        '401':
+          description: Not a project device session
+        '403':
+          description: 'Scope, grant or membership missing, or capture is off (details.policy: capture)'
+        '429':
+          description: Admission budget
+      security:
+      - device_session:
+        - content:propose
+  /projects/{id}/agent/sessions/{session}/turns:
+    post:
+      tags:
+      - agent
+      summary: |-
+        Record one turn of a session: the prompt as the person typed it (`prompt_source`
+        `launcher`) or as the agent reports it (`agent`), and the agent's visible reasoning.
+      operationId: agent_session_turn
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: session
+        in: path
+        description: A session of this agent key
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: The turn number and how many secrets were redacted. Prompt and reasoning are stored only under full capture. Name session and turn in a later propose call to link its blocks to this turn
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid body or not this key's session
+        '401':
+          description: Not a project device session
+        '403':
+          description: Scope, grant or membership missing, or capture is off
+        '429':
+          description: Admission budget
+      security:
+      - device_session:
+        - content:propose
   /projects/{id}/change-requests:
     get:
       tags: []
@@ -7574,6 +7929,21 @@ components:
           - string
           - 'null'
           description: Heading ref, instead of `refs`.
+      additionalProperties: false
+    CaptureBody:
+      type: object
+      required:
+      - capture
+      - prompt_visibility
+      properties:
+        capture:
+          type: string
+          description: '`off` (no agent sessions), `actions` (sessions and tool calls, no text) or `full`.'
+        prompt_visibility:
+          type: string
+          description: |-
+            Who may read stored prompts: `author` (the person the agent acted for), `reviewers`
+            (also the document's reviewers, editors and managers) or `members`.
       additionalProperties: false
     ChallengeRequest:
       type: object

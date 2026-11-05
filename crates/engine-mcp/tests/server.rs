@@ -223,7 +223,7 @@ async fn tools_list_is_the_six_read_tools_in_order_and_is_deterministic() {
         .collect();
     assert_eq!(
         names,
-        ["files", "outline", "read", "find", "diff", "status"]
+        ["files", "outline", "read", "find", "diff", "status", "memory"]
     );
     for tool in first["result"]["tools"].as_array().unwrap() {
         let hints = &tool["annotations"];
@@ -559,10 +559,16 @@ async fn the_full_profile_lists_eight_tools_and_the_default_still_lists_six() {
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        ["files", "outline", "read", "find", "diff", "propose", "submit", "status"]
+        [
+            "files", "outline", "read", "find", "diff", "propose", "submit", "status", "memory",
+            "remember"
+        ]
     );
     for tool in tools {
-        let write = matches!(tool["name"].as_str().unwrap(), "propose" | "submit");
+        let write = matches!(
+            tool["name"].as_str().unwrap(),
+            "propose" | "submit" | "remember"
+        );
         let hints = &tool["annotations"];
         assert_eq!(hints["readOnlyHint"], !write, "{tool}");
         assert_eq!(hints["destructiveHint"], false);
@@ -583,7 +589,7 @@ async fn the_full_profile_lists_eight_tools_and_the_default_still_lists_six() {
     // The default profile, on its own server, is untouched.
     let (read_only, _) = server_with_read_only_profile();
     let list = one(&read_only, request(3, "tools/list", json!({}))).await;
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 7);
 }
 
 fn server_with_read_only_profile() -> (Server<Scripted>, Scripted) {

@@ -243,11 +243,30 @@ pub(super) fn json_body(parsed: Result<Json<Value>, JsonRejection>) -> Result<Va
 
 /// The arguments of a `propose` call. The route names the file, so the body may leave `file`
 /// out; if it says one it must be this one.
-fn parse_call(body: &Value, document: Uuid) -> Result<ProposeArgs, CompileError> {
+/// The agent session and turn a `propose` call names (decision 026); outside the protocol
+/// grammar of the call itself.
+pub(super) type Link = (Option<Uuid>, Option<i32>);
+
+fn parse_call(body: &Value, document: Uuid) -> Result<(ProposeArgs, Link), CompileError> {
     let mut map = body
         .as_object()
         .cloned()
         .ok_or(AgentError::BadRequest { field: "body" })?;
+    let session = match map.remove("session") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            Some(Uuid::parse_str(&s).map_err(|_| AgentError::BadRequest { field: "session" })?)
+        }
+        Some(_) => return Err(AgentError::BadRequest { field: "session" }.into()),
+    };
+    let turn = match map.remove("turn") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_i64()
+                .filter(|t| (1..=10_000).contains(t))
+                .ok_or(AgentError::BadRequest { field: "turn" })? as i32,
+        ),
+    };
     match map.get("file") {
         None => {
             map.insert("file".into(), json!(document));
@@ -255,7 +274,7 @@ fn parse_call(body: &Value, document: Uuid) -> Result<ProposeArgs, CompileError>
         Some(named) if named.as_str().and_then(|s| Uuid::parse_str(s).ok()) == Some(document) => {}
         Some(_) => return Err(AgentError::BadRequest { field: "file" }.into()),
     }
-    parse_propose(&Value::Object(map))
+    Ok((parse_propose(&Value::Object(map))?, (session, turn)))
 }
 
 // --- answers ---------------------------------------------------------------------------
@@ -574,7 +593,7 @@ async fn propose_call(
         .map_err(ApiError::from)?
         .ok_or(ApiError::Forbidden)?;
     let body = json_body(parsed)?;
-    let args = parse_call(&body, document)?;
+    let (args, link) = parse_call(&body, document)?;
     let digest = request_digest(document, args.rev, args.proposal, &body["ops"], args.strict);
     call.digest = Some(digest);
     // The permit is held until the compiler is done, even if the caller gives up.
@@ -597,7 +616,10 @@ async fn propose_call(
     } else {
         // The connection goes back to the pool.
         drop(admitted.db);
-        write_proposal(ctx, call, &agent, document, kind, args, digest, permit).await?
+        write_proposal(
+            ctx, call, &agent, document, kind, args, link, digest, permit,
+        )
+        .await?
     };
     Ok(Served {
         bytes: body.len(),
@@ -883,10 +905,12 @@ async fn write_proposal(
     document: Uuid,
     kind: FileKind,
     mut args: ProposeArgs,
+    link: Link,
     digest: [u8; 32],
     permit: ReadPermit,
 ) -> Result<String, AgentFail> {
     let (mut tx, role) = begin_locked(ctx, document).await?;
+    let link = super::session::check_link(&mut tx, ctx.project, agent.id, link.0, link.1).await?;
     let (head, _) = engine_core::snapshot::read_current_state(&mut tx, DocumentId(document))
         .await
         .map_err(ApiError::from)?;
@@ -1066,7 +1090,15 @@ async fn write_proposal(
         .take(5)
         .map(|s| s.at.clone())
         .collect();
-    let stored = sqlx::query("insert into agent_proposal_receipt(draft_id,document_id,project_id,agent_identity_id,principal_id,key_id,kind,request_id,opened,rev,base_seq,head_seq,ops_in,ops_engine,stale,stale_refs,revision,request_digest,outcome,why) values($1,$2,$3,$4,$5,$6,'propose',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'ok',$18)")
+    // The blocks this call touched, for agent blame (decision 026).
+    let mut nodes: Vec<String> = compiled
+        .ops
+        .iter()
+        .filter_map(|op| op.target_node_id().map(|n| n.0.clone()))
+        .collect();
+    nodes.sort();
+    nodes.dedup();
+    let stored = sqlx::query("insert into agent_proposal_receipt(draft_id,document_id,project_id,agent_identity_id,principal_id,key_id,kind,request_id,opened,rev,base_seq,head_seq,ops_in,ops_engine,stale,stale_refs,revision,request_digest,outcome,why,session_id,turn,nodes) values($1,$2,$3,$4,$5,$6,'propose',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'ok',$18,$19,$20,$21)")
         .bind(proposal_id)
         .bind(document)
         .bind(ctx.project)
@@ -1085,6 +1117,9 @@ async fn write_proposal(
         .bind(revision)
         .bind(&digest[..])
         .bind(Value::Array(whys))
+        .bind(link.map(|l| l.0))
+        .bind(link.and_then(|l| l.1))
+        .bind(&nodes)
         .execute(&mut *tx)
         .await;
     match stored {
@@ -1245,8 +1280,22 @@ mod tests {
         let doc = Uuid::from_u128(7);
         let body =
             json!({"rev":3,"request_id":Uuid::from_u128(8),"ops":[{"op":"delete","ref":"7C02"}]});
-        let args = parse_call(&body, doc).unwrap();
+        let (args, link) = parse_call(&body, doc).unwrap();
         assert_eq!(args.file, doc);
+        assert_eq!(link, (None, None));
+        // The session and turn are taken out before the grammar sees the call.
+        let mut linked = body.clone();
+        linked["session"] = json!(Uuid::from_u128(5));
+        linked["turn"] = json!(2);
+        assert_eq!(
+            parse_call(&linked, doc).unwrap().1,
+            (Some(Uuid::from_u128(5)), Some(2))
+        );
+        linked["turn"] = json!(0);
+        assert!(parse_call(&linked, doc).is_err());
+        linked["turn"] = json!(1);
+        linked["session"] = json!("not-a-uuid");
+        assert!(parse_call(&linked, doc).is_err());
         let mut named = body.clone();
         named["file"] = json!(doc);
         assert!(parse_call(&named, doc).is_ok());

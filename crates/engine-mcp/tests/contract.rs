@@ -101,7 +101,7 @@ fn the_definitions_are_the_specifications_apart_from_the_stated_deviations() {
         .collect();
     assert_eq!(
         names,
-        ["files", "outline", "read", "find", "diff", "status"]
+        ["files", "outline", "read", "find", "diff", "status", "memory"]
     );
 }
 
@@ -127,11 +127,12 @@ fn the_definitions_stay_small() {
         .map(|d| serde_json::to_string(d).unwrap().len())
         .sum();
     println!("definition bytes as published (with titles): {published}");
-    // 4,845 and 4,983 when written. Spec 13.3 says 4,472 for a read-only grant and the
-    // token-efficiency document 4,616; the difference is the stated deviations.
-    assert!(total <= 4_900, "definitions grew to {total} bytes");
+    // 4,845 and 4,983 when written; 5,398 and 5,561 with `memory` (spec 7.10, 553 bytes).
+    // Spec 13.3 says 4,472 for the six read tools and the token-efficiency document 4,616;
+    // the difference is the stated deviations.
+    assert!(total <= 5_450, "definitions grew to {total} bytes");
     assert!(
-        published <= 5_050,
+        published <= 5_620,
         "published definitions grew to {published} bytes"
     );
 }

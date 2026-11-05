@@ -38,8 +38,11 @@ fn the_read_only_profile_is_the_default_and_byte_for_byte_what_it_was() {
         serde_json::from_str(include_str!("golden/read_only_tools.json")).unwrap();
     let now = Profile::read_only().definitions();
     let as_text = |v: &Vec<Value>| serde_json::to_string(v).unwrap();
-    assert_eq!(as_text(&now), as_text(&before));
-    assert_eq!(as_text(&now).len(), 4_990);
+    // Decision 026 added one read tool, `memory` (spec 7.10), after the six; they are unchanged.
+    assert_eq!(as_text(&now[..6].to_vec()), as_text(&before));
+    assert_eq!(as_text(&before).len(), 4_990);
+    assert_eq!(now[6]["name"], "memory");
+    assert_eq!(now.len(), 7);
     let names: Vec<&str> = Profile::read_only()
         .tools()
         .iter()
@@ -47,7 +50,7 @@ fn the_read_only_profile_is_the_default_and_byte_for_byte_what_it_was() {
         .collect();
     assert_eq!(
         names,
-        ["files", "outline", "read", "find", "diff", "status"]
+        ["files", "outline", "read", "find", "diff", "status", "memory"]
     );
     assert_eq!(
         Profile::read_only().instructions(),
@@ -63,7 +66,10 @@ fn the_read_only_profile_is_the_default_and_byte_for_byte_what_it_was() {
     let order: Vec<&str> = all.iter().map(|d| d["name"].as_str().unwrap()).collect();
     assert_eq!(
         order,
-        ["files", "outline", "read", "find", "diff", "propose", "submit", "status"]
+        [
+            "files", "outline", "read", "find", "diff", "propose", "submit", "status", "memory",
+            "remember"
+        ]
     );
     assert_ne!(all[7], before[5], "status widens in the full profile");
 }
@@ -244,7 +250,7 @@ fn the_write_definitions_are_the_specifications_apart_from_the_stated_deviations
 }
 
 #[test]
-fn the_full_profile_has_eight_tools_and_a_pinned_size() {
+fn the_full_profile_has_ten_tools_and_a_pinned_size() {
     let full = Profile::full();
     let mut counted_total = 0;
     let mut published_total = 0;
@@ -268,9 +274,10 @@ fn the_full_profile_has_eight_tools_and_a_pinned_size() {
     // 444, status 477); ours are 597 more: the read tools carry the deviations of the
     // crate documentation (383), the write tools theirs (propose 72, submit 66, status 76).
     // The default profile's six are 4,845 on this measure and 4,983 published, pinned by
-    // `the_read_only_profile_is_the_default_and_byte_for_byte_what_it_was`.
-    assert_eq!(counted_total, 8_396, "{sizes:?}");
-    assert_eq!(published_total, 8_580);
+    // `the_read_only_profile_is_the_default_and_byte_for_byte_what_it_was`. Decision 026
+    // added `memory` (553) and `remember` (821): 8,396 and 8,580 before.
+    assert_eq!(counted_total, 9_770, "{sizes:?}");
+    assert_eq!(published_total, 10_006);
 }
 
 // --- section 16: the transcript's write steps ------------------------------------------------------

@@ -36,6 +36,7 @@ const HISTORY: &[&str] = &[
     "device_key_class",
     "agent_call",
     "agent_proposal_receipt",
+    "agent_memory_revision",
 ];
 const MUTABLE: &[&str] = &[
     "document",
@@ -94,6 +95,13 @@ const INSERT_UPDATE: &[&str] = &[
     "file_agent_policy",
     "agent_identity",
     "export_node_token",
+    // Agent provenance (schema 56): the capture policy holds its current value; a session
+    // only gains turns and a turn only loses its text on erasure (triggers refuse the rest).
+    "project_agent_capture",
+    "agent_session",
+    "agent_turn",
+    // Shared agent memory (schema 57): the current row moves only with a recorded revision.
+    "agent_memory",
 ];
 const FUNCTIONS: &[&str] = &[
     "access_role_rank(text)",

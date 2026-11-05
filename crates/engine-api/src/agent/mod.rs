@@ -129,10 +129,12 @@ pub mod identity;
 pub mod inbox;
 pub mod ledger;
 pub mod manage;
+pub mod memory;
 pub mod policy;
 pub mod proposal;
 pub mod routes;
 pub mod schema;
+pub mod session;
 pub mod state;
 pub mod write;
 

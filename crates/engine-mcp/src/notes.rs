@@ -105,6 +105,13 @@ fn note_for(tool: Tool, text: &str) -> Option<String> {
                 .to_owned(),
             )
         }
+        Tool::Remember => Some(
+            match get("state")? {
+                "proposed" => "proposed: a person accepts this memory before agents see it.",
+                _ => "already a memory of this project; nothing was added.",
+            }
+            .to_owned(),
+        ),
         Tool::Status => match get("what")? {
             "proposal" => Some(state_note(get("state")?).to_owned()),
             "access" if get("write_mode") == Some("none") => Some(
