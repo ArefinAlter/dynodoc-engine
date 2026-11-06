@@ -1870,3 +1870,239 @@ async fn incremental_v3_concurrent_same_revision(pool: PgPool) -> anyhow::Result
     assert_eq!(state_root, p1.root.as_str());
     Ok(())
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_v3_multi_codec_selection_and_replay_equivalence(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+
+    for i in 2..=35 {
+        append(
+            &pool,
+            document,
+            &EventPayload::FieldEdited {
+                node_id: node.clone(),
+                field: "label".into(),
+                value: json!(format!("Rev {i} edit")),
+            },
+            actor,
+        )
+        .await?;
+    }
+
+    // Rev 10: publish Codec::V1
+    let p1 = postgres::take_with_codec(&pool, document, 10, Limits::default(), postgres::Codec::V1)
+        .await?;
+    assert_eq!(p1.through_seq, 10);
+
+    // Rev 20: publish Codec::V2 (incremental)
+    let p2 = postgres::take_incremental(&pool, document, 20, Limits::default()).await?;
+    assert_eq!(p2.through_seq, 20);
+
+    // Rev 30: publish Codec::V3 (incremental)
+    let p3 = postgres::take_incremental_v3(&pool, document, 30, Limits::default()).await?;
+    assert_eq!(p3.through_seq, 30);
+
+    let all_events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id=$1 order by seq")
+            .bind(document.0)
+            .fetch_all(&pool)
+            .await?;
+
+    let mut connection = pool.acquire().await?;
+
+    // Verify historical reads at exact checkpoint boundaries
+    let h10 = read_state_at(&mut connection, document, 10).await?;
+    assert_eq!(h10.checkpoint_format, CheckpointFormat::SharedV1);
+    assert_eq!(h10.snapshot_seq, 10);
+    assert_eq!(h10.replayed_events, 0);
+    assert_eq!(h10.state, Materializer::fold(&all_events[..10])?);
+
+    let h20 = read_state_at(&mut connection, document, 20).await?;
+    assert_eq!(h20.checkpoint_format, CheckpointFormat::SharedV2);
+    assert_eq!(h20.snapshot_seq, 20);
+    assert_eq!(h20.replayed_events, 0);
+    assert_eq!(h20.state, Materializer::fold(&all_events[..20])?);
+
+    let h30 = read_state_at(&mut connection, document, 30).await?;
+    assert_eq!(h30.checkpoint_format, CheckpointFormat::SharedV3);
+    assert_eq!(h30.snapshot_seq, 30);
+    assert_eq!(h30.replayed_events, 0);
+    assert_eq!(h30.state, Materializer::fold(&all_events[..30])?);
+
+    // Verify historical reads at intermediate revisions (tail folding on top of closest checkpoint)
+    let h15 = read_state_at(&mut connection, document, 15).await?;
+    assert_eq!(h15.checkpoint_format, CheckpointFormat::SharedV1);
+    assert_eq!(h15.snapshot_seq, 10);
+    assert_eq!(h15.replayed_events, 5);
+    assert_eq!(h15.state, Materializer::fold(&all_events[..15])?);
+
+    let h25 = read_state_at(&mut connection, document, 25).await?;
+    assert_eq!(h25.checkpoint_format, CheckpointFormat::SharedV2);
+    assert_eq!(h25.snapshot_seq, 20);
+    assert_eq!(h25.replayed_events, 5);
+    assert_eq!(h25.state, Materializer::fold(&all_events[..25])?);
+
+    let h35 = read_state_at(&mut connection, document, 35).await?;
+    assert_eq!(h35.checkpoint_format, CheckpointFormat::SharedV3);
+    assert_eq!(h35.snapshot_seq, 30);
+    assert_eq!(h35.replayed_events, 5);
+    assert_eq!(h35.state, Materializer::fold(&all_events[..35])?);
+
+    // Verify background periodic snapshot selection with SharedV3
+    let engine = SnapshotEngine::new(pool.clone()).with_periodic_storage(PeriodicStorage::SharedV3);
+    engine.ensure_recent(document, 0).await?;
+    let latest_v3: (i16, i64) = sqlx::query_as(
+        "select codec_version, through_seq from shared_checkpoint where document_id=$1 and through_seq=35",
+    )
+    .bind(document.0)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(latest_v3.0, 3);
+    assert_eq!(latest_v3.1, 35);
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn corrupted_checkpoint_transparent_fallback_to_prior_valid_codec(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+
+    for i in 2..=35 {
+        append(
+            &pool,
+            document,
+            &EventPayload::FieldEdited {
+                node_id: node.clone(),
+                field: "label".into(),
+                value: json!(format!("Rev {i} edit")),
+            },
+            actor,
+        )
+        .await?;
+    }
+
+    // Rev 10: publish Codec::V1
+    postgres::take_with_codec(&pool, document, 10, Limits::default(), postgres::Codec::V1).await?;
+
+    // Rev 20: publish Codec::V2 (incremental)
+    postgres::take_incremental(&pool, document, 20, Limits::default()).await?;
+
+    // Rev 30: publish Codec::V3 (incremental)
+    postgres::take_incremental_v3(&pool, document, 30, Limits::default()).await?;
+
+    let all_events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id=$1 order by seq")
+            .bind(document.0)
+            .fetch_all(&pool)
+            .await?;
+
+    let mut connection = pool.acquire().await?;
+
+    // Inject a corrupted checkpoint candidate at rev 32 with Codec::V3
+    let corrupt_root_32 = "e".repeat(64);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(document.0)
+        .bind(&corrupt_root_32)
+        .bind(b"corrupt_v3_data".as_slice())
+        .execute(&pool)
+        .await?;
+    let chain_32 = postgres::chain_at(&mut connection, document, 32).await?;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,32,3,$2,$3)",
+    )
+    .bind(document.0)
+    .bind(&corrupt_root_32)
+    .bind(&chain_32)
+    .execute(&pool)
+    .await?;
+
+    // Reading at rev 35: candidate 32 is corrupt, so it falls back to valid candidate 30 (V3)
+    let h35 = read_state_at(&mut connection, document, 35).await?;
+    assert_eq!(h35.checkpoint_format, CheckpointFormat::SharedV3);
+    assert_eq!(h35.snapshot_seq, 30);
+    assert_eq!(h35.replayed_events, 5);
+    assert_eq!(h35.state, Materializer::fold(&all_events[..35])?);
+
+    // Now inject another corrupted candidate at rev 31 with Codec::V2
+    let corrupt_root_31 = "f".repeat(64);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(document.0)
+        .bind(&corrupt_root_31)
+        .bind(b"corrupt_v2_data".as_slice())
+        .execute(&pool)
+        .await?;
+    let chain_31 = postgres::chain_at(&mut connection, document, 31).await?;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,31,2,$2,$3)",
+    )
+    .bind(document.0)
+    .bind(&corrupt_root_31)
+    .bind(&chain_31)
+    .execute(&pool)
+    .await?;
+
+    // Reading at rev 31: candidate 31 (corrupt V2) fails, falls back to candidate 30 (valid V3)
+    let h31 = read_state_at(&mut connection, document, 31).await?;
+    assert_eq!(h31.checkpoint_format, CheckpointFormat::SharedV3);
+    assert_eq!(h31.snapshot_seq, 30);
+    assert_eq!(h31.replayed_events, 1);
+    assert_eq!(h31.state, Materializer::fold(&all_events[..31])?);
+
+    // Reading at rev 25: candidate 25 (if corrupt) falls back to candidate 20 (valid V2)
+    let corrupt_root_25 = "a".repeat(64);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(document.0)
+        .bind(&corrupt_root_25)
+        .bind(b"corrupt_v2_at_25".as_slice())
+        .execute(&pool)
+        .await?;
+    let chain_25 = postgres::chain_at(&mut connection, document, 25).await?;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,25,2,$2,$3)",
+    )
+    .bind(document.0)
+    .bind(&corrupt_root_25)
+    .bind(&chain_25)
+    .execute(&pool)
+    .await?;
+
+    let h25 = read_state_at(&mut connection, document, 25).await?;
+    assert_eq!(h25.checkpoint_format, CheckpointFormat::SharedV2);
+    assert_eq!(h25.snapshot_seq, 20);
+    assert_eq!(h25.replayed_events, 5);
+    assert_eq!(h25.state, Materializer::fold(&all_events[..25])?);
+
+    // If candidate at 15 is corrupt: falls back to 10 (V1)
+    let corrupt_root_15 = "b".repeat(64);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(document.0)
+        .bind(&corrupt_root_15)
+        .bind(b"corrupt_v1_at_15".as_slice())
+        .execute(&pool)
+        .await?;
+    let chain_15 = postgres::chain_at(&mut connection, document, 15).await?;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,15,1,$2,$3)",
+    )
+    .bind(document.0)
+    .bind(&corrupt_root_15)
+    .bind(&chain_15)
+    .execute(&pool)
+    .await?;
+
+    let h15 = read_state_at(&mut connection, document, 15).await?;
+    assert_eq!(h15.checkpoint_format, CheckpointFormat::SharedV1);
+    assert_eq!(h15.snapshot_seq, 10);
+    assert_eq!(h15.replayed_events, 5);
+    assert_eq!(h15.state, Materializer::fold(&all_events[..15])?);
+
+    Ok(())
+}
