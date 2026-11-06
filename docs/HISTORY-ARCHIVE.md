@@ -88,7 +88,9 @@ freshness, or native-format fidelity: an attacker could author a validly signed 
 fork. The expected head, obtained out-of-band or from an authoritative pin, ties the
 archive's cryptographic closure to the operator's trusted history.
 
-The offline verifier (`engine-cli archive-verify FILE --project UUID --expect-head ADDRESS`):
+The offline verifier (`engine-cli archive-verify FILE --project UUID --expect-head ADDRESS`; it
+refuses an incremental archive, whose base and history are not in the file, and so never reports a
+delta as a verified complete history):
 - Operates entirely offline with no target repository, network access, account keys, or branch writes.
 - Uses bounded private temporary storage for frame staging and graph reachability validation.
 - Requires the exact dependency and object closure: every commit must be reachable from `head`,
@@ -132,10 +134,10 @@ separate, explicit step.
 
 `engine-cli repository DATABASE PROJECT archive-recovery-preflight FILE --source COMMIT [--onto COMMIT] [--branch BRANCH] [--kind cherry-pick|revert] [--mainline COMMIT]`
 performs read-only preflight feasibility analysis for applying commit-addressed recovery (cherry-pick or revert) directly against an offline history archive.
-- Operates strictly read-only: it never mutates SQLite, writes WAL frames, modifies branch references, or writes files to disk. If the database does not exist, `--onto` allows evaluating cherry-pick feasibility directly across commits in the archive stream.
+- Operates read-only: it never mutates the repository, its branch references or any project file. If the database does not exist, `--onto` (a commit in the archive) allows evaluating feasibility across the archive's own commits.
 - Analyzes 3-way merge feasibility against the active branch head (or specified `--onto` commit), classifying any conflicts (`content_conflict`, `modify_delete`, `namespace_collision`) and reporting modified paths.
-- Verifies base parent commitments: if the source or mainline parent commit is absent from both the archive and repository, the preflight refuses fail-closed with an error (`absent parent refusal`).
-- Returns a structured JSON report detailing `feasible: bool`, `modified_paths`, `conflicts`, `required_base_commits`, and `missing_base_commits`.
+- Resolves the source, `--onto` and mainline commits only from verified evidence: each must hash and verify to the address it was looked up by and belong to this project, or the preflight refuses. A commit absent from both the archive and the repository is refused (`absent parent refusal`); a merge source needs an explicit `--mainline` that is one of its parents.
+- Returns a structured JSON report: `feasible` is true only when there is no conflict and no required commit is missing from the repository, `conflict_free` reports conflicts alone, and `evidence` says what was checked. The analysis rests on commit frames (addresses, signatures, project); typed file states and recovery rules are not replayed, so it is not a promise that the recovery will commit.
 
 ## Historical file diff
 
