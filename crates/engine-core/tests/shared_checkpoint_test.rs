@@ -9,8 +9,8 @@ use engine_core::{
         READ_BATCH_OBJECTS, WRITE_BATCH_BYTES, WRITE_BATCH_OBJECTS,
     },
     snapshot::{
-        read_state_at, CheckpointFormat, PeriodicStorage, SnapshotEngine, SnapshotError,
-        SnapshotReason,
+        read_state_at, CheckpointFormat, NamedStorage, PeriodicStorage, SnapshotEngine,
+        SnapshotError, SnapshotReason,
     },
 };
 use engine_shared::{DocumentId, Event, EventPayload, IdentityId, NodeId, NodeType};
@@ -1669,6 +1669,84 @@ async fn incremental_v3_mixed_codec_history_and_base_isolation(pool: PgPool) -> 
         let expected = Materializer::fold(&events)?;
         assert_eq!(loaded, expected);
     }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn retention_plan_keeps_what_a_kept_incremental_checkpoint_reaches(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    let snapshot = SnapshotEngine::new(pool.clone())
+        .with_named_storage(NamedStorage::SharedV2)
+        .take(document, SnapshotReason::Deployed)
+        .await?;
+    let edit = EventPayload::FieldEdited {
+        node_id: node,
+        field: "label".into(),
+        value: json!("rev 2 edit"),
+    };
+    append(&pool, document, &edit, actor).await?;
+    postgres::take_incremental_v3(&pool, document, 1, Limits::default()).await?;
+    let increment = postgres::take_incremental_v3(&pool, document, 2, Limits::default()).await?;
+    assert_eq!(increment.base_seq, Some(1));
+
+    let limits = Limits::default();
+    sqlx::query(
+        "insert into workspace_draft(document_id,name,base_seq,base_state,created_by)
+         select $1::uuid,'draft',1,jsonb_build_object('$dynodoc_state',2,'root',state_root),$2::uuid
+         from shared_checkpoint where document_id=$1 and through_seq=1",
+    )
+    .bind(document.0)
+    .bind(actor.0)
+    .execute(&pool)
+    .await?;
+    let pinned = postgres::unreferenced_objects(&pool, document, &[2], limits).await?;
+    assert!(
+        pinned.is_empty(),
+        "a draft base keeps the objects it reaches"
+    );
+    sqlx::query("delete from workspace_draft where document_id=$1")
+        .bind(document.0)
+        .execute(&pool)
+        .await?;
+
+    let both = postgres::unreferenced_objects(&pool, document, &[1, 2], limits).await?;
+    assert!(both.is_empty(), "every object belongs to a kept root");
+    let plan = postgres::unreferenced_objects(&pool, document, &[2], limits).await?;
+    assert!(!plan.is_empty(), "objects only the base used are freed");
+    let snapshot_root: String = sqlx::query_scalar("select state_root from snapshot where id=$1")
+        .bind(snapshot.id.0)
+        .fetch_one(&pool)
+        .await?;
+    assert!(!plan.contains(&Address::try_from(snapshot_root)?));
+    assert!(matches!(
+        postgres::unreferenced_objects(&pool, document, &[9], limits).await,
+        Err(Error::Invalid("checkpoint not found"))
+    ));
+
+    // Prune exactly the plan, as a database owner outside the runtime role would.
+    let mut tx = pool.begin().await?;
+    sqlx::query("set local session_replication_role=replica")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from shared_checkpoint where document_id=$1 and through_seq=1")
+        .bind(document.0)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from checkpoint_object where document_id=$1 and address=any($2)")
+        .bind(document.0)
+        .bind(plan.iter().map(Address::as_str).collect::<Vec<_>>())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    let events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id=$1 and seq <= 2 order by seq")
+            .bind(document.0)
+            .fetch_all(&pool)
+            .await?;
+    let loaded = postgres::load(&pool, document, 2, limits).await?;
+    assert_eq!(loaded, Materializer::fold(&events)?);
     Ok(())
 }
 

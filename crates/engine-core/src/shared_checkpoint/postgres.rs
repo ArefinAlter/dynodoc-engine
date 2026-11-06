@@ -5,8 +5,8 @@ use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    read_state, validate_stored, write_state, Address, Error, Limits, ObjectStore, WriteStats,
-    READ_BATCH_OBJECTS, WRITE_BATCH_BYTES, WRITE_BATCH_OBJECTS,
+    read_state, references, validate_stored, write_state, Address, Error, Limits, ObjectStore,
+    WriteStats, READ_BATCH_OBJECTS, WRITE_BATCH_BYTES, WRITE_BATCH_OBJECTS,
 };
 use crate::{log::ZERO_HASH, materializer::DocumentState, snapshot::read_legacy_state_at};
 
@@ -703,6 +703,74 @@ pub(crate) async fn publish_incremental_in_connection(
         base_seq: Some(base_seq),
         fallback_ran: false,
     })
+}
+
+/// Read-only retention plan: the document's stored objects that no retained root
+/// reaches. Retained roots are the `keep` checkpoints plus every root a typed named
+/// snapshot or draft base holds. A checkpoint keeps everything it reaches, so a kept
+/// incremental checkpoint never needs its base row. Nothing is deleted: objects are
+/// append-only.
+pub async fn unreferenced_objects(
+    pool: &PgPool,
+    document: DocumentId,
+    keep: &[i64],
+    limits: Limits,
+) -> Result<BTreeSet<Address>, Error> {
+    let mut tx = pool.begin().await?;
+    protect_document(&mut tx, document).await?;
+    let mut roots: Vec<String> = sqlx::query_scalar(
+        "select state_root from shared_checkpoint where document_id=$1 and through_seq=any($2)",
+    )
+    .bind(document.0)
+    .bind(keep)
+    .fetch_all(&mut *tx)
+    .await?;
+    if roots.len() != keep.iter().collect::<BTreeSet<_>>().len() {
+        return Err(Error::Invalid("checkpoint not found"));
+    }
+    roots.extend(
+        sqlx::query_scalar::<_, String>(
+            "select state_root from snapshot where document_id=$1 and state_root is not null
+             union select base_state_root from workspace_draft where document_id=$1 and base_state_root is not null
+             union select merge_base_root from workspace_draft where document_id=$1 and merge_base_root is not null",
+        )
+        .bind(document.0)
+        .fetch_all(&mut *tx)
+        .await?,
+    );
+    let mut queue = roots
+        .into_iter()
+        .map(Address::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut reached = BTreeSet::new();
+    let mut store = PgStore::new(&mut tx);
+    while !queue.is_empty() {
+        let batch: Vec<_> = queue
+            .drain(..queue.len().min(READ_BATCH_OBJECTS))
+            .filter(|address| reached.insert(address.clone()))
+            .collect();
+        if reached.len() > limits.max_objects {
+            return Err(Error::Limit("objects"));
+        }
+        store.prefetch(document, &batch).await?;
+        for address in &batch {
+            queue.extend(references(address, &store.get(document, address).await?)?);
+        }
+    }
+    let mut unreferenced = BTreeSet::new();
+    for address in sqlx::query_scalar::<_, String>(
+        "select address from checkpoint_object where document_id=$1",
+    )
+    .bind(document.0)
+    .fetch_all(&mut *tx)
+    .await?
+    {
+        let address = Address::try_from(address)?;
+        if !reached.contains(&address) {
+            unreferenced.insert(address);
+        }
+    }
+    Ok(unreferenced)
 }
 
 /// Load an exact published checkpoint, checking chain-position metadata and every
