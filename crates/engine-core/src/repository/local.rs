@@ -2,14 +2,15 @@
 //! ref CAS. No remote permissions or automatic native-file writes are implied.
 
 use super::{
-    archive, historical_diff, recovery, Commit, Error, Head, SignedCommit, MAX_ANCESTORS,
-    MAX_COMMIT_BYTES,
+    archive, historical_diff, recovery, state_export, Commit, Error, Head, SignedCommit,
+    MAX_ANCESTORS, MAX_COMMIT_BYTES,
 };
 use crate::{
     materializer::DocumentState,
     shared_checkpoint::{self, typed, Address, Limits, ObjectStore, WriteStats},
 };
 use engine_shared::DocumentId;
+use ring::signature::Ed25519KeyPair;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
     SqliteConnection, SqlitePool,
@@ -513,6 +514,57 @@ impl LocalRepository {
             &file_b,
             &state_b,
         )
+    }
+
+    /// Export the normalized state envelope for a file in a commit along with a cryptographic provenance attestation.
+    pub async fn export_file_with_attestation(
+        &self,
+        commit_addr: &Address,
+        file_path: &str,
+        authority_epoch: u32,
+        key: &Ed25519KeyPair,
+        issued_at_ms: i64,
+    ) -> Result<
+        (
+            state_export::StateExportEnvelope,
+            state_export::StateExportAttestation,
+            Vec<u8>,
+        ),
+        Error,
+    > {
+        let (signed, _) = {
+            let mut conn = self.pool.acquire().await?;
+            load_commit(&mut conn, self.project, commit_addr).await?
+        };
+        signed.verify()?;
+
+        let file_entry = signed
+            .commit
+            .files
+            .get(file_path)
+            .cloned()
+            .ok_or_else(|| Error::Invalid("file path not found in commit"))?;
+
+        let state = self
+            .read_state(file_entry.document, &file_entry.state)
+            .await?;
+        let envelope = state_export::StateExportEnvelope::new(file_path.to_string(), signed, state);
+
+        let mut json_bytes = Vec::new();
+        envelope
+            .write_to_writer(&mut json_bytes)
+            .map_err(|_| Error::Invalid("state export envelope serialization"))?;
+
+        let attestation = state_export::StateExportAttestation::generate(
+            self.project,
+            authority_epoch,
+            commit_addr.clone(),
+            &json_bytes,
+            key,
+            issued_at_ms,
+        )?;
+
+        Ok((envelope, attestation, json_bytes))
     }
 
     /// Import a signed commit only after all parents and complete file graphs are

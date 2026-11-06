@@ -171,6 +171,54 @@ pub enum Action {
         /// Output file path for the normalized state (refuses overwrite).
         #[arg(long)]
         out: PathBuf,
+        /// Optional Ed25519 PKCS#8 key file to emit a companion .dynoattest provenance attestation.
+        #[arg(long)]
+        attest_key: Option<PathBuf>,
+        /// Authority epoch for the attestation key (>= 1, defaults to 1).
+        #[arg(long, default_value_t = 1)]
+        attest_epoch: u32,
+    },
+    /// Generate a cryptographic provenance attestation companion (.dynoattest) for an exported state file.
+    AttestState {
+        /// Exported normalized state JSON file (.json) to attest.
+        #[arg(long)]
+        state: PathBuf,
+        /// Commit address containing this state.
+        #[arg(long)]
+        commit: String,
+        /// Authority epoch for the attestation key (>= 1).
+        #[arg(long, default_value_t = 1)]
+        epoch: u32,
+        /// Ed25519 PKCS#8 key file to sign with.
+        #[arg(long)]
+        key: PathBuf,
+        /// Optional companion output path (defaults to `<state>.dynoattest`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Declared issuance time in ms (defaults to current UTC time).
+        #[arg(long)]
+        issued_at_ms: Option<i64>,
+    },
+    /// Verify a state export provenance attestation companion (.dynoattest).
+    VerifyStateAttestation {
+        /// Exported normalized state JSON file (.json) to verify.
+        #[arg(long)]
+        state: PathBuf,
+        /// Companion attestation file (defaults to `<state>.dynoattest`).
+        #[arg(long)]
+        attestation: Option<PathBuf>,
+        /// Expected commit address (optional).
+        #[arg(long)]
+        commit: Option<String>,
+        /// Trusted public key (hex-encoded Ed25519; repeatable).
+        #[arg(long)]
+        trusted_key: Vec<String>,
+        /// Minimum allowed authority epoch.
+        #[arg(long)]
+        min_epoch: Option<u32>,
+        /// Maximum allowed authority epoch.
+        #[arg(long)]
+        max_epoch: Option<u32>,
     },
     /// Compare two historical file revisions across commits or archives without extracting files to disk.
     HistoricalDiff {
@@ -977,6 +1025,8 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     | Action::HorizonPlan { .. }
                     | Action::ArchiveExport { .. }
                     | Action::ExportFile { .. }
+                    | Action::AttestState { .. }
+                    | Action::VerifyStateAttestation { .. }
                     | Action::Log { .. }
             ) {
                 LocalRepository::open_read_only(&path, project).await?
@@ -1114,6 +1164,8 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     commit,
                     path: file_path,
                     out,
+                    attest_key,
+                    attest_epoch,
                 } => {
                     let commit_addr = address(commit)?;
                     anyhow::ensure!(
@@ -1177,7 +1229,7 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
 
                     envelope.write_to_path(&out)?;
 
-                    serde_json::json!({
+                    let mut res = serde_json::json!({
                         "out": out.display().to_string(),
                         "commit": commit_addr,
                         "path": file_path,
@@ -1185,6 +1237,101 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                         "state_root": file_entry.state,
                         "format": engine_core::repository::state_export::STATE_EXPORT_FORMAT,
                         "version": engine_core::repository::state_export::STATE_EXPORT_VERSION,
+                    });
+
+                    if let Some(key_path) = attest_key {
+                        let key = crate::signing::load(&key_path)?;
+                        let bytes = std::fs::read(&out)?;
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let attestation = engine_core::repository::state_export::StateExportAttestation::generate(
+                            project,
+                            attest_epoch,
+                            commit_addr.clone(),
+                            &bytes,
+                            &key,
+                            now_ms,
+                        )?;
+                        let companion_path =
+                            engine_core::repository::state_export::companion_attestation_path(&out);
+                        attestation.write_companion_file(&companion_path)?;
+                        res["attestation"] = serde_json::to_value(&attestation)?;
+                        res["attestation_file"] =
+                            serde_json::json!(companion_path.display().to_string());
+                    }
+
+                    res
+                }
+                Action::AttestState {
+                    state,
+                    commit,
+                    epoch,
+                    key,
+                    out,
+                    issued_at_ms,
+                } => {
+                    let commit_addr = address(commit)?;
+                    let key = crate::signing::load(&key)?;
+                    let bytes = std::fs::read(&state)
+                        .with_context(|| format!("reading state file at {}", state.display()))?;
+                    let issued_at =
+                        issued_at_ms.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+                    let attestation =
+                        engine_core::repository::state_export::StateExportAttestation::generate(
+                            project,
+                            epoch,
+                            commit_addr.clone(),
+                            &bytes,
+                            &key,
+                            issued_at,
+                        )?;
+                    let out_path = out.unwrap_or_else(|| {
+                        engine_core::repository::state_export::companion_attestation_path(&state)
+                    });
+                    attestation.write_companion_file(&out_path)?;
+                    serde_json::json!({
+                        "state": state.display().to_string(),
+                        "attestation": out_path.display().to_string(),
+                        "project": project,
+                        "commit": commit_addr.as_str(),
+                        "authority_epoch": epoch,
+                        "signer_key": attestation.signer_key,
+                        "state_digest": attestation.state_digest,
+                    })
+                }
+                Action::VerifyStateAttestation {
+                    state,
+                    attestation,
+                    commit,
+                    trusted_key,
+                    min_epoch,
+                    max_epoch,
+                } => {
+                    let mut policy =
+                        engine_core::repository::state_export::AttestationVerificationPolicy::new()
+                            .with_project(project)
+                            .with_trusted_keys(trusted_key);
+                    if let Some(c) = commit {
+                        policy = policy.with_commit(address(c)?);
+                    }
+                    if let Some(min) = min_epoch {
+                        policy = policy.with_min_epoch(min);
+                    }
+                    if let Some(max) = max_epoch {
+                        policy = policy.with_max_epoch(max);
+                    }
+                    let verified = engine_core::repository::state_export::verify_state_export_attestation_file(
+                        &state,
+                        attestation.as_ref(),
+                        &policy,
+                    )?;
+                    serde_json::json!({
+                        "verified": true,
+                        "state": state.display().to_string(),
+                        "project": verified.project,
+                        "commit": verified.commit.as_str(),
+                        "authority_epoch": verified.authority_epoch,
+                        "signer_key": verified.signer_key,
+                        "state_digest": verified.state_digest,
                     })
                 }
                 Action::ImportObjects { input } => {
@@ -3728,6 +3875,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "Report.docx".to_string(),
                 out: export_out.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3756,6 +3905,8 @@ mod tests {
                 commit: c3.as_str().to_string(),
                 path: "Report.docx".to_string(),
                 out: export_fail_deleted.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3775,6 +3926,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "Report-Renamed.docx".to_string(),
                 out: export_fail_rename.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3808,6 +3961,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "doc.docx".to_string(),
                 out: export_out.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3827,6 +3982,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "doc.docx".to_string(),
                 out: export_out.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3879,6 +4036,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "doc.docx".to_string(),
                 out: export_out.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3920,6 +4079,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "Report.docx".to_string(),
                 out: export_out.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3945,6 +4106,7 @@ mod tests {
                 project,
                 expect_commit,
                 path,
+                ..
             } => {
                 assert_eq!(file, export_out);
                 assert_eq!(project, f.project);
@@ -4115,6 +4277,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "doc.docx".to_string(),
                 out: export_out.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -6196,6 +6360,250 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn state_export_provenance_attestation_cli_workflow() {
+        use crate::{Cli, Command};
+        use clap::Parser;
+        use ring::signature::KeyPair;
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Attested state content")]).await;
+        let c1 = f
+            .commit(&[], vec![("Certified.docx", f1)], "Genesis commit")
+            .await;
+
+        // Generate test signing key
+        let key_path =
+            std::env::temp_dir().join(format!("test_signer-{}.key", uuid::Uuid::new_v4()));
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        std::fs::write(&key_path, pkcs8.as_ref()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let key = crate::signing::load(&key_path).unwrap();
+        let signer_pubkey = hex::encode(key.public_key().as_ref());
+
+        let export_out =
+            std::env::temp_dir().join(format!("test-attest-state-{}.json", uuid::Uuid::new_v4()));
+        let companion_attest =
+            engine_core::repository::state_export::companion_attestation_path(&export_out);
+        let _ = std::fs::remove_file(&export_out);
+        let _ = std::fs::remove_file(&companion_attest);
+
+        // 1. Export with --attest-key and --attest-epoch: emits both .json and companion .dynoattest
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ExportFile {
+                commit: c1.as_str().to_string(),
+                path: "Certified.docx".to_string(),
+                out: export_out.clone(),
+                attest_key: Some(key_path.clone()),
+                attest_epoch: 2,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(export_out.is_file(), "state export file must exist");
+        assert!(
+            companion_attest.is_file(),
+            "companion attestation file must exist"
+        );
+
+        // 2. Verify companion attestation contents
+        let attest_obj =
+            engine_core::repository::state_export::StateExportAttestation::read_companion_file(
+                &companion_attest,
+            )
+            .unwrap();
+        assert_eq!(attest_obj.project, f.project);
+        assert_eq!(attest_obj.authority_epoch, 2);
+        assert_eq!(attest_obj.commit, c1);
+        assert_eq!(attest_obj.signer_key, signer_pubkey);
+
+        // 3. Action::VerifyStateAttestation succeeds
+        run(
+            f.path.clone(),
+            f.project,
+            Action::VerifyStateAttestation {
+                state: export_out.clone(),
+                attestation: None, // automatically resolves companion
+                commit: Some(c1.as_str().to_string()),
+                trusted_key: vec![signer_pubkey.clone()],
+                min_epoch: Some(1),
+                max_epoch: Some(5),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 4. Standalone top-level state_export_verify_full CLI function
+        super::super::state_export_verify_full(
+            export_out.clone(),
+            f.project,
+            c1.as_str().to_string(),
+            "Certified.docx".to_string(),
+            None,
+            vec![signer_pubkey.clone()],
+            Some(2),
+            Some(3),
+        )
+        .await
+        .unwrap();
+
+        // 5. Tampered state file rejection
+        let tampered_out = std::env::temp_dir().join(format!(
+            "test-attest-tampered-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut raw_bytes = std::fs::read(&export_out).unwrap();
+        raw_bytes.push(b' '); // append trailing byte
+        std::fs::write(&tampered_out, raw_bytes).unwrap();
+
+        let err_tamper = run(
+            f.path.clone(),
+            f.project,
+            Action::VerifyStateAttestation {
+                state: tampered_out.clone(),
+                attestation: Some(companion_attest.clone()),
+                commit: Some(c1.as_str().to_string()),
+                trusted_key: vec![signer_pubkey.clone()],
+                min_epoch: None,
+                max_epoch: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err_tamper.to_string().contains("digest mismatch")
+                || err_tamper.to_string().contains("failed")
+        );
+
+        // 6. Untrusted signer key rejection
+        let err_untrusted = run(
+            f.path.clone(),
+            f.project,
+            Action::VerifyStateAttestation {
+                state: export_out.clone(),
+                attestation: None,
+                commit: Some(c1.as_str().to_string()),
+                trusted_key: vec![
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                ],
+                min_epoch: None,
+                max_epoch: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err_untrusted
+            .to_string()
+            .contains("not in the trusted keys"));
+
+        // 7. Epoch policy violation rejection
+        let err_epoch = run(
+            f.path.clone(),
+            f.project,
+            Action::VerifyStateAttestation {
+                state: export_out.clone(),
+                attestation: None,
+                commit: Some(c1.as_str().to_string()),
+                trusted_key: vec![],
+                min_epoch: Some(3), // epoch is 2
+                max_epoch: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err_epoch.to_string().contains("is expired"));
+
+        // 8. Standalone Action::AttestState on an un-attested export file
+        let separate_out =
+            std::env::temp_dir().join(format!("test-separate-{}.json", uuid::Uuid::new_v4()));
+        let separate_attest =
+            std::env::temp_dir().join(format!("test-separate-{}.dynoattest", uuid::Uuid::new_v4()));
+        std::fs::copy(&export_out, &separate_out).unwrap();
+
+        run(
+            f.path.clone(),
+            f.project,
+            Action::AttestState {
+                state: separate_out.clone(),
+                commit: c1.as_str().to_string(),
+                epoch: 3,
+                key: key_path.clone(),
+                out: Some(separate_attest.clone()),
+                issued_at_ms: Some(1700000000000),
+            },
+        )
+        .await
+        .unwrap();
+
+        let read_sep =
+            engine_core::repository::state_export::StateExportAttestation::read_companion_file(
+                &separate_attest,
+            )
+            .unwrap();
+        assert_eq!(read_sep.authority_epoch, 3);
+        assert_eq!(read_sep.issued_at_ms, 1700000000000);
+
+        // 9. Clap parsing verification for state-export-attest and state-export-verify
+        let parsed_attest = Cli::try_parse_from([
+            "engine-cli",
+            "state-export-attest",
+            separate_out.to_str().unwrap(),
+            "--project",
+            &f.project.to_string(),
+            "--commit",
+            c1.as_str(),
+            "--epoch",
+            "3",
+            "--key",
+            key_path.to_str().unwrap(),
+        ])
+        .expect("clap parsing state-export-attest");
+        assert!(matches!(
+            parsed_attest.command,
+            Command::StateExportAttest { .. }
+        ));
+
+        let parsed_verify = Cli::try_parse_from([
+            "engine-cli",
+            "state-export-verify",
+            export_out.to_str().unwrap(),
+            "--project",
+            &f.project.to_string(),
+            "--expect-commit",
+            c1.as_str(),
+            "--path",
+            "Certified.docx",
+            "--trusted-key",
+            &signer_pubkey,
+            "--min-epoch",
+            "1",
+        ])
+        .expect("clap parsing state-export-verify with attestation options");
+        assert!(matches!(
+            parsed_verify.command,
+            Command::StateExportVerify { .. }
+        ));
+
+        // 10. Clean up
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&export_out);
+        let _ = std::fs::remove_file(&companion_attest);
+        let _ = std::fs::remove_file(&tampered_out);
+        let _ = std::fs::remove_file(&separate_out);
+        let _ = std::fs::remove_file(&separate_attest);
         f.finish().await;
     }
 }

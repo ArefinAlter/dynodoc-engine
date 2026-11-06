@@ -4,12 +4,15 @@
 //! normalized DocumentState JSON envelope. It is not a DOCX/XLSX/PPTX binary,
 //! but a verified canonical document model at an exact commit.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::Path;
 
+use ring::signature::Ed25519KeyPair;
 use serde::de::{DeserializeSeed, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 
+use super::{attestation, hex, unhex, Error};
 use crate::materializer::DocumentState;
 use crate::repository::SignedCommit;
 use crate::shared_checkpoint::{
@@ -497,13 +500,410 @@ pub async fn verify_state_export_limited<R: std::io::Read>(
     })
 }
 
+/// The companion `.dynoattest` file extension.
+pub const ATTESTATION_EXTENSION: &str = "dynoattest";
+
+/// Domain separation for state export attestation payload address hashing.
+pub const STATE_EXPORT_ATTESTATION_DOMAIN: &[u8] = b"dynodoc.state-export-attestation\0v1\0";
+
+/// Domain separation for state export attestation Ed25519 signatures.
+pub const STATE_EXPORT_ATTESTATION_SIGN_DOMAIN: &[u8] =
+    b"dynodoc.state-export-attestation-signature\0v1\0";
+
+/// Format version for state export provenance attestations.
+pub const ATTESTATION_VERSION: u8 = 1;
+
+/// Maximum size in bytes allowed for an attestation JSON envelope (4 KiB).
+pub const MAX_ATTESTATION_BYTES: usize = 4096;
+
+/// Compute lowercase hex-encoded SHA-256 digest of raw state bytes.
+pub fn compute_state_digest(state_bytes: &[u8]) -> String {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(state_bytes);
+    hex(ctx.finish().as_ref())
+}
+
+/// Helper to derive companion `.dynoattest` path for a given state export file path.
+pub fn companion_attestation_path<P: AsRef<Path>>(state_path: P) -> std::path::PathBuf {
+    let p = state_path.as_ref();
+    let mut s = p.as_os_str().to_os_string();
+    s.push(format!(".{ATTESTATION_EXTENSION}"));
+    std::path::PathBuf::from(s)
+}
+
+/// Unsigned claim binding the exported state to a project repository commit and authority epoch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateExportPayload {
+    /// Format version (1).
+    pub version: u8,
+    /// Stable project UUID.
+    pub project: uuid::Uuid,
+    /// Authority epoch under which this attestation was issued.
+    pub authority_epoch: u32,
+    /// Hex-encoded 32-byte Ed25519 public key of the signer.
+    #[serde(alias = "signer_public_key")]
+    pub signer_key: String,
+    /// Verified commit address containing the state.
+    #[serde(alias = "commit_address")]
+    pub commit: Address,
+    /// Hex-encoded 32-byte SHA-256 digest of the exported state bytes.
+    #[serde(alias = "state_hash", alias = "digest")]
+    pub state_digest: String,
+    /// Declared issuance time in milliseconds since Unix epoch.
+    pub issued_at_ms: i64,
+}
+
+impl StateExportPayload {
+    /// Compute the canonical address for this attestation payload under domain separation.
+    pub fn address(&self) -> Result<Address, Error> {
+        if self.version != ATTESTATION_VERSION {
+            return Err(Error::Invalid("attestation version"));
+        }
+        if self.project.is_nil() {
+            return Err(Error::Invalid("attestation project"));
+        }
+        if self.authority_epoch < 1
+            || self.authority_epoch > crate::repository::authority_epoch::MAX_EPOCH
+        {
+            return Err(Error::Invalid("attestation authority epoch"));
+        }
+        unhex(&self.signer_key, 32)?;
+        unhex(&self.state_digest, 32)?;
+        if self.issued_at_ms < 0 {
+            return Err(Error::Invalid("attestation timestamp"));
+        }
+        attestation::hash(STATE_EXPORT_ATTESTATION_DOMAIN, self)
+    }
+}
+
+/// Cryptographic provenance attestation emitted in a companion `.dynoattest` JSON block.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateExportAttestation {
+    /// Format version (1).
+    pub version: u8,
+    /// Stable project UUID.
+    pub project: uuid::Uuid,
+    /// Authority epoch under which this attestation was issued.
+    pub authority_epoch: u32,
+    /// Hex-encoded 32-byte Ed25519 public key of the signer.
+    #[serde(alias = "signer_public_key")]
+    pub signer_key: String,
+    /// Verified commit address containing the state.
+    #[serde(alias = "commit_address")]
+    pub commit: Address,
+    /// Hex-encoded 32-byte SHA-256 digest of the exported state bytes.
+    #[serde(alias = "state_hash", alias = "digest")]
+    pub state_digest: String,
+    /// Declared issuance time in milliseconds since Unix epoch.
+    pub issued_at_ms: i64,
+    /// Hex-encoded 64-byte Ed25519 signature over domain and payload address.
+    pub signature: String,
+}
+
+impl StateExportAttestation {
+    /// Extract the unsigned payload of this attestation.
+    pub fn payload(&self) -> StateExportPayload {
+        StateExportPayload {
+            version: self.version,
+            project: self.project,
+            authority_epoch: self.authority_epoch,
+            signer_key: self.signer_key.clone(),
+            commit: self.commit.clone(),
+            state_digest: self.state_digest.clone(),
+            issued_at_ms: self.issued_at_ms,
+        }
+    }
+
+    /// Compute the address of this attestation's payload.
+    pub fn address(&self) -> Result<Address, Error> {
+        self.payload().address()
+    }
+
+    /// Sign a payload with an Ed25519 keypair.
+    pub fn sign(mut payload: StateExportPayload, key: &Ed25519KeyPair) -> Result<Self, Error> {
+        use ring::signature::KeyPair;
+        payload.signer_key = hex(key.public_key().as_ref());
+        let addr = payload.address()?;
+        let msg = attestation::message(STATE_EXPORT_ATTESTATION_SIGN_DOMAIN, &addr)?;
+        let signature = hex(key.sign(&msg).as_ref());
+        Ok(Self {
+            version: payload.version,
+            project: payload.project,
+            authority_epoch: payload.authority_epoch,
+            signer_key: payload.signer_key,
+            commit: payload.commit,
+            state_digest: payload.state_digest,
+            issued_at_ms: payload.issued_at_ms,
+            signature,
+        })
+    }
+
+    /// Generate and sign a new provenance attestation for raw exported state bytes.
+    pub fn generate(
+        project: uuid::Uuid,
+        authority_epoch: u32,
+        commit: Address,
+        state_bytes: &[u8],
+        key: &Ed25519KeyPair,
+        issued_at_ms: i64,
+    ) -> Result<Self, Error> {
+        use ring::signature::KeyPair;
+        let state_digest = compute_state_digest(state_bytes);
+        let payload = StateExportPayload {
+            version: ATTESTATION_VERSION,
+            project,
+            authority_epoch,
+            signer_key: hex(key.public_key().as_ref()),
+            commit,
+            state_digest,
+            issued_at_ms,
+        };
+        Self::sign(payload, key)
+    }
+
+    /// Write this attestation to a companion file with owner-only private permissions (0600 on Unix, private ACL on Windows).
+    pub fn write_companion_file<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
+        let p = path.as_ref();
+        anyhow::ensure!(
+            !p.exists(),
+            "attestation file {} already exists; refusing overwrite",
+            p.display()
+        );
+        let mut file = super::private_fs::create_private_file(p)
+            .map_err(|e| anyhow::anyhow!("creating attestation file at {}: {e}", p.display()))?;
+        let guard = super::private_fs::AutoRemoveFile::new(p.to_path_buf());
+        let json_bytes = serde_json::to_vec_pretty(self)?;
+        anyhow::ensure!(
+            json_bytes.len() <= MAX_ATTESTATION_BYTES,
+            "attestation exceeds maximum size limit ({} bytes)",
+            MAX_ATTESTATION_BYTES
+        );
+        file.write_all(&json_bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        guard.commit();
+        Ok(())
+    }
+
+    /// Read an attestation from a companion file path, enforcing the maximum size limit.
+    pub fn read_companion_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let p = path.as_ref();
+        let file = std::fs::File::open(p)
+            .map_err(|e| anyhow::anyhow!("opening attestation file at {}: {e}", p.display()))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_ATTESTATION_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_ATTESTATION_BYTES,
+            "attestation file exceeds maximum size limit ({} bytes)",
+            MAX_ATTESTATION_BYTES
+        );
+        let attestation: Self = serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("parsing attestation JSON: {e}"))?;
+        Ok(attestation)
+    }
+}
+
+/// Error conditions during provenance attestation verification.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AttestationError {
+    #[error("invalid attestation: {0}")]
+    Invalid(&'static str),
+
+    #[error("state digest mismatch: expected {expected}, actual {actual}")]
+    DigestMismatch { expected: String, actual: String },
+
+    #[error("project UUID mismatch: expected {expected}, actual {actual}")]
+    ProjectMismatch {
+        expected: uuid::Uuid,
+        actual: uuid::Uuid,
+    },
+
+    #[error("commit address mismatch: expected {expected:?}, actual {actual:?}")]
+    CommitMismatch { expected: Address, actual: Address },
+
+    #[error("signer key {signer_key} is not in the trusted keys for this project")]
+    UntrustedKey { signer_key: String },
+
+    #[error("cryptographic signature verification failed: {0}")]
+    SignatureFailed(&'static str),
+
+    #[error("authority epoch {epoch} is expired (minimum valid epoch is {min_valid_epoch})")]
+    ExpiredEpoch { epoch: u32, min_valid_epoch: u32 },
+
+    #[error("authority epoch {epoch} exceeds maximum active epoch {max_valid_epoch}")]
+    FutureEpoch { epoch: u32, max_valid_epoch: u32 },
+}
+
+/// Verification policy configuring trust anchors for provenance attestations.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AttestationVerificationPolicy {
+    pub expected_project: Option<uuid::Uuid>,
+    pub expected_commit: Option<Address>,
+    pub trusted_keys: BTreeSet<String>,
+    pub min_epoch: Option<u32>,
+    pub max_epoch: Option<u32>,
+}
+
+impl AttestationVerificationPolicy {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_trusted_key(mut self, key: impl Into<String>) -> Self {
+        self.trusted_keys.insert(key.into());
+        self
+    }
+
+    pub fn with_trusted_keys<I, S>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for k in keys {
+            self.trusted_keys.insert(k.into());
+        }
+        self
+    }
+
+    pub fn with_project(mut self, project: uuid::Uuid) -> Self {
+        self.expected_project = Some(project);
+        self
+    }
+
+    pub fn with_commit(mut self, commit: Address) -> Self {
+        self.expected_commit = Some(commit);
+        self
+    }
+
+    pub fn with_min_epoch(mut self, min: u32) -> Self {
+        self.min_epoch = Some(min);
+        self
+    }
+
+    pub fn with_max_epoch(mut self, max: u32) -> Self {
+        self.max_epoch = Some(max);
+        self
+    }
+
+    pub fn with_active_epoch(mut self, active_epoch: u32, max_age: u32) -> Self {
+        self.min_epoch = Some(active_epoch.saturating_sub(max_age));
+        self.max_epoch = Some(active_epoch);
+        self
+    }
+}
+
+/// Verify a state export provenance attestation against state bytes and verification policy.
+pub fn verify_state_attestation(
+    attestation: &StateExportAttestation,
+    state_bytes: &[u8],
+    policy: &AttestationVerificationPolicy,
+) -> Result<(), AttestationError> {
+    // 1. Verify state digest
+    let actual_digest = compute_state_digest(state_bytes);
+    if attestation.state_digest != actual_digest {
+        return Err(AttestationError::DigestMismatch {
+            expected: attestation.state_digest.clone(),
+            actual: actual_digest,
+        });
+    }
+
+    // 2. Verify project UUID if specified in policy
+    if let Some(expected_project) = policy.expected_project {
+        if attestation.project != expected_project {
+            return Err(AttestationError::ProjectMismatch {
+                expected: expected_project,
+                actual: attestation.project,
+            });
+        }
+    }
+
+    // 3. Verify commit address if specified in policy
+    if let Some(ref expected_commit) = policy.expected_commit {
+        if &attestation.commit != expected_commit {
+            return Err(AttestationError::CommitMismatch {
+                expected: expected_commit.clone(),
+                actual: attestation.commit.clone(),
+            });
+        }
+    }
+
+    // 4. Verify authority epoch bounds
+    if let Some(min_epoch) = policy.min_epoch {
+        if attestation.authority_epoch < min_epoch {
+            return Err(AttestationError::ExpiredEpoch {
+                epoch: attestation.authority_epoch,
+                min_valid_epoch: min_epoch,
+            });
+        }
+    }
+    if let Some(max_epoch) = policy.max_epoch {
+        if attestation.authority_epoch > max_epoch {
+            return Err(AttestationError::FutureEpoch {
+                epoch: attestation.authority_epoch,
+                max_valid_epoch: max_epoch,
+            });
+        }
+    }
+
+    // 5. Verify trusted signer keys (if non-empty)
+    if !policy.trusted_keys.is_empty() && !policy.trusted_keys.contains(&attestation.signer_key) {
+        return Err(AttestationError::UntrustedKey {
+            signer_key: attestation.signer_key.clone(),
+        });
+    }
+
+    // 6. Verify cryptographic signature
+    let addr = attestation
+        .address()
+        .map_err(|_| AttestationError::Invalid("attestation payload"))?;
+    let msg = attestation::message(STATE_EXPORT_ATTESTATION_SIGN_DOMAIN, &addr)
+        .map_err(|_| AttestationError::Invalid("signature message"))?;
+    attestation::verify(&attestation.signer_key, &attestation.signature, &msg).map_err(|_| {
+        AttestationError::SignatureFailed("Ed25519 signature is invalid for the signer key")
+    })?;
+
+    Ok(())
+}
+
+/// Offline verification of an exported state file and companion attestation file.
+pub fn verify_state_export_attestation_file<P: AsRef<Path>, Q: AsRef<Path>>(
+    state_path: P,
+    attestation_path: Option<Q>,
+    policy: &AttestationVerificationPolicy,
+) -> anyhow::Result<StateExportAttestation> {
+    let s_path = state_path.as_ref();
+    let a_path = match attestation_path {
+        Some(ref p) => p.as_ref().to_path_buf(),
+        None => companion_attestation_path(s_path),
+    };
+    let attestation = StateExportAttestation::read_companion_file(&a_path)?;
+    let state_file = std::fs::File::open(s_path)
+        .map_err(|e| anyhow::anyhow!("opening state file at {}: {e}", s_path.display()))?;
+    let mut state_bytes = Vec::new();
+    state_file
+        .take(MAX_STATE_EXPORT_BYTES as u64 + 1)
+        .read_to_end(&mut state_bytes)?;
+    anyhow::ensure!(
+        state_bytes.len() <= MAX_STATE_EXPORT_BYTES,
+        "state file exceeds maximum size limit ({} bytes)",
+        MAX_STATE_EXPORT_BYTES
+    );
+    verify_state_attestation(&attestation, &state_bytes, policy)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(attestation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::materializer::{CommentState, MaterializedNode, SuggestionState};
     use crate::repository::Commit;
     use engine_shared::NodeId;
-    use ring::signature::Ed25519KeyPair;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
@@ -1278,5 +1678,271 @@ mod tests {
         assert_eq!(report.path, path);
         assert_eq!(report.document, doc);
         assert_eq!(report.root, state_root);
+    }
+
+    #[test]
+    fn test_valid_attestation_verification() {
+        let key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let pub_key = super::super::hex(key.public_key().as_ref());
+        let project = uuid::Uuid::new_v4();
+        let commit = Address::try_from(
+            "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+        )
+        .unwrap();
+        let state_bytes =
+            b"{\"format\":\"dynodoc.state-export\",\"version\":1,\"data\":\"sample\"}";
+
+        let attestation = StateExportAttestation::generate(
+            project,
+            2,
+            commit.clone(),
+            state_bytes,
+            &key,
+            1_700_000_000_000,
+        )
+        .expect("generation should succeed");
+
+        assert_eq!(attestation.version, ATTESTATION_VERSION);
+        assert_eq!(attestation.project, project);
+        assert_eq!(attestation.authority_epoch, 2);
+        assert_eq!(attestation.signer_key, pub_key);
+        assert_eq!(attestation.commit, commit);
+        assert_eq!(attestation.state_digest, compute_state_digest(state_bytes));
+
+        let policy = AttestationVerificationPolicy::new()
+            .with_project(project)
+            .with_commit(commit)
+            .with_trusted_key(&pub_key)
+            .with_active_epoch(3, 1); // min_epoch: 2, max_epoch: 3
+
+        verify_state_attestation(&attestation, state_bytes, &policy)
+            .expect("valid attestation must verify cleanly");
+    }
+
+    #[test]
+    fn test_tampered_state_rejection() {
+        let key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let pub_key = super::super::hex(key.public_key().as_ref());
+        let project = uuid::Uuid::new_v4();
+        let commit = Address::try_from(
+            "2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+        )
+        .unwrap();
+        let original_state = b"{\"format\":\"dynodoc.state-export\",\"version\":1}";
+        let tampered_state = b"{\"format\":\"dynodoc.state-export\",\"version\":2}";
+
+        let attestation = StateExportAttestation::generate(
+            project,
+            1,
+            commit.clone(),
+            original_state,
+            &key,
+            1_700_000_000_000,
+        )
+        .expect("generation should succeed");
+
+        let policy = AttestationVerificationPolicy::new()
+            .with_project(project)
+            .with_commit(commit)
+            .with_trusted_key(&pub_key);
+
+        let err = verify_state_attestation(&attestation, tampered_state, &policy)
+            .expect_err("tampered state must fail verification");
+
+        match err {
+            AttestationError::DigestMismatch { expected, actual } => {
+                assert_eq!(expected, compute_state_digest(original_state));
+                assert_eq!(actual, compute_state_digest(tampered_state));
+            }
+            other => panic!("expected DigestMismatch error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_wrong_key_rejection() {
+        let key1 = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let key2 = Ed25519KeyPair::from_seed_unchecked(&[8; 32]).unwrap();
+        let pub_key2 = super::super::hex(key2.public_key().as_ref());
+
+        let project = uuid::Uuid::new_v4();
+        let commit = Address::try_from(
+            "3333333333333333333333333333333333333333333333333333333333333333".to_string(),
+        )
+        .unwrap();
+        let state_bytes = b"{\"content\":\"verified\"}";
+
+        let attestation = StateExportAttestation::generate(
+            project,
+            1,
+            commit.clone(),
+            state_bytes,
+            &key1,
+            1_700_000_000_000,
+        )
+        .expect("generation should succeed");
+
+        // 1. Untrusted signer key in policy
+        let policy_untrusted = AttestationVerificationPolicy::new()
+            .with_project(project)
+            .with_commit(commit.clone())
+            .with_trusted_key(&pub_key2);
+
+        let err = verify_state_attestation(&attestation, state_bytes, &policy_untrusted)
+            .expect_err("untrusted key must be rejected");
+
+        assert!(matches!(err, AttestationError::UntrustedKey { .. }));
+
+        // 2. Cryptographic signature corruption
+        let mut corrupted_attestation = attestation.clone();
+        corrupted_attestation.signature = "00".repeat(64);
+
+        let policy_with_key1 = AttestationVerificationPolicy::new()
+            .with_project(project)
+            .with_commit(commit)
+            .with_trusted_key(super::super::hex(key1.public_key().as_ref()));
+
+        let err_sig =
+            verify_state_attestation(&corrupted_attestation, state_bytes, &policy_with_key1)
+                .expect_err("corrupted signature must fail");
+
+        assert!(matches!(err_sig, AttestationError::SignatureFailed(_)));
+    }
+
+    #[test]
+    fn test_expired_epoch_handling() {
+        let key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let pub_key = super::super::hex(key.public_key().as_ref());
+        let project = uuid::Uuid::new_v4();
+        let commit = Address::try_from(
+            "4444444444444444444444444444444444444444444444444444444444444444".to_string(),
+        )
+        .unwrap();
+        let state_bytes = b"{\"nodes\":[]}";
+
+        // Attestation signed at epoch 1
+        let attestation_epoch1 = StateExportAttestation::generate(
+            project,
+            1,
+            commit.clone(),
+            state_bytes,
+            &key,
+            1_700_000_000_000,
+        )
+        .expect("generation should succeed");
+
+        // Policy requires active epoch 3 with max age 1 -> allowed range [2, 3]
+        let policy_window = AttestationVerificationPolicy::new()
+            .with_project(project)
+            .with_commit(commit.clone())
+            .with_trusted_key(&pub_key)
+            .with_active_epoch(3, 1);
+
+        let err_expired =
+            verify_state_attestation(&attestation_epoch1, state_bytes, &policy_window)
+                .expect_err("epoch 1 must be rejected as expired when min_epoch is 2");
+
+        match err_expired {
+            AttestationError::ExpiredEpoch {
+                epoch,
+                min_valid_epoch,
+            } => {
+                assert_eq!(epoch, 1);
+                assert_eq!(min_valid_epoch, 2);
+            }
+            other => panic!("expected ExpiredEpoch, got {other:?}"),
+        }
+
+        // Future epoch check: attestation at epoch 5 when policy max_epoch is 4
+        let attestation_future = StateExportAttestation::generate(
+            project,
+            5,
+            commit.clone(),
+            state_bytes,
+            &key,
+            1_700_000_000_000,
+        )
+        .expect("generation should succeed");
+
+        let policy_max = AttestationVerificationPolicy::new()
+            .with_project(project)
+            .with_commit(commit)
+            .with_trusted_key(&pub_key)
+            .with_max_epoch(4);
+
+        let err_future = verify_state_attestation(&attestation_future, state_bytes, &policy_max)
+            .expect_err("future epoch must be rejected");
+
+        match err_future {
+            AttestationError::FutureEpoch {
+                epoch,
+                max_valid_epoch,
+            } => {
+                assert_eq!(epoch, 5);
+                assert_eq!(max_valid_epoch, 4);
+            }
+            other => panic!("expected FutureEpoch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_companion_file_roundtrip_and_permissions() {
+        let dir = TempDir::new();
+        let key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let pub_key = super::super::hex(key.public_key().as_ref());
+        let project = uuid::Uuid::new_v4();
+        let commit = Address::try_from(
+            "5555555555555555555555555555555555555555555555555555555555555555".to_string(),
+        )
+        .unwrap();
+        let state_bytes = b"{\"state\":{\"nodes\":{}}}";
+
+        let state_file_path = dir.path().join("exported_doc.json");
+        std::fs::write(&state_file_path, state_bytes).unwrap();
+
+        let companion_path = companion_attestation_path(&state_file_path);
+        assert_eq!(
+            companion_path,
+            dir.path().join("exported_doc.json.dynoattest")
+        );
+
+        let attestation = StateExportAttestation::generate(
+            project,
+            1,
+            commit.clone(),
+            state_bytes,
+            &key,
+            1_700_000_000_000,
+        )
+        .unwrap();
+
+        attestation.write_companion_file(&companion_path).unwrap();
+        assert!(companion_path.is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&companion_path).unwrap().permissions();
+            assert_eq!(perms.mode() & 0o777, 0o600);
+        }
+
+        // Refuse overwrite
+        let err_overwrite = attestation
+            .write_companion_file(&companion_path)
+            .unwrap_err();
+        assert!(err_overwrite
+            .to_string()
+            .contains("already exists; refusing overwrite"));
+
+        // Read and verify
+        let policy = AttestationVerificationPolicy::new()
+            .with_project(project)
+            .with_commit(commit)
+            .with_trusted_key(&pub_key);
+
+        let verified =
+            verify_state_export_attestation_file(&state_file_path, None::<&Path>, &policy)
+                .expect("file verification helper should succeed");
+
+        assert_eq!(verified, attestation);
     }
 }
