@@ -2106,3 +2106,154 @@ async fn corrupted_checkpoint_transparent_fallback_to_prior_valid_codec(
 
     Ok(())
 }
+
+/// A periodic checkpoint at `seq` that fails to read: its root object is not a graph.
+async fn inject_corrupt_checkpoint(pool: &PgPool, document: DocumentId, seq: i64, bad_chain: bool) {
+    let root = format!("{seq:02x}").repeat(32);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(document.0)
+        .bind(&root)
+        .bind(b"corrupt_v3_data".as_slice())
+        .execute(pool)
+        .await
+        .unwrap();
+    // A wrong chain hash is corrupt metadata over otherwise readable data.
+    let chain: Vec<u8> = if bad_chain {
+        vec![0; 32]
+    } else {
+        sqlx::query_scalar("select chain_hash from event where document_id=$1 and seq=$2")
+            .bind(document.0)
+            .bind(seq)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    };
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,$2,3,$3,$4)",
+    )
+    .bind(document.0)
+    .bind(seq)
+    .bind(&root)
+    .bind(&chain)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_historical_read_skips_only_a_bounded_number_of_corrupt_periodic_checkpoints(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    for n in 2..=7 {
+        let edit = EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!(format!("rev {n}")),
+        };
+        append(&pool, document, &edit, actor).await?;
+    }
+    for seq in [2, 3] {
+        postgres::take_with_codec(&pool, document, seq, Limits::default(), postgres::Codec::V3)
+            .await?;
+    }
+    // Corrupt bytes, a wrong chain position, and corrupt bytes again, newest valid below.
+    inject_corrupt_checkpoint(&pool, document, 4, false).await;
+    inject_corrupt_checkpoint(&pool, document, 5, true).await;
+    inject_corrupt_checkpoint(&pool, document, 6, false).await;
+    let events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id=$1 order by seq")
+            .bind(document.0)
+            .fetch_all(&pool)
+            .await?;
+
+    let mut connection = pool.acquire().await?;
+    let read = read_state_at(&mut connection, document, 7).await?;
+    assert_eq!(
+        (read.snapshot_seq, read.checkpoint_format),
+        (3, CheckpointFormat::SharedV3)
+    );
+    assert_eq!(read.state, Materializer::fold(&events[..7])?);
+
+    // One more corrupt checkpoint exceeds the bound: an error, not an unbounded search
+    // down to genesis.
+    inject_corrupt_checkpoint(&pool, document, 7, false).await;
+    let err = read_state_at(&mut connection, document, 7)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("too many corrupt periodic checkpoints"),
+        "{err}"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_named_snapshot_serves_its_sequence_but_is_never_skipped_for_an_older_checkpoint(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    for n in 2..=4 {
+        let edit = EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!(format!("rev {n}")),
+        };
+        append(&pool, document, &edit, actor).await?;
+    }
+    // A valid older periodic checkpoint, and a named v2 snapshot at the head.
+    postgres::take_with_codec(&pool, document, 2, Limits::default(), postgres::Codec::V3).await?;
+    let snapshot = SnapshotEngine::new(pool.clone())
+        .with_named_storage(engine_core::snapshot::NamedStorage::SharedV2)
+        .take(document, SnapshotReason::Deployed)
+        .await?;
+    let events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id=$1 order by seq")
+            .bind(document.0)
+            .fetch_all(&pool)
+            .await?;
+    let mut connection = pool.acquire().await?;
+
+    let read = read_state_at(&mut connection, document, 4).await?;
+    assert_eq!(
+        (read.snapshot_seq, read.checkpoint_format),
+        (4, CheckpointFormat::SharedV2)
+    );
+
+    // A corrupt periodic checkpoint at the same sequence sorts first and is skipped; the
+    // named snapshot at that sequence serves the read with nothing replayed.
+    inject_corrupt_checkpoint(&pool, document, 4, false).await;
+    let read = read_state_at(&mut connection, document, 4).await?;
+    assert_eq!(
+        (
+            read.snapshot_seq,
+            read.checkpoint_format,
+            read.replayed_events
+        ),
+        (4, CheckpointFormat::SharedV2, 0)
+    );
+    assert_eq!(read.state, Materializer::fold(&events)?);
+
+    // Corrupt the named snapshot's graph: that is an error, not a reason to read the older
+    // valid periodic checkpoint at revision 2 and replay.
+    let root: String = sqlx::query_scalar("select state_root from snapshot where id=$1")
+        .bind(snapshot.id.0)
+        .fetch_one(&pool)
+        .await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("set local session_replication_role=replica")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "update checkpoint_object set bytes=decode('00','hex') where document_id=$1 and address=$2",
+    )
+    .bind(document.0)
+    .bind(&root)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    assert!(read_state_at(&mut connection, document, 4).await.is_err());
+    Ok(())
+}
