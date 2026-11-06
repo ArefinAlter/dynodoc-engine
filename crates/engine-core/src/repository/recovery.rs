@@ -1,16 +1,65 @@
 //! Commit-addressed project recovery. Apply a source delta (or its inverse) to
 //! an explicit current commit. Recovery sources never become ancestry implicitly.
 //! Same-file edits and shared path/identity constraints require explicit choices.
-use super::{compare, Commit, Error, FileEntry};
+use super::{archive, compare, Commit, Error, FileEntry, SignedCommit};
 use crate::shared_checkpoint::Address;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
     CherryPick,
     Revert,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictClass {
+    ContentConflict,
+    ModifyDelete,
+    NamespaceCollision,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictReport {
+    pub path: String,
+    pub classification: ConflictClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_state: Option<Address>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onto_state: Option<Address>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_state: Option<Address>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModifiedPath {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<FileEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<FileEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryPreflightReport {
+    /// True only when there is no conflict and no required commit is missing from the
+    /// destination: a report built on missing data is never clean.
+    pub feasible: bool,
+    /// No path conflicts, whatever the destination holds.
+    pub conflict_free: bool,
+    /// What the analysis rests on.
+    pub evidence: String,
+    pub kind: Kind,
+    pub source: Address,
+    pub onto: Address,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mainline: Option<Address>,
+    pub modified_paths: Vec<ModifiedPath>,
+    pub conflicts: Vec<ConflictReport>,
+    pub required_base_commits: Vec<Address>,
+    pub missing_base_commits: Vec<Address>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +174,193 @@ impl Plan {
         result.bytes()?; // Shared identity, namespace and size validation.
         Ok(result)
     }
+}
+
+/// A commit is evidence only if it hashes and verifies to the address it was looked up
+/// by and belongs to this project, whoever supplied it.
+pub fn verified(
+    signed: SignedCommit,
+    expected: &Address,
+    project: uuid::Uuid,
+) -> Result<SignedCommit, Error> {
+    if signed.verify()? != *expected {
+        return Err(Error::Invalid("commit does not match its address"));
+    }
+    if signed.commit.project != project {
+        return Err(Error::Invalid("commit belongs to another project"));
+    }
+    Ok(signed)
+}
+
+/// Compute structured read-only preflight analysis for applying a recovery delta onto `onto`.
+///
+/// Evaluates feasibility, classified conflicts, modified paths, and required base commitments
+/// without writing or creating any database records or modifying repository refs.
+pub fn preflight_plan(
+    kind: Kind,
+    source: &Commit,
+    onto: &Commit,
+    mainline: Option<&Commit>,
+    is_base_commit_present: impl Fn(&Address) -> bool,
+) -> Result<RecoveryPreflightReport, Error> {
+    let p = plan(kind, source, onto, mainline)?;
+    let source_addr = source.address()?;
+    let onto_addr = onto.address()?;
+    let mainline_addr = match mainline {
+        Some(m) => Some(m.address()?),
+        None => None,
+    };
+
+    let mut required_base_commits = vec![source_addr.clone(), onto_addr.clone()];
+    if let Some(ref m) = mainline_addr {
+        if !required_base_commits.contains(m) {
+            required_base_commits.push(m.clone());
+        }
+    }
+
+    let missing_base_commits: Vec<Address> = required_base_commits
+        .iter()
+        .filter(|addr| !is_base_commit_present(addr))
+        .cloned()
+        .collect();
+
+    let mut conflicts = Vec::new();
+    for c in p.changes.conflicts {
+        let classification = if c.left.is_some() && c.right.is_some() {
+            ConflictClass::ContentConflict
+        } else if c.left.is_none() && c.right.is_none() {
+            ConflictClass::NamespaceCollision
+        } else {
+            ConflictClass::ModifyDelete
+        };
+        let base_state = c.base.as_ref().map(|f| f.state.clone());
+        let onto_state = c.left.as_ref().map(|f| f.state.clone());
+        let source_state = c.right.as_ref().map(|f| f.state.clone());
+        conflicts.push(ConflictReport {
+            path: c.path,
+            classification,
+            base_state,
+            onto_state,
+            source_state,
+        });
+    }
+
+    let conflict_paths: BTreeSet<&String> = conflicts.iter().map(|c| &c.path).collect();
+    let mut all_paths: BTreeSet<&String> = onto.files.keys().collect();
+    for path in p.changes.files.keys() {
+        all_paths.insert(path);
+    }
+
+    let mut modified_paths = Vec::new();
+    for path in all_paths {
+        if conflict_paths.contains(path) {
+            continue;
+        }
+        let from = onto.files.get(path).cloned();
+        let to = p.changes.files.get(path).cloned();
+        if from != to {
+            modified_paths.push(ModifiedPath {
+                path: path.clone(),
+                from,
+                to,
+            });
+        }
+    }
+
+    let conflict_free = conflicts.is_empty();
+    let feasible = conflict_free && missing_base_commits.is_empty();
+
+    Ok(RecoveryPreflightReport {
+        feasible,
+        conflict_free,
+        evidence: "commit frames only: addresses, signatures and project were checked; typed file states and recovery rules were not replayed".into(),
+        kind,
+        source: source_addr,
+        onto: onto_addr,
+        mainline: mainline_addr,
+        modified_paths,
+        conflicts,
+        required_base_commits,
+        missing_base_commits,
+    })
+}
+
+/// Read-only preflight analysis for commit-addressed recovery directly against an archive stream.
+///
+/// Streams commits from `reader` up to `limits.max_commits`, resolves `source` and `mainline`
+/// parents across the archive and optional target repository lookup, and returns structured
+/// feasibility and conflict reports without any side effects on disk or database.
+#[allow(clippy::too_many_arguments)]
+pub fn preflight_archive_recovery<R: std::io::Read>(
+    reader: R,
+    limits: archive::ArchiveLimits,
+    kind: Kind,
+    source_addr: &Address,
+    onto_addr: &Address,
+    mainline_addr: Option<&Address>,
+    target_repo_commits: impl Fn(&Address) -> Option<SignedCommit>,
+    is_base_commit_present: impl Fn(&Address) -> bool,
+) -> Result<RecoveryPreflightReport, Error> {
+    let mut archive_reader = archive::ArchiveReader::new(reader, limits);
+    let mut project = None;
+    let mut commits_in_archive: HashMap<Address, SignedCommit> = HashMap::new();
+
+    while let Some(entry) = archive_reader.next_entry().map_err(|e| match e {
+        archive::ArchiveError::Limit(_) => {
+            Error::Limit("archive limits exceeded during recovery preflight")
+        }
+        _ => Error::Invalid("malformed archive stream during recovery preflight"),
+    })? {
+        match entry {
+            archive::ArchiveEntry::Header { project: p, .. } => project = Some(p.0),
+            archive::ArchiveEntry::Commit {
+                address, signed, ..
+            } => {
+                commits_in_archive.insert(address, signed);
+            }
+            _ => {}
+        }
+    }
+    let project = project.ok_or(Error::Invalid("archive has no header"))?;
+
+    let get_commit = |addr: &Address| -> Result<SignedCommit, Error> {
+        let signed = commits_in_archive
+            .get(addr)
+            .cloned()
+            .or_else(|| target_repo_commits(addr))
+            .ok_or_else(|| Error::Missing(addr.clone()))?;
+        verified(signed, addr, project)
+    };
+
+    let onto_signed = get_commit(onto_addr)?;
+    let source_signed = get_commit(source_addr)?;
+    let source_commit = &source_signed.commit;
+
+    let baseline = match (mainline_addr, source_commit.parents.as_slice()) {
+        (Some(chosen), parents) if parents.contains(chosen) => {
+            let parent_signed = get_commit(chosen)?;
+            Some(parent_signed.commit)
+        }
+        (Some(_), _) => return Err(Error::Invalid("recovery mainline is not a source parent")),
+        (None, []) => None,
+        (None, [parent]) => {
+            let parent_signed = get_commit(parent)?;
+            Some(parent_signed.commit)
+        }
+        (None, _) => {
+            return Err(Error::Invalid(
+                "merge recovery requires an explicit mainline",
+            ))
+        }
+    };
+
+    preflight_plan(
+        kind,
+        source_commit,
+        &onto_signed.commit,
+        baseline.as_ref(),
+        is_base_commit_present,
+    )
 }
 
 #[cfg(test)]
@@ -349,5 +585,270 @@ mod tests {
         bad = signed.commit;
         bad.parents.clear();
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn test_preflight_plan_clean_cherry_pick() {
+        let base = commit(
+            vec![],
+            BTreeMap::from([
+                ("Report.docx".into(), entry(1, "a")),
+                ("Budget.xlsx".into(), entry(2, "b")),
+            ]),
+        );
+        let mut source = base.clone();
+        source.parents = vec![base.address().unwrap()];
+        source.files.get_mut("Report.docx").unwrap().state = entry(1, "c").state;
+        let mut onto = base.clone();
+        onto.parents = vec![base.address().unwrap()];
+        onto.files.get_mut("Budget.xlsx").unwrap().state = entry(2, "d").state;
+
+        let report =
+            preflight_plan(Kind::CherryPick, &source, &onto, Some(&base), |_| true).unwrap();
+        assert!(report.feasible);
+        assert!(report.conflicts.is_empty());
+        assert_eq!(report.modified_paths.len(), 1);
+        assert_eq!(report.modified_paths[0].path, "Report.docx");
+        assert_eq!(report.modified_paths[0].from, Some(entry(1, "a")));
+        assert_eq!(report.modified_paths[0].to, Some(entry(1, "c")));
+        assert_eq!(
+            report.required_base_commits,
+            vec![
+                source.address().unwrap(),
+                onto.address().unwrap(),
+                base.address().unwrap(),
+            ]
+        );
+        assert!(report.missing_base_commits.is_empty());
+    }
+
+    #[test]
+    fn test_preflight_plan_conflict_detection() {
+        let base = commit(
+            vec![],
+            BTreeMap::from([("Report.docx".into(), entry(1, "a"))]),
+        );
+        let mut source = base.clone();
+        source.parents = vec![base.address().unwrap()];
+        source.files.get_mut("Report.docx").unwrap().state = entry(1, "b").state;
+
+        // ContentConflict: both changed Report.docx differently
+        let mut onto = base.clone();
+        onto.parents = vec![base.address().unwrap()];
+        onto.files.get_mut("Report.docx").unwrap().state = entry(1, "c").state;
+
+        let report =
+            preflight_plan(Kind::CherryPick, &source, &onto, Some(&base), |_| true).unwrap();
+        assert!(!report.feasible);
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(report.conflicts[0].path, "Report.docx");
+        assert_eq!(
+            report.conflicts[0].classification,
+            ConflictClass::ContentConflict
+        );
+        assert_eq!(report.conflicts[0].base_state, Some(entry(1, "a").state));
+        assert_eq!(report.conflicts[0].onto_state, Some(entry(1, "c").state));
+        assert_eq!(report.conflicts[0].source_state, Some(entry(1, "b").state));
+
+        // ModifyDelete: onto deleted Report.docx
+        let mut onto_del = base.clone();
+        onto_del.parents = vec![base.address().unwrap()];
+        onto_del.files.clear();
+
+        let report_del =
+            preflight_plan(Kind::CherryPick, &source, &onto_del, Some(&base), |_| true).unwrap();
+        assert!(!report_del.feasible);
+        assert_eq!(report_del.conflicts.len(), 1);
+        assert_eq!(report_del.conflicts[0].path, "Report.docx");
+        assert_eq!(
+            report_del.conflicts[0].classification,
+            ConflictClass::ModifyDelete
+        );
+    }
+
+    #[test]
+    fn test_preflight_archive_recovery_absent_parent_refusal() {
+        let project = DocumentId(uuid::Uuid::from_u128(1));
+        let genesis_signed = signed(
+            project.0,
+            vec![],
+            BTreeMap::from([("a".into(), entry(1, "a"))]),
+            "genesis",
+        );
+        let genesis_addr = genesis_signed.commit.address().unwrap();
+
+        let child_signed = signed(
+            project.0,
+            vec![genesis_addr.clone()],
+            BTreeMap::from([("a".into(), entry(1, "a")), ("b".into(), entry(2, "b"))]),
+            "child",
+        );
+        let child_addr = child_signed.commit.address().unwrap();
+
+        let onto_signed = signed(
+            project.0,
+            vec![],
+            BTreeMap::from([("c".into(), entry(3, "c"))]),
+            "onto",
+        );
+        let onto_addr = onto_signed.commit.address().unwrap();
+
+        // Create an archive containing ONLY child_signed, declaring genesis_addr as `since`
+        let mut buf = Vec::new();
+        let mut writer = archive::ArchiveWriter::new(&mut buf).unwrap();
+        writer
+            .write_header_with_since(1, project, child_addr.clone(), Some(genesis_addr.clone()))
+            .unwrap();
+        writer.write_commit(&child_signed).unwrap();
+        writer.finish().unwrap();
+
+        // Attempt preflight where parent genesis_addr is absent in archive and target_repo_commits returns None
+        let err = preflight_archive_recovery(
+            std::io::Cursor::new(&buf),
+            archive::ArchiveLimits::default(),
+            Kind::CherryPick,
+            &child_addr,
+            &onto_addr,
+            None,
+            |a| (a == &onto_addr).then(|| onto_signed.clone()),
+            |_| false,
+        )
+        .unwrap_err();
+
+        // Must refuse due to absent parent
+        assert!(matches!(err, Error::Missing(addr) if addr == genesis_addr));
+    }
+
+    #[test]
+    fn test_preflight_archive_recovery_success_with_archive_commits() {
+        let project = DocumentId(uuid::Uuid::from_u128(1));
+        let base_signed = signed(
+            project.0,
+            vec![],
+            BTreeMap::from([("a".into(), entry(1, "a"))]),
+            "base",
+        );
+        let base_addr = base_signed.commit.address().unwrap();
+
+        let source_signed = signed(
+            project.0,
+            vec![base_addr.clone()],
+            BTreeMap::from([("a".into(), entry(1, "a")), ("b".into(), entry(2, "b"))]),
+            "source",
+        );
+        let source_addr = source_signed.commit.address().unwrap();
+
+        let onto_signed = signed(
+            project.0,
+            vec![],
+            BTreeMap::from([("a".into(), entry(1, "a"))]),
+            "onto",
+        );
+        let onto_addr = onto_signed.commit.address().unwrap();
+
+        let mut buf = Vec::new();
+        let mut writer = archive::ArchiveWriter::new(&mut buf).unwrap();
+        writer
+            .write_header(1, project, source_addr.clone())
+            .unwrap();
+        writer.write_commit(&base_signed).unwrap();
+        writer.write_commit(&source_signed).unwrap();
+        writer.finish().unwrap();
+
+        let preflight = |present: bool| {
+            preflight_archive_recovery(
+                std::io::Cursor::new(&buf),
+                archive::ArchiveLimits::default(),
+                Kind::CherryPick,
+                &source_addr,
+                &onto_addr,
+                None,
+                |a| (a == &onto_addr).then(|| onto_signed.clone()),
+                move |_| present,
+            )
+            .unwrap()
+        };
+
+        // Nothing in a destination: the changes are conflict free, but the report is not
+        // feasible while every required commit is missing there.
+        let offline = preflight(false);
+        assert!(offline.conflict_free && !offline.feasible);
+        assert_eq!(offline.missing_base_commits.len(), 3);
+        assert_eq!(offline.modified_paths.len(), 1);
+        assert_eq!(offline.modified_paths[0].path, "b");
+        assert!(offline.evidence.contains("not replayed"));
+
+        let present = preflight(true);
+        assert!(present.conflict_free && present.feasible);
+        assert!(present.missing_base_commits.is_empty());
+    }
+
+    #[test]
+    fn test_preflight_archive_recovery_refuses_unverified_callback_commits() {
+        let project = DocumentId(uuid::Uuid::from_u128(1));
+        let source_signed = signed(
+            project.0,
+            vec![],
+            BTreeMap::from([("a".into(), entry(1, "a"))]),
+            "source",
+        );
+        let source_addr = source_signed.commit.address().unwrap();
+        let onto_signed = signed(
+            project.0,
+            vec![],
+            BTreeMap::from([("b".into(), entry(2, "b"))]),
+            "onto",
+        );
+        let onto_addr = onto_signed.commit.address().unwrap();
+        let foreign_onto = signed(
+            uuid::Uuid::from_u128(2),
+            vec![],
+            BTreeMap::from([("b".into(), entry(2, "b"))]),
+            "onto",
+        );
+        let foreign_addr = foreign_onto.commit.address().unwrap();
+
+        let mut buf = Vec::new();
+        let mut writer = archive::ArchiveWriter::new(&mut buf).unwrap();
+        writer
+            .write_header(1, project, source_addr.clone())
+            .unwrap();
+        writer.write_commit(&source_signed).unwrap();
+        writer.finish().unwrap();
+
+        let preflight = |onto: &Address, supplied: SignedCommit| {
+            preflight_archive_recovery(
+                std::io::Cursor::new(&buf),
+                archive::ArchiveLimits::default(),
+                Kind::CherryPick,
+                &source_addr,
+                onto,
+                None,
+                |_| Some(supplied.clone()),
+                |_| true,
+            )
+        };
+        // Another project's commit under its own, correct address.
+        let err = preflight(&foreign_addr, foreign_onto.clone()).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Invalid("commit belongs to another project")
+        ));
+        // A genuine commit is accepted; a different one supplied under the requested address is not.
+        assert!(preflight(&onto_addr, onto_signed).is_ok());
+        let err = preflight(
+            &foreign_addr,
+            signed(
+                project.0,
+                vec![],
+                BTreeMap::from([("z".into(), entry(9, "e"))]),
+                "other",
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Invalid("commit does not match its address")
+        ));
     }
 }

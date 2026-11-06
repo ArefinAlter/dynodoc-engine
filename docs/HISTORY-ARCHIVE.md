@@ -117,13 +117,38 @@ removed if the export fails and synced to disk before success is reported.
 
 `engine-cli repository DATABASE PROJECT archive-import FILE --expect-head ADDRESS` runs the
 complete offline verification first, including a semantic import into a disposable private
-repository, before it creates, opens or upgrades the target database. It then copies the
+repository, before it creates, opens or upgrades the target database. When importing an
+incremental archive (with a declared `since` base commitment), semantic preflight verifies that
+the target repository exists and contains the declared `since` commit before copying any staged
+objects. If the destination lacks the required base commit or is absent, the import is refused
+fail-closed without mutating or creating the target database. It then copies the
 objects in transfer batches (at most 64 objects / 1 MiB each) and the commits in dependency
-order. It never creates or moves a branch and never raises storage limits. If the target
+order. Redundant imports are zero-copy, and destination branch references and pins remain
+invariant. It never creates or moves a branch and never raises storage limits. If the target
 fails part way, for example at its capacity limit, the error reports how many objects and
 commits were already imported; those rows stay, like any committed transfer batch, and
 are charged to capacity. A retry is idempotent. Moving a branch to the imported head is a
 separate, explicit step.
+
+## Offline recovery and cherry-pick feasibility preflight
+
+`engine-cli repository DATABASE PROJECT archive-recovery-preflight FILE --source COMMIT [--onto COMMIT] [--branch BRANCH] [--kind cherry-pick|revert] [--mainline COMMIT]`
+performs read-only preflight feasibility analysis for applying commit-addressed recovery (cherry-pick or revert) directly against an offline history archive.
+- Operates read-only: it never mutates the repository, its branch references or any project file. If the database does not exist, `--onto` (a commit in the archive) allows evaluating feasibility across the archive's own commits.
+- Analyzes 3-way merge feasibility against the active branch head (or specified `--onto` commit), classifying any conflicts (`content_conflict`, `modify_delete`, `namespace_collision`) and reporting modified paths.
+- Resolves the source, `--onto` and mainline commits only from verified evidence: each must hash and verify to the address it was looked up by and belong to this project, or the preflight refuses. A commit absent from both the archive and the repository is refused (`absent parent refusal`); a merge source needs an explicit `--mainline` that is one of its parents.
+- Returns a structured JSON report: `feasible` is true only when there is no conflict and no required commit is missing from the repository, `conflict_free` reports conflicts alone, and `evidence` says what was checked. The analysis rests on commit frames (addresses, signatures, project); typed file states and recovery rules are not replayed, so it is not a promise that the recovery will commit.
+
+## Historical file diff
+
+`engine-cli repository DATABASE PROJECT historical-diff --commit-a <c1> [--path-a <p1>] --commit-b <c2> [--path-b <p2>] [--path <p>] [--archive <archive.dynoarc>] [--json]`
+(or top-level `engine-cli historical-diff ...`) compares two file revisions across commits or directly from an offline history archive without extracting any files to disk.
+- Reads object graphs directly from local repository storage (or in-memory store from a `.dynoarc` archive stream) and reconstructs normalized `DocumentState` representations.
+- Produces deterministic unified structural diffs with context lines and headers (`--- a/... +++ b/...`), node-level change tracking (`added`, `deleted`, `modified`), and fine-grained semantic AST operations.
+- `is_identical` is complete-state equality for the same document: nodes with their parents, tombstones and variable names, comments, suggestions and removed choices. A replaced document with an equal state root is not identical. Differences outside live nodes are named in `also_differs` (`document`, `comments`, `suggestions`, `removed_choices`, `tombstones`); a modified node lists what changed (`fields`, `type`, `position`, `parent`, `var_name`).
+- Output is bounded: at most 1,000 node changes and 256 KiB of unified diff, and a value over 4 KiB is shown as its length and SHA-256 (a change to it still shows). What is left out is counted in `omitted`. The semantic event list is all or nothing: it is listed whole within 1,000 events and 256 KiB, otherwise `events_unavailable` says why. A comparison is not an executable patch for every pair of states.
+- Fails closed with an error on missing paths or missing commits. Commits read from an archive must hash to the address they are listed under and belong to this project.
+- Operates read-only: it never mutates the repository or writes files.
 
 ## Normalized state export
 

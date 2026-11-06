@@ -18,6 +18,7 @@ pub mod compare;
 pub mod convergence;
 pub mod device;
 pub mod device_session;
+pub mod historical_diff;
 pub mod horizon;
 pub mod local;
 pub mod log;
