@@ -729,44 +729,15 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                         "target repository does not exist and no explicit --onto commit provided"
                     )
                 })?;
-                let mut commits_in_archive = std::collections::HashMap::new();
-                let mut archive_reader =
-                    engine_core::repository::archive::ArchiveReader::new(file_handle, limits);
-                while let Some(entry) = archive_reader
-                    .next_entry()
-                    .map_err(|e| anyhow::anyhow!("failed reading archive: {e}"))?
-                {
-                    if let engine_core::repository::archive::ArchiveEntry::Commit {
-                        address,
-                        signed,
-                        ..
-                    } = entry
-                    {
-                        commits_in_archive.insert(address, signed);
-                    }
-                }
-                let onto_signed = commits_in_archive.get(&onto_addr).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "onto commit {} not found in archive and repository does not exist",
-                        onto_addr.as_str()
-                    )
-                })?;
-                let source_signed = commits_in_archive.get(&source_addr).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "source commit {} not found in archive",
-                        source_addr.as_str()
-                    )
-                })?;
-                let mainline_commit = mainline_addr
-                    .as_ref()
-                    .and_then(|m| commits_in_archive.get(m))
-                    .map(|s| &s.commit);
-                engine_core::repository::recovery::preflight_plan(
+                engine_core::repository::recovery::preflight_archive_recovery(
+                    file_handle,
+                    limits,
                     recovery_kind,
-                    &source_signed.commit,
-                    &onto_signed.commit,
-                    mainline_commit,
-                    |_addr| false,
+                    &source_addr,
+                    &onto_addr,
+                    mainline_addr.as_ref(),
+                    |_| None,
+                    |_| false,
                 )
                 .map_err(|e| anyhow::anyhow!("archive recovery preflight failed: {e}"))?
             };

@@ -636,6 +636,7 @@ impl LocalRepository {
                 address, signed, ..
             } = entry
             {
+                let signed = recovery::verified(signed, &address, self.project)?;
                 commits_in_archive.insert(address, signed);
             }
         }
