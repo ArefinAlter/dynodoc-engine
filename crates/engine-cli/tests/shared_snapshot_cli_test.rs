@@ -113,6 +113,34 @@ async fn cli_first_snapshot_publishes_fallback_ran_true(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn cli_reencode_check_verifies_compact_v3_and_writes_nothing(pool: PgPool) {
+    let (_, doc, _) = seed_document(&pool).await;
+    let url = owner_url(&pool);
+    let id = doc.0.to_string();
+    let (ok, out) = run_cli(
+        &url,
+        &["shared-snapshot", &id, "--through-seq", "1", "--typed"],
+    );
+    assert!(ok, "{out}");
+    let rows = || {
+        sqlx::query_as::<_, (i64, i64)>(
+            "select (select count(*) from checkpoint_object), (select count(*) from shared_checkpoint)",
+        )
+        .fetch_one(&pool)
+    };
+    let before = rows().await.unwrap();
+
+    let (ok, out) = run_cli(&url, &["shared-reencode-check", &id, "--through-seq", "1"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("codec 2"), "{out}");
+    assert!(out.contains("nothing was written"), "{out}");
+    assert_eq!(rows().await.unwrap(), before);
+
+    let (ok, out) = run_cli(&url, &["shared-reencode-check", &id, "--through-seq", "9"]);
+    assert!(!ok && out.contains("checkpoint not found"), "{out}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn cli_incremental_edit_selects_earlier_base(pool: PgPool) {
     let (actor, doc, node) = seed_document(&pool).await;
     let url = owner_url(&pool);
