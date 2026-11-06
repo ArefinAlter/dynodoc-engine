@@ -108,8 +108,9 @@ pub struct HistoricalState {
 }
 
 /// Read an exact revision from the nearest legacy/shared checkpoint and a streamed
-/// event suffix. Ties prefer the verified shared graph, and candidates fall back
-/// transparently to earlier valid checkpoints if corruption is detected. Full state stays resident.
+/// event suffix. Ties prefer the verified shared graph. A corrupt periodic shared
+/// checkpoint falls back to an earlier candidate; a corrupt legacy, named or deployed
+/// snapshot is an error. Full state stays resident.
 /// Callers authorize document access and retain their existing transaction/locks.
 pub async fn read_state_at(
     connection: &mut PgConnection,
@@ -188,54 +189,25 @@ async fn read_state_at_with_formats(
                 }
             }
             0 => {
-                let snapshot_res: Result<Snapshot, _> = sqlx::query_as(
+                // Legacy, named and deployed snapshots are attested: corruption is an
+                // error, never a reason to choose an older checkpoint.
+                let snapshot: Snapshot = sqlx::query_as(
                     "select * from snapshot where document_id=$1 and through_seq=$2",
                 )
                 .bind(document_id.0)
                 .bind(seq)
                 .fetch_one(&mut *connection)
-                .await;
-                match snapshot_res {
-                    Ok(snapshot) => {
-                        match crate::snapshot_verification::read_verified_state(
-                            connection, &snapshot,
-                        )
-                        .await
-                        {
-                            Ok(state) => {
-                                let format = if snapshot.state.get("$dynodoc_state").is_some() {
-                                    CheckpointFormat::SharedV2
-                                } else {
-                                    CheckpointFormat::Legacy
-                                };
-                                candidate_result = Some((seq, format, state));
-                                break;
-                            }
-                            Err(err) => {
-                                warn!(
-                                    document_id = %document_id.0,
-                                    through_seq = seq,
-                                    error = %err,
-                                    "snapshot candidate corrupted or invalid; attempting fallback to earlier checkpoint"
-                                );
-                                if first_error.is_none() {
-                                    first_error = Some(err);
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
-                            document_id = %document_id.0,
-                            through_seq = seq,
-                            error = %err,
-                            "failed to fetch snapshot row; attempting fallback to earlier checkpoint"
-                        );
-                        if first_error.is_none() {
-                            first_error = Some(SnapshotError::Db(err));
-                        }
-                    }
-                }
+                .await?;
+                let state =
+                    crate::snapshot_verification::read_verified_state(connection, &snapshot)
+                        .await?;
+                let format = if snapshot.state.get("$dynodoc_state").is_some() {
+                    CheckpointFormat::SharedV2
+                } else {
+                    CheckpointFormat::Legacy
+                };
+                candidate_result = Some((seq, format, state));
+                break;
             }
             _ => {
                 warn!(
