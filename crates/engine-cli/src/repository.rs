@@ -629,14 +629,23 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
             let file_handle = std::fs::File::open(&file)
                 .with_context(|| format!("failed to open archive at {}", file.display()))?;
 
-            let staged = engine_core::repository::archive::validate_and_stage_archive(
+            let target_read_only = if path.exists() {
+                Some(LocalRepository::open_read_only(&path, project).await?)
+            } else {
+                None
+            };
+
+            let staged = engine_core::repository::archive::validate_and_stage_archive_with_target(
                 file_handle,
                 engine_core::repository::archive::ArchiveLimits::default(),
                 Some(&expect_head_addr),
                 Some(DocumentId(project)),
+                target_read_only.as_ref(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("archive validation failed: {e}"))?;
+
+            drop(target_read_only);
 
             let repo = LocalRepository::open(&path, project).await?;
 
@@ -4412,6 +4421,437 @@ mod tests {
         );
 
         f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_incremental_missing_base_refusal_and_target_untouched() {
+        let f1 = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+
+        let f1_v1 = f1.file(doc1, &[(0, "Genesis content")]).await;
+        let c1 = f1
+            .commit(&[], vec![("doc.docx", f1_v1)], "Genesis commit")
+            .await;
+
+        let f1_v2 = f1.file(doc1, &[(0, "Second revision content")]).await;
+        let c2 = f1
+            .commit(&[&c1], vec![("doc.docx", f1_v2)], "Delta commit")
+            .await;
+
+        let inc_archive = std::env::temp_dir().join(format!(
+            "test-inc-missing-base-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&inc_archive);
+
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                since: Some(c1.as_str().to_string()),
+                out: inc_archive.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1. Target repository lacks c1 base commit (empty repo)
+        let f2 = Fixture::with_project(f1.project).await;
+        let inv_before = f2.repo.inventory(None, 10).await.unwrap();
+
+        let err1 = run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: inc_archive.clone(),
+                expect_head: c2.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let err1_msg = format!("{err1:#}");
+        assert!(
+            err1_msg.contains("missing base commit"),
+            "expected missing base refusal, got: {err1_msg}"
+        );
+        assert!(
+            err1_msg.contains(c1.as_str()),
+            "expected missing base commit address in error, got: {err1_msg}"
+        );
+
+        let inv_after = f2.repo.inventory(None, 10).await.unwrap();
+        assert_eq!(
+            inv_before, inv_after,
+            "target repository must remain completely untouched on missing base refusal"
+        );
+        assert!(matches!(
+            f2.repo.commit(&c2).await.unwrap_err(),
+            engine_core::repository::Error::Missing(_)
+        ));
+
+        // 2. Absent destination path: must refuse and NOT create target database
+        let absent_path =
+            std::env::temp_dir().join(format!("dynodoc-absent-inc-{}.db", uuid::Uuid::new_v4()));
+        assert!(!absent_path.exists());
+
+        let err2 = run(
+            absent_path.clone(),
+            f1.project,
+            Action::ArchiveImport {
+                file: inc_archive.clone(),
+                expect_head: c2.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let err2_msg = format!("{err2:#}");
+        assert!(
+            err2_msg.contains("missing base commit")
+                || err2_msg.contains("requires target repository"),
+            "expected missing base refusal on absent target, got: {err2_msg}"
+        );
+        assert!(
+            !absent_path.exists(),
+            "absent destination database must NOT be created on failure"
+        );
+
+        let _ = std::fs::remove_file(&inc_archive);
+        f1.finish().await;
+        f2.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_incremental_bounds_the_base_and_refuses_a_tampered_base_commit() {
+        use engine_core::repository::archive::{
+            validate_and_stage_archive_with_target, ArchiveError, ArchiveLimits,
+        };
+        use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions};
+
+        let f1 = Fixture::new().await;
+        let (doc1, doc2) = (
+            DocumentId(uuid::Uuid::new_v4()),
+            DocumentId(uuid::Uuid::new_v4()),
+        );
+        let v1 = f1.file(doc1, &[(0, "Genesis doc1")]).await;
+        let w1 = f1.file(doc2, &[(0, "Genesis doc2")]).await;
+        let c1 = f1
+            .commit(
+                &[],
+                vec![("doc1.docx", v1), ("doc2.docx", w1.clone())],
+                "Genesis",
+            )
+            .await;
+        let v2 = f1.file(doc1, &[(0, "Updated doc1")]).await;
+        let c2 = f1
+            .commit(&[&c1], vec![("doc1.docx", v2), ("doc2.docx", w1)], "Update")
+            .await;
+        let id = uuid::Uuid::new_v4();
+        let base = std::env::temp_dir().join(format!("test-bound-base-{id}.dynoarc"));
+        let delta = std::env::temp_dir().join(format!("test-bound-delta-{id}.dynoarc"));
+        for (head, since, out) in [
+            (&c1, None, &base),
+            (&c2, Some(c1.as_str().to_string()), &delta),
+        ] {
+            run(
+                f1.path.clone(),
+                f1.project,
+                Action::ArchiveExport {
+                    head: head.as_str().to_string(),
+                    since,
+                    out: out.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let f2 = Fixture::with_project(f1.project).await;
+        run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: base.clone(),
+                expect_head: c1.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The base objects a delta needs count against the archive limits: unchanged doc2
+        // comes from the target, so a limit equal to the archive's own objects trips.
+        let stage = |limits| {
+            validate_and_stage_archive_with_target(
+                std::fs::File::open(&delta).unwrap(),
+                limits,
+                Some(&c2),
+                Some(DocumentId(f2.project)),
+                Some(&f2.repo),
+            )
+        };
+        let staged = stage(ArchiveLimits::default()).await.unwrap();
+        let tight = ArchiveLimits {
+            max_objects: staged.objects.len(),
+            ..ArchiveLimits::default()
+        };
+        drop(staged);
+        let err = stage(tight).await.unwrap_err();
+        assert!(matches!(err, ArchiveError::Limit(_)), "{err:?}");
+
+        // A base commit whose stored height does not follow from its parents is not
+        // trusted: the import is refused and the target is left as it was.
+        let mut raw = SqliteConnectOptions::new()
+            .filename(&f2.path)
+            .connect()
+            .await
+            .unwrap();
+        // As someone outside the repository's own immutability guard would.
+        sqlx::query("drop trigger commits_no_update")
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        sqlx::query("update commits set height=height+7 where address=?")
+            .bind(c1.as_str())
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        drop(raw);
+        let before = f2.repo.inventory(None, 10).await.unwrap();
+        let err = run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: delta.clone(),
+                expect_head: c2.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("does not follow from its parents"),
+            "{message}"
+        );
+        assert_eq!(f2.repo.inventory(None, 10).await.unwrap(), before);
+        assert!(f2.repo.commit(&c2).await.is_err());
+
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&delta);
+        f1.finish().await;
+        f2.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_incremental_matching_base_success_and_redundant_zero_copy() {
+        let f1 = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let doc2 = DocumentId(uuid::Uuid::new_v4());
+        let doc3 = DocumentId(uuid::Uuid::new_v4());
+
+        // c1: doc1 and doc2
+        let f1_v1 = f1.file(doc1, &[(0, "Genesis doc1")]).await;
+        let f2_v1 = f1.file(doc2, &[(0, "Genesis doc2")]).await;
+        let c1 = f1
+            .commit(
+                &[],
+                vec![("doc1.docx", f1_v1.clone()), ("doc2.docx", f2_v1.clone())],
+                "Genesis commit",
+            )
+            .await;
+
+        // c2: doc1 modified, doc2 unchanged
+        let f1_v2 = f1.file(doc1, &[(0, "Updated doc1")]).await;
+        let c2 = f1
+            .commit(
+                &[&c1],
+                vec![("doc1.docx", f1_v2.clone()), ("doc2.docx", f2_v1.clone())],
+                "Update doc1",
+            )
+            .await;
+
+        // c3: doc3 added, doc1 and doc2 unchanged
+        let f3_v1 = f1.file(doc3, &[(0, "Added doc3")]).await;
+        let c3 = f1
+            .commit(
+                &[&c2],
+                vec![
+                    ("doc1.docx", f1_v2.clone()),
+                    ("doc2.docx", f2_v1.clone()),
+                    ("doc3.docx", f3_v1.clone()),
+                ],
+                "Add doc3",
+            )
+            .await;
+
+        let base_archive =
+            std::env::temp_dir().join(format!("test-inc-base-{}.dynoarc", uuid::Uuid::new_v4()));
+        let inc_archive =
+            std::env::temp_dir().join(format!("test-inc-delta-{}.dynoarc", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&base_archive);
+        let _ = std::fs::remove_file(&inc_archive);
+
+        // Export full base archive at c1
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                since: None,
+                out: base_archive.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Export incremental archive: c1 -> c3
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveExport {
+                head: c3.as_str().to_string(),
+                since: Some(c1.as_str().to_string()),
+                out: inc_archive.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Target repository f2: import base archive first
+        let f2 = Fixture::with_project(f1.project).await;
+
+        run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: base_archive.clone(),
+                expect_head: c1.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Set a head ref on f2 pointing to c1 to verify ref invariance later
+        f2.repo.compare_and_swap("main", None, &c1).await.unwrap();
+        assert_eq!(
+            f2.repo.head("main").await.unwrap().map(|h| h.commit),
+            Some(c1.clone())
+        );
+
+        // Now import incremental archive into f2
+        run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: inc_archive.clone(),
+                expect_head: c3.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1. Verify all commits are present in f2
+        let read_c1 = f2.repo.commit(&c1).await.unwrap();
+        assert_eq!(read_c1.commit.message, "Genesis commit");
+        let read_c2 = f2.repo.commit(&c2).await.unwrap();
+        assert_eq!(read_c2.commit.message, "Update doc1");
+        let read_c3 = f2.repo.commit(&c3).await.unwrap();
+        assert_eq!(read_c3.commit.message, "Add doc3");
+
+        // 2. Verify all file states reconstructed correctly
+        let state_doc1_v1 = f2.repo.read_state(doc1, &f1_v1.state).await.unwrap();
+        assert_eq!(state_doc1_v1, paragraphs(&[(0, "Genesis doc1")]));
+        let state_doc1_v2 = f2.repo.read_state(doc1, &f1_v2.state).await.unwrap();
+        assert_eq!(state_doc1_v2, paragraphs(&[(0, "Updated doc1")]));
+
+        // doc2 was only committed at c1 and unchanged through c3:
+        let state_doc2 = f2.repo.read_state(doc2, &f2_v1.state).await.unwrap();
+        assert_eq!(state_doc2, paragraphs(&[(0, "Genesis doc2")]));
+
+        let state_doc3 = f2.repo.read_state(doc3, &f3_v1.state).await.unwrap();
+        assert_eq!(state_doc3, paragraphs(&[(0, "Added doc3")]));
+
+        // 3. Target ref invariance: main branch still points to c1!
+        assert_eq!(
+            f2.repo.head("main").await.unwrap().map(|h| h.commit),
+            Some(c1.clone()),
+            "archive import must NEVER move branch heads or pins"
+        );
+
+        // 4. Redundant import: second import must succeed with zero-copy!
+        let staged_again =
+            engine_core::repository::archive::validate_and_stage_archive_with_target(
+                std::fs::File::open(&inc_archive).unwrap(),
+                engine_core::repository::archive::ArchiveLimits::default(),
+                Some(&c3),
+                Some(DocumentId(f2.project)),
+                Some(&f2.repo),
+            )
+            .await
+            .unwrap();
+
+        let redundant_summary =
+            engine_core::repository::archive::import_archive(&f2.repo, &staged_again)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            redundant_summary.objects_imported, 0,
+            "redundant import must copy 0 objects (zero-copy)"
+        );
+        assert_eq!(
+            redundant_summary.commits_imported, 0,
+            "redundant import must copy 0 commits (zero-copy)"
+        );
+        assert_eq!(redundant_summary.total_commits, 2);
+        assert!(redundant_summary.total_objects > 0);
+
+        let _ = std::fs::remove_file(&base_archive);
+        let _ = std::fs::remove_file(&inc_archive);
+        f1.finish().await;
+        f2.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_incremental_empty_delta_success() {
+        let f1 = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1_v1 = f1.file(doc1, &[(0, "Content")]).await;
+        let c1 = f1.commit(&[], vec![("doc.docx", f1_v1)], "Genesis").await;
+
+        let empty_archive = std::env::temp_dir().join(format!(
+            "test-inc-empty-delta-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&empty_archive);
+
+        // Export empty delta: since == head == c1
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                since: Some(c1.as_str().to_string()),
+                out: empty_archive.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Import empty delta into f1 (which has c1)
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveImport {
+                file: empty_archive.clone(),
+                expect_head: c1.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let _ = std::fs::remove_file(&empty_archive);
+        f1.finish().await;
     }
 
     #[tokio::test]
