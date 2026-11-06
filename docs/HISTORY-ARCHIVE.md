@@ -137,6 +137,15 @@ performs read-only preflight feasibility analysis for applying commit-addressed 
 - Verifies base parent commitments: if the source or mainline parent commit is absent from both the archive and repository, the preflight refuses fail-closed with an error (`absent parent refusal`).
 - Returns a structured JSON report detailing `feasible: bool`, `modified_paths`, `conflicts`, `required_base_commits`, and `missing_base_commits`.
 
+## Historical file diff
+
+`engine-cli repository DATABASE PROJECT historical-diff --commit-a <c1> [--path-a <p1>] --commit-b <c2> [--path-b <p2>] [--path <p>] [--archive <archive.dynoarc>] [--json]`
+(or top-level `engine-cli historical-diff ...`) compares two file revisions across commits or directly from an offline history archive without extracting any files to disk.
+- Reads object graphs directly from local repository storage (or in-memory store from a `.dynoarc` archive stream) and reconstructs normalized `DocumentState` representations.
+- Produces deterministic unified structural diffs with context lines and headers (`--- a/... +++ b/...`), node-level change tracking (`added`, `deleted`, `modified`), and fine-grained semantic AST operations.
+- Returns clean identical-commit no-op (`is_identical: true` and empty diff), reports text modifications, node insertions/deletions, and fails closed with an error on missing paths or missing commits.
+- Operates strictly read-only: never mutates SQLite, WAL, or disk.
+
 ## Normalized state export
 
 `engine-cli repository DATABASE PROJECT export-file --commit ADDRESS --path PATH --out FILE`

@@ -172,6 +172,30 @@ pub enum Action {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Compare two historical file revisions across commits or archives without extracting files to disk.
+    HistoricalDiff {
+        /// First commit address.
+        #[arg(long = "commit-a")]
+        commit_a: String,
+        /// Path in first commit.
+        #[arg(long = "path-a")]
+        path_a: Option<String>,
+        /// Second commit address.
+        #[arg(long = "commit-b")]
+        commit_b: String,
+        /// Path in second commit (defaults to path-a if omitted).
+        #[arg(long = "path-b")]
+        path_b: Option<String>,
+        /// Common path in both commits (shorthand for same path comparison).
+        #[arg(long)]
+        path: Option<String>,
+        /// Optional offline archive file (.dynoarc) to diff against.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        /// Emit structural diff as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Import a private staging upload JSON batch, without moving any branch.
     ImportObjects { input: PathBuf },
     /// Read-only retention plan: what no branch head or recovery source reaches.
@@ -774,6 +798,177 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
             let out = serde_json::to_value(&report)?;
             (out, None)
         }
+        Action::HistoricalDiff {
+            commit_a,
+            path_a,
+            commit_b,
+            path_b,
+            path: common_path,
+            archive,
+            json,
+        } => {
+            let resolved_path_a = path_a.or_else(|| common_path.clone()).ok_or_else(|| {
+                anyhow::anyhow!("missing path for commit-a (provide --path-a or --path)")
+            })?;
+            let resolved_path_b = path_b
+                .or_else(|| common_path.clone())
+                .unwrap_or_else(|| resolved_path_a.clone());
+
+            let commit_a_addr = address(commit_a)?;
+            let commit_b_addr = address(commit_b)?;
+
+            let report = if let Some(archive_path) = archive {
+                anyhow::ensure!(
+                    archive_path.is_file(),
+                    "archive file not found at {}",
+                    archive_path.display()
+                );
+                let file_handle = std::fs::File::open(&archive_path).with_context(|| {
+                    format!("failed to open archive at {}", archive_path.display())
+                })?;
+                let mut archive_reader = engine_core::repository::archive::ArchiveReader::new(
+                    file_handle,
+                    engine_core::repository::archive::ArchiveLimits::default(),
+                );
+                let mut memory_store = engine_core::shared_checkpoint::MemoryStore::default();
+                let mut commits_in_archive = std::collections::HashMap::new();
+
+                while let Some(entry) = archive_reader
+                    .next_entry()
+                    .map_err(|e| anyhow::anyhow!("failed reading archive: {e}"))?
+                {
+                    match entry {
+                        engine_core::repository::archive::ArchiveEntry::Object {
+                            document,
+                            address,
+                            bytes,
+                            ..
+                        } => {
+                            use engine_core::shared_checkpoint::ObjectStore;
+                            memory_store.put(document, &address, &bytes).await?;
+                        }
+                        engine_core::repository::archive::ArchiveEntry::Commit {
+                            address,
+                            signed,
+                            ..
+                        } => {
+                            commits_in_archive.insert(address, signed);
+                        }
+                        _ => {}
+                    }
+                }
+
+                let signed_a = commits_in_archive.get(&commit_a_addr).ok_or_else(|| {
+                    anyhow::anyhow!("commit {} not found in archive", commit_a_addr.as_str())
+                })?;
+                let signed_b = commits_in_archive.get(&commit_b_addr).ok_or_else(|| {
+                    anyhow::anyhow!("commit {} not found in archive", commit_b_addr.as_str())
+                })?;
+
+                let file_a = signed_a
+                    .commit
+                    .files
+                    .get(&resolved_path_a)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "path {:?} not found in commit {}",
+                            resolved_path_a,
+                            commit_a_addr.as_str()
+                        )
+                    })?;
+                let file_b = signed_b
+                    .commit
+                    .files
+                    .get(&resolved_path_b)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "path {:?} not found in commit {}",
+                            resolved_path_b,
+                            commit_b_addr.as_str()
+                        )
+                    })?;
+
+                let state_a = engine_core::shared_checkpoint::typed::read_state(
+                    &mut memory_store,
+                    file_a.document,
+                    &file_a.state,
+                    engine_core::shared_checkpoint::Limits::default(),
+                    Default::default(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to reconstruct state root {} for document {}",
+                        file_a.state.as_str(),
+                        file_a.document.0
+                    )
+                })?;
+
+                let state_b = engine_core::shared_checkpoint::typed::read_state(
+                    &mut memory_store,
+                    file_b.document,
+                    &file_b.state,
+                    engine_core::shared_checkpoint::Limits::default(),
+                    Default::default(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to reconstruct state root {} for document {}",
+                        file_b.state.as_str(),
+                        file_b.document.0
+                    )
+                })?;
+
+                engine_core::repository::historical_diff::diff_states(
+                    &commit_a_addr,
+                    &resolved_path_a,
+                    &file_a,
+                    &state_a,
+                    &commit_b_addr,
+                    &resolved_path_b,
+                    &file_b,
+                    &state_b,
+                )
+                .map_err(|e| anyhow::anyhow!("historical diff failed: {e}"))?
+            } else {
+                anyhow::ensure!(
+                    path.is_file(),
+                    "no repository database at {}",
+                    path.display()
+                );
+                let repo = LocalRepository::open_read_only(&path, project).await?;
+                let report = repo
+                    .historical_diff(
+                        &commit_a_addr,
+                        &resolved_path_a,
+                        &commit_b_addr,
+                        &resolved_path_b,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("historical diff failed: {e}"))?;
+                repo.close().await;
+                report
+            };
+
+            let out = serde_json::to_value(&report)?;
+            if !json {
+                text = Some(if report.is_identical {
+                    format!(
+                        "Files are identical: {} ({}) == {} ({})\n",
+                        resolved_path_a,
+                        commit_a_addr.as_str(),
+                        resolved_path_b,
+                        commit_b_addr.as_str()
+                    )
+                } else {
+                    report.unified_diff.clone()
+                });
+            }
+            (out, None)
+        }
         other_action => {
             // The retention, horizon plans, archive export, export-file and log must not create, upgrade or write the database.
             let repo = if matches!(
@@ -799,7 +994,8 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
             let out = match other_action {
                 Action::ArchiveVerify { .. }
                 | Action::ArchiveImport { .. }
-                | Action::ArchiveRecoveryPreflight { .. } => unreachable!(),
+                | Action::ArchiveRecoveryPreflight { .. }
+                | Action::HistoricalDiff { .. } => unreachable!(),
                 Action::Init => {
                     serde_json::json!({"project":project,"local_schema":SCHEMA_VERSION})
                 }
@@ -5698,6 +5894,305 @@ mod tests {
             snapshot(),
             before,
             "archive-recovery-preflight must not mutate the database or WAL"
+        );
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn historical_diff_identical_commit_noop() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        let report = f
+            .repo
+            .historical_diff(&c1, "doc.docx", &c1, "doc.docx")
+            .await
+            .unwrap();
+
+        assert!(report.is_identical);
+        assert!(report.unified_diff.is_empty());
+        assert!(report.node_changes.is_empty());
+
+        // Test CLI execution
+        run(
+            f.path.clone(),
+            f.project,
+            Action::HistoricalDiff {
+                commit_a: c1.as_str().to_string(),
+                path_a: None,
+                commit_b: c1.as_str().to_string(),
+                path_b: None,
+                path: Some("doc.docx".to_string()),
+                archive: None,
+                json: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn historical_diff_text_modification() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Original Content")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        let f2 = f.file(doc1, &[(0, "Modified Content")]).await;
+        let c2 = f
+            .commit(&[&c1], vec![("doc.docx", f2.clone())], "Edit")
+            .await;
+
+        let report = f
+            .repo
+            .historical_diff(&c1, "doc.docx", &c2, "doc.docx")
+            .await
+            .unwrap();
+
+        assert!(!report.is_identical);
+        assert_eq!(report.node_changes.len(), 1);
+        assert_eq!(
+            report.node_changes[0].kind,
+            engine_core::repository::historical_diff::NodeChangeKind::Modified
+        );
+        assert!(report.unified_diff.contains(
+            "-00000000000000000000000000: paragraph pos=p000000: {\"label\":\"Original Content\"}"
+        ));
+        assert!(report.unified_diff.contains(
+            "+00000000000000000000000000: paragraph pos=p000000: {\"label\":\"Modified Content\"}"
+        ));
+
+        // CLI execution with text output
+        run(
+            f.path.clone(),
+            f.project,
+            Action::HistoricalDiff {
+                commit_a: c1.as_str().to_string(),
+                path_a: Some("doc.docx".to_string()),
+                commit_b: c2.as_str().to_string(),
+                path_b: Some("doc.docx".to_string()),
+                path: None,
+                archive: None,
+                json: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn historical_diff_node_insertion_and_deletion() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+
+        // State A: 2 paragraphs
+        let mut state_a = DocumentState::default();
+        state_a.nodes.insert(
+            NodeId("001".into()),
+            MaterializedNode {
+                id: NodeId("001".into()),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "p01".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: serde_json::json!({"label": "Keep"}),
+            },
+        );
+        state_a.nodes.insert(
+            NodeId("002".into()),
+            MaterializedNode {
+                id: NodeId("002".into()),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "p02".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: serde_json::json!({"label": "Delete Me"}),
+            },
+        );
+        let (root_a, _) = f.repo.write_state(doc1, &state_a).await.unwrap();
+        let fa = FileEntry {
+            document: doc1,
+            state: root_a,
+        };
+        let c1 = f.commit(&[], vec![("doc.docx", fa)], "State A").await;
+
+        // State B: node 002 deleted, node 003 inserted
+        let mut state_b = DocumentState::default();
+        state_b.nodes.insert(
+            NodeId("001".into()),
+            MaterializedNode {
+                id: NodeId("001".into()),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "p01".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: serde_json::json!({"label": "Keep"}),
+            },
+        );
+        state_b.nodes.insert(
+            NodeId("003".into()),
+            MaterializedNode {
+                id: NodeId("003".into()),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "p03".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: serde_json::json!({"label": "Added Paragraph"}),
+            },
+        );
+        let (root_b, _) = f.repo.write_state(doc1, &state_b).await.unwrap();
+        let fb = FileEntry {
+            document: doc1,
+            state: root_b,
+        };
+        let c2 = f.commit(&[&c1], vec![("doc.docx", fb)], "State B").await;
+
+        let report = f
+            .repo
+            .historical_diff(&c1, "doc.docx", &c2, "doc.docx")
+            .await
+            .unwrap();
+
+        assert!(!report.is_identical);
+        let deleted = report
+            .node_changes
+            .iter()
+            .find(|c| c.kind == engine_core::repository::historical_diff::NodeChangeKind::Deleted)
+            .unwrap();
+        assert_eq!(deleted.node_id, "002");
+        let added = report
+            .node_changes
+            .iter()
+            .find(|c| c.kind == engine_core::repository::historical_diff::NodeChangeKind::Added)
+            .unwrap();
+        assert_eq!(added.node_id, "003");
+        assert!(report.unified_diff.contains("-002: paragraph pos=p02:"));
+        assert!(report.unified_diff.contains("+003: paragraph pos=p03:"));
+
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn historical_diff_missing_path_error() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f.commit(&[], vec![("doc.docx", f1)], "Genesis").await;
+
+        let err = run(
+            f.path.clone(),
+            f.project,
+            Action::HistoricalDiff {
+                commit_a: c1.as_str().to_string(),
+                path_a: Some("absent.docx".to_string()),
+                commit_b: c1.as_str().to_string(),
+                path_b: Some("doc.docx".to_string()),
+                path: None,
+                archive: None,
+                json: true,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("not found in commit"));
+
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn historical_diff_across_archive_and_database_immutability() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Original")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        let f2 = f.file(doc1, &[(0, "Altered")]).await;
+        let c2 = f
+            .commit(&[&c1], vec![("doc.docx", f2.clone())], "Altered")
+            .await;
+
+        let archive_path = f.path.with_extension("archive-diff.dynoarc");
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                since: None,
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1. Direct archive diff (without touching local repository database)
+        let missing_db = f.path.with_extension("absent-db");
+        run(
+            missing_db.clone(),
+            f.project,
+            Action::HistoricalDiff {
+                commit_a: c1.as_str().to_string(),
+                path_a: None,
+                commit_b: c2.as_str().to_string(),
+                path_b: None,
+                path: Some("doc.docx".to_string()),
+                archive: Some(archive_path.clone()),
+                json: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!missing_db.exists(), "missing database must not be created");
+
+        // 2. Database immutability check
+        let (path, project) = (f.path.clone(), f.project);
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let snapshot = || {
+            (
+                std::fs::read(&path).unwrap(),
+                std::fs::read(&wal).unwrap_or_default(),
+            )
+        };
+        let before = snapshot();
+
+        run(
+            path.clone(),
+            project,
+            Action::HistoricalDiff {
+                commit_a: c1.as_str().to_string(),
+                path_a: None,
+                commit_b: c2.as_str().to_string(),
+                path_b: None,
+                path: Some("doc.docx".to_string()),
+                archive: None,
+                json: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            snapshot(),
+            before,
+            "historical-diff must not mutate the database or WAL"
         );
 
         let _ = std::fs::remove_file(&archive_path);

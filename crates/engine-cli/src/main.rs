@@ -168,6 +168,36 @@ enum Command {
         #[arg(long, visible_alias = "expect-path")]
         path: String,
     },
+    /// Compare two historical file revisions across commits or offline archives without extracting files to disk.
+    HistoricalDiff {
+        /// Repository database path (optional if --archive is provided).
+        #[arg(long)]
+        repository: Option<std::path::PathBuf>,
+        /// Project UUID (defaults to nil UUID if omitting repository).
+        #[arg(long, default_value = "00000000-0000-0000-0000-000000000000")]
+        project: Uuid,
+        /// First commit address.
+        #[arg(long = "commit-a")]
+        commit_a: String,
+        /// Path in first commit.
+        #[arg(long = "path-a")]
+        path_a: Option<String>,
+        /// Second commit address.
+        #[arg(long = "commit-b")]
+        commit_b: String,
+        /// Path in second commit (defaults to path-a if omitted).
+        #[arg(long = "path-b")]
+        path_b: Option<String>,
+        /// Common path in both commits (shorthand for same path comparison).
+        #[arg(long)]
+        path: Option<String>,
+        /// Optional offline archive file (.dynoarc) to diff against.
+        #[arg(long)]
+        archive: Option<std::path::PathBuf>,
+        /// Emit structural diff as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Independently verify the event chain and all legacy snapshots.
     Verify {
         /// Document id (UUID).
@@ -353,6 +383,33 @@ async fn run() -> anyhow::Result<()> {
             expect_commit,
             path,
         } => state_export_verify(file, project, expect_commit, path).await,
+        Command::HistoricalDiff {
+            repository,
+            project,
+            commit_a,
+            path_a,
+            commit_b,
+            path_b,
+            path,
+            archive,
+            json,
+        } => {
+            let repo_path = repository.unwrap_or_else(|| std::path::PathBuf::from(":memory:"));
+            repository::run(
+                repo_path,
+                project,
+                repository::Action::HistoricalDiff {
+                    commit_a,
+                    path_a,
+                    commit_b,
+                    path_b,
+                    path,
+                    archive,
+                    json,
+                },
+            )
+            .await
+        }
         Command::Verify {
             document_id,
             expect_head,

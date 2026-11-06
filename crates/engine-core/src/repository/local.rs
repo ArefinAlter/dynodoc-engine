@@ -2,7 +2,8 @@
 //! ref CAS. No remote permissions or automatic native-file writes are implied.
 
 use super::{
-    archive, recovery, Commit, Error, Head, SignedCommit, MAX_ANCESTORS, MAX_COMMIT_BYTES,
+    archive, historical_diff, recovery, Commit, Error, Head, SignedCommit, MAX_ANCESTORS,
+    MAX_COMMIT_BYTES,
 };
 use crate::{
     materializer::DocumentState,
@@ -467,6 +468,51 @@ impl LocalRepository {
             Default::default(),
         )
         .await?)
+    }
+
+    /// Compare two historical file revisions across commits without extracting files to disk.
+    pub async fn historical_diff(
+        &self,
+        commit_a_addr: &Address,
+        path_a: &str,
+        commit_b_addr: &Address,
+        path_b: &str,
+    ) -> Result<historical_diff::HistoricalDiffReport, Error> {
+        let (signed_a, _) = {
+            let mut conn = self.pool.acquire().await?;
+            load_commit(&mut conn, self.project, commit_a_addr).await?
+        };
+        let (signed_b, _) = {
+            let mut conn = self.pool.acquire().await?;
+            load_commit(&mut conn, self.project, commit_b_addr).await?
+        };
+
+        let file_a = signed_a
+            .commit
+            .files
+            .get(path_a)
+            .cloned()
+            .ok_or_else(|| Error::Invalid("path not found in commit A"))?;
+        let file_b = signed_b
+            .commit
+            .files
+            .get(path_b)
+            .cloned()
+            .ok_or_else(|| Error::Invalid("path not found in commit B"))?;
+
+        let state_a = self.read_state(file_a.document, &file_a.state).await?;
+        let state_b = self.read_state(file_b.document, &file_b.state).await?;
+
+        historical_diff::diff_states(
+            commit_a_addr,
+            path_a,
+            &file_a,
+            &state_a,
+            commit_b_addr,
+            path_b,
+            &file_b,
+            &state_b,
+        )
     }
 
     /// Import a signed commit only after all parents and complete file graphs are
