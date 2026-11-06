@@ -6,6 +6,11 @@ the API writer; its default is legacy. Core callers explicitly select
 `NamedStorage::SharedV2`. Periodic checkpoints and draft bases keep their separate
 writer settings. This capability is not enabled on the VPS.
 
+`shared-v3` (migration 0056) stores the compact v3 graph instead, with state
+`{"$dynodoc_state":3,"root":"<64 hex>"}`. Readers from before 0056 refuse that
+envelope, so deploy v3-capable readers first. Existing rows and receipts are
+unchanged.
+
 The existing snapshot row retains its identity, document, exact event sequence,
 node Merkle root, chain hash and creation time. Its state column holds
 `{"$dynodoc_state":2,"root":"<64 lowercase hex characters>"}`. A strict shape

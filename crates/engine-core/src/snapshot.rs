@@ -96,6 +96,7 @@ pub enum PeriodicStorage {
 pub enum NamedStorage {
     Legacy,
     SharedV2,
+    SharedV3,
 }
 
 /// A historical state and the work required to reconstruct it.
@@ -203,10 +204,10 @@ async fn read_state_at_with_formats(
                         .await
                         {
                             Ok(state) => {
-                                let format = if snapshot.state.get("$dynodoc_state").is_some() {
-                                    CheckpointFormat::SharedV2
-                                } else {
-                                    CheckpointFormat::Legacy
+                                let format = match snapshot.state.get("$dynodoc_state") {
+                                    None => CheckpointFormat::Legacy,
+                                    Some(v) if *v == 3 => CheckpointFormat::SharedV3,
+                                    Some(_) => CheckpointFormat::SharedV2,
                                 };
                                 candidate_result = Some((seq, format, state));
                                 break;

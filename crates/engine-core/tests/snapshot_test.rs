@@ -740,6 +740,77 @@ async fn shared_named_snapshots_reuse_objects_and_preserve_mixed_history(
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn compact_v3_named_snapshots_mix_with_v2_and_bind_their_codec(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, doc, node) = seed(&pool).await?;
+    let legacy = SnapshotEngine::new(pool.clone());
+    let v2 = legacy.clone().with_named_storage(NamedStorage::SharedV2);
+    let v3 = legacy.with_named_storage(NamedStorage::SharedV3);
+    v2.take(doc, SnapshotReason::Deployed).await?;
+    append(
+        &pool,
+        doc,
+        &field_edit(&node, "large", &"aλ".repeat(100_000)),
+        actor,
+    )
+    .await?;
+    let second = v3.take(doc, SnapshotReason::Deployed).await?;
+    let raw: serde_json::Value = sqlx::query_scalar("select state from snapshot where id=$1")
+        .bind(second.id.0)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(raw["$dynodoc_state"], 3);
+    assert!(raw.to_string().len() < 100);
+
+    let events: Vec<engine_shared::Event> =
+        sqlx::query_as("select * from event where document_id=$1 order by seq")
+            .bind(doc.0)
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(
+        second.state,
+        serde_json::to_value(Materializer::fold(&events)?)?
+    );
+    let mut connection = pool.acquire().await?;
+    for (seq, format) in [
+        (1, engine_core::snapshot::CheckpointFormat::SharedV2),
+        (2, engine_core::snapshot::CheckpointFormat::SharedV3),
+    ] {
+        let at = read_state_at(&mut connection, doc, seq).await?;
+        assert_eq!(at.state, Materializer::fold(&events[..seq as usize])?);
+        assert_eq!((at.checkpoint_format, at.replayed_events), (format, 0));
+    }
+    drop(connection);
+
+    // The receipt binds the codec: the same root relabelled as v2 is refused.
+    let mut tx = pool.begin().await?;
+    sqlx::query("alter table snapshot disable trigger snapshot_no_update")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("update snapshot set state=jsonb_set(state,'{$dynodoc_state}','2') where id=$1")
+        .bind(second.id.0)
+        .execute(&mut *tx)
+        .await?;
+    assert!(matches!(
+        snapshot_verification::load(&mut tx, doc, second.id.0).await,
+        Err(SnapshotError::Unverified { .. })
+    ));
+    tx.rollback().await?;
+
+    assert_eq!(verify_document(&pool, doc, true).await?.snapshots, 2);
+    let limits = engine_core::shared_checkpoint::Limits::default();
+    let unreferenced =
+        engine_core::shared_checkpoint::postgres::unreferenced_objects(&pool, doc, &[], limits)
+            .await?;
+    assert!(
+        unreferenced.is_empty(),
+        "snapshot roots of both codecs are kept"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn shared_named_snapshots_fail_closed_on_root_and_object_tampering(
     pool: PgPool,
 ) -> anyhow::Result<()> {

@@ -110,12 +110,11 @@ impl AppState {
             ref_signer: None,
             shared_draft_bases: std::env::var("DYNODOC_SHARED_DRAFT_BASES").as_deref()
                 == Ok("shared-v2"),
-            named_snapshot_storage: if std::env::var("DYNODOC_NAMED_SNAPSHOT_STORAGE").as_deref()
-                == Ok("shared-v2")
+            named_snapshot_storage: match std::env::var("DYNODOC_NAMED_SNAPSHOT_STORAGE").as_deref()
             {
-                engine_core::snapshot::NamedStorage::SharedV2
-            } else {
-                engine_core::snapshot::NamedStorage::Legacy
+                Ok("shared-v2") => engine_core::snapshot::NamedStorage::SharedV2,
+                Ok("shared-v3") => engine_core::snapshot::NamedStorage::SharedV3,
+                _ => engine_core::snapshot::NamedStorage::Legacy,
             },
             agent_gateway: std::env::var("AGENT_GATEWAY").as_deref() == Ok("on"),
             agent_cache: Default::default(),
