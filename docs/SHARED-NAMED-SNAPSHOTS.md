@@ -8,8 +8,11 @@ writer settings. This capability is not enabled on the VPS.
 
 `shared-v3` (migration 0056) stores the compact v3 graph instead, with state
 `{"$dynodoc_state":3,"root":"<64 hex>"}`. Readers from before 0056 refuse that
-envelope, so deploy v3-capable readers first. Existing rows and receipts are
-unchanged.
+envelope, so deploy v3-capable readers first; their refusal is a compatibility
+limit, not rollback support. The migration rebuilds the generated `state_root`
+column (100,000 rows took under a second), so restart API processes after it:
+connections that prepared `select * from snapshot` earlier fail with "cached plan
+must not change result type". Existing rows and receipts are unchanged.
 
 The existing snapshot row retains its identity, document, exact event sequence,
 node Merkle root, chain hash and creation time. Its state column holds
