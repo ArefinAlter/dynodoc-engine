@@ -49,33 +49,33 @@ fn receipt_version(snapshot: &Snapshot) -> i16 {
 }
 
 /// Strict reference recognition; a malformed/new version never falls back to JSON.
-fn shared_root(snapshot: &Snapshot) -> Result<Option<Address>, SnapshotError> {
+fn shared_root(snapshot: &Snapshot) -> Result<Option<(Address, i32)>, SnapshotError> {
     let value = &snapshot.state;
     if value.get("$dynodoc_state").is_none() {
         return Ok(None);
     }
-    if value["$dynodoc_state"] != 2 || value.as_object().is_none_or(|o| o.len() != 2) {
+    let version = [2, 3].into_iter().find(|v| value["$dynodoc_state"] == *v);
+    let Some(version) = version.filter(|_| value.as_object().is_some_and(|o| o.len() == 2)) else {
         return Err(invalid(snapshot, "invalid shared state reference"));
-    }
+    };
     let root = value["root"]
         .as_str()
         .ok_or_else(|| invalid(snapshot, "missing shared state root"))?;
-    Ok(Some(Address::try_from(root.to_owned())?))
+    Ok(Some((Address::try_from(root.to_owned())?, version)))
 }
 
 async fn materialize(
     connection: &mut PgConnection,
     snapshot: &Snapshot,
 ) -> Result<DocumentState, SnapshotError> {
-    if let Some(root) = shared_root(snapshot)? {
-        Ok(typed::read_state(
-            &mut PgStore::new(connection),
-            snapshot.document_id,
-            &root,
-            Limits::default(),
-            Default::default(),
-        )
-        .await?)
+    if let Some((root, version)) = shared_root(snapshot)? {
+        let store = &mut PgStore::new(connection);
+        let (document, limits) = (snapshot.document_id, Limits::default());
+        Ok(if version == 3 {
+            typed::read_state_v3(store, document, &root, limits, Default::default()).await?
+        } else {
+            typed::read_state(store, document, &root, limits, Default::default()).await?
+        })
     } else {
         Ok(DocumentState::deserialize(&snapshot.state)?)
     }
@@ -349,16 +349,19 @@ pub async fn take_with_storage_in_connection(
         crate::event_merkle::root_in_connection(connection, document, through_seq).await?;
     let encoded = match storage {
         NamedStorage::Legacy => serde_json::to_value(&state)?,
-        NamedStorage::SharedV2 => {
-            let (root, _) = typed::write_state(
-                &mut PgStore::new(connection),
-                document,
-                &state,
-                Limits::default(),
-                Default::default(),
-            )
-            .await?;
-            serde_json::json!({"$dynodoc_state":2,"root":root})
+        NamedStorage::SharedV2 | NamedStorage::SharedV3 => {
+            let store = &mut PgStore::new(connection);
+            let limits = Limits::default();
+            let (version, (root, _)) = if storage == NamedStorage::SharedV3 {
+                let written =
+                    typed::write_state_v3(store, document, &state, limits, Default::default());
+                (3, written.await?)
+            } else {
+                let written =
+                    typed::write_state(store, document, &state, limits, Default::default());
+                (2, written.await?)
+            };
+            serde_json::json!({"$dynodoc_state":version,"root":root})
         }
     };
     sqlx::query(
@@ -538,6 +541,36 @@ mod tests {
             hex,
             "3108937000f9ea2d5fef24341ac085f2886808ba24f9197613ea603e23ff3d76"
         );
+    }
+
+    #[test]
+    fn the_envelope_is_exactly_a_version_two_or_three_and_a_root() {
+        let root = "0123456789abcdef".repeat(4);
+        let snapshot = |state: serde_json::Value| Snapshot {
+            id: engine_shared::SnapshotId(Uuid::nil()),
+            document_id: DocumentId(Uuid::from_u128(1)),
+            through_seq: 0,
+            state,
+            merkle_root: vec![0; 32],
+            event_chain_hash: vec![0; 32],
+            event_merkle_root: None,
+            created_at: "2026-10-11T00:00:00Z".parse().unwrap(),
+        };
+        let parsed = |state| shared_root(&snapshot(state)).map(|r| r.map(|(_, version)| version));
+        assert_eq!(parsed(serde_json::json!({"nodes":{}})).unwrap(), None);
+        for version in [2, 3] {
+            let state = serde_json::json!({"$dynodoc_state":version,"root":root});
+            assert_eq!(parsed(state).unwrap(), Some(version));
+        }
+        for state in [
+            serde_json::json!({"$dynodoc_state":4,"root":root}),
+            serde_json::json!({"$dynodoc_state":"3","root":root}),
+            serde_json::json!({"$dynodoc_state":3,"root":root,"extra":1}),
+            serde_json::json!({"$dynodoc_state":3}),
+            serde_json::json!({"$dynodoc_state":3,"root":"not-hex"}),
+        ] {
+            assert!(parsed(state.clone()).is_err(), "{state}");
+        }
     }
 
     #[test]
