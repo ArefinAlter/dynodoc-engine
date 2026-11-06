@@ -1,7 +1,9 @@
 //! SQLite local history with immutable content, verified commits and transactional
 //! ref CAS. No remote permissions or automatic native-file writes are implied.
 
-use super::{recovery, Commit, Error, Head, SignedCommit, MAX_ANCESTORS, MAX_COMMIT_BYTES};
+use super::{
+    archive, recovery, Commit, Error, Head, SignedCommit, MAX_ANCESTORS, MAX_COMMIT_BYTES,
+};
 use crate::{
     materializer::DocumentState,
     shared_checkpoint::{self, typed, Address, Limits, ObjectStore, WriteStats},
@@ -545,6 +547,40 @@ impl LocalRepository {
         Ok(load_commit(&mut connection, self.project, address).await?.0)
     }
 
+    pub(crate) async fn raw_commit_record(
+        &self,
+        address: &Address,
+    ) -> Result<(Vec<u8>, i64), Error> {
+        let mut connection = self.pool.acquire().await?;
+        let (bytes, height): (Vec<u8>, i64) = sqlx::query_as(
+            "select body,height from commits where address=? and length(body)<=1049600",
+        )
+        .bind(address.as_str())
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| Error::Missing(address.clone()))?;
+        Ok((bytes, height))
+    }
+
+    pub(crate) async fn insert_base_commit_raw(
+        &self,
+        address: &Address,
+        body: &[u8],
+        height: i64,
+    ) -> Result<(), Error> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query(
+            "insert into commits(address, body, height) values(?, ?, ?) on conflict(address) do nothing",
+        )
+        .bind(address.as_str())
+        .bind(body)
+        .bind(height)
+        .execute(&mut *connection)
+        .await
+        .map_err(storage::error)?;
+        Ok(())
+    }
+
     /// Retrieve a bounded page of first-parent commit history starting at `head`.
     pub async fn first_parent_log(
         &self,
@@ -570,6 +606,134 @@ impl LocalRepository {
     ) -> Result<recovery::Plan, Error> {
         let mut connection = self.pool.acquire().await?;
         load_recovery_plan(&mut connection, self.project, kind, source, onto, mainline).await
+    }
+
+    /// Read-only preflight analysis for commit-addressed recovery directly against an offline archive.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn plan_archive_recovery_preflight<R: std::io::Read>(
+        &self,
+        reader: R,
+        limits: archive::ArchiveLimits,
+        kind: recovery::Kind,
+        source_addr: &Address,
+        onto_addr: Option<&Address>,
+        branch: Option<&str>,
+        mainline_addr: Option<&Address>,
+    ) -> Result<recovery::RecoveryPreflightReport, Error> {
+        let mut connection = self.pool.acquire().await?;
+
+        let mut archive_reader = archive::ArchiveReader::new(reader, limits);
+        let mut commits_in_archive: std::collections::HashMap<Address, SignedCommit> =
+            std::collections::HashMap::new();
+
+        while let Some(entry) = archive_reader.next_entry().map_err(|e| match e {
+            archive::ArchiveError::Limit(_) => {
+                Error::Limit("archive limits exceeded during recovery preflight")
+            }
+            _ => Error::Invalid("malformed archive stream during recovery preflight"),
+        })? {
+            if let archive::ArchiveEntry::Commit {
+                address, signed, ..
+            } = entry
+            {
+                let signed = recovery::verified(signed, &address, self.project)?;
+                commits_in_archive.insert(address, signed);
+            }
+        }
+
+        // 1. Determine onto commit
+        let onto_signed = match onto_addr {
+            Some(addr) => match load_commit(&mut connection, self.project, addr).await {
+                Ok((signed, _)) => signed,
+                Err(_) => commits_in_archive
+                    .get(addr)
+                    .cloned()
+                    .ok_or_else(|| Error::Missing(addr.clone()))?,
+            },
+            None => {
+                let branch_name = branch.unwrap_or("main");
+                let head = self
+                    .head(branch_name)
+                    .await?
+                    .ok_or_else(|| Error::Invalid("branch not found"))?;
+                load_commit(&mut connection, self.project, &head.commit)
+                    .await?
+                    .0
+            }
+        };
+
+        // 2. Determine source commit
+        let source_signed = match commits_in_archive.get(source_addr) {
+            Some(signed) => signed.clone(),
+            None => {
+                load_commit(&mut connection, self.project, source_addr)
+                    .await?
+                    .0
+            }
+        };
+
+        // 3. Determine baseline parent commit
+        let source_commit = &source_signed.commit;
+        let baseline = match (mainline_addr, source_commit.parents.as_slice()) {
+            (Some(chosen), parents) if parents.contains(chosen) => {
+                let parent_signed = match commits_in_archive.get(chosen) {
+                    Some(signed) => signed.clone(),
+                    None => load_commit(&mut connection, self.project, chosen).await?.0,
+                };
+                Some(parent_signed)
+            }
+            (Some(_), _) => return Err(Error::Invalid("recovery mainline is not a source parent")),
+            (None, []) => None,
+            (None, [parent]) => {
+                let parent_signed = match commits_in_archive.get(parent) {
+                    Some(signed) => signed.clone(),
+                    None => load_commit(&mut connection, self.project, parent).await?.0,
+                };
+                Some(parent_signed)
+            }
+            (None, _) => {
+                return Err(Error::Invalid(
+                    "merge recovery requires an explicit mainline",
+                ))
+            }
+        };
+
+        let onto_commit_addr = onto_signed.commit.address()?;
+        let source_in_repo = load_commit(&mut connection, self.project, source_addr)
+            .await
+            .is_ok();
+        let onto_in_repo = load_commit(&mut connection, self.project, &onto_commit_addr)
+            .await
+            .is_ok();
+        let baseline_in_repo = match &baseline {
+            Some(b) => {
+                let b_addr = b.commit.address()?;
+                load_commit(&mut connection, self.project, &b_addr)
+                    .await
+                    .is_ok()
+            }
+            None => true,
+        };
+
+        let baseline_addr = baseline.as_ref().map(|b| b.commit.address()).transpose()?;
+
+        recovery::preflight_plan(
+            kind,
+            source_commit,
+            &onto_signed.commit,
+            baseline.as_ref().map(|b| &b.commit),
+            |addr| {
+                if addr == source_addr {
+                    source_in_repo
+                } else if addr == &onto_commit_addr {
+                    onto_in_repo
+                } else if Some(addr) == baseline_addr.as_ref() {
+                    baseline_in_repo
+                } else {
+                    false
+                }
+            },
+        )
     }
 
     pub async fn head(&self, branch: &str) -> Result<Option<Head>, Error> {
