@@ -1423,172 +1423,179 @@ pub async fn validate_and_stage_archive_with_target_in<R: Read>(
             ArchiveError::InvalidFrame("failed to initialize preflight scratch repository")
         })?;
 
-    let mut reachable_staged_objects: HashSet<(DocumentId, Address)> = HashSet::new();
-    let mut base_batch: Vec<ObjectPacket> = Vec::new();
-    let (mut base_batch_bytes, mut base_objects, mut base_bytes) = (0usize, 0usize, 0u64);
-    let mut base_visited: HashSet<(DocumentId, Address)> = HashSet::new();
+    // Every exit closes the scratch repository so its files can be removed (Windows keeps
+    // open SQLite handles locked).
+    let preflight = async {
+        let mut reachable_staged_objects: HashSet<(DocumentId, Address)> = HashSet::new();
+        let mut base_batch: Vec<ObjectPacket> = Vec::new();
+        let (mut base_batch_bytes, mut base_objects, mut base_bytes) = (0usize, 0usize, 0u64);
+        let mut base_visited: HashSet<(DocumentId, Address)> = HashSet::new();
 
-    let mut sorted_docs: Vec<_> = file_roots.into_iter().collect();
-    sorted_docs.sort_by_key(|(doc, _)| doc.0);
+        let mut sorted_docs: Vec<_> = file_roots.into_iter().collect();
+        sorted_docs.sort_by_key(|(doc, _)| doc.0);
 
-    for (doc_id, roots) in sorted_docs {
-        let mut obj_stack: Vec<Address> = roots.into_iter().collect();
-        while let Some(addr) = obj_stack.pop() {
-            if let Some(idx) = staged_objects_map.get(&(doc_id, addr.clone())) {
-                if reachable_staged_objects.insert((doc_id, addr.clone())) {
-                    let raw_bytes = std::fs::read(&staged_objects[*idx].path)?;
-                    let children = crate::shared_checkpoint::references(&addr, &raw_bytes)
-                        .map_err(|_| ArchiveError::InvalidFrame("malformed object references"))?;
-                    for child in children {
-                        if !reachable_staged_objects.contains(&(doc_id, child.clone())) {
-                            obj_stack.push(child);
-                        }
-                    }
-                }
-            } else if let Some(target) = target_repo {
-                if summary.since.is_some() {
-                    if base_visited.insert((doc_id, addr.clone())) {
-                        let packet = target
-                            .object(&ObjectKey {
-                                document: doc_id,
-                                address: addr.clone(),
-                            })
-                            .await
-                            .map_err(|_| {
-                                ArchiveError::InvalidFrame(
-                                    "object referenced in file graph is missing from archive and target repository",
-                                )
-                            })?;
-                        let children = crate::shared_checkpoint::references(&addr, &packet.bytes)
-                            .map_err(|_| {
-                            ArchiveError::InvalidFrame("malformed object references")
-                        })?;
+        for (doc_id, roots) in sorted_docs {
+            let mut obj_stack: Vec<Address> = roots.into_iter().collect();
+            while let Some(addr) = obj_stack.pop() {
+                if let Some(idx) = staged_objects_map.get(&(doc_id, addr.clone())) {
+                    if reachable_staged_objects.insert((doc_id, addr.clone())) {
+                        let raw_bytes = std::fs::read(&staged_objects[*idx].path)?;
+                        let children = crate::shared_checkpoint::references(&addr, &raw_bytes)
+                            .map_err(|_| ArchiveError::InvalidFrame("malformed object references"))?;
                         for child in children {
-                            if !base_visited.contains(&(doc_id, child.clone()))
-                                && !reachable_staged_objects.contains(&(doc_id, child.clone()))
-                            {
+                            if !reachable_staged_objects.contains(&(doc_id, child.clone())) {
                                 obj_stack.push(child);
                             }
                         }
-                        base_objects += 1;
-                        base_bytes += packet.bytes.len() as u64;
-                        if staged_objects.len() + base_objects > limits.max_objects
-                            || base_bytes > limits.max_total_bytes
-                        {
-                            return Err(ArchiveError::Limit(
-                                "base object closure exceeds the archive limits",
-                            ));
-                        }
-                        base_batch_bytes += packet.bytes.len();
-                        base_batch.push(packet);
-                        if base_batch.len() >= 64 || base_batch_bytes >= 800 * 1024 {
-                            scratch_repo
-                                .import_objects(&base_batch)
+                    }
+                } else if let Some(target) = target_repo {
+                    if summary.since.is_some() {
+                        if base_visited.insert((doc_id, addr.clone())) {
+                            let packet = target
+                                .object(&ObjectKey {
+                                    document: doc_id,
+                                    address: addr.clone(),
+                                })
                                 .await
                                 .map_err(|_| {
                                     ArchiveError::InvalidFrame(
-                                        "preflight base object staging failed",
+                                        "object referenced in file graph is missing from archive and target repository",
                                     )
                                 })?;
-                            base_batch.clear();
-                            base_batch_bytes = 0;
+                            let children = crate::shared_checkpoint::references(&addr, &packet.bytes)
+                                .map_err(|_| {
+                                ArchiveError::InvalidFrame("malformed object references")
+                            })?;
+                            for child in children {
+                                if !base_visited.contains(&(doc_id, child.clone()))
+                                    && !reachable_staged_objects.contains(&(doc_id, child.clone()))
+                                {
+                                    obj_stack.push(child);
+                                }
+                            }
+                            base_objects += 1;
+                            base_bytes += packet.bytes.len() as u64;
+                            if staged_objects.len() + base_objects > limits.max_objects
+                                || base_bytes > limits.max_total_bytes
+                            {
+                                return Err(ArchiveError::Limit(
+                                    "base object closure exceeds the archive limits",
+                                ));
+                            }
+                            base_batch_bytes += packet.bytes.len();
+                            base_batch.push(packet);
+                            if base_batch.len() >= 64 || base_batch_bytes >= 800 * 1024 {
+                                scratch_repo
+                                    .import_objects(&base_batch)
+                                    .await
+                                    .map_err(|_| {
+                                        ArchiveError::InvalidFrame(
+                                            "preflight base object staging failed",
+                                        )
+                                    })?;
+                                base_batch.clear();
+                                base_batch_bytes = 0;
+                            }
                         }
+                    } else {
+                        return Err(ArchiveError::InvalidFrame(
+                            "object referenced in file graph is missing from archive",
+                        ));
                     }
                 } else {
                     return Err(ArchiveError::InvalidFrame(
                         "object referenced in file graph is missing from archive",
                     ));
                 }
-            } else {
-                return Err(ArchiveError::InvalidFrame(
-                    "object referenced in file graph is missing from archive",
-                ));
             }
         }
-    }
 
-    if !base_batch.is_empty() {
-        scratch_repo
-            .import_objects(&base_batch)
-            .await
-            .map_err(|_| ArchiveError::InvalidFrame("preflight base object staging failed"))?;
-    }
+        if !base_batch.is_empty() {
+            scratch_repo
+                .import_objects(&base_batch)
+                .await
+                .map_err(|_| ArchiveError::InvalidFrame("preflight base object staging failed"))?;
+        }
 
-    if reachable_staged_objects.len() != staged_objects.len() {
-        return Err(ArchiveError::InvalidFrame(
-            "archive contains extra objects outside the selected object closure",
-        ));
-    }
+        if reachable_staged_objects.len() != staged_objects.len() {
+            return Err(ArchiveError::InvalidFrame(
+                "archive contains extra objects outside the selected object closure",
+            ));
+        }
 
-    // 3. Async semantic preflight in a private disposable LocalRepository.
-    // Verifies complete typed reconstructions, recovery and merge evidence
-    // before touching any destination repository.
-    let mut batch_packets: Vec<ObjectPacket> = Vec::new();
-    let mut batch_bytes = 0usize;
+        // 3. Async semantic preflight in a private disposable LocalRepository.
+        // Verifies complete typed reconstructions, recovery and merge evidence
+        // before touching any destination repository.
+        let mut batch_packets: Vec<ObjectPacket> = Vec::new();
+        let mut batch_bytes = 0usize;
 
-    for entry in &staged_objects {
-        let bytes = std::fs::read(&entry.path)?;
-        batch_bytes += bytes.len();
-        batch_packets.push(ObjectPacket {
-            key: ObjectKey {
-                document: entry.document,
-                address: entry.address.clone(),
-            },
-            bytes,
-        });
-        if batch_packets.len() >= 64 || batch_bytes >= 800 * 1024 {
+        for entry in &staged_objects {
+            let bytes = std::fs::read(&entry.path)?;
+            batch_bytes += bytes.len();
+            batch_packets.push(ObjectPacket {
+                key: ObjectKey {
+                    document: entry.document,
+                    address: entry.address.clone(),
+                },
+                bytes,
+            });
+            if batch_packets.len() >= 64 || batch_bytes >= 800 * 1024 {
+                scratch_repo
+                    .import_objects(&batch_packets)
+                    .await
+                    .map_err(|_| ArchiveError::InvalidFrame("preflight object staging failed"))?;
+                batch_packets.clear();
+                batch_bytes = 0;
+            }
+        }
+        if !batch_packets.is_empty() {
             scratch_repo
                 .import_objects(&batch_packets)
                 .await
                 .map_err(|_| ArchiveError::InvalidFrame("preflight object staging failed"))?;
-            batch_packets.clear();
-            batch_bytes = 0;
         }
-    }
-    if !batch_packets.is_empty() {
-        scratch_repo
-            .import_objects(&batch_packets)
-            .await
-            .map_err(|_| ArchiveError::InvalidFrame("preflight object staging failed"))?;
-    }
 
-    // A base commit enters the scratch repository only when an import needs it, after
-    // `seed_base_commit` has checked it, and only within the commit and byte limits.
-    let mut seeded: HashSet<Address> = HashSet::new();
-    for signed in &staged_commits {
-        loop {
-            match scratch_repo.import_commit(signed).await {
-                Ok(_) => break,
-                Err(crate::repository::Error::Missing(needed)) => {
-                    let target = target_repo.filter(|_| summary.since.is_some());
-                    let Some(target) = target else {
+        // A base commit enters the scratch repository only when an import needs it, after
+        // `seed_base_commit` has checked it, and only within the commit and byte limits.
+        let mut seeded: HashSet<Address> = HashSet::new();
+        for signed in &staged_commits {
+            loop {
+                match scratch_repo.import_commit(signed).await {
+                    Ok(_) => break,
+                    Err(crate::repository::Error::Missing(needed)) => {
+                        let target = target_repo.filter(|_| summary.since.is_some());
+                        let Some(target) = target else {
+                            return Err(ArchiveError::InvalidFrame(
+                                "archive contains semantically invalid commits or object graphs",
+                            ));
+                        };
+                        if !seeded.insert(needed.clone()) || seeded.len() > limits.max_commits {
+                            return Err(ArchiveError::Limit(
+                                "base commit context exceeds the limits",
+                            ));
+                        }
+                        seed_base_commit(target, &scratch_repo, &needed).await?;
+                    }
+                    Err(crate::repository::Error::Limit(_)) => {
+                        return Err(ArchiveError::Limit("semantic preflight limit exceeded"));
+                    }
+                    Err(_) => {
                         return Err(ArchiveError::InvalidFrame(
                             "archive contains semantically invalid commits or object graphs",
                         ));
-                    };
-                    if !seeded.insert(needed.clone()) || seeded.len() > limits.max_commits {
-                        return Err(ArchiveError::Limit(
-                            "base commit context exceeds the limits",
-                        ));
                     }
-                    seed_base_commit(target, &scratch_repo, &needed).await?;
-                }
-                Err(crate::repository::Error::Limit(_)) => {
-                    return Err(ArchiveError::Limit("semantic preflight limit exceeded"));
-                }
-                Err(_) => {
-                    return Err(ArchiveError::InvalidFrame(
-                        "archive contains semantically invalid commits or object graphs",
-                    ));
                 }
             }
         }
-    }
 
+        Ok::<(), ArchiveError>(())
+    }
+    .await;
     scratch_repo.close().await;
     let _ = std::fs::remove_file(&scratch_db_path);
     let _ = std::fs::remove_file(staging_dir.path().join("preflight_scratch.db-wal"));
     let _ = std::fs::remove_file(staging_dir.path().join("preflight_scratch.db-shm"));
+    preflight?;
 
     Ok(StagedArchive {
         summary,
