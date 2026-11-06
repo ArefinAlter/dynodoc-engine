@@ -17,6 +17,11 @@ use crate::{
 /// Default tail length before an automatic background snapshot is taken.
 pub const DEFAULT_MAX_EVENTS_IN_TAIL: i64 = 500;
 
+/// Corrupt periodic checkpoints one historical read may skip. Each attempt has its own
+/// full read budget, so a read costs at most this many plus one times that budget, and a
+/// fallback replays at most this many checkpoint intervals more than a clean read.
+const MAX_PERIODIC_FALLBACKS: usize = 3;
+
 /// Why a snapshot was requested.
 #[derive(Debug, Clone, Copy)]
 pub enum SnapshotReason {
@@ -158,6 +163,7 @@ async fn read_state_at_with_formats(
 
     let mut candidate_result = None;
     let mut first_error: Option<SnapshotError> = None;
+    let mut fallbacks = 0usize;
 
     for (seq, version) in candidates {
         match version {
@@ -176,6 +182,18 @@ async fn read_state_at_with_formats(
                         break;
                     }
                     Err(err) => {
+                        // Only corrupt data is a reason to try an older checkpoint. A database,
+                        // I/O or resource error says nothing about this checkpoint, so it
+                        // surfaces instead of triggering a longer replay.
+                        if !matches!(
+                            err,
+                            shared_checkpoint::Error::Invalid(_)
+                                | shared_checkpoint::Error::Missing(_)
+                                | shared_checkpoint::Error::HashMismatch
+                                | shared_checkpoint::Error::Json(_)
+                        ) {
+                            return Err(err.into());
+                        }
                         warn!(
                             document_id = %document_id.0,
                             through_seq = seq,
@@ -183,6 +201,13 @@ async fn read_state_at_with_formats(
                             error = %err,
                             "shared checkpoint candidate corrupted or invalid; attempting fallback to earlier checkpoint"
                         );
+                        fallbacks += 1;
+                        if fallbacks > MAX_PERIODIC_FALLBACKS {
+                            return Err(shared_checkpoint::Error::Limit(
+                                "too many corrupt periodic checkpoints",
+                            )
+                            .into());
+                        }
                         if first_error.is_none() {
                             first_error = Some(err.into());
                         }
