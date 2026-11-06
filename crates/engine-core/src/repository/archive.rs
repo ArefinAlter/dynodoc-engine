@@ -71,6 +71,8 @@ pub enum ArchiveError {
     OrderViolation(&'static str),
     #[error("dependency missing: commit {0} depends on unseen {1}")]
     MissingDependency(String, String),
+    #[error("missing base commit {0} in target repository")]
+    MissingBaseCommit(String),
     #[error("footer mismatch: {0}")]
     FooterMismatch(&'static str),
     #[error("unexpected trailing data after footer")]
@@ -1058,6 +1060,7 @@ pub async fn export_archive_incremental<W: Write>(
 
 /// Bounded private temporary directory for archive staging.
 /// Permissions are 0700 on Unix. Recursively cleaned up on drop.
+#[derive(Debug)]
 pub struct PrivateTempDir {
     path: PathBuf,
 }
@@ -1091,6 +1094,7 @@ pub struct StagedObjectEntry {
 }
 
 /// A fully verified archive staged on temporary disk, ready for atomic target import.
+#[derive(Debug)]
 pub struct StagedArchive {
     pub summary: ArchiveSummary,
     pub objects: Vec<StagedObjectEntry>,
@@ -1155,8 +1159,15 @@ pub async fn validate_and_stage_archive<R: Read>(
     expected_project: Option<DocumentId>,
 ) -> Result<StagedArchive, ArchiveError> {
     let staging_dir = PrivateTempDir::new()?;
-    validate_and_stage_archive_in(reader, limits, expected_head, expected_project, staging_dir)
-        .await
+    validate_and_stage_archive_with_target_in(
+        reader,
+        limits,
+        expected_head,
+        expected_project,
+        None,
+        staging_dir,
+    )
+    .await
 }
 
 /// Validate and stage an archive into the given private temporary directory.
@@ -1165,6 +1176,47 @@ pub async fn validate_and_stage_archive_in<R: Read>(
     limits: ArchiveLimits,
     expected_head: Option<&Address>,
     expected_project: Option<DocumentId>,
+    staging_dir: PrivateTempDir,
+) -> Result<StagedArchive, ArchiveError> {
+    validate_and_stage_archive_with_target_in(
+        reader,
+        limits,
+        expected_head,
+        expected_project,
+        None,
+        staging_dir,
+    )
+    .await
+}
+
+/// Validate an archive stream with an optional target repository for incremental base resolution
+/// and stage its objects into a fresh private temporary directory.
+pub async fn validate_and_stage_archive_with_target<R: Read>(
+    reader: R,
+    limits: ArchiveLimits,
+    expected_head: Option<&Address>,
+    expected_project: Option<DocumentId>,
+    target_repo: Option<&LocalRepository>,
+) -> Result<StagedArchive, ArchiveError> {
+    let staging_dir = PrivateTempDir::new()?;
+    validate_and_stage_archive_with_target_in(
+        reader,
+        limits,
+        expected_head,
+        expected_project,
+        target_repo,
+        staging_dir,
+    )
+    .await
+}
+
+/// Validate and stage an archive with optional target repository into the given private temporary directory.
+pub async fn validate_and_stage_archive_with_target_in<R: Read>(
+    reader: R,
+    limits: ArchiveLimits,
+    expected_head: Option<&Address>,
+    expected_project: Option<DocumentId>,
+    target_repo: Option<&LocalRepository>,
     staging_dir: PrivateTempDir,
 ) -> Result<StagedArchive, ArchiveError> {
     let mut archive_reader = ArchiveReader::new(reader, limits);
@@ -1184,7 +1236,7 @@ pub async fn validate_and_stage_archive_in<R: Read>(
                 version: _,
                 project,
                 head,
-                ..
+                since: _,
             } => {
                 if let Some(exp_proj) = expected_project {
                     if project != exp_proj {
@@ -1247,10 +1299,19 @@ pub async fn validate_and_stage_archive_in<R: Read>(
 
     let summary = footer_summary.ok_or(ArchiveError::UnexpectedEof)?;
 
-    if summary.since.is_some() {
-        return Err(ArchiveError::InvalidFrame(
+    if let Some(ref since_addr) = summary.since {
+        let target = target_repo.ok_or(ArchiveError::InvalidFrame(
             "staged validation of incremental archive requires target repository",
-        ));
+        ))?;
+        if target.project() != summary.project.0 {
+            return Err(ArchiveError::InvalidFrame(
+                "archive project mismatch with target repository",
+            ));
+        }
+        target
+            .commit(since_addr)
+            .await
+            .map_err(|_| ArchiveError::MissingBaseCommit(since_addr.as_str().to_string()))?;
     }
 
     if let Some(exp_head) = expected_head {
@@ -1270,19 +1331,65 @@ pub async fn validate_and_stage_archive_in<R: Read>(
 
     // 1. Commit closure verification
     let mut reachable_commits = HashSet::new();
-    let mut commit_stack = vec![summary.head.clone()];
+    let mut commit_stack = Vec::new();
+    let mut since_encountered = false;
+
+    if let Some(ref since_addr) = summary.since {
+        if &summary.head == since_addr {
+            since_encountered = true;
+        } else {
+            commit_stack.push(summary.head.clone());
+        }
+    } else {
+        commit_stack.push(summary.head.clone());
+    }
+
     while let Some(addr) = commit_stack.pop() {
+        if let Some(ref since_addr) = summary.since {
+            if &addr == since_addr {
+                since_encountered = true;
+                continue;
+            }
+        }
         if reachable_commits.insert(addr.clone()) {
             let idx = staged_commits_map.get(&addr).ok_or_else(|| {
                 ArchiveError::MissingDependency("commit".into(), addr.as_str().into())
             })?;
             let signed = &staged_commits[*idx];
             for dep in signed.commit.dependencies() {
-                if !reachable_commits.contains(&dep) {
-                    commit_stack.push(dep);
+                if let Some(ref since_addr) = summary.since {
+                    if &dep == since_addr {
+                        since_encountered = true;
+                        continue;
+                    }
+                }
+                if staged_commits_map.contains_key(&dep) {
+                    if !reachable_commits.contains(&dep) {
+                        commit_stack.push(dep);
+                    }
+                } else if let Some(target) = target_repo {
+                    if summary.since.is_some() && target.commit(&dep).await.is_ok() {
+                        continue;
+                    } else {
+                        return Err(ArchiveError::MissingDependency(
+                            "commit".into(),
+                            dep.as_str().into(),
+                        ));
+                    }
+                } else {
+                    return Err(ArchiveError::MissingDependency(
+                        "commit".into(),
+                        dep.as_str().into(),
+                    ));
                 }
             }
         }
+    }
+
+    if summary.since.is_some() && !since_encountered {
+        return Err(ArchiveError::InvalidFrame(
+            "head is not a descendant of since",
+        ));
     }
 
     if reachable_commits.len() != staged_commits.len() {
@@ -1302,32 +1409,68 @@ pub async fn validate_and_stage_archive_in<R: Read>(
         }
     }
 
-    let mut reachable_objects: HashSet<(DocumentId, Address)> = HashSet::new();
+    let mut reachable_staged_objects: HashSet<(DocumentId, Address)> = HashSet::new();
+    let mut base_packets: Vec<ObjectPacket> = Vec::new();
+    let mut base_visited: HashSet<(DocumentId, Address)> = HashSet::new();
+
     let mut sorted_docs: Vec<_> = file_roots.into_iter().collect();
     sorted_docs.sort_by_key(|(doc, _)| doc.0);
 
     for (doc_id, roots) in sorted_docs {
         let mut obj_stack: Vec<Address> = roots.into_iter().collect();
         while let Some(addr) = obj_stack.pop() {
-            if reachable_objects.insert((doc_id, addr.clone())) {
-                let idx = staged_objects_map.get(&(doc_id, addr.clone())).ok_or(
-                    ArchiveError::InvalidFrame(
-                        "object referenced in file graph is missing from archive",
-                    ),
-                )?;
-                let raw_bytes = std::fs::read(&staged_objects[*idx].path)?;
-                let children = crate::shared_checkpoint::references(&addr, &raw_bytes)
-                    .map_err(|_| ArchiveError::InvalidFrame("malformed object references"))?;
-                for child in children {
-                    if !reachable_objects.contains(&(doc_id, child.clone())) {
-                        obj_stack.push(child);
+            if let Some(idx) = staged_objects_map.get(&(doc_id, addr.clone())) {
+                if reachable_staged_objects.insert((doc_id, addr.clone())) {
+                    let raw_bytes = std::fs::read(&staged_objects[*idx].path)?;
+                    let children = crate::shared_checkpoint::references(&addr, &raw_bytes)
+                        .map_err(|_| ArchiveError::InvalidFrame("malformed object references"))?;
+                    for child in children {
+                        if !reachable_staged_objects.contains(&(doc_id, child.clone())) {
+                            obj_stack.push(child);
+                        }
                     }
                 }
+            } else if let Some(target) = target_repo {
+                if summary.since.is_some() {
+                    if base_visited.insert((doc_id, addr.clone())) {
+                        let packet = target
+                            .object(&ObjectKey {
+                                document: doc_id,
+                                address: addr.clone(),
+                            })
+                            .await
+                            .map_err(|_| {
+                                ArchiveError::InvalidFrame(
+                                    "object referenced in file graph is missing from archive and target repository",
+                                )
+                            })?;
+                        let children = crate::shared_checkpoint::references(&addr, &packet.bytes)
+                            .map_err(|_| {
+                            ArchiveError::InvalidFrame("malformed object references")
+                        })?;
+                        for child in children {
+                            if !base_visited.contains(&(doc_id, child.clone()))
+                                && !reachable_staged_objects.contains(&(doc_id, child.clone()))
+                            {
+                                obj_stack.push(child);
+                            }
+                        }
+                        base_packets.push(packet);
+                    }
+                } else {
+                    return Err(ArchiveError::InvalidFrame(
+                        "object referenced in file graph is missing from archive",
+                    ));
+                }
+            } else {
+                return Err(ArchiveError::InvalidFrame(
+                    "object referenced in file graph is missing from archive",
+                ));
             }
         }
     }
 
-    if reachable_objects.len() != staged_objects.len() {
+    if reachable_staged_objects.len() != staged_objects.len() {
         return Err(ArchiveError::InvalidFrame(
             "archive contains extra objects outside the selected object closure",
         ));
@@ -1370,6 +1513,70 @@ pub async fn validate_and_stage_archive_in<R: Read>(
             .import_objects(&batch_packets)
             .await
             .map_err(|_| ArchiveError::InvalidFrame("preflight object staging failed"))?;
+        batch_packets.clear();
+        batch_bytes = 0;
+    }
+
+    for packet in base_packets {
+        batch_bytes += packet.bytes.len();
+        batch_packets.push(packet);
+        if batch_packets.len() >= 64 || batch_bytes >= 800 * 1024 {
+            scratch_repo
+                .import_objects(&batch_packets)
+                .await
+                .map_err(|_| ArchiveError::InvalidFrame("preflight base object staging failed"))?;
+            batch_packets.clear();
+            batch_bytes = 0;
+        }
+    }
+    if !batch_packets.is_empty() {
+        scratch_repo
+            .import_objects(&batch_packets)
+            .await
+            .map_err(|_| ArchiveError::InvalidFrame("preflight base object staging failed"))?;
+    }
+
+    if let Some(target) = target_repo {
+        if let Some(ref since_addr) = summary.since {
+            let (body, height) = target
+                .raw_commit_record(since_addr)
+                .await
+                .map_err(|_| ArchiveError::MissingBaseCommit(since_addr.as_str().to_string()))?;
+            scratch_repo
+                .insert_base_commit_raw(since_addr, &body, height)
+                .await
+                .map_err(|_| ArchiveError::InvalidFrame("preflight base commit staging failed"))?;
+
+            for signed in &staged_commits {
+                for parent in &signed.commit.parents {
+                    if !staged_commits_map.contains_key(parent) && parent != since_addr {
+                        if let Ok((body, height)) = target.raw_commit_record(parent).await {
+                            let _ = scratch_repo
+                                .insert_base_commit_raw(parent, &body, height)
+                                .await;
+                        }
+                    }
+                }
+                if let Some(ref source) = signed.commit.recovery {
+                    if !staged_commits_map.contains_key(&source.commit) {
+                        if let Ok((body, height)) = target.raw_commit_record(&source.commit).await {
+                            let _ = scratch_repo
+                                .insert_base_commit_raw(&source.commit, &body, height)
+                                .await;
+                        }
+                    }
+                    if let Some(ref mainline) = source.mainline {
+                        if !staged_commits_map.contains_key(mainline) {
+                            if let Ok((body, height)) = target.raw_commit_record(mainline).await {
+                                let _ = scratch_repo
+                                    .insert_base_commit_raw(mainline, &body, height)
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     for signed in &staged_commits {
@@ -1413,6 +1620,14 @@ pub async fn import_archive(
         )));
     }
 
+    if let Some(ref since_addr) = staged.summary.since {
+        repo.commit(since_addr).await.map_err(|_| {
+            ArchiveImportError::Validation(ArchiveError::MissingBaseCommit(
+                since_addr.as_str().to_string(),
+            ))
+        })?;
+    }
+
     let mut objects_imported = 0usize;
     let mut batch_packets: Vec<ObjectPacket> = Vec::new();
     let mut batch_bytes = 0usize;
@@ -1420,14 +1635,14 @@ pub async fn import_archive(
     for entry in &staged.objects {
         let bytes = std::fs::read(&entry.path)?;
         if batch_packets.len() >= 64 || batch_bytes + bytes.len() > 800 * 1024 {
-            repo.import_objects(&batch_packets).await.map_err(|e| {
+            let newly_inserted = repo.import_objects(&batch_packets).await.map_err(|e| {
                 ArchiveImportError::TargetCopy {
                     objects_imported,
                     commits_imported: 0,
                     source: e,
                 }
             })?;
-            objects_imported += batch_packets.len();
+            objects_imported += newly_inserted;
             batch_packets.clear();
             batch_bytes = 0;
         }
@@ -1442,18 +1657,22 @@ pub async fn import_archive(
     }
 
     if !batch_packets.is_empty() {
-        repo.import_objects(&batch_packets)
-            .await
-            .map_err(|e| ArchiveImportError::TargetCopy {
+        let newly_inserted = repo.import_objects(&batch_packets).await.map_err(|e| {
+            ArchiveImportError::TargetCopy {
                 objects_imported,
                 commits_imported: 0,
                 source: e,
-            })?;
-        objects_imported += batch_packets.len();
+            }
+        })?;
+        objects_imported += newly_inserted;
     }
 
     let mut commits_imported = 0usize;
     for signed in &staged.commits {
+        let addr = signed.verify().map_err(|_| {
+            ArchiveImportError::Validation(ArchiveError::InvalidFrame("invalid commit signature"))
+        })?;
+        let already_present = repo.commit(&addr).await.is_ok();
         repo.import_commit(signed)
             .await
             .map_err(|e| ArchiveImportError::TargetCopy {
@@ -1461,7 +1680,9 @@ pub async fn import_archive(
                 commits_imported,
                 source: e,
             })?;
-        commits_imported += 1;
+        if !already_present {
+            commits_imported += 1;
+        }
     }
 
     Ok(ArchiveImportSummary {

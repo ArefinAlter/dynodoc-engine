@@ -545,6 +545,40 @@ impl LocalRepository {
         Ok(load_commit(&mut connection, self.project, address).await?.0)
     }
 
+    pub(crate) async fn raw_commit_record(
+        &self,
+        address: &Address,
+    ) -> Result<(Vec<u8>, i64), Error> {
+        let mut connection = self.pool.acquire().await?;
+        let (bytes, height): (Vec<u8>, i64) = sqlx::query_as(
+            "select body,height from commits where address=? and length(body)<=1049600",
+        )
+        .bind(address.as_str())
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| Error::Missing(address.clone()))?;
+        Ok((bytes, height))
+    }
+
+    pub(crate) async fn insert_base_commit_raw(
+        &self,
+        address: &Address,
+        body: &[u8],
+        height: i64,
+    ) -> Result<(), Error> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query(
+            "insert into commits(address, body, height) values(?, ?, ?) on conflict(address) do nothing",
+        )
+        .bind(address.as_str())
+        .bind(body)
+        .bind(height)
+        .execute(&mut *connection)
+        .await
+        .map_err(storage::error)?;
+        Ok(())
+    }
+
     /// Retrieve a bounded page of first-parent commit history starting at `head`.
     pub async fn first_parent_log(
         &self,
