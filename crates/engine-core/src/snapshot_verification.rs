@@ -544,6 +544,36 @@ mod tests {
     }
 
     #[test]
+    fn the_envelope_is_exactly_a_version_two_or_three_and_a_root() {
+        let root = "0123456789abcdef".repeat(4);
+        let snapshot = |state: serde_json::Value| Snapshot {
+            id: engine_shared::SnapshotId(Uuid::nil()),
+            document_id: DocumentId(Uuid::from_u128(1)),
+            through_seq: 0,
+            state,
+            merkle_root: vec![0; 32],
+            event_chain_hash: vec![0; 32],
+            event_merkle_root: None,
+            created_at: "2026-10-11T00:00:00Z".parse().unwrap(),
+        };
+        let parsed = |state| shared_root(&snapshot(state)).map(|r| r.map(|(_, version)| version));
+        assert_eq!(parsed(serde_json::json!({"nodes":{}})).unwrap(), None);
+        for version in [2, 3] {
+            let state = serde_json::json!({"$dynodoc_state":version,"root":root});
+            assert_eq!(parsed(state).unwrap(), Some(version));
+        }
+        for state in [
+            serde_json::json!({"$dynodoc_state":4,"root":root}),
+            serde_json::json!({"$dynodoc_state":"3","root":root}),
+            serde_json::json!({"$dynodoc_state":3,"root":root,"extra":1}),
+            serde_json::json!({"$dynodoc_state":3}),
+            serde_json::json!({"$dynodoc_state":3,"root":"not-hex"}),
+        ] {
+            assert!(parsed(state.clone()).is_err(), "{state}");
+        }
+    }
+
+    #[test]
     fn legacy_receipt_v3_binds_the_event_root_with_a_stable_vector() {
         // The event-prefix root of three events whose content hashes are the 8-byte
         // big-endian integers 0, 1 and 2: H(01 || H(01 || L0 || L1) || H(01 || L2 || 0^32))

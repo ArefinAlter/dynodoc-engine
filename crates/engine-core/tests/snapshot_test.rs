@@ -800,13 +800,149 @@ async fn compact_v3_named_snapshots_mix_with_v2_and_bind_their_codec(
 
     assert_eq!(verify_document(&pool, doc, true).await?.snapshots, 2);
     let limits = engine_core::shared_checkpoint::Limits::default();
-    let unreferenced =
-        engine_core::shared_checkpoint::postgres::unreferenced_objects(&pool, doc, &[], limits)
-            .await?;
+    let report =
+        engine_core::shared_checkpoint::postgres::retention_report(&pool, doc, &[], limits).await?;
     assert!(
-        unreferenced.is_empty(),
+        report.outside_keep.is_empty() && report.unreferenced.is_empty(),
         "snapshot roots of both codecs are kept"
     );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn compact_v3_named_snapshots_fail_closed_keep_the_first_writer_and_roll_back(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, doc, node) = seed(&pool).await?;
+    let engine = SnapshotEngine::new(pool.clone());
+    let v2 = engine.clone().with_named_storage(NamedStorage::SharedV2);
+    let v3 = engine.with_named_storage(NamedStorage::SharedV3);
+
+    // The first writer of a sequence wins; a later v3 request returns the stored v2 snapshot.
+    let first = v2.take(doc, SnapshotReason::Deployed).await?;
+    assert_eq!(v3.take(doc, SnapshotReason::Deployed).await?, first);
+    let raw: serde_json::Value = sqlx::query_scalar("select state from snapshot where id=$1")
+        .bind(first.id.0)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(raw["$dynodoc_state"], 2);
+
+    // A publication that rolls back leaves no snapshot, receipt or object behind.
+    append(&pool, doc, &field_edit(&node, "label", "Changed"), actor).await?;
+    let counts = || {
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "select (select count(*) from snapshot), (select count(*) from snapshot_verification),
+                    (select count(*) from checkpoint_object)",
+        )
+        .fetch_one(&pool)
+    };
+    let before = counts().await?;
+    let mut tx = pool.begin().await?;
+    snapshot_verification::take_with_storage_in_connection(&mut tx, doc, 2, NamedStorage::SharedV3)
+        .await?;
+    tx.rollback().await?;
+    assert_eq!(counts().await?, before);
+
+    // An altered v3 root object fails closed through the loader and the historical reader.
+    let second = v3.take(doc, SnapshotReason::Deployed).await?;
+    let root: String = sqlx::query_scalar("select state_root from snapshot where id=$1")
+        .bind(second.id.0)
+        .fetch_one(&pool)
+        .await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("set local session_replication_role=replica")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "update checkpoint_object set bytes=decode('00','hex') where document_id=$1 and address=$2",
+    )
+    .bind(doc.0)
+    .bind(&root)
+    .execute(&mut *tx)
+    .await?;
+    assert!(snapshot_verification::load(&mut tx, doc, second.id.0)
+        .await
+        .is_err());
+    assert!(read_state_at(&mut tx, doc, 2).await.is_err());
+    tx.rollback().await?;
+    Ok(())
+}
+
+async fn snapshot_rows(pool: &PgPool) -> anyhow::Result<serde_json::Value> {
+    Ok(sqlx::query_scalar(
+        "select jsonb_build_object(
+            'snapshots',(select jsonb_agg(to_jsonb(s) order by through_seq) from snapshot s),
+            'receipts',(select jsonb_agg(to_jsonb(v) order by snapshot_id) from snapshot_verification v))",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+#[sqlx::test(migrations = false)]
+async fn migration_0056_keeps_populated_snapshots_receipts_and_references(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let mut at_55 = sqlx::migrate!("../../migrations");
+    at_55.migrations = at_55
+        .migrations
+        .iter()
+        .filter(|m| m.version < 56)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    at_55.run(&pool).await?;
+
+    // Legacy and v2 snapshots, with their receipts, written at schema 55.
+    let (actor, doc, node) = seed(&pool).await?;
+    let engine = SnapshotEngine::new(pool.clone());
+    let first = engine.take(doc, SnapshotReason::Periodic).await?;
+    append(&pool, doc, &field_edit(&node, "label", "Changed"), actor).await?;
+    let shared = engine.clone().with_named_storage(NamedStorage::SharedV2);
+    let second = shared.take(doc, SnapshotReason::Deployed).await?;
+    let before = snapshot_rows(&pool).await?;
+
+    sqlx::migrate!("../../migrations").run(&pool).await?;
+    // Connections that prepared `select * from snapshot` before the column was rebuilt
+    // fail with "cached plan must not change result type", so restart the pool as a
+    // deploy restarts the API.
+    let options = (*pool.connect_options()).clone();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await?;
+    assert_eq!(
+        snapshot_rows(&pool).await?,
+        before,
+        "rows, regenerated roots and receipts"
+    );
+    let mut connection = pool.acquire().await?;
+    for snapshot in [&first, &second] {
+        let loaded = snapshot_verification::load(&mut connection, doc, snapshot.id.0).await?;
+        assert_eq!(loaded.as_ref(), Some(snapshot));
+    }
+    drop(connection);
+
+    // The widened envelope is accepted; an unknown version and a missing object are refused.
+    append(&pool, doc, &field_edit(&node, "label", "Again"), actor).await?;
+    let v3 = SnapshotEngine::new(pool.clone()).with_named_storage(NamedStorage::SharedV3);
+    assert_eq!(v3.take(doc, SnapshotReason::Deployed).await?.through_seq, 3);
+    for (version, root) in [(4, "ab".repeat(32)), (3, "cd".repeat(32))] {
+        let mut tx = pool.begin().await?;
+        let inserted = sqlx::query(
+            "insert into snapshot(document_id,through_seq,state,merkle_root,event_chain_hash)
+             values($1,9,jsonb_build_object('$dynodoc_state',$2::int,'root',$3::text),
+                    decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'))",
+        )
+        .bind(doc.0)
+        .bind(version)
+        .bind(&root)
+        .execute(&mut *tx)
+        .await;
+        assert!(
+            inserted.is_err() || tx.commit().await.is_err(),
+            "version {version}"
+        );
+    }
     Ok(())
 }
 

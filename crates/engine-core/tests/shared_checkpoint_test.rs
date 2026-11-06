@@ -1672,8 +1672,20 @@ async fn incremental_v3_mixed_codec_history_and_base_isolation(pool: PgPool) -> 
     Ok(())
 }
 
+async fn checkpoint_root(pool: &PgPool, document: DocumentId, seq: i64) -> Address {
+    let root: String = sqlx::query_scalar(
+        "select state_root from shared_checkpoint where document_id=$1 and through_seq=$2",
+    )
+    .bind(document.0)
+    .bind(seq)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    Address::try_from(root).unwrap()
+}
+
 #[sqlx::test(migrations = "../../migrations")]
-async fn retention_plan_keeps_what_a_kept_incremental_checkpoint_reaches(
+async fn retention_report_keeps_what_a_kept_incremental_checkpoint_reaches(
     pool: PgPool,
 ) -> anyhow::Result<()> {
     let (actor, document, node) = seed(&pool).await?;
@@ -1701,9 +1713,9 @@ async fn retention_plan_keeps_what_a_kept_incremental_checkpoint_reaches(
     .bind(actor.0)
     .execute(&pool)
     .await?;
-    let pinned = postgres::unreferenced_objects(&pool, document, &[2], limits).await?;
+    let pinned = postgres::retention_report(&pool, document, &[2], limits).await?;
     assert!(
-        pinned.is_empty(),
+        pinned.outside_keep.is_empty(),
         "a draft base keeps the objects it reaches"
     );
     sqlx::query("delete from workspace_draft where document_id=$1")
@@ -1711,21 +1723,31 @@ async fn retention_plan_keeps_what_a_kept_incremental_checkpoint_reaches(
         .execute(&pool)
         .await?;
 
-    let both = postgres::unreferenced_objects(&pool, document, &[1, 2], limits).await?;
-    assert!(both.is_empty(), "every object belongs to a kept root");
-    let plan = postgres::unreferenced_objects(&pool, document, &[2], limits).await?;
-    assert!(!plan.is_empty(), "objects only the base used are freed");
+    let both = postgres::retention_report(&pool, document, &[1, 2], limits).await?;
+    assert!(both.outside_keep.is_empty() && both.unreferenced.is_empty());
+    let report = postgres::retention_report(&pool, document, &[2], limits).await?;
+    assert!(
+        !report.outside_keep.is_empty(),
+        "objects only the base used are outside the keep set"
+    );
+    assert!(
+        report.unreferenced.is_empty(),
+        "the base checkpoint row still reaches them"
+    );
     let snapshot_root: String = sqlx::query_scalar("select state_root from snapshot where id=$1")
         .bind(snapshot.id.0)
         .fetch_one(&pool)
         .await?;
-    assert!(!plan.contains(&Address::try_from(snapshot_root)?));
+    assert!(!report
+        .outside_keep
+        .contains(&Address::try_from(snapshot_root)?));
     assert!(matches!(
-        postgres::unreferenced_objects(&pool, document, &[9], limits).await,
+        postgres::retention_report(&pool, document, &[9], limits).await,
         Err(Error::Invalid("checkpoint not found"))
     ));
 
-    // Prune exactly the plan, as a database owner outside the runtime role would.
+    // Prune exactly what is outside the keep set, as a database owner outside the
+    // runtime role would, then read the increment without its base.
     let mut tx = pool.begin().await?;
     sqlx::query("set local session_replication_role=replica")
         .execute(&mut *tx)
@@ -1736,7 +1758,13 @@ async fn retention_plan_keeps_what_a_kept_incremental_checkpoint_reaches(
         .await?;
     sqlx::query("delete from checkpoint_object where document_id=$1 and address=any($2)")
         .bind(document.0)
-        .bind(plan.iter().map(Address::as_str).collect::<Vec<_>>())
+        .bind(
+            report
+                .outside_keep
+                .iter()
+                .map(Address::as_str)
+                .collect::<Vec<_>>(),
+        )
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -1747,6 +1775,165 @@ async fn retention_plan_keeps_what_a_kept_incremental_checkpoint_reaches(
             .await?;
     let loaded = postgres::load(&pool, document, 2, limits).await?;
     assert_eq!(loaded, Materializer::fold(&events)?);
+    let after = postgres::retention_report(&pool, document, &[2], limits).await?;
+    assert!(after.outside_keep.is_empty() && after.unreferenced.is_empty());
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn retention_report_honours_pins_orphans_limits_and_inventory_pages(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    for n in 2..=3 {
+        let edit = EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!(format!("rev {n} edit")),
+        };
+        append(&pool, document, &edit, actor).await?;
+    }
+    let limits = Limits::default();
+    for (seq, codec) in [
+        (1, postgres::Codec::V1),
+        (2, postgres::Codec::V2),
+        (3, postgres::Codec::V3),
+    ] {
+        postgres::take_with_codec(&pool, document, seq, limits, codec).await?;
+    }
+    let (root1, root2) = (
+        checkpoint_root(&pool, document, 1).await,
+        checkpoint_root(&pool, document, 2).await,
+    );
+
+    // Older v1 and v2 roots are outside a keep set of the v3 head, yet still stored roots.
+    let report = postgres::retention_report(&pool, document, &[3], limits).await?;
+    assert!(report.outside_keep.contains(&root1) && report.outside_keep.contains(&root2));
+    assert!(report.unreferenced.is_empty());
+
+    // Staged and published project objects pin an object and everything it reaches.
+    let project: uuid::Uuid = sqlx::query_scalar(
+        "insert into access_space(name,kind,created_by) values('Pins','project',$1) returning id",
+    )
+    .bind(actor.0)
+    .fetch_one(&pool)
+    .await?;
+    sqlx::query("insert into project_settings(space_id) values($1)")
+        .bind(project)
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "insert into project_published_object(project_id,state_root,document_id,address)
+         values($1,$2,$3,$2)",
+    )
+    .bind(project)
+    .bind(root1.as_str())
+    .bind(document.0)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "insert into project_staged_object(identity_id,project_id,document_id,address,charged_bytes)
+         values($1,$2,$3,$4,1)",
+    )
+    .bind(actor.0)
+    .bind(project)
+    .bind(document.0)
+    .bind(root2.as_str())
+    .execute(&pool)
+    .await?;
+    let report = postgres::retention_report(&pool, document, &[3], limits).await?;
+    assert!(!report.outside_keep.contains(&root1) && !report.outside_keep.contains(&root2));
+
+    // Orphans from nowhere are unreferenced; 2,500 of them span three inventory pages.
+    sqlx::query(
+        "insert into checkpoint_object(document_id,address,bytes)
+         select $1, md5(i::text)||md5((i+1000000)::text), '\\x00'::bytea from generate_series(1,2500) i",
+    )
+    .bind(document.0)
+    .execute(&pool)
+    .await?;
+    let report = postgres::retention_report(&pool, document, &[3], limits).await?;
+    assert_eq!(report.unreferenced.len(), 2500);
+    assert!(report.outside_keep.is_superset(&report.unreferenced));
+
+    for tight in [
+        Limits {
+            max_objects: 1,
+            ..limits
+        },
+        Limits {
+            max_bytes: 1,
+            ..limits
+        },
+    ] {
+        let err = postgres::retention_report(&pool, document, &[3], tight).await;
+        assert!(matches!(err, Err(Error::Limit(_))), "{err:?}");
+    }
+
+    // A reachable object that is altered or gone fails the report instead of shrinking it.
+    let root3 = checkpoint_root(&pool, document, 3).await;
+    let mut tx = pool.begin().await?;
+    sqlx::query("set local session_replication_role=replica")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "update checkpoint_object set bytes=decode('00','hex') where document_id=$1 and address=$2",
+    )
+    .bind(document.0)
+    .bind(root3.as_str())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    assert!(postgres::retention_report(&pool, document, &[3], limits)
+        .await
+        .is_err());
+    let mut tx = pool.begin().await?;
+    sqlx::query("set local session_replication_role=replica")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from checkpoint_object where document_id=$1 and address=$2")
+        .bind(document.0)
+        .bind(root3.as_str())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    let err = postgres::retention_report(&pool, document, &[3], limits).await;
+    assert!(matches!(err, Err(Error::Missing(_))), "{err:?}");
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn retention_report_is_one_snapshot_and_refuses_a_weaker_isolation(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    let edit = EventPayload::FieldEdited {
+        node_id: node,
+        field: "label".into(),
+        value: json!("rev 2 edit"),
+    };
+    append(&pool, document, &edit, actor).await?;
+    let limits = Limits::default();
+    postgres::take_incremental_v3(&pool, document, 1, limits).await?;
+
+    let mut weak = pool.acquire().await?;
+    let refused = postgres::retention_report_in(&mut weak, document, &[1], limits).await;
+    assert!(matches!(refused, Err(Error::Invalid(_))), "{refused:?}");
+    drop(weak);
+
+    // A publication that commits after the snapshot is not seen, so its objects are
+    // not mistaken for orphans of roots the report never read.
+    let mut tx = pool.begin().await?;
+    sqlx::query("set transaction isolation level repeatable read")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("select 1").fetch_one(&mut *tx).await?;
+    postgres::take_incremental_v3(&pool, document, 2, limits).await?;
+    let report = postgres::retention_report_in(&mut tx, document, &[1], limits).await?;
+    assert!(report.unreferenced.is_empty() && report.outside_keep.is_empty());
+    tx.rollback().await?;
+    let later = postgres::retention_report(&pool, document, &[1], limits).await?;
+    assert!(!later.outside_keep.is_empty() && later.unreferenced.is_empty());
     Ok(())
 }
 
