@@ -1937,6 +1937,142 @@ async fn retention_report_is_one_snapshot_and_refuses_a_weaker_isolation(
     Ok(())
 }
 
+async fn table_digests(pool: &PgPool) -> serde_json::Value {
+    sqlx::query_scalar(
+        "select jsonb_build_object(
+            'objects',(select md5(string_agg(t::text,'|' order by t::text)) from checkpoint_object t),
+            'checkpoints',(select md5(string_agg(t::text,'|' order by t::text)) from shared_checkpoint t),
+            'snapshots',(select md5(string_agg(t::text,'|' order by t::text)) from snapshot t),
+            'receipts',(select md5(string_agg(t::text,'|' order by t::text)) from snapshot_verification t),
+            'events',(select md5(string_agg(t::text,'|' order by t::text)) from event t),
+            'documents',(select md5(string_agg(t::text,'|' order by t::text)) from document t))",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reencode_check_previews_every_codec_and_changes_nothing(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    // An old-style identity and an annotation, so the state is not only canonical ids.
+    sqlx::query(
+        "insert into node(id,document_id,type,pos,current_fields) values('legacy-form-1',$1,'form','b0','{}')",
+    )
+    .bind(document.0)
+    .execute(&pool)
+    .await?;
+    let payloads = [
+        EventPayload::NodeCreated {
+            node_id: NodeId("legacy-form-1".into()),
+            node_type: NodeType::Form,
+            parent_id: None,
+            pos: "b0".into(),
+            fields: json!({"label": "Old"}),
+            var_name: None,
+        },
+        EventPayload::CommentAdded {
+            node_id: Some(node.clone()),
+            body: "Retained review".into(),
+        },
+        EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!("Edited"),
+        },
+    ];
+    for payload in &payloads {
+        append(&pool, document, payload, actor).await?;
+    }
+    let limits = Limits::default();
+    for (seq, codec) in [
+        (1, postgres::Codec::V1),
+        (2, postgres::Codec::V2),
+        (3, postgres::Codec::V3),
+    ] {
+        postgres::take_with_codec(&pool, document, seq, limits, codec).await?;
+    }
+    postgres::take_incremental_v3(&pool, document, 4, limits).await?;
+
+    let before = table_digests(&pool).await;
+    for (seq, codec_version) in [(1, 1), (2, 2), (3, 3), (4, 3)] {
+        let check = postgres::reencode_check(&pool, document, seq, limits).await?;
+        assert_eq!(check.codec_version, codec_version, "revision {seq}");
+        assert_eq!(
+            check.source_root,
+            checkpoint_root(&pool, document, seq).await
+        );
+        assert!(check.v3.visited_objects > 0 && check.v3.encoded_bytes > 0);
+        // Roots differ across codecs by design; a v3 source previews as itself.
+        assert_eq!(
+            check.v3_root == check.source_root,
+            codec_version == 3,
+            "revision {seq}"
+        );
+    }
+    assert_eq!(
+        table_digests(&pool).await,
+        before,
+        "the preview wrote nothing"
+    );
+
+    // No checkpoint at a revision means nothing to preview; a tight budget is refused.
+    let missing = postgres::reencode_check(&pool, document, 5, limits).await;
+    assert!(
+        matches!(missing, Err(Error::Invalid("checkpoint not found"))),
+        "{missing:?}"
+    );
+    let tight = Limits {
+        max_objects: 1,
+        ..limits
+    };
+    assert!(postgres::reencode_check(&pool, document, 4, tight)
+        .await
+        .is_err());
+
+    // A checkpoint holding another revision's state passes its own chain check, so `load`
+    // accepts it, but it is not event replay and the preview says so.
+    append(&pool, document, &payloads[2], actor).await?;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         select document_id,5,codec_version,state_root,
+                (select chain_hash from event where document_id=$1 and seq=5)
+         from shared_checkpoint where document_id=$1 and through_seq=3",
+    )
+    .bind(document.0)
+    .execute(&pool)
+    .await?;
+    postgres::load(&pool, document, 5, limits).await?;
+    let stale = postgres::reencode_check(&pool, document, 5, limits).await;
+    assert!(
+        matches!(
+            stale,
+            Err(Error::Invalid("checkpoint differs from the event history"))
+        ),
+        "{stale:?}"
+    );
+
+    // A corrupted source object fails the preview instead of being re-encoded.
+    let mut tx = pool.begin().await?;
+    sqlx::query("set local session_replication_role=replica")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "update checkpoint_object set bytes=decode('00','hex') where document_id=$1 and address=$2",
+    )
+    .bind(document.0)
+    .bind(checkpoint_root(&pool, document, 4).await.as_str())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    assert!(postgres::reencode_check(&pool, document, 4, limits)
+        .await
+        .is_err());
+    Ok(())
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn incremental_v3_occupied_target_revision_rejects_conversion(
     pool: PgPool,

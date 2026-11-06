@@ -790,8 +790,9 @@ async fn shared_reencode_check(document_id: String, through_seq: i64) -> anyhow:
     .await
     .context("compact v3 re-encode check failed")?;
     println!(
-        "shared checkpoint at revision {through_seq}: codec {}",
-        check.codec_version
+        "shared checkpoint at revision {through_seq}: codec {}, root {}",
+        check.codec_version,
+        check.source_root.as_str()
     );
     println!("compact v3 root: {}", check.v3_root.as_str());
     println!(
@@ -801,7 +802,7 @@ async fn shared_reencode_check(document_id: String, through_seq: i64) -> anyhow:
         check.v2.visited_objects,
         check.v2.encoded_bytes
     );
-    println!("state identical; nothing was written");
+    println!("state matches event replay and decodes identical; nothing was written");
     Ok(())
 }
 

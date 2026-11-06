@@ -122,17 +122,35 @@ async fn cli_reencode_check_verifies_compact_v3_and_writes_nothing(pool: PgPool)
         &["shared-snapshot", &id, "--through-seq", "1", "--typed"],
     );
     assert!(ok, "{out}");
+    // Digests of every table a checkpoint, snapshot, receipt or quota could land in.
     let rows = || {
-        sqlx::query_as::<_, (i64, i64)>(
-            "select (select count(*) from checkpoint_object), (select count(*) from shared_checkpoint)",
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "select jsonb_build_object(
+                'objects',(select md5(string_agg(t::text,'|' order by t::text)) from checkpoint_object t),
+                'checkpoints',(select md5(string_agg(t::text,'|' order by t::text)) from shared_checkpoint t),
+                'snapshots',(select md5(string_agg(t::text,'|' order by t::text)) from snapshot t),
+                'receipts',(select md5(string_agg(t::text,'|' order by t::text)) from snapshot_verification t),
+                'events',(select md5(string_agg(t::text,'|' order by t::text)) from event t),
+                'documents',(select md5(string_agg(t::text,'|' order by t::text)) from document t),
+                'history_storage',(select md5(string_agg(t::text,'|' order by t::text)) from project_history_storage t))",
         )
         .fetch_one(&pool)
     };
     let before = rows().await.unwrap();
+    let source_root: String = sqlx::query_scalar(
+        "select state_root from shared_checkpoint where document_id=$1 and through_seq=1",
+    )
+    .bind(doc.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
     let (ok, out) = run_cli(&url, &["shared-reencode-check", &id, "--through-seq", "1"]);
     assert!(ok, "{out}");
-    assert!(out.contains("codec 2"), "{out}");
+    assert!(
+        out.contains(&format!("codec 2, root {source_root}")),
+        "{out}"
+    );
     assert!(out.contains("nothing was written"), "{out}");
     assert_eq!(rows().await.unwrap(), before);
 
