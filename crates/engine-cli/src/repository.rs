@@ -823,6 +823,9 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                             signed,
                             ..
                         } => {
+                            let signed = engine_core::repository::recovery::verified(
+                                signed, &address, project,
+                            )?;
                             commits_in_archive.insert(address, signed);
                         }
                         _ => {}

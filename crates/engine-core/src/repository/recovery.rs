@@ -178,7 +178,7 @@ impl Plan {
 
 /// A commit is evidence only if it hashes and verifies to the address it was looked up
 /// by and belongs to this project, whoever supplied it.
-pub(crate) fn verified(
+pub fn verified(
     signed: SignedCommit,
     expected: &Address,
     project: uuid::Uuid,

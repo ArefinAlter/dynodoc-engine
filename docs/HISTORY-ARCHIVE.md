@@ -145,8 +145,10 @@ performs read-only preflight feasibility analysis for applying commit-addressed 
 (or top-level `engine-cli historical-diff ...`) compares two file revisions across commits or directly from an offline history archive without extracting any files to disk.
 - Reads object graphs directly from local repository storage (or in-memory store from a `.dynoarc` archive stream) and reconstructs normalized `DocumentState` representations.
 - Produces deterministic unified structural diffs with context lines and headers (`--- a/... +++ b/...`), node-level change tracking (`added`, `deleted`, `modified`), and fine-grained semantic AST operations.
-- Returns clean identical-commit no-op (`is_identical: true` and empty diff), reports text modifications, node insertions/deletions, and fails closed with an error on missing paths or missing commits.
-- Operates strictly read-only: never mutates SQLite, WAL, or disk.
+- `is_identical` is complete-state equality for the same document: nodes with their parents, tombstones and variable names, comments, suggestions and removed choices. A replaced document with an equal state root is not identical. Differences outside live nodes are named in `also_differs` (`document`, `comments`, `suggestions`, `removed_choices`, `tombstones`); a modified node lists what changed (`fields`, `type`, `position`, `parent`, `var_name`).
+- Output is bounded: at most 1,000 node changes and 256 KiB of unified diff, and a value over 4 KiB is shown as its length and SHA-256 (a change to it still shows). What is left out is counted in `omitted`. The semantic event list is all or nothing: it is listed whole within 1,000 events and 256 KiB, otherwise `events_unavailable` says why. A comparison is not an executable patch for every pair of states.
+- Fails closed with an error on missing paths or missing commits. Commits read from an archive must hash to the address they are listed under and belong to this project.
+- Operates read-only: it never mutates the repository or writes files.
 
 ## Normalized state export
 
