@@ -90,6 +90,12 @@ an explicit compact v3 shared checkpoint. Compact v3 uses the full writer only;
 The publication is verified against the pinned event-derived state in a single
 transaction.
 
+`engine-cli shared-reencode-check DOCUMENT --through-seq N` is read-only. It checks
+that a published checkpoint equals event replay at its revision and re-encodes as
+compact v3 and reads back identical, and prints both sizes. The roots differ between
+codecs by design. Checkpoints are immutable and an occupied revision refuses another
+codec, so it never replaces one; it runs in a read-only transaction.
+
 **Scope and Limits:**
 - This is an operator-facing publication feature. It does not mark portable/native adoption
   from PR-64/PR-65 as complete.

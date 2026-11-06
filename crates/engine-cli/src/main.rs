@@ -219,6 +219,13 @@ enum Command {
         #[arg(long)]
         codec: Option<String>,
     },
+    /// Read-only: check that a published shared checkpoint re-encodes as compact v3 and
+    /// report the sizes. Checkpoints are immutable, so nothing is written.
+    SharedReencodeCheck {
+        document_id: String,
+        #[arg(long)]
+        through_seq: i64,
+    },
     /// Emit the generated OpenAPI document. With `--out`, write it there; otherwise
     /// print to stdout. CI compares the committed `openapi.yaml` against `--out -` to
     /// fail on drift (see SETUP.md).
@@ -368,6 +375,10 @@ async fn run() -> anyhow::Result<()> {
             incremental,
             codec,
         } => shared_snapshot(document_id, through_seq, typed, incremental, codec).await,
+        Command::SharedReencodeCheck {
+            document_id,
+            through_seq,
+        } => shared_reencode_check(document_id, through_seq).await,
         Command::Openapi { out } => openapi(out),
     }
 }
@@ -764,6 +775,34 @@ async fn shared_snapshot(
         "new objects: {}; new canonical bytes: {}",
         result.stats.new_objects, result.stats.new_bytes
     );
+    Ok(())
+}
+
+async fn shared_reencode_check(document_id: String, through_seq: i64) -> anyhow::Result<()> {
+    let doc = parse_document_id(&document_id)?;
+    let pool = connect().await?;
+    let check = engine_core::shared_checkpoint::postgres::reencode_check(
+        &pool,
+        doc,
+        through_seq,
+        engine_core::shared_checkpoint::Limits::default(),
+    )
+    .await
+    .context("compact v3 re-encode check failed")?;
+    println!(
+        "shared checkpoint at revision {through_seq}: codec {}, root {}",
+        check.codec_version,
+        check.source_root.as_str()
+    );
+    println!("compact v3 root: {}", check.v3_root.as_str());
+    println!(
+        "compact v3: {} objects, {} encoded bytes; typed v2: {} objects, {} encoded bytes",
+        check.v3.visited_objects,
+        check.v3.encoded_bytes,
+        check.v2.visited_objects,
+        check.v2.encoded_bytes
+    );
+    println!("state matches event replay and decodes identical; nothing was written");
     Ok(())
 }
 

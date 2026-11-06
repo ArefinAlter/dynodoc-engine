@@ -5,8 +5,9 @@ use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    read_state, references, validate_stored, write_state, Address, Error, Limits, ObjectStore,
-    WriteStats, READ_BATCH_OBJECTS, WRITE_BATCH_BYTES, WRITE_BATCH_OBJECTS,
+    read_state, references, typed, validate_stored, write_state, Address, Error, Limits,
+    MemoryStore, ObjectStore, WriteStats, READ_BATCH_OBJECTS, WRITE_BATCH_BYTES,
+    WRITE_BATCH_OBJECTS,
 };
 use crate::{log::ZERO_HASH, materializer::DocumentState, snapshot::read_legacy_state_at};
 
@@ -880,6 +881,73 @@ async fn reach(
             found.extend(references(address, &bytes)?);
         }
     }
+}
+
+/// What a published checkpoint would cost as compact v3, compared with typed v2.
+/// The roots differ between codecs by design; only the decoded state is compared.
+#[derive(Debug)]
+pub struct ReencodeCheck {
+    pub codec_version: i16,
+    pub source_root: Address,
+    pub v3_root: Address,
+    pub v3: WriteStats,
+    pub v2: WriteStats,
+}
+
+/// Read-only preview: check that a published checkpoint equals event replay at its
+/// revision and that its state re-encodes as compact v3 and reads back identical.
+/// Checkpoints are immutable and an occupied revision refuses another codec, so nothing
+/// is written (the transaction is read-only); the new graphs exist only in memory.
+pub async fn reencode_check(
+    pool: &PgPool,
+    document: DocumentId,
+    through_seq: i64,
+    limits: Limits,
+) -> Result<ReencodeCheck, Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("set transaction isolation level repeatable read, read only")
+        .execute(&mut *tx)
+        .await?;
+    let (codec_version, source_root): (i16, String) = sqlx::query_as(
+        "select c.codec_version, c.state_root from shared_checkpoint c
+         join document d on d.id=c.document_id and d.deleted_at is null
+         where c.document_id=$1 and c.through_seq=$2",
+    )
+    .bind(document.0)
+    .bind(through_seq)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(Error::Invalid("checkpoint not found"))?;
+    let state = load_in_connection(&mut tx, document, through_seq, limits).await?;
+    if read_legacy_state_at(&mut tx, document, through_seq)
+        .await?
+        .state
+        != state
+    {
+        return Err(Error::Invalid("checkpoint differs from the event history"));
+    }
+    let mut store = MemoryStore::default();
+    let (v3_root, v3) =
+        typed::write_state_v3(&mut store, document, &state, limits, Default::default()).await?;
+    let read = typed::read_state_v3(&mut store, document, &v3_root, limits, Default::default());
+    if read.await? != state {
+        return Err(Error::Invalid("compact v3 differs from the checkpoint"));
+    }
+    let (_, v2) = typed::write_state(
+        &mut MemoryStore::default(),
+        document,
+        &state,
+        limits,
+        Default::default(),
+    )
+    .await?;
+    Ok(ReencodeCheck {
+        codec_version,
+        source_root: Address::try_from(source_root)?,
+        v3_root,
+        v3,
+        v2,
+    })
 }
 
 /// Load an exact published checkpoint, checking chain-position metadata and every
