@@ -140,6 +140,26 @@ pub enum Action {
         #[arg(long)]
         expect_head: String,
     },
+    /// Read-only preflight analysis for commit recovery directly against an archive.
+    ArchiveRecoveryPreflight {
+        /// Archive file to inspect.
+        file: PathBuf,
+        /// Recovery kind: cherry-pick or revert.
+        #[arg(long, value_enum, default_value = "cherry-pick")]
+        kind: RecoveryKind,
+        /// Commit address to recover.
+        #[arg(long)]
+        source: String,
+        /// Base commit address to recover onto (defaults to branch head).
+        #[arg(long)]
+        onto: Option<String>,
+        /// Target branch to recover onto (defaults to "main").
+        #[arg(long, default_value = "main")]
+        branch: String,
+        /// Parent commit address to treat as mainline for merge recovery.
+        #[arg(long)]
+        mainline: Option<String>,
+    },
     /// Export a local historical file as a normalized-state JSON envelope.
     ExportFile {
         /// Commit address containing the file.
@@ -151,6 +171,82 @@ pub enum Action {
         /// Output file path for the normalized state (refuses overwrite).
         #[arg(long)]
         out: PathBuf,
+        /// Optional Ed25519 PKCS#8 key file to emit a companion .dynoattest provenance attestation.
+        #[arg(long)]
+        attest_key: Option<PathBuf>,
+        /// Authority epoch for the attestation key (>= 1, defaults to 1).
+        #[arg(long, default_value_t = 1)]
+        attest_epoch: u32,
+    },
+    /// Generate a cryptographic provenance attestation companion (.dynoattest) for an exported state file.
+    AttestState {
+        /// Exported normalized state JSON file (.json) to attest.
+        #[arg(long)]
+        state: PathBuf,
+        /// Commit address containing this state.
+        #[arg(long)]
+        commit: String,
+        /// Authority epoch for the attestation key (>= 1).
+        #[arg(long, default_value_t = 1)]
+        epoch: u32,
+        /// Ed25519 PKCS#8 key file to sign with.
+        #[arg(long)]
+        key: PathBuf,
+        /// Optional companion output path (defaults to `<state>.dynoattest`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Declared issuance time in ms (defaults to current UTC time).
+        #[arg(long)]
+        issued_at_ms: Option<i64>,
+    },
+    /// Verify a state export provenance attestation companion (.dynoattest).
+    VerifyStateAttestation {
+        /// Exported normalized state JSON file (.json) to verify.
+        #[arg(long)]
+        state: PathBuf,
+        /// Companion attestation file (defaults to `<state>.dynoattest`).
+        #[arg(long)]
+        attestation: Option<PathBuf>,
+        /// Expected commit address (optional).
+        #[arg(long)]
+        commit: Option<String>,
+        /// Trusted public key (hex-encoded Ed25519; repeatable).
+        #[arg(long)]
+        trusted_key: Vec<String>,
+        /// Minimum allowed authority epoch.
+        #[arg(long)]
+        min_epoch: Option<u32>,
+        /// Maximum allowed authority epoch.
+        #[arg(long)]
+        max_epoch: Option<u32>,
+        /// Check only that the embedded key signed these bytes, trusting nobody: the result is
+        /// labelled `signature_only`. Cannot be combined with `--trusted-key`.
+        #[arg(long)]
+        signature_only: bool,
+    },
+    /// Compare two historical file revisions across commits or archives without extracting files to disk.
+    HistoricalDiff {
+        /// First commit address.
+        #[arg(long = "commit-a")]
+        commit_a: String,
+        /// Path in first commit.
+        #[arg(long = "path-a")]
+        path_a: Option<String>,
+        /// Second commit address.
+        #[arg(long = "commit-b")]
+        commit_b: String,
+        /// Path in second commit (defaults to path-a if omitted).
+        #[arg(long = "path-b")]
+        path_b: Option<String>,
+        /// Common path in both commits (shorthand for same path comparison).
+        #[arg(long)]
+        path: Option<String>,
+        /// Optional offline archive file (.dynoarc) to diff against.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        /// Emit structural diff as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Import a private staging upload JSON batch, without moving any branch.
     ImportObjects { input: PathBuf },
@@ -629,14 +725,23 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
             let file_handle = std::fs::File::open(&file)
                 .with_context(|| format!("failed to open archive at {}", file.display()))?;
 
-            let staged = engine_core::repository::archive::validate_and_stage_archive(
+            let target_read_only = if path.exists() {
+                Some(LocalRepository::open_read_only(&path, project).await?)
+            } else {
+                None
+            };
+
+            let staged = engine_core::repository::archive::validate_and_stage_archive_with_target(
                 file_handle,
                 engine_core::repository::archive::ArchiveLimits::default(),
                 Some(&expect_head_addr),
                 Some(DocumentId(project)),
+                target_read_only.as_ref(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("archive validation failed: {e}"))?;
+
+            drop(target_read_only);
 
             let repo = LocalRepository::open(&path, project).await?;
 
@@ -654,6 +759,242 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
             });
             (out, Some(repo))
         }
+        Action::ArchiveRecoveryPreflight {
+            file,
+            kind,
+            source,
+            onto,
+            branch,
+            mainline,
+        } => {
+            let source_addr = address(source)?;
+            let onto_addr = onto.map(address).transpose()?;
+            let mainline_addr = mainline.map(address).transpose()?;
+
+            anyhow::ensure!(
+                file.is_file(),
+                "archive file not found at {}",
+                file.display()
+            );
+
+            let file_handle = std::fs::File::open(&file)
+                .with_context(|| format!("failed to open archive at {}", file.display()))?;
+
+            let limits = engine_core::repository::archive::ArchiveLimits::default();
+            let recovery_kind: engine_core::repository::recovery::Kind = kind.into();
+
+            let report = if path.exists() {
+                let repo = LocalRepository::open_read_only(&path, project).await?;
+                let report = repo
+                    .plan_archive_recovery_preflight(
+                        file_handle,
+                        limits,
+                        recovery_kind,
+                        &source_addr,
+                        onto_addr.as_ref(),
+                        Some(&branch),
+                        mainline_addr.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("archive recovery preflight failed: {e}"))?;
+                repo.close().await;
+                report
+            } else {
+                let onto_addr = onto_addr.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "target repository does not exist and no explicit --onto commit provided"
+                    )
+                })?;
+                engine_core::repository::recovery::preflight_archive_recovery(
+                    file_handle,
+                    limits,
+                    recovery_kind,
+                    &source_addr,
+                    &onto_addr,
+                    mainline_addr.as_ref(),
+                    |_| None,
+                    |_| false,
+                )
+                .map_err(|e| anyhow::anyhow!("archive recovery preflight failed: {e}"))?
+            };
+
+            let out = serde_json::to_value(&report)?;
+            (out, None)
+        }
+        Action::HistoricalDiff {
+            commit_a,
+            path_a,
+            commit_b,
+            path_b,
+            path: common_path,
+            archive,
+            json,
+        } => {
+            let resolved_path_a = path_a.or_else(|| common_path.clone()).ok_or_else(|| {
+                anyhow::anyhow!("missing path for commit-a (provide --path-a or --path)")
+            })?;
+            let resolved_path_b = path_b
+                .or_else(|| common_path.clone())
+                .unwrap_or_else(|| resolved_path_a.clone());
+
+            let commit_a_addr = address(commit_a)?;
+            let commit_b_addr = address(commit_b)?;
+
+            let report = if let Some(archive_path) = archive {
+                anyhow::ensure!(
+                    archive_path.is_file(),
+                    "archive file not found at {}",
+                    archive_path.display()
+                );
+                let file_handle = std::fs::File::open(&archive_path).with_context(|| {
+                    format!("failed to open archive at {}", archive_path.display())
+                })?;
+                let mut archive_reader = engine_core::repository::archive::ArchiveReader::new(
+                    file_handle,
+                    engine_core::repository::archive::ArchiveLimits::default(),
+                );
+                let mut memory_store = engine_core::shared_checkpoint::MemoryStore::default();
+                let mut commits_in_archive = std::collections::HashMap::new();
+
+                while let Some(entry) = archive_reader
+                    .next_entry()
+                    .map_err(|e| anyhow::anyhow!("failed reading archive: {e}"))?
+                {
+                    match entry {
+                        engine_core::repository::archive::ArchiveEntry::Object {
+                            document,
+                            address,
+                            bytes,
+                            ..
+                        } => {
+                            use engine_core::shared_checkpoint::ObjectStore;
+                            memory_store.put(document, &address, &bytes).await?;
+                        }
+                        engine_core::repository::archive::ArchiveEntry::Commit {
+                            address,
+                            signed,
+                            ..
+                        } => {
+                            let signed = engine_core::repository::recovery::verified(
+                                signed, &address, project,
+                            )?;
+                            commits_in_archive.insert(address, signed);
+                        }
+                        _ => {}
+                    }
+                }
+
+                let signed_a = commits_in_archive.get(&commit_a_addr).ok_or_else(|| {
+                    anyhow::anyhow!("commit {} not found in archive", commit_a_addr.as_str())
+                })?;
+                let signed_b = commits_in_archive.get(&commit_b_addr).ok_or_else(|| {
+                    anyhow::anyhow!("commit {} not found in archive", commit_b_addr.as_str())
+                })?;
+
+                let file_a = signed_a
+                    .commit
+                    .files
+                    .get(&resolved_path_a)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "path {:?} not found in commit {}",
+                            resolved_path_a,
+                            commit_a_addr.as_str()
+                        )
+                    })?;
+                let file_b = signed_b
+                    .commit
+                    .files
+                    .get(&resolved_path_b)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "path {:?} not found in commit {}",
+                            resolved_path_b,
+                            commit_b_addr.as_str()
+                        )
+                    })?;
+
+                let state_a = engine_core::shared_checkpoint::typed::read_state(
+                    &mut memory_store,
+                    file_a.document,
+                    &file_a.state,
+                    engine_core::shared_checkpoint::Limits::default(),
+                    Default::default(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to reconstruct state root {} for document {}",
+                        file_a.state.as_str(),
+                        file_a.document.0
+                    )
+                })?;
+
+                let state_b = engine_core::shared_checkpoint::typed::read_state(
+                    &mut memory_store,
+                    file_b.document,
+                    &file_b.state,
+                    engine_core::shared_checkpoint::Limits::default(),
+                    Default::default(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to reconstruct state root {} for document {}",
+                        file_b.state.as_str(),
+                        file_b.document.0
+                    )
+                })?;
+
+                engine_core::repository::historical_diff::diff_states(
+                    &commit_a_addr,
+                    &resolved_path_a,
+                    &file_a,
+                    &state_a,
+                    &commit_b_addr,
+                    &resolved_path_b,
+                    &file_b,
+                    &state_b,
+                )
+                .map_err(|e| anyhow::anyhow!("historical diff failed: {e}"))?
+            } else {
+                anyhow::ensure!(
+                    path.is_file(),
+                    "no repository database at {}",
+                    path.display()
+                );
+                let repo = LocalRepository::open_read_only(&path, project).await?;
+                let report = repo
+                    .historical_diff(
+                        &commit_a_addr,
+                        &resolved_path_a,
+                        &commit_b_addr,
+                        &resolved_path_b,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("historical diff failed: {e}"))?;
+                repo.close().await;
+                report
+            };
+
+            let out = serde_json::to_value(&report)?;
+            if !json {
+                text = Some(if report.is_identical {
+                    format!(
+                        "Files are identical: {} ({}) == {} ({})\n",
+                        resolved_path_a,
+                        commit_a_addr.as_str(),
+                        resolved_path_b,
+                        commit_b_addr.as_str()
+                    )
+                } else {
+                    report.unified_diff.clone()
+                });
+            }
+            (out, None)
+        }
         other_action => {
             // The retention, horizon plans, archive export, export-file and log must not create, upgrade or write the database.
             let repo = if matches!(
@@ -662,6 +1003,8 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     | Action::HorizonPlan { .. }
                     | Action::ArchiveExport { .. }
                     | Action::ExportFile { .. }
+                    | Action::AttestState { .. }
+                    | Action::VerifyStateAttestation { .. }
                     | Action::Log { .. }
             ) {
                 LocalRepository::open_read_only(&path, project).await?
@@ -677,7 +1020,10 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                 LocalRepository::open(&path, project).await?
             };
             let out = match other_action {
-                Action::ArchiveVerify { .. } | Action::ArchiveImport { .. } => unreachable!(),
+                Action::ArchiveVerify { .. }
+                | Action::ArchiveImport { .. }
+                | Action::ArchiveRecoveryPreflight { .. }
+                | Action::HistoricalDiff { .. } => unreachable!(),
                 Action::Init => {
                     serde_json::json!({"project":project,"local_schema":SCHEMA_VERSION})
                 }
@@ -796,6 +1142,8 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     commit,
                     path: file_path,
                     out,
+                    attest_key,
+                    attest_epoch,
                 } => {
                     let commit_addr = address(commit)?;
                     anyhow::ensure!(
@@ -859,7 +1207,7 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
 
                     envelope.write_to_path(&out)?;
 
-                    serde_json::json!({
+                    let mut res = serde_json::json!({
                         "out": out.display().to_string(),
                         "commit": commit_addr,
                         "path": file_path,
@@ -867,6 +1215,106 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                         "state_root": file_entry.state,
                         "format": engine_core::repository::state_export::STATE_EXPORT_FORMAT,
                         "version": engine_core::repository::state_export::STATE_EXPORT_VERSION,
+                    });
+
+                    if let Some(key_path) = attest_key {
+                        let key = crate::signing::load(&key_path)?;
+                        let bytes = std::fs::read(&out)?;
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let attestation = engine_core::repository::state_export::StateExportAttestation::generate(
+                            project,
+                            attest_epoch,
+                            commit_addr.clone(),
+                            &bytes,
+                            &key,
+                            now_ms,
+                        )?;
+                        let companion_path =
+                            engine_core::repository::state_export::companion_attestation_path(&out);
+                        attestation.write_companion_file(&companion_path)?;
+                        res["attestation"] = serde_json::to_value(&attestation)?;
+                        res["attestation_file"] =
+                            serde_json::json!(companion_path.display().to_string());
+                    }
+
+                    res
+                }
+                Action::AttestState {
+                    state,
+                    commit,
+                    epoch,
+                    key,
+                    out,
+                    issued_at_ms,
+                } => {
+                    let commit_addr = address(commit)?;
+                    let key = crate::signing::load(&key)?;
+                    let bytes = std::fs::read(&state)
+                        .with_context(|| format!("reading state file at {}", state.display()))?;
+                    let issued_at =
+                        issued_at_ms.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+                    let attestation =
+                        engine_core::repository::state_export::StateExportAttestation::generate(
+                            project,
+                            epoch,
+                            commit_addr.clone(),
+                            &bytes,
+                            &key,
+                            issued_at,
+                        )?;
+                    let out_path = out.unwrap_or_else(|| {
+                        engine_core::repository::state_export::companion_attestation_path(&state)
+                    });
+                    attestation.write_companion_file(&out_path)?;
+                    serde_json::json!({
+                        "state": state.display().to_string(),
+                        "attestation": out_path.display().to_string(),
+                        "project": project,
+                        "commit": commit_addr.as_str(),
+                        "authority_epoch": epoch,
+                        "signer_key": attestation.signer_key,
+                        "state_digest": attestation.state_digest,
+                    })
+                }
+                Action::VerifyStateAttestation {
+                    state,
+                    attestation,
+                    commit,
+                    trusted_key,
+                    min_epoch,
+                    max_epoch,
+                    signature_only,
+                } => {
+                    let mut policy =
+                        engine_core::repository::state_export::AttestationVerificationPolicy::new()
+                            .with_project(project)
+                            .with_trusted_keys(trusted_key);
+                    if signature_only {
+                        policy = policy.with_signature_only();
+                    }
+                    if let Some(c) = commit {
+                        policy = policy.with_commit(address(c)?);
+                    }
+                    if let Some(min) = min_epoch {
+                        policy = policy.with_min_epoch(min);
+                    }
+                    if let Some(max) = max_epoch {
+                        policy = policy.with_max_epoch(max);
+                    }
+                    let (verified, trust) = engine_core::repository::state_export::verify_state_export_attestation_file(
+                        &state,
+                        attestation.as_ref(),
+                        &policy,
+                    )?;
+                    serde_json::json!({
+                        "verified": true,
+                        "trust": trust,
+                        "state": state.display().to_string(),
+                        "project": verified.project,
+                        "commit": verified.commit.as_str(),
+                        "authority_epoch": verified.authority_epoch,
+                        "signer_key": verified.signer_key,
+                        "state_digest": verified.state_digest,
                     })
                 }
                 Action::ImportObjects { input } => {
@@ -3148,7 +3596,9 @@ mod tests {
         let f = Fixture::new().await;
         let doc1 = DocumentId(uuid::Uuid::new_v4());
         let f1 = f.file(doc1, &[(0, "Genesis")]).await;
-        let c1 = f.commit(&[], vec![("doc.docx", f1)], "Genesis").await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
 
         let archive_path = std::env::temp_dir().join(format!(
             "test-verify-subst-{}.dynoarc",
@@ -3408,6 +3858,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "Report.docx".to_string(),
                 out: export_out.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3436,6 +3888,8 @@ mod tests {
                 commit: c3.as_str().to_string(),
                 path: "Report.docx".to_string(),
                 out: export_fail_deleted.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3455,6 +3909,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "Report-Renamed.docx".to_string(),
                 out: export_fail_rename.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3488,6 +3944,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "doc.docx".to_string(),
                 out: export_out.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3507,6 +3965,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "doc.docx".to_string(),
                 out: export_out.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3559,6 +4019,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "doc.docx".to_string(),
                 out: export_out.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3600,6 +4062,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "Report.docx".to_string(),
                 out: export_out.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -3625,6 +4089,7 @@ mod tests {
                 project,
                 expect_commit,
                 path,
+                ..
             } => {
                 assert_eq!(file, export_out);
                 assert_eq!(project, f.project);
@@ -3795,6 +4260,8 @@ mod tests {
                 commit: c1.as_str().to_string(),
                 path: "doc.docx".to_string(),
                 out: export_out.clone(),
+                attest_key: None,
+                attest_epoch: 1,
             },
         )
         .await
@@ -4299,7 +4766,9 @@ mod tests {
         let f = Fixture::new().await;
         let doc1 = DocumentId(uuid::Uuid::new_v4());
         let f1 = f.file(doc1, &[(0, "Genesis")]).await;
-        let c1 = f.commit(&[], vec![("doc.docx", f1)], "Genesis").await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
 
         let empty_out = std::env::temp_dir().join(format!(
             "test-archive-empty-{}.dynoarc",
@@ -4412,6 +4881,437 @@ mod tests {
         );
 
         f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_incremental_missing_base_refusal_and_target_untouched() {
+        let f1 = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+
+        let f1_v1 = f1.file(doc1, &[(0, "Genesis content")]).await;
+        let c1 = f1
+            .commit(&[], vec![("doc.docx", f1_v1)], "Genesis commit")
+            .await;
+
+        let f1_v2 = f1.file(doc1, &[(0, "Second revision content")]).await;
+        let c2 = f1
+            .commit(&[&c1], vec![("doc.docx", f1_v2)], "Delta commit")
+            .await;
+
+        let inc_archive = std::env::temp_dir().join(format!(
+            "test-inc-missing-base-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&inc_archive);
+
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                since: Some(c1.as_str().to_string()),
+                out: inc_archive.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1. Target repository lacks c1 base commit (empty repo)
+        let f2 = Fixture::with_project(f1.project).await;
+        let inv_before = f2.repo.inventory(None, 10).await.unwrap();
+
+        let err1 = run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: inc_archive.clone(),
+                expect_head: c2.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let err1_msg = format!("{err1:#}");
+        assert!(
+            err1_msg.contains("missing base commit"),
+            "expected missing base refusal, got: {err1_msg}"
+        );
+        assert!(
+            err1_msg.contains(c1.as_str()),
+            "expected missing base commit address in error, got: {err1_msg}"
+        );
+
+        let inv_after = f2.repo.inventory(None, 10).await.unwrap();
+        assert_eq!(
+            inv_before, inv_after,
+            "target repository must remain completely untouched on missing base refusal"
+        );
+        assert!(matches!(
+            f2.repo.commit(&c2).await.unwrap_err(),
+            engine_core::repository::Error::Missing(_)
+        ));
+
+        // 2. Absent destination path: must refuse and NOT create target database
+        let absent_path =
+            std::env::temp_dir().join(format!("dynodoc-absent-inc-{}.db", uuid::Uuid::new_v4()));
+        assert!(!absent_path.exists());
+
+        let err2 = run(
+            absent_path.clone(),
+            f1.project,
+            Action::ArchiveImport {
+                file: inc_archive.clone(),
+                expect_head: c2.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let err2_msg = format!("{err2:#}");
+        assert!(
+            err2_msg.contains("missing base commit")
+                || err2_msg.contains("requires target repository"),
+            "expected missing base refusal on absent target, got: {err2_msg}"
+        );
+        assert!(
+            !absent_path.exists(),
+            "absent destination database must NOT be created on failure"
+        );
+
+        let _ = std::fs::remove_file(&inc_archive);
+        f1.finish().await;
+        f2.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_incremental_bounds_the_base_and_refuses_a_tampered_base_commit() {
+        use engine_core::repository::archive::{
+            validate_and_stage_archive_with_target, ArchiveError, ArchiveLimits,
+        };
+        use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions};
+
+        let f1 = Fixture::new().await;
+        let (doc1, doc2) = (
+            DocumentId(uuid::Uuid::new_v4()),
+            DocumentId(uuid::Uuid::new_v4()),
+        );
+        let v1 = f1.file(doc1, &[(0, "Genesis doc1")]).await;
+        let w1 = f1.file(doc2, &[(0, "Genesis doc2")]).await;
+        let c1 = f1
+            .commit(
+                &[],
+                vec![("doc1.docx", v1), ("doc2.docx", w1.clone())],
+                "Genesis",
+            )
+            .await;
+        let v2 = f1.file(doc1, &[(0, "Updated doc1")]).await;
+        let c2 = f1
+            .commit(&[&c1], vec![("doc1.docx", v2), ("doc2.docx", w1)], "Update")
+            .await;
+        let id = uuid::Uuid::new_v4();
+        let base = std::env::temp_dir().join(format!("test-bound-base-{id}.dynoarc"));
+        let delta = std::env::temp_dir().join(format!("test-bound-delta-{id}.dynoarc"));
+        for (head, since, out) in [
+            (&c1, None, &base),
+            (&c2, Some(c1.as_str().to_string()), &delta),
+        ] {
+            run(
+                f1.path.clone(),
+                f1.project,
+                Action::ArchiveExport {
+                    head: head.as_str().to_string(),
+                    since,
+                    out: out.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let f2 = Fixture::with_project(f1.project).await;
+        run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: base.clone(),
+                expect_head: c1.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The base objects a delta needs count against the archive limits: unchanged doc2
+        // comes from the target, so a limit equal to the archive's own objects trips.
+        let stage = |limits| {
+            validate_and_stage_archive_with_target(
+                std::fs::File::open(&delta).unwrap(),
+                limits,
+                Some(&c2),
+                Some(DocumentId(f2.project)),
+                Some(&f2.repo),
+            )
+        };
+        let staged = stage(ArchiveLimits::default()).await.unwrap();
+        let tight = ArchiveLimits {
+            max_objects: staged.objects.len(),
+            ..ArchiveLimits::default()
+        };
+        drop(staged);
+        let err = stage(tight).await.unwrap_err();
+        assert!(matches!(err, ArchiveError::Limit(_)), "{err:?}");
+
+        // A base commit whose stored height does not follow from its parents is not
+        // trusted: the import is refused and the target is left as it was.
+        let mut raw = SqliteConnectOptions::new()
+            .filename(&f2.path)
+            .connect()
+            .await
+            .unwrap();
+        // As someone outside the repository's own immutability guard would.
+        sqlx::query("drop trigger commits_no_update")
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        sqlx::query("update commits set height=height+7 where address=?")
+            .bind(c1.as_str())
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        drop(raw);
+        let before = f2.repo.inventory(None, 10).await.unwrap();
+        let err = run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: delta.clone(),
+                expect_head: c2.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("does not follow from its parents"),
+            "{message}"
+        );
+        assert_eq!(f2.repo.inventory(None, 10).await.unwrap(), before);
+        assert!(f2.repo.commit(&c2).await.is_err());
+
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&delta);
+        f1.finish().await;
+        f2.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_incremental_matching_base_success_and_redundant_zero_copy() {
+        let f1 = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let doc2 = DocumentId(uuid::Uuid::new_v4());
+        let doc3 = DocumentId(uuid::Uuid::new_v4());
+
+        // c1: doc1 and doc2
+        let f1_v1 = f1.file(doc1, &[(0, "Genesis doc1")]).await;
+        let f2_v1 = f1.file(doc2, &[(0, "Genesis doc2")]).await;
+        let c1 = f1
+            .commit(
+                &[],
+                vec![("doc1.docx", f1_v1.clone()), ("doc2.docx", f2_v1.clone())],
+                "Genesis commit",
+            )
+            .await;
+
+        // c2: doc1 modified, doc2 unchanged
+        let f1_v2 = f1.file(doc1, &[(0, "Updated doc1")]).await;
+        let c2 = f1
+            .commit(
+                &[&c1],
+                vec![("doc1.docx", f1_v2.clone()), ("doc2.docx", f2_v1.clone())],
+                "Update doc1",
+            )
+            .await;
+
+        // c3: doc3 added, doc1 and doc2 unchanged
+        let f3_v1 = f1.file(doc3, &[(0, "Added doc3")]).await;
+        let c3 = f1
+            .commit(
+                &[&c2],
+                vec![
+                    ("doc1.docx", f1_v2.clone()),
+                    ("doc2.docx", f2_v1.clone()),
+                    ("doc3.docx", f3_v1.clone()),
+                ],
+                "Add doc3",
+            )
+            .await;
+
+        let base_archive =
+            std::env::temp_dir().join(format!("test-inc-base-{}.dynoarc", uuid::Uuid::new_v4()));
+        let inc_archive =
+            std::env::temp_dir().join(format!("test-inc-delta-{}.dynoarc", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&base_archive);
+        let _ = std::fs::remove_file(&inc_archive);
+
+        // Export full base archive at c1
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                since: None,
+                out: base_archive.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Export incremental archive: c1 -> c3
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveExport {
+                head: c3.as_str().to_string(),
+                since: Some(c1.as_str().to_string()),
+                out: inc_archive.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Target repository f2: import base archive first
+        let f2 = Fixture::with_project(f1.project).await;
+
+        run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: base_archive.clone(),
+                expect_head: c1.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Set a head ref on f2 pointing to c1 to verify ref invariance later
+        f2.repo.compare_and_swap("main", None, &c1).await.unwrap();
+        assert_eq!(
+            f2.repo.head("main").await.unwrap().map(|h| h.commit),
+            Some(c1.clone())
+        );
+
+        // Now import incremental archive into f2
+        run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: inc_archive.clone(),
+                expect_head: c3.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1. Verify all commits are present in f2
+        let read_c1 = f2.repo.commit(&c1).await.unwrap();
+        assert_eq!(read_c1.commit.message, "Genesis commit");
+        let read_c2 = f2.repo.commit(&c2).await.unwrap();
+        assert_eq!(read_c2.commit.message, "Update doc1");
+        let read_c3 = f2.repo.commit(&c3).await.unwrap();
+        assert_eq!(read_c3.commit.message, "Add doc3");
+
+        // 2. Verify all file states reconstructed correctly
+        let state_doc1_v1 = f2.repo.read_state(doc1, &f1_v1.state).await.unwrap();
+        assert_eq!(state_doc1_v1, paragraphs(&[(0, "Genesis doc1")]));
+        let state_doc1_v2 = f2.repo.read_state(doc1, &f1_v2.state).await.unwrap();
+        assert_eq!(state_doc1_v2, paragraphs(&[(0, "Updated doc1")]));
+
+        // doc2 was only committed at c1 and unchanged through c3:
+        let state_doc2 = f2.repo.read_state(doc2, &f2_v1.state).await.unwrap();
+        assert_eq!(state_doc2, paragraphs(&[(0, "Genesis doc2")]));
+
+        let state_doc3 = f2.repo.read_state(doc3, &f3_v1.state).await.unwrap();
+        assert_eq!(state_doc3, paragraphs(&[(0, "Added doc3")]));
+
+        // 3. Target ref invariance: main branch still points to c1!
+        assert_eq!(
+            f2.repo.head("main").await.unwrap().map(|h| h.commit),
+            Some(c1.clone()),
+            "archive import must NEVER move branch heads or pins"
+        );
+
+        // 4. Redundant import: second import must succeed with zero-copy!
+        let staged_again =
+            engine_core::repository::archive::validate_and_stage_archive_with_target(
+                std::fs::File::open(&inc_archive).unwrap(),
+                engine_core::repository::archive::ArchiveLimits::default(),
+                Some(&c3),
+                Some(DocumentId(f2.project)),
+                Some(&f2.repo),
+            )
+            .await
+            .unwrap();
+
+        let redundant_summary =
+            engine_core::repository::archive::import_archive(&f2.repo, &staged_again)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            redundant_summary.objects_imported, 0,
+            "redundant import must copy 0 objects (zero-copy)"
+        );
+        assert_eq!(
+            redundant_summary.commits_imported, 0,
+            "redundant import must copy 0 commits (zero-copy)"
+        );
+        assert_eq!(redundant_summary.total_commits, 2);
+        assert!(redundant_summary.total_objects > 0);
+
+        let _ = std::fs::remove_file(&base_archive);
+        let _ = std::fs::remove_file(&inc_archive);
+        f1.finish().await;
+        f2.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_incremental_empty_delta_success() {
+        let f1 = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1_v1 = f1.file(doc1, &[(0, "Content")]).await;
+        let c1 = f1.commit(&[], vec![("doc.docx", f1_v1)], "Genesis").await;
+
+        let empty_archive = std::env::temp_dir().join(format!(
+            "test-inc-empty-delta-{}.dynoarc",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&empty_archive);
+
+        // Export empty delta: since == head == c1
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveExport {
+                head: c1.as_str().to_string(),
+                since: Some(c1.as_str().to_string()),
+                out: empty_archive.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Import empty delta into f1 (which has c1)
+        run(
+            f1.path.clone(),
+            f1.project,
+            Action::ArchiveImport {
+                file: empty_archive.clone(),
+                expect_head: c1.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let _ = std::fs::remove_file(&empty_archive);
+        f1.finish().await;
     }
 
     #[tokio::test]
@@ -4987,6 +5887,915 @@ mod tests {
             "log action must not mutate the database or WAL"
         );
 
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_recovery_preflight_clean_cherry_pick() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        let doc2 = DocumentId(uuid::Uuid::new_v4());
+        let f2 = f.file(doc2, &[(0, "Feature")]).await;
+        let c2 = f
+            .commit(
+                &[&c1],
+                vec![("doc.docx", f1), ("feature.docx", f2)],
+                "Feature",
+            )
+            .await;
+
+        f.repo.compare_and_swap("main", None, &c1).await.unwrap();
+
+        let archive_path = f.path.with_extension("archive-preflight-clean.dynoarc");
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                since: None,
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1. Direct plan check
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let report = f
+            .repo
+            .plan_archive_recovery_preflight(
+                file,
+                engine_core::repository::archive::ArchiveLimits::default(),
+                engine_core::repository::recovery::Kind::CherryPick,
+                &c2,
+                None,
+                Some("main"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(report.feasible);
+        assert!(report.conflicts.is_empty());
+        assert_eq!(report.modified_paths.len(), 1);
+        assert_eq!(report.modified_paths[0].path, "feature.docx");
+
+        // 2. Action CLI execution
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveRecoveryPreflight {
+                file: archive_path.clone(),
+                kind: RecoveryKind::CherryPick,
+                source: c2.as_str().to_string(),
+                onto: None,
+                branch: "main".to_string(),
+                mainline: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_recovery_preflight_conflicting_change_detection() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        let f2 = f.file(doc1, &[(0, "Genesis"), (1, "Branch A")]).await;
+        let c2 = f.commit(&[&c1], vec![("doc.docx", f2)], "Branch A").await;
+
+        let f3 = f.file(doc1, &[(0, "Genesis"), (1, "Branch B")]).await;
+        let c3 = f.commit(&[&c1], vec![("doc.docx", f3)], "Branch B").await;
+
+        f.repo.compare_and_swap("main", None, &c3).await.unwrap();
+
+        let archive_path = f.path.with_extension("archive-preflight-conflict.dynoarc");
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                since: None,
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1. Direct plan check
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let report = f
+            .repo
+            .plan_archive_recovery_preflight(
+                file,
+                engine_core::repository::archive::ArchiveLimits::default(),
+                engine_core::repository::recovery::Kind::CherryPick,
+                &c2,
+                None,
+                Some("main"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!report.feasible);
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(report.conflicts[0].path, "doc.docx");
+        assert_eq!(
+            report.conflicts[0].classification,
+            engine_core::repository::recovery::ConflictClass::ContentConflict
+        );
+
+        // 2. Action CLI execution
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveRecoveryPreflight {
+                file: archive_path.clone(),
+                kind: RecoveryKind::CherryPick,
+                source: c2.as_str().to_string(),
+                onto: None,
+                branch: "main".to_string(),
+                mainline: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_recovery_preflight_absent_parent_refusal() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+        f.repo.compare_and_swap("main", None, &c1).await.unwrap();
+
+        // Create an external parent and child in memory without adding to f.repo
+        let absent_parent = Address::try_from("11".repeat(32)).unwrap();
+        let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+            .unwrap();
+        let key_pair = ring::signature::Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+        let commit = Commit {
+            version: 1,
+            project: f.project,
+            parents: vec![absent_parent.clone()],
+            files: BTreeMap::new(),
+            author_key: String::new(),
+            authored_at_ms: 1_700_000_000_000,
+            message: "Orphan recovery commit".into(),
+            recovery: None,
+            same_file_resolutions: Vec::new(),
+        };
+        let signed = SignedCommit::sign(commit, &key_pair).unwrap();
+        let source_addr = signed.commit.address().unwrap();
+
+        let archive_path = f.path.with_extension("archive-preflight-absent.dynoarc");
+        let mut file = std::fs::File::create(&archive_path).unwrap();
+        let mut writer = engine_core::repository::archive::ArchiveWriter::new(&mut file).unwrap();
+        writer
+            .write_header_with_since(
+                1,
+                DocumentId(f.project),
+                source_addr.clone(),
+                Some(absent_parent.clone()),
+            )
+            .unwrap();
+        writer.write_commit(&signed).unwrap();
+        writer.finish().unwrap();
+
+        let err = run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveRecoveryPreflight {
+                file: archive_path.clone(),
+                kind: RecoveryKind::CherryPick,
+                source: source_addr.as_str().to_string(),
+                onto: None,
+                branch: "main".to_string(),
+                mainline: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("absent")
+                || err.to_string().contains("not found")
+                || err.to_string().contains("failed")
+                || err.to_string().contains(absent_parent.as_str()),
+            "unexpected error message: {err}"
+        );
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_recovery_preflight_revert_and_database_immutability() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        let doc2 = DocumentId(uuid::Uuid::new_v4());
+        let f2 = f.file(doc2, &[(0, "Feature")]).await;
+        let c2 = f
+            .commit(
+                &[&c1],
+                vec![("doc.docx", f1), ("feature.docx", f2)],
+                "Feature",
+            )
+            .await;
+
+        f.repo.compare_and_swap("main", None, &c2).await.unwrap();
+
+        let archive_path = f.path.with_extension("archive-preflight-revert.dynoarc");
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                since: None,
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Database immutability: record snapshot, run action, verify unchanged
+        let (path, project) = (f.path.clone(), f.project);
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let snapshot = || {
+            (
+                std::fs::read(&path).unwrap(),
+                std::fs::read(&wal).unwrap_or_default(),
+            )
+        };
+        let before = snapshot();
+
+        run(
+            path.clone(),
+            project,
+            Action::ArchiveRecoveryPreflight {
+                file: archive_path.clone(),
+                kind: RecoveryKind::Revert,
+                source: c2.as_str().to_string(),
+                onto: None,
+                branch: "main".to_string(),
+                mainline: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            snapshot(),
+            before,
+            "archive-recovery-preflight must not mutate the database or WAL"
+        );
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn historical_diff_identical_commit_noop() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        let report = f
+            .repo
+            .historical_diff(&c1, "doc.docx", &c1, "doc.docx")
+            .await
+            .unwrap();
+
+        assert!(report.is_identical);
+        assert!(report.unified_diff.is_empty());
+        assert!(report.node_changes.is_empty());
+
+        // Test CLI execution
+        run(
+            f.path.clone(),
+            f.project,
+            Action::HistoricalDiff {
+                commit_a: c1.as_str().to_string(),
+                path_a: None,
+                commit_b: c1.as_str().to_string(),
+                path_b: None,
+                path: Some("doc.docx".to_string()),
+                archive: None,
+                json: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn historical_diff_text_modification() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Original Content")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        let f2 = f.file(doc1, &[(0, "Modified Content")]).await;
+        let c2 = f
+            .commit(&[&c1], vec![("doc.docx", f2.clone())], "Edit")
+            .await;
+
+        let report = f
+            .repo
+            .historical_diff(&c1, "doc.docx", &c2, "doc.docx")
+            .await
+            .unwrap();
+
+        assert!(!report.is_identical);
+        assert_eq!(report.node_changes.len(), 1);
+        assert_eq!(
+            report.node_changes[0].kind,
+            engine_core::repository::historical_diff::NodeChangeKind::Modified
+        );
+        assert!(report.unified_diff.contains(
+            "-00000000000000000000000000: paragraph pos=p000000: {\"label\":\"Original Content\"}"
+        ));
+        assert!(report.unified_diff.contains(
+            "+00000000000000000000000000: paragraph pos=p000000: {\"label\":\"Modified Content\"}"
+        ));
+
+        // CLI execution with text output
+        run(
+            f.path.clone(),
+            f.project,
+            Action::HistoricalDiff {
+                commit_a: c1.as_str().to_string(),
+                path_a: Some("doc.docx".to_string()),
+                commit_b: c2.as_str().to_string(),
+                path_b: Some("doc.docx".to_string()),
+                path: None,
+                archive: None,
+                json: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn historical_diff_node_insertion_and_deletion() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+
+        // State A: 2 paragraphs
+        let mut state_a = DocumentState::default();
+        state_a.nodes.insert(
+            NodeId("001".into()),
+            MaterializedNode {
+                id: NodeId("001".into()),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "p01".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: serde_json::json!({"label": "Keep"}),
+            },
+        );
+        state_a.nodes.insert(
+            NodeId("002".into()),
+            MaterializedNode {
+                id: NodeId("002".into()),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "p02".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: serde_json::json!({"label": "Delete Me"}),
+            },
+        );
+        let (root_a, _) = f.repo.write_state(doc1, &state_a).await.unwrap();
+        let fa = FileEntry {
+            document: doc1,
+            state: root_a,
+        };
+        let c1 = f.commit(&[], vec![("doc.docx", fa)], "State A").await;
+
+        // State B: node 002 deleted, node 003 inserted
+        let mut state_b = DocumentState::default();
+        state_b.nodes.insert(
+            NodeId("001".into()),
+            MaterializedNode {
+                id: NodeId("001".into()),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "p01".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: serde_json::json!({"label": "Keep"}),
+            },
+        );
+        state_b.nodes.insert(
+            NodeId("003".into()),
+            MaterializedNode {
+                id: NodeId("003".into()),
+                parent_id: None,
+                node_type: "paragraph".into(),
+                pos: "p03".into(),
+                var_name: None,
+                deleted: false,
+                current_fields: serde_json::json!({"label": "Added Paragraph"}),
+            },
+        );
+        let (root_b, _) = f.repo.write_state(doc1, &state_b).await.unwrap();
+        let fb = FileEntry {
+            document: doc1,
+            state: root_b,
+        };
+        let c2 = f.commit(&[&c1], vec![("doc.docx", fb)], "State B").await;
+
+        let report = f
+            .repo
+            .historical_diff(&c1, "doc.docx", &c2, "doc.docx")
+            .await
+            .unwrap();
+
+        assert!(!report.is_identical);
+        let deleted = report
+            .node_changes
+            .iter()
+            .find(|c| c.kind == engine_core::repository::historical_diff::NodeChangeKind::Deleted)
+            .unwrap();
+        assert_eq!(deleted.node_id, "002");
+        let added = report
+            .node_changes
+            .iter()
+            .find(|c| c.kind == engine_core::repository::historical_diff::NodeChangeKind::Added)
+            .unwrap();
+        assert_eq!(added.node_id, "003");
+        assert!(report.unified_diff.contains("-002: paragraph pos=p02:"));
+        assert!(report.unified_diff.contains("+003: paragraph pos=p03:"));
+
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn historical_diff_missing_path_error() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f.commit(&[], vec![("doc.docx", f1)], "Genesis").await;
+
+        let err = run(
+            f.path.clone(),
+            f.project,
+            Action::HistoricalDiff {
+                commit_a: c1.as_str().to_string(),
+                path_a: Some("absent.docx".to_string()),
+                commit_b: c1.as_str().to_string(),
+                path_b: Some("doc.docx".to_string()),
+                path: None,
+                archive: None,
+                json: true,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("not found in commit"));
+
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn historical_diff_across_archive_and_database_immutability() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Original")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        let f2 = f.file(doc1, &[(0, "Altered")]).await;
+        let c2 = f
+            .commit(&[&c1], vec![("doc.docx", f2.clone())], "Altered")
+            .await;
+
+        let archive_path = f.path.with_extension("archive-diff.dynoarc");
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                since: None,
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1. Direct archive diff (without touching local repository database)
+        let missing_db = f.path.with_extension("absent-db");
+        run(
+            missing_db.clone(),
+            f.project,
+            Action::HistoricalDiff {
+                commit_a: c1.as_str().to_string(),
+                path_a: None,
+                commit_b: c2.as_str().to_string(),
+                path_b: None,
+                path: Some("doc.docx".to_string()),
+                archive: Some(archive_path.clone()),
+                json: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!missing_db.exists(), "missing database must not be created");
+
+        // 2. Database immutability check
+        let (path, project) = (f.path.clone(), f.project);
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let snapshot = || {
+            (
+                std::fs::read(&path).unwrap(),
+                std::fs::read(&wal).unwrap_or_default(),
+            )
+        };
+        let before = snapshot();
+
+        run(
+            path.clone(),
+            project,
+            Action::HistoricalDiff {
+                commit_a: c1.as_str().to_string(),
+                path_a: None,
+                commit_b: c2.as_str().to_string(),
+                path_b: None,
+                path: Some("doc.docx".to_string()),
+                archive: None,
+                json: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            snapshot(),
+            before,
+            "historical-diff must not mutate the database or WAL"
+        );
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn state_export_provenance_attestation_cli_workflow() {
+        use crate::{Cli, Command};
+        use clap::Parser;
+        use ring::signature::KeyPair;
+
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Attested state content")]).await;
+        let c1 = f
+            .commit(&[], vec![("Certified.docx", f1)], "Genesis commit")
+            .await;
+
+        // Generate test signing key
+        let key_path =
+            std::env::temp_dir().join(format!("test_signer-{}.key", uuid::Uuid::new_v4()));
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        std::fs::write(&key_path, pkcs8.as_ref()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let key = crate::signing::load(&key_path).unwrap();
+        let signer_pubkey = hex::encode(key.public_key().as_ref());
+
+        let export_out =
+            std::env::temp_dir().join(format!("test-attest-state-{}.json", uuid::Uuid::new_v4()));
+        let companion_attest =
+            engine_core::repository::state_export::companion_attestation_path(&export_out);
+        let _ = std::fs::remove_file(&export_out);
+        let _ = std::fs::remove_file(&companion_attest);
+
+        // 1. Export with --attest-key and --attest-epoch: emits both .json and companion .dynoattest
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ExportFile {
+                commit: c1.as_str().to_string(),
+                path: "Certified.docx".to_string(),
+                out: export_out.clone(),
+                attest_key: Some(key_path.clone()),
+                attest_epoch: 2,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(export_out.is_file(), "state export file must exist");
+        assert!(
+            companion_attest.is_file(),
+            "companion attestation file must exist"
+        );
+
+        // 2. Verify companion attestation contents
+        let attest_obj =
+            engine_core::repository::state_export::StateExportAttestation::read_companion_file(
+                &companion_attest,
+            )
+            .unwrap();
+        assert_eq!(attest_obj.project, f.project);
+        assert_eq!(attest_obj.authority_epoch, 2);
+        assert_eq!(attest_obj.commit, c1);
+        assert_eq!(attest_obj.signer_key, signer_pubkey);
+
+        // 3. Action::VerifyStateAttestation succeeds
+        run(
+            f.path.clone(),
+            f.project,
+            Action::VerifyStateAttestation {
+                state: export_out.clone(),
+                attestation: None, // automatically resolves companion
+                commit: Some(c1.as_str().to_string()),
+                trusted_key: vec![signer_pubkey.clone()],
+                min_epoch: Some(1),
+                max_epoch: Some(5),
+                signature_only: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // 4. Standalone top-level state_export_verify_full CLI function
+        super::super::state_export_verify_full(
+            export_out.clone(),
+            f.project,
+            c1.as_str().to_string(),
+            "Certified.docx".to_string(),
+            None,
+            vec![signer_pubkey.clone()],
+            Some(2),
+            Some(3),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // 5. Tampered state file rejection
+        let tampered_out = std::env::temp_dir().join(format!(
+            "test-attest-tampered-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut raw_bytes = std::fs::read(&export_out).unwrap();
+        raw_bytes.push(b' '); // append trailing byte
+        std::fs::write(&tampered_out, raw_bytes).unwrap();
+
+        let err_tamper = run(
+            f.path.clone(),
+            f.project,
+            Action::VerifyStateAttestation {
+                state: tampered_out.clone(),
+                attestation: Some(companion_attest.clone()),
+                commit: Some(c1.as_str().to_string()),
+                trusted_key: vec![signer_pubkey.clone()],
+                min_epoch: None,
+                max_epoch: None,
+                signature_only: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err_tamper.to_string().contains("digest mismatch")
+                || err_tamper.to_string().contains("failed")
+        );
+
+        // 6. Untrusted signer key rejection
+        let err_untrusted = run(
+            f.path.clone(),
+            f.project,
+            Action::VerifyStateAttestation {
+                state: export_out.clone(),
+                attestation: None,
+                commit: Some(c1.as_str().to_string()),
+                trusted_key: vec![
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                ],
+                min_epoch: None,
+                max_epoch: None,
+                signature_only: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err_untrusted
+            .to_string()
+            .contains("not in the trusted keys"));
+
+        // 7. Epoch policy violation rejection
+        let err_epoch = run(
+            f.path.clone(),
+            f.project,
+            Action::VerifyStateAttestation {
+                state: export_out.clone(),
+                attestation: None,
+                commit: Some(c1.as_str().to_string()),
+                trusted_key: vec![signer_pubkey.clone()],
+                min_epoch: Some(3), // epoch is 2
+                max_epoch: None,
+                signature_only: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err_epoch.to_string().contains("is expired"));
+
+        // 7b. No trust anchor is refused; the weaker check has to be asked for.
+        let attest_only =
+            |trusted_key: Vec<String>, signature_only: bool| Action::VerifyStateAttestation {
+                state: export_out.clone(),
+                attestation: None,
+                commit: Some(c1.as_str().to_string()),
+                trusted_key,
+                min_epoch: None,
+                max_epoch: None,
+                signature_only,
+            };
+        let no_anchor = run(f.path.clone(), f.project, attest_only(vec![], false))
+            .await
+            .unwrap_err();
+        assert!(
+            no_anchor.to_string().contains("no trust anchor"),
+            "{no_anchor}"
+        );
+        run(f.path.clone(), f.project, attest_only(vec![], true))
+            .await
+            .unwrap();
+        let contradictory = run(
+            f.path.clone(),
+            f.project,
+            attest_only(vec![signer_pubkey.clone()], true),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            contradictory.to_string().contains("inconsistent"),
+            "{contradictory}"
+        );
+        let asked_without_anchor = super::super::state_export_verify_full(
+            export_out.clone(),
+            f.project,
+            c1.as_str().to_string(),
+            "Certified.docx".to_string(),
+            Some(companion_attest.clone()),
+            vec![],
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            asked_without_anchor.to_string().contains("no trust anchor"),
+            "{asked_without_anchor}"
+        );
+
+        // 7c. A companion file that merely exists, even a corrupt one, does not change
+        // ordinary verification: nothing was asked of the attestation.
+        let stray_out =
+            std::env::temp_dir().join(format!("test-stray-{}.json", uuid::Uuid::new_v4()));
+        std::fs::copy(&export_out, &stray_out).unwrap();
+        let stray_sidecar =
+            engine_core::repository::state_export::companion_attestation_path(&stray_out);
+        std::fs::write(&stray_sidecar, b"not an attestation").unwrap();
+        super::super::state_export_verify_full(
+            stray_out.clone(),
+            f.project,
+            c1.as_str().to_string(),
+            "Certified.docx".to_string(),
+            None,
+            vec![],
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_file(&stray_out);
+        let _ = std::fs::remove_file(&stray_sidecar);
+
+        // 8. Standalone Action::AttestState on an un-attested export file
+        let separate_out =
+            std::env::temp_dir().join(format!("test-separate-{}.json", uuid::Uuid::new_v4()));
+        let separate_attest =
+            std::env::temp_dir().join(format!("test-separate-{}.dynoattest", uuid::Uuid::new_v4()));
+        std::fs::copy(&export_out, &separate_out).unwrap();
+
+        run(
+            f.path.clone(),
+            f.project,
+            Action::AttestState {
+                state: separate_out.clone(),
+                commit: c1.as_str().to_string(),
+                epoch: 3,
+                key: key_path.clone(),
+                out: Some(separate_attest.clone()),
+                issued_at_ms: Some(1700000000000),
+            },
+        )
+        .await
+        .unwrap();
+
+        let read_sep =
+            engine_core::repository::state_export::StateExportAttestation::read_companion_file(
+                &separate_attest,
+            )
+            .unwrap();
+        assert_eq!(read_sep.authority_epoch, 3);
+        assert_eq!(read_sep.issued_at_ms, 1700000000000);
+
+        // 9. Clap parsing verification for state-export-attest and state-export-verify
+        let parsed_attest = Cli::try_parse_from([
+            "engine-cli",
+            "state-export-attest",
+            separate_out.to_str().unwrap(),
+            "--project",
+            &f.project.to_string(),
+            "--commit",
+            c1.as_str(),
+            "--epoch",
+            "3",
+            "--key",
+            key_path.to_str().unwrap(),
+        ])
+        .expect("clap parsing state-export-attest");
+        assert!(matches!(
+            parsed_attest.command,
+            Command::StateExportAttest { .. }
+        ));
+
+        let parsed_verify = Cli::try_parse_from([
+            "engine-cli",
+            "state-export-verify",
+            export_out.to_str().unwrap(),
+            "--project",
+            &f.project.to_string(),
+            "--expect-commit",
+            c1.as_str(),
+            "--path",
+            "Certified.docx",
+            "--trusted-key",
+            &signer_pubkey,
+            "--min-epoch",
+            "1",
+        ])
+        .expect("clap parsing state-export-verify with attestation options");
+        assert!(matches!(
+            parsed_verify.command,
+            Command::StateExportVerify { .. }
+        ));
+
+        // 10. Clean up
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&export_out);
+        let _ = std::fs::remove_file(&companion_attest);
+        let _ = std::fs::remove_file(&tampered_out);
+        let _ = std::fs::remove_file(&separate_out);
+        let _ = std::fs::remove_file(&separate_attest);
         f.finish().await;
     }
 }

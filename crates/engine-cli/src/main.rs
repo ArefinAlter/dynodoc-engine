@@ -167,6 +167,72 @@ enum Command {
         /// Expected document file path in commit manifest.
         #[arg(long, visible_alias = "expect-path")]
         path: String,
+        /// Companion .dynoattest provenance attestation file to verify (optional, defaults to `<file>.dynoattest`).
+        #[arg(long)]
+        attestation: Option<std::path::PathBuf>,
+        /// Trusted signer public key (hex-encoded Ed25519; repeatable).
+        #[arg(long)]
+        trusted_key: Vec<String>,
+        /// Minimum allowed authority epoch.
+        #[arg(long)]
+        min_epoch: Option<u32>,
+        /// Maximum allowed authority epoch.
+        #[arg(long)]
+        max_epoch: Option<u32>,
+        /// Check only that the embedded key signed these bytes, trusting nobody: the result is
+        /// labelled `signature_only`. Cannot be combined with `--trusted-key`.
+        #[arg(long)]
+        signature_only: bool,
+    },
+    /// Sign an exported state file and emit a companion `.dynoattest` provenance attestation.
+    StateExportAttest {
+        /// Normalized state export JSON file (.json) to attest.
+        file: std::path::PathBuf,
+        /// Project UUID.
+        #[arg(long)]
+        project: Uuid,
+        /// Commit address containing this state.
+        #[arg(long)]
+        commit: String,
+        /// Authority epoch for the signing key (>= 1).
+        #[arg(long, default_value_t = 1)]
+        epoch: u32,
+        /// Ed25519 PKCS#8 key file to sign with.
+        #[arg(long)]
+        key: std::path::PathBuf,
+        /// Optional companion output path (defaults to `<file>.dynoattest`).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Compare two historical file revisions across commits or offline archives without extracting files to disk.
+    HistoricalDiff {
+        /// Repository database path (optional if --archive is provided).
+        #[arg(long)]
+        repository: Option<std::path::PathBuf>,
+        /// Project UUID (defaults to nil UUID if omitting repository).
+        #[arg(long, default_value = "00000000-0000-0000-0000-000000000000")]
+        project: Uuid,
+        /// First commit address.
+        #[arg(long = "commit-a")]
+        commit_a: String,
+        /// Path in first commit.
+        #[arg(long = "path-a")]
+        path_a: Option<String>,
+        /// Second commit address.
+        #[arg(long = "commit-b")]
+        commit_b: String,
+        /// Path in second commit (defaults to path-a if omitted).
+        #[arg(long = "path-b")]
+        path_b: Option<String>,
+        /// Common path in both commits (shorthand for same path comparison).
+        #[arg(long)]
+        path: Option<String>,
+        /// Optional offline archive file (.dynoarc) to diff against.
+        #[arg(long)]
+        archive: Option<std::path::PathBuf>,
+        /// Emit structural diff as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Independently verify the event chain and all legacy snapshots.
     Verify {
@@ -352,7 +418,60 @@ async fn run() -> anyhow::Result<()> {
             project,
             expect_commit,
             path,
-        } => state_export_verify(file, project, expect_commit, path).await,
+            attestation,
+            trusted_key,
+            min_epoch,
+            max_epoch,
+            signature_only,
+        } => {
+            state_export_verify_full(
+                file,
+                project,
+                expect_commit,
+                path,
+                attestation,
+                trusted_key,
+                min_epoch,
+                max_epoch,
+                signature_only,
+            )
+            .await
+        }
+        Command::StateExportAttest {
+            file,
+            project,
+            commit,
+            epoch,
+            key,
+            out,
+        } => state_export_attest(file, project, commit, epoch, key, out).await,
+        Command::HistoricalDiff {
+            repository,
+            project,
+            commit_a,
+            path_a,
+            commit_b,
+            path_b,
+            path,
+            archive,
+            json,
+        } => {
+            let repo_path = repository.unwrap_or_else(|| std::path::PathBuf::from(":memory:"));
+            repository::run(
+                repo_path,
+                project,
+                repository::Action::HistoricalDiff {
+                    commit_a,
+                    path_a,
+                    commit_b,
+                    path_b,
+                    path,
+                    archive,
+                    json,
+                },
+            )
+            .await
+        }
         Command::Verify {
             document_id,
             expect_head,
@@ -434,12 +553,43 @@ async fn archive_verify(
 }
 
 /// Verify an offline normalized state export file without any database or target repository.
-async fn state_export_verify(
+pub async fn state_export_verify(
     file: std::path::PathBuf,
     project: Uuid,
     expect_commit: String,
     path: String,
 ) -> anyhow::Result<()> {
+    state_export_verify_full(
+        file,
+        project,
+        expect_commit,
+        path,
+        None,
+        Vec::new(),
+        None,
+        None,
+        false,
+    )
+    .await
+}
+
+/// Verify an offline normalized state export file. An attestation is checked only when the
+/// caller asks for it (an attestation path, trusted keys, epoch limits or `--signature-only`):
+/// a companion file that merely exists changes nothing, so a stray sidecar can neither fail
+/// nor appear to vouch for an ordinary verification. When asked, both checks share one read.
+#[allow(clippy::too_many_arguments)]
+pub async fn state_export_verify_full(
+    file: std::path::PathBuf,
+    project: Uuid,
+    expect_commit: String,
+    path: String,
+    attestation: Option<std::path::PathBuf>,
+    trusted_key: Vec<String>,
+    min_epoch: Option<u32>,
+    max_epoch: Option<u32>,
+    signature_only: bool,
+) -> anyhow::Result<()> {
+    use engine_core::repository::state_export;
     anyhow::ensure!(
         file.is_file(),
         "state export file not found at {}",
@@ -448,22 +598,106 @@ async fn state_export_verify(
     let expect_commit_addr = engine_core::shared_checkpoint::Address::try_from(expect_commit)
         .context("invalid expect_commit address")?;
 
-    let report = engine_core::repository::state_export::verify_state_export_file(
-        &file,
-        project,
-        &expect_commit_addr,
-        &path,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("state export verification failed: {e}"))?;
+    let attestation_requested = attestation.is_some()
+        || !trusted_key.is_empty()
+        || min_epoch.is_some()
+        || max_epoch.is_some()
+        || signature_only;
+    let companion = state_export::companion_attestation_path(&file);
 
-    let output = serde_json::json!({
+    let (report, attested) = if attestation_requested {
+        let mut policy =
+            state_export::AttestationVerificationPolicy::new().with_trusted_keys(trusted_key);
+        if signature_only {
+            policy = policy.with_signature_only();
+        }
+        if let Some(min) = min_epoch {
+            policy = policy.with_min_epoch(min);
+        }
+        if let Some(max) = max_epoch {
+            policy = policy.with_max_epoch(max);
+        }
+        let (report, attest, trust) = state_export::verify_state_export_and_attestation_file(
+            &file,
+            attestation.as_ref(),
+            project,
+            &expect_commit_addr,
+            &path,
+            &policy,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("state export attestation verification failed: {e}"))?;
+        let mut value = serde_json::to_value(&attest)?;
+        value["trust"] = serde_json::to_value(trust)?;
+        (report, Some(value))
+    } else {
+        let report =
+            state_export::verify_state_export_file(&file, project, &expect_commit_addr, &path)
+                .await
+                .map_err(|e| anyhow::anyhow!("state export verification failed: {e}"))?;
+        (report, None)
+    };
+
+    let mut output = serde_json::json!({
         "file": file.display().to_string(),
         "project": report.project,
         "commit": report.commit.as_str(),
         "path": report.path,
         "document": report.document.0,
         "root": report.root.as_str(),
+    });
+    match attested {
+        Some(value) => output["attestation"] = value,
+        None if companion.is_file() => {
+            output["attestation_not_checked"] = serde_json::json!(companion.display().to_string());
+        }
+        None => {}
+    }
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+/// Sign an exported state file and emit a companion .dynoattest provenance attestation.
+async fn state_export_attest(
+    file: std::path::PathBuf,
+    project: Uuid,
+    commit: String,
+    epoch: u32,
+    key_path: std::path::PathBuf,
+    out: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        file.is_file(),
+        "state export file not found at {}",
+        file.display()
+    );
+    let commit_addr = engine_core::shared_checkpoint::Address::try_from(commit)
+        .context("invalid commit address")?;
+    let key = signing::load(&key_path)?;
+    let bytes = std::fs::read(&file)
+        .with_context(|| format!("reading state file at {}", file.display()))?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let attestation = engine_core::repository::state_export::StateExportAttestation::generate(
+        project,
+        epoch,
+        commit_addr.clone(),
+        &bytes,
+        &key,
+        now_ms,
+    )?;
+    let out_path = out.unwrap_or_else(|| {
+        engine_core::repository::state_export::companion_attestation_path(&file)
+    });
+    attestation.write_companion_file(&out_path)?;
+    let output = serde_json::json!({
+        "file": file.display().to_string(),
+        "attestation_file": out_path.display().to_string(),
+        "project": project,
+        "commit": commit_addr.as_str(),
+        "authority_epoch": epoch,
+        "signer_key": attestation.signer_key,
+        "state_digest": attestation.state_digest,
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
