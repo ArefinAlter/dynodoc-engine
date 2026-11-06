@@ -93,7 +93,9 @@ and backend/load acceptance remain open. Part 2 is therefore still in progress.
 
 Normal current/history and API write materialization now select mixed checkpoints.
 The periodic shared writer is explicit opt-in; default legacy remains reversible.
-Capacity fallback is transactional; corrupt shared data fails closed. PostgreSQL
+Capacity fallback is transactional. A historical read skips at most three corrupt
+periodic shared checkpoints (logged) and replays from an older one; a corrupt legacy,
+named or deployed snapshot fails closed. PostgreSQL
 value reads are bounded batches. Named/deployed versions and draft bases stay
 legacy JSON. Part 2b measurements gated writer rollout: publication scanned full
 state, performed per-object writes and blocked document FOR UPDATE appends. Part
