@@ -4349,6 +4349,17 @@ mod tests {
         .unwrap();
         assert_eq!(incr_summary.commits, 2); // c2 and c3 only
         assert_eq!(incr_summary.since, Some(c1.clone()));
+        // Review patch: the CLI's offline verifier fails closed on a delta, so it is never
+        // reported as a verified complete history (audit F-05).
+        let err =
+            super::super::archive_verify(incr_out.clone(), f.project, c3.as_str().to_string())
+                .await
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("incremental archive requires target repository"),
+            "{err}"
+        );
 
         // Assert size reduction
         let full_len = std::fs::metadata(&full_out).unwrap().len();
@@ -4625,6 +4636,125 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&inc_archive);
+        f1.finish().await;
+        f2.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_import_incremental_bounds_the_base_and_refuses_a_tampered_base_commit() {
+        use engine_core::repository::archive::{
+            validate_and_stage_archive_with_target, ArchiveError, ArchiveLimits,
+        };
+        use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions};
+
+        let f1 = Fixture::new().await;
+        let (doc1, doc2) = (
+            DocumentId(uuid::Uuid::new_v4()),
+            DocumentId(uuid::Uuid::new_v4()),
+        );
+        let v1 = f1.file(doc1, &[(0, "Genesis doc1")]).await;
+        let w1 = f1.file(doc2, &[(0, "Genesis doc2")]).await;
+        let c1 = f1
+            .commit(
+                &[],
+                vec![("doc1.docx", v1), ("doc2.docx", w1.clone())],
+                "Genesis",
+            )
+            .await;
+        let v2 = f1.file(doc1, &[(0, "Updated doc1")]).await;
+        let c2 = f1
+            .commit(&[&c1], vec![("doc1.docx", v2), ("doc2.docx", w1)], "Update")
+            .await;
+        let id = uuid::Uuid::new_v4();
+        let base = std::env::temp_dir().join(format!("test-bound-base-{id}.dynoarc"));
+        let delta = std::env::temp_dir().join(format!("test-bound-delta-{id}.dynoarc"));
+        for (head, since, out) in [
+            (&c1, None, &base),
+            (&c2, Some(c1.as_str().to_string()), &delta),
+        ] {
+            run(
+                f1.path.clone(),
+                f1.project,
+                Action::ArchiveExport {
+                    head: head.as_str().to_string(),
+                    since,
+                    out: out.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let f2 = Fixture::with_project(f1.project).await;
+        run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: base.clone(),
+                expect_head: c1.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The base objects a delta needs count against the archive limits: unchanged doc2
+        // comes from the target, so a limit equal to the archive's own objects trips.
+        let stage = |limits| {
+            validate_and_stage_archive_with_target(
+                std::fs::File::open(&delta).unwrap(),
+                limits,
+                Some(&c2),
+                Some(DocumentId(f2.project)),
+                Some(&f2.repo),
+            )
+        };
+        let staged = stage(ArchiveLimits::default()).await.unwrap();
+        let tight = ArchiveLimits {
+            max_objects: staged.objects.len(),
+            ..ArchiveLimits::default()
+        };
+        drop(staged);
+        let err = stage(tight).await.unwrap_err();
+        assert!(matches!(err, ArchiveError::Limit(_)), "{err:?}");
+
+        // A base commit whose stored height does not follow from its parents is not
+        // trusted: the import is refused and the target is left as it was.
+        let mut raw = SqliteConnectOptions::new()
+            .filename(&f2.path)
+            .connect()
+            .await
+            .unwrap();
+        // As someone outside the repository's own immutability guard would.
+        sqlx::query("drop trigger commits_no_update")
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        sqlx::query("update commits set height=height+7 where address=?")
+            .bind(c1.as_str())
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        drop(raw);
+        let before = f2.repo.inventory(None, 10).await.unwrap();
+        let err = run(
+            f2.path.clone(),
+            f2.project,
+            Action::ArchiveImport {
+                file: delta.clone(),
+                expect_head: c2.as_str().to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("does not follow from its parents"),
+            "{message}"
+        );
+        assert_eq!(f2.repo.inventory(None, 10).await.unwrap(), before);
+        assert!(f2.repo.commit(&c2).await.is_err());
+
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&delta);
         f1.finish().await;
         f2.finish().await;
     }

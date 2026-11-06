@@ -88,7 +88,9 @@ freshness, or native-format fidelity: an attacker could author a validly signed 
 fork. The expected head, obtained out-of-band or from an authoritative pin, ties the
 archive's cryptographic closure to the operator's trusted history.
 
-The offline verifier (`engine-cli archive-verify FILE --project UUID --expect-head ADDRESS`):
+The offline verifier (`engine-cli archive-verify FILE --project UUID --expect-head ADDRESS`; it
+refuses an incremental archive, whose base and history are not in the file, and so never reports a
+delta as a verified complete history):
 - Operates entirely offline with no target repository, network access, account keys, or branch writes.
 - Uses bounded private temporary storage for frame staging and graph reachability validation.
 - Requires the exact dependency and object closure: every commit must be reachable from `head`,

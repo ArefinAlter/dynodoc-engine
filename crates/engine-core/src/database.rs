@@ -68,7 +68,13 @@ const MUTABLE: &[&str] = &[
     "app_handover_code",
 ];
 /// Rows are created and pruned but never edited: a replay ledger, not a record.
-const INSERT_DELETE: &[&str] = &["device_session", "project_issue_label", "project_star"];
+const INSERT_DELETE: &[&str] = &[
+    "device_session",
+    "project_issue_label",
+    "project_star",
+    // Content-addressed images of host-native blocks: stored once, pruned when unreferenced.
+    "connector_media",
+];
 /// Rows the runtime login may read, end and prune but NEVER create: only the operator's owner
 /// credential inserts them (operator-issued sign-in links, schema 47; a trigger lets a row be
 /// ended exactly once). Having no INSERT is the point: no API route, and no bug in one, can mint a
