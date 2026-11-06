@@ -17,6 +17,11 @@ use crate::{
 /// Default tail length before an automatic background snapshot is taken.
 pub const DEFAULT_MAX_EVENTS_IN_TAIL: i64 = 500;
 
+/// Corrupt periodic checkpoints one historical read may skip. Each attempt has its own
+/// full read budget, so a read costs at most this many plus one times that budget, and a
+/// fallback replays at most this many checkpoint intervals more than a clean read.
+const MAX_PERIODIC_FALLBACKS: usize = 3;
+
 /// Why a snapshot was requested.
 #[derive(Debug, Clone, Copy)]
 pub enum SnapshotReason {
@@ -88,6 +93,7 @@ pub enum PeriodicStorage {
     Legacy,
     SharedV1,
     SharedV2,
+    SharedV3,
 }
 
 /// Storage for named/deployed/public snapshots; the response shape stays legacy.
@@ -107,8 +113,9 @@ pub struct HistoricalState {
 }
 
 /// Read an exact revision from the nearest legacy/shared checkpoint and a streamed
-/// event suffix. Ties prefer the verified shared graph. Corruption is an error,
-/// never a reason to silently choose an older checkpoint. Full state stays resident.
+/// event suffix. Ties prefer the verified shared graph. A corrupt periodic shared
+/// checkpoint falls back to an earlier candidate; a corrupt legacy, named or deployed
+/// snapshot is an error. Full state stays resident.
 /// Callers authorize document access and retain their existing transaction/locks.
 pub async fn read_state_at(
     connection: &mut PgConnection,
@@ -137,55 +144,120 @@ async fn read_state_at_with_formats(
     if through_seq < 0 {
         return Err(SnapshotError::InvalidRevision(through_seq));
     }
-    // Metadata only: never hydrate an older full JSON snapshot just to compare it.
-    let selected: Option<(i64, i16)> = sqlx::query_as(
+    // Metadata only: query candidate checkpoints in descending order of revision and codec version.
+    let candidates: Vec<(i64, i16)> = sqlx::query_as(
         "select through_seq,codec from (
-           (select through_seq,0::smallint as codec from snapshot
-            where document_id=$1 and through_seq<=$2 order by through_seq desc limit 1)
+           select through_seq,0::smallint as codec from snapshot
+            where document_id=$1 and through_seq<=$2
            union all
-           (select through_seq,codec_version as codec from shared_checkpoint
-            where document_id=$1 and through_seq<=$2 and $3 order by through_seq desc limit 1)
-         ) candidates order by through_seq desc,codec desc limit 1",
+           select through_seq,codec_version as codec from shared_checkpoint
+            where document_id=$1 and through_seq<=$2 and $3
+         ) candidates order by through_seq desc,codec desc limit 64",
     )
     .bind(document_id.0)
     .bind(through_seq)
     .bind(include_shared)
-    .fetch_optional(&mut *connection)
+    .fetch_all(&mut *connection)
     .await?;
-    let (snapshot_seq, checkpoint_format, mut state) = match selected {
-        Some((seq, version @ 1..=3)) => (
-            seq,
-            match version {
-                1 => CheckpointFormat::SharedV1,
-                2 => CheckpointFormat::SharedV2,
-                3 => CheckpointFormat::SharedV3,
-                _ => unreachable!(),
-            },
-            shared::load_in_connection(connection, document_id, seq, Limits::default()).await?,
-        ),
-        Some((seq, 0)) => {
-            let snapshot: Snapshot =
-                sqlx::query_as("select * from snapshot where document_id=$1 and through_seq=$2")
-                    .bind(document_id.0)
-                    .bind(seq)
-                    .fetch_one(&mut *connection)
-                    .await?;
-            let state =
-                crate::snapshot_verification::read_verified_state(connection, &snapshot).await?;
-            (
-                seq,
-                if snapshot.state.get("$dynodoc_state").is_some() {
+
+    let mut candidate_result = None;
+    let mut first_error: Option<SnapshotError> = None;
+    let mut fallbacks = 0usize;
+
+    for (seq, version) in candidates {
+        match version {
+            1..=3 => {
+                let format = match version {
+                    1 => CheckpointFormat::SharedV1,
+                    2 => CheckpointFormat::SharedV2,
+                    3 => CheckpointFormat::SharedV3,
+                    _ => unreachable!(),
+                };
+                match shared::load_in_connection(connection, document_id, seq, Limits::default())
+                    .await
+                {
+                    Ok(state) => {
+                        candidate_result = Some((seq, format, state));
+                        break;
+                    }
+                    Err(err) => {
+                        // Only corrupt data is a reason to try an older checkpoint. A database,
+                        // I/O or resource error says nothing about this checkpoint, so it
+                        // surfaces instead of triggering a longer replay.
+                        if !matches!(
+                            err,
+                            shared_checkpoint::Error::Invalid(_)
+                                | shared_checkpoint::Error::Missing(_)
+                                | shared_checkpoint::Error::HashMismatch
+                                | shared_checkpoint::Error::Json(_)
+                        ) {
+                            return Err(err.into());
+                        }
+                        warn!(
+                            document_id = %document_id.0,
+                            through_seq = seq,
+                            codec = version,
+                            error = %err,
+                            "shared checkpoint candidate corrupted or invalid; attempting fallback to earlier checkpoint"
+                        );
+                        fallbacks += 1;
+                        if fallbacks > MAX_PERIODIC_FALLBACKS {
+                            return Err(shared_checkpoint::Error::Limit(
+                                "too many corrupt periodic checkpoints",
+                            )
+                            .into());
+                        }
+                        if first_error.is_none() {
+                            first_error = Some(err.into());
+                        }
+                    }
+                }
+            }
+            0 => {
+                // Legacy, named and deployed snapshots are attested: corruption is an
+                // error, never a reason to choose an older checkpoint.
+                let snapshot: Snapshot = sqlx::query_as(
+                    "select * from snapshot where document_id=$1 and through_seq=$2",
+                )
+                .bind(document_id.0)
+                .bind(seq)
+                .fetch_one(&mut *connection)
+                .await?;
+                let state =
+                    crate::snapshot_verification::read_verified_state(connection, &snapshot)
+                        .await?;
+                let format = if snapshot.state.get("$dynodoc_state").is_some() {
                     CheckpointFormat::SharedV2
                 } else {
                     CheckpointFormat::Legacy
-                },
-                state,
-            )
+                };
+                candidate_result = Some((seq, format, state));
+                break;
+            }
+            _ => {
+                warn!(
+                    document_id = %document_id.0,
+                    through_seq = seq,
+                    codec = version,
+                    "unsupported checkpoint version; attempting fallback"
+                );
+                if first_error.is_none() {
+                    first_error = Some(
+                        shared_checkpoint::Error::Invalid("unsupported checkpoint version").into(),
+                    );
+                }
+            }
         }
-        Some(_) => {
-            return Err(shared_checkpoint::Error::Invalid("unsupported checkpoint version").into())
+    }
+
+    let (snapshot_seq, checkpoint_format, mut state) = match candidate_result {
+        Some(found) => found,
+        None => {
+            if let Some(err) = first_error {
+                return Err(err);
+            }
+            (0, CheckpointFormat::Genesis, DocumentState::default())
         }
-        None => (0, CheckpointFormat::Genesis, DocumentState::default()),
     };
     let mut previous = shared::chain_at(connection, document_id, snapshot_seq).await?;
     let mut tail = sqlx::query_as::<_, Event>(
@@ -368,21 +440,80 @@ impl SnapshotEngine {
             sqlx::query("savepoint shared_periodic")
                 .execute(&mut *tx)
                 .await?;
-            match shared::publish_in_connection(
-                &mut tx,
-                document_id,
-                seq,
-                &state,
-                chain.clone(),
-                Limits::default(),
-                if self.periodic_storage == PeriodicStorage::SharedV2 {
-                    shared::Codec::V2
+            let codec = match self.periodic_storage {
+                PeriodicStorage::SharedV3 => shared::Codec::V3,
+                PeriodicStorage::SharedV2 => shared::Codec::V2,
+                PeriodicStorage::SharedV1 => shared::Codec::V1,
+                PeriodicStorage::Legacy => unreachable!(),
+            };
+            let publish_result = if matches!(codec, shared::Codec::V2 | shared::Codec::V3) {
+                let base_row: Option<(i64, String, Vec<u8>)> = sqlx::query_as(
+                    "select through_seq,state_root,event_chain_hash from shared_checkpoint
+                     where document_id=$1 and through_seq < $2 and codec_version=$3
+                     order by through_seq desc limit 1",
+                )
+                .bind(document_id.0)
+                .bind(seq)
+                .bind(codec as i16)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some((base_seq, base_root_str, base_chain)) = base_row {
+                    let chain_match = shared::chain_at(&mut tx, document_id, base_seq).await.ok()
+                        == Some(base_chain);
+                    if chain_match {
+                        if let Ok(base_root) = shared_checkpoint::Address::try_from(base_root_str) {
+                            let mut store = shared::PgStore::new(&mut tx);
+                            if let Ok(base_state) = codec
+                                .read(&mut store, document_id, &base_root, Limits::default())
+                                .await
+                            {
+                                drop(store);
+                                Some(
+                                    shared::publish_incremental_in_connection(
+                                        &mut tx,
+                                        document_id,
+                                        seq,
+                                        base_seq,
+                                        &base_root,
+                                        &base_state,
+                                        &state,
+                                        chain.clone(),
+                                        Limits::default(),
+                                        codec,
+                                    )
+                                    .await,
+                                )
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 } else {
-                    shared::Codec::V1
-                },
-            )
-            .await
-            {
+                    None
+                }
+            } else {
+                None
+            };
+            let publish_res = match publish_result {
+                Some(res) => res,
+                None => {
+                    shared::publish_in_connection(
+                        &mut tx,
+                        document_id,
+                        seq,
+                        &state,
+                        chain.clone(),
+                        Limits::default(),
+                        codec,
+                    )
+                    .await
+                }
+            };
+            match publish_res {
                 Ok(_) => {
                     sqlx::query("release savepoint shared_periodic")
                         .execute(&mut *tx)
@@ -482,6 +613,7 @@ pub fn spawn_ensure_recent(pool: PgPool, document_id: DocumentId, max_events_in_
         let storage = match std::env::var("DYNODOC_PERIODIC_CHECKPOINT_STORAGE").as_deref() {
             Ok("shared-v1") => PeriodicStorage::SharedV1,
             Ok("shared-v2") => PeriodicStorage::SharedV2,
+            Ok("shared-v3") => PeriodicStorage::SharedV3,
             _ => PeriodicStorage::Legacy,
         };
         let engine = SnapshotEngine::new(pool).with_periodic_storage(storage);

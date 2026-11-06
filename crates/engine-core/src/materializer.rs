@@ -298,6 +298,15 @@ impl Materializer {
         Ok(state)
     }
 
+    /// Restore from a previously verified state and fold tail events on top.
+    pub fn from_state(
+        mut state: DocumentState,
+        tail: &[Event],
+    ) -> Result<DocumentState, MaterializeError> {
+        Self::fold_into(&mut state, tail)?;
+        Ok(state)
+    }
+
     pub(crate) fn fold_into(
         state: &mut DocumentState,
         events: &[Event],
@@ -466,6 +475,10 @@ mod tests {
         };
         assert_eq!(
             Materializer::from_snapshot(&snapshot, &events[4..]).unwrap(),
+            state
+        );
+        assert_eq!(
+            Materializer::from_state(prefix, &events[4..]).unwrap(),
             state
         );
         assert!(state.removed_choices.contains(&choice));
