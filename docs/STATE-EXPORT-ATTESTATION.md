@@ -66,16 +66,34 @@ Signing is performed with standard RFC 8032 Ed25519 keys (`ring::signature::ED25
 
 ## Verification Policy
 
-When verifying an attestation with `AttestationVerificationPolicy`:
+A signature proves only that the key written in the attestation signed these bytes. It says
+nothing about who holds that key, so a verdict about authority needs a trust anchor that
+the verifier configured itself. An embedded signer key, or an epoch range the caller
+supplies, does not create one.
 
-1. **State Digest:** The SHA-256 hash of the state export file on disk is computed and compared to `state_digest`. Any bit alteration, whitespace variation, or truncation causes `DigestMismatch`.
-2. **Signature Validity:** The Ed25519 signature is verified against `signer_key` using the canonical payload. Tampered signatures cause `SignatureFailed`.
-3. **Project Binding:** If the policy expects a project UUID, it must match `project`. Mismatch causes `ProjectMismatch`.
-4. **Commit Binding:** If the policy expects a commit address, it must match `commit`. Mismatch causes `CommitMismatch`.
-5. **Authority Epoch Bounds:**
-   - If `min_epoch` is specified and `authority_epoch < min_epoch`, verification fails with `ExpiredEpoch`.
-   - If `max_epoch` is specified and `authority_epoch > max_epoch`, verification fails with `FutureEpoch`.
-6. **Trusted Signer Keys:** If `trusted_keys` is non-empty, `signer_key` must appear in the trusted key set. If not present, verification fails with `UntrustedKey`.
+Verification is `Authority` by default and needs at least one trusted key; with none it
+fails with `NoTrustAnchor` instead of accepting any signer. `SignatureOnly` must be asked
+for (`--signature-only`); it cannot be combined with trusted keys, and its result is
+labelled `signature_only` so it is never read as trusted.
+
+When verifying with `AttestationVerificationPolicy`:
+
+1. **Policy:** contradictory settings fail with `InconsistentPolicy` (minimum epoch above the maximum, signature-only with trusted keys, a key window that ends before it starts).
+2. **State Digest:** The SHA-256 hash of the state export file on disk is compared to `state_digest`. Any bit alteration, whitespace variation, or truncation causes `DigestMismatch`.
+3. **Project and Commit Binding:** If the policy expects a project UUID or a commit address, it must match, else `ProjectMismatch` or `CommitMismatch`. The CLI always sets both from the export it verified.
+4. **Epoch Limits:** `min_epoch` and `max_epoch` are plain limits (`ExpiredEpoch`, `FutureEpoch`). They are not rotation or revocation and do not show the signer was authorized at a real time.
+5. **Trusted Signer Key:** In `Authority` mode `signer_key` must be a configured trusted key (`UntrustedKey`). Each trusted key carries its own epoch window, inclusive, with an optional end for a retired or revoked key; an attestation outside it fails with `KeyEpochOutsideWindow`. The CLI trusts a key in every epoch; narrower windows are set through the library.
+6. **Signature Validity:** The Ed25519 signature is verified against `signer_key` using the canonical payload. Tampered signatures cause `SignatureFailed`.
+
+The result is `Authority` or `SignatureOnly`. Neither is a timestamp-authenticity claim:
+`issued_at_ms` is whatever the signer wrote.
+
+An attestation is checked only when asked for. `state-export-verify` verifies the signed
+manifest, the path and the full typed state root as always, and checks an attestation only
+when `--attestation`, `--trusted-key`, `--min-epoch`, `--max-epoch` or `--signature-only`
+is given; a `.dynoattest` file that merely sits next to the export is neither verified nor
+trusted (the output says `attestation_not_checked`). When asked, both checks use one
+bounded read of the export, so they describe the same bytes.
 
 ---
 
@@ -106,13 +124,17 @@ dynodoc-engine state-export-attest /tmp/financials.json \
 ### Verifying State Export and Attestation
 
 ```bash
-# Verifies envelope syntax, document state tree, and companion attestation:
+# Verifies envelope syntax and document state tree; with a trusted key, also the
+# companion attestation as an authority verdict:
 dynodoc-engine state-export-verify /tmp/financials.json \
   --project <project-uuid> \
   --expect-commit <commit-hash> \
   --path "Financials.docx" \
   --trusted-key <pubkey-hex> \
   --min-epoch 1
+
+# Signature only, trusting nobody; the result is labelled signature_only:
+dynodoc-engine state-export-verify /tmp/financials.json ... --signature-only
 ```
 
 All verification operations operate offline without database connections, WAL allocation, or write transactions.

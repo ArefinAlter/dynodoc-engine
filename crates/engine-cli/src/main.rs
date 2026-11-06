@@ -179,6 +179,10 @@ enum Command {
         /// Maximum allowed authority epoch.
         #[arg(long)]
         max_epoch: Option<u32>,
+        /// Check only that the embedded key signed these bytes, trusting nobody: the result is
+        /// labelled `signature_only`. Cannot be combined with `--trusted-key`.
+        #[arg(long)]
+        signature_only: bool,
     },
     /// Sign an exported state file and emit a companion `.dynoattest` provenance attestation.
     StateExportAttest {
@@ -418,6 +422,7 @@ async fn run() -> anyhow::Result<()> {
             trusted_key,
             min_epoch,
             max_epoch,
+            signature_only,
         } => {
             state_export_verify_full(
                 file,
@@ -428,6 +433,7 @@ async fn run() -> anyhow::Result<()> {
                 trusted_key,
                 min_epoch,
                 max_epoch,
+                signature_only,
             )
             .await
         }
@@ -562,11 +568,15 @@ pub async fn state_export_verify(
         Vec::new(),
         None,
         None,
+        false,
     )
     .await
 }
 
-/// Verify an offline normalized state export file with optional cryptographic attestation policy.
+/// Verify an offline normalized state export file. An attestation is checked only when the
+/// caller asks for it (an attestation path, trusted keys, epoch limits or `--signature-only`):
+/// a companion file that merely exists changes nothing, so a stray sidecar can neither fail
+/// nor appear to vouch for an ordinary verification. When asked, both checks share one read.
 #[allow(clippy::too_many_arguments)]
 pub async fn state_export_verify_full(
     file: std::path::PathBuf,
@@ -577,7 +587,9 @@ pub async fn state_export_verify_full(
     trusted_key: Vec<String>,
     min_epoch: Option<u32>,
     max_epoch: Option<u32>,
+    signature_only: bool,
 ) -> anyhow::Result<()> {
+    use engine_core::repository::state_export;
     anyhow::ensure!(
         file.is_file(),
         "state export file not found at {}",
@@ -586,14 +598,45 @@ pub async fn state_export_verify_full(
     let expect_commit_addr = engine_core::shared_checkpoint::Address::try_from(expect_commit)
         .context("invalid expect_commit address")?;
 
-    let report = engine_core::repository::state_export::verify_state_export_file(
-        &file,
-        project,
-        &expect_commit_addr,
-        &path,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("state export verification failed: {e}"))?;
+    let attestation_requested = attestation.is_some()
+        || !trusted_key.is_empty()
+        || min_epoch.is_some()
+        || max_epoch.is_some()
+        || signature_only;
+    let companion = state_export::companion_attestation_path(&file);
+
+    let (report, attested) = if attestation_requested {
+        let mut policy =
+            state_export::AttestationVerificationPolicy::new().with_trusted_keys(trusted_key);
+        if signature_only {
+            policy = policy.with_signature_only();
+        }
+        if let Some(min) = min_epoch {
+            policy = policy.with_min_epoch(min);
+        }
+        if let Some(max) = max_epoch {
+            policy = policy.with_max_epoch(max);
+        }
+        let (report, attest, trust) = state_export::verify_state_export_and_attestation_file(
+            &file,
+            attestation.as_ref(),
+            project,
+            &expect_commit_addr,
+            &path,
+            &policy,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("state export attestation verification failed: {e}"))?;
+        let mut value = serde_json::to_value(&attest)?;
+        value["trust"] = serde_json::to_value(trust)?;
+        (report, Some(value))
+    } else {
+        let report =
+            state_export::verify_state_export_file(&file, project, &expect_commit_addr, &path)
+                .await
+                .map_err(|e| anyhow::anyhow!("state export verification failed: {e}"))?;
+        (report, None)
+    };
 
     let mut output = serde_json::json!({
         "file": file.display().to_string(),
@@ -603,33 +646,12 @@ pub async fn state_export_verify_full(
         "document": report.document.0,
         "root": report.root.as_str(),
     });
-
-    let companion_default =
-        engine_core::repository::state_export::companion_attestation_path(&file);
-    if attestation.is_some()
-        || !trusted_key.is_empty()
-        || min_epoch.is_some()
-        || max_epoch.is_some()
-        || companion_default.is_file()
-    {
-        let mut policy =
-            engine_core::repository::state_export::AttestationVerificationPolicy::new()
-                .with_project(project)
-                .with_commit(expect_commit_addr)
-                .with_trusted_keys(trusted_key);
-        if let Some(min) = min_epoch {
-            policy = policy.with_min_epoch(min);
+    match attested {
+        Some(value) => output["attestation"] = value,
+        None if companion.is_file() => {
+            output["attestation_not_checked"] = serde_json::json!(companion.display().to_string());
         }
-        if let Some(max) = max_epoch {
-            policy = policy.with_max_epoch(max);
-        }
-        let attest = engine_core::repository::state_export::verify_state_export_attestation_file(
-            &file,
-            attestation.as_ref(),
-            &policy,
-        )
-        .map_err(|e| anyhow::anyhow!("state export attestation verification failed: {e}"))?;
-        output["attestation"] = serde_json::to_value(&attest)?;
+        None => {}
     }
 
     println!("{}", serde_json::to_string_pretty(&output)?);

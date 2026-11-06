@@ -219,6 +219,10 @@ pub enum Action {
         /// Maximum allowed authority epoch.
         #[arg(long)]
         max_epoch: Option<u32>,
+        /// Check only that the embedded key signed these bytes, trusting nobody: the result is
+        /// labelled `signature_only`. Cannot be combined with `--trusted-key`.
+        #[arg(long)]
+        signature_only: bool,
     },
     /// Compare two historical file revisions across commits or archives without extracting files to disk.
     HistoricalDiff {
@@ -1279,11 +1283,15 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     trusted_key,
                     min_epoch,
                     max_epoch,
+                    signature_only,
                 } => {
                     let mut policy =
                         engine_core::repository::state_export::AttestationVerificationPolicy::new()
                             .with_project(project)
                             .with_trusted_keys(trusted_key);
+                    if signature_only {
+                        policy = policy.with_signature_only();
+                    }
                     if let Some(c) = commit {
                         policy = policy.with_commit(address(c)?);
                     }
@@ -1293,13 +1301,14 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     if let Some(max) = max_epoch {
                         policy = policy.with_max_epoch(max);
                     }
-                    let verified = engine_core::repository::state_export::verify_state_export_attestation_file(
+                    let (verified, trust) = engine_core::repository::state_export::verify_state_export_attestation_file(
                         &state,
                         attestation.as_ref(),
                         &policy,
                     )?;
                     serde_json::json!({
                         "verified": true,
+                        "trust": trust,
                         "state": state.display().to_string(),
                         "project": verified.project,
                         "commit": verified.commit.as_str(),
@@ -6545,6 +6554,7 @@ mod tests {
                 trusted_key: vec![signer_pubkey.clone()],
                 min_epoch: Some(1),
                 max_epoch: Some(5),
+                signature_only: false,
             },
         )
         .await
@@ -6560,6 +6570,7 @@ mod tests {
             vec![signer_pubkey.clone()],
             Some(2),
             Some(3),
+            false,
         )
         .await
         .unwrap();
@@ -6583,6 +6594,7 @@ mod tests {
                 trusted_key: vec![signer_pubkey.clone()],
                 min_epoch: None,
                 max_epoch: None,
+                signature_only: false,
             },
         )
         .await
@@ -6605,6 +6617,7 @@ mod tests {
                 ],
                 min_epoch: None,
                 max_epoch: None,
+                signature_only: false,
             },
         )
         .await
@@ -6621,14 +6634,89 @@ mod tests {
                 state: export_out.clone(),
                 attestation: None,
                 commit: Some(c1.as_str().to_string()),
-                trusted_key: vec![],
+                trusted_key: vec![signer_pubkey.clone()],
                 min_epoch: Some(3), // epoch is 2
                 max_epoch: None,
+                signature_only: false,
             },
         )
         .await
         .unwrap_err();
         assert!(err_epoch.to_string().contains("is expired"));
+
+        // 7b. No trust anchor is refused; the weaker check has to be asked for.
+        let attest_only =
+            |trusted_key: Vec<String>, signature_only: bool| Action::VerifyStateAttestation {
+                state: export_out.clone(),
+                attestation: None,
+                commit: Some(c1.as_str().to_string()),
+                trusted_key,
+                min_epoch: None,
+                max_epoch: None,
+                signature_only,
+            };
+        let no_anchor = run(f.path.clone(), f.project, attest_only(vec![], false))
+            .await
+            .unwrap_err();
+        assert!(
+            no_anchor.to_string().contains("no trust anchor"),
+            "{no_anchor}"
+        );
+        run(f.path.clone(), f.project, attest_only(vec![], true))
+            .await
+            .unwrap();
+        let contradictory = run(
+            f.path.clone(),
+            f.project,
+            attest_only(vec![signer_pubkey.clone()], true),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            contradictory.to_string().contains("inconsistent"),
+            "{contradictory}"
+        );
+        let asked_without_anchor = super::super::state_export_verify_full(
+            export_out.clone(),
+            f.project,
+            c1.as_str().to_string(),
+            "Certified.docx".to_string(),
+            Some(companion_attest.clone()),
+            vec![],
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            asked_without_anchor.to_string().contains("no trust anchor"),
+            "{asked_without_anchor}"
+        );
+
+        // 7c. A companion file that merely exists, even a corrupt one, does not change
+        // ordinary verification: nothing was asked of the attestation.
+        let stray_out =
+            std::env::temp_dir().join(format!("test-stray-{}.json", uuid::Uuid::new_v4()));
+        std::fs::copy(&export_out, &stray_out).unwrap();
+        let stray_sidecar =
+            engine_core::repository::state_export::companion_attestation_path(&stray_out);
+        std::fs::write(&stray_sidecar, b"not an attestation").unwrap();
+        super::super::state_export_verify_full(
+            stray_out.clone(),
+            f.project,
+            c1.as_str().to_string(),
+            "Certified.docx".to_string(),
+            None,
+            vec![],
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_file(&stray_out);
+        let _ = std::fs::remove_file(&stray_sidecar);
 
         // 8. Standalone Action::AttestState on an un-attested export file
         let separate_out =

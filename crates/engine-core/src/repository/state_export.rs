@@ -4,7 +4,7 @@
 //! normalized DocumentState JSON envelope. It is not a DOCX/XLSX/PPTX binary,
 //! but a verified canonical document model at an exact commit.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -728,6 +728,20 @@ pub enum AttestationError {
     #[error("signer key {signer_key} is not in the trusted keys for this project")]
     UntrustedKey { signer_key: String },
 
+    #[error("no trust anchor: pass at least one trusted key, or ask for signature-only verification explicitly")]
+    NoTrustAnchor,
+
+    #[error("inconsistent verification policy: {0}")]
+    InconsistentPolicy(&'static str),
+
+    #[error("authority epoch {epoch} is outside the window of signer key {signer_key} (from {from_epoch}, until {until_epoch:?})")]
+    KeyEpochOutsideWindow {
+        signer_key: String,
+        epoch: u32,
+        from_epoch: u32,
+        until_epoch: Option<u32>,
+    },
+
     #[error("cryptographic signature verification failed: {0}")]
     SignatureFailed(&'static str),
 
@@ -738,14 +752,36 @@ pub enum AttestationError {
     FutureEpoch { epoch: u32, max_valid_epoch: u32 },
 }
 
-/// Verification policy configuring trust anchors for provenance attestations.
+/// What a successful attestation check establishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationTrust {
+    /// The signer key is a trust anchor the caller configured, and the attestation's
+    /// epoch lies in that key's window.
+    Authority,
+    /// Only that the key embedded in the attestation signed these bytes. Nothing here
+    /// says who holds that key.
+    SignatureOnly,
+}
+
+/// Epochs, inclusive, in which a configured trust anchor may sign. `until_epoch: None`
+/// means the key is still active; a retired or revoked key has an end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyEpochs {
+    pub from_epoch: u32,
+    pub until_epoch: Option<u32>,
+}
+
+/// Verification policy configuring trust anchors for provenance attestations. Without
+/// `signature_only`, at least one trusted key is required: an empty set trusts nobody.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AttestationVerificationPolicy {
     pub expected_project: Option<uuid::Uuid>,
     pub expected_commit: Option<Address>,
-    pub trusted_keys: BTreeSet<String>,
+    pub trusted_keys: BTreeMap<String, KeyEpochs>,
     pub min_epoch: Option<u32>,
     pub max_epoch: Option<u32>,
+    pub signature_only: bool,
 }
 
 impl AttestationVerificationPolicy {
@@ -753,8 +789,25 @@ impl AttestationVerificationPolicy {
         Self::default()
     }
 
-    pub fn with_trusted_key(mut self, key: impl Into<String>) -> Self {
-        self.trusted_keys.insert(key.into());
+    /// Trust a key in every epoch.
+    pub fn with_trusted_key(self, key: impl Into<String>) -> Self {
+        self.with_trusted_key_epochs(key, 0, None)
+    }
+
+    /// Trust a key only for attestations issued in `from_epoch..=until_epoch`.
+    pub fn with_trusted_key_epochs(
+        mut self,
+        key: impl Into<String>,
+        from_epoch: u32,
+        until_epoch: Option<u32>,
+    ) -> Self {
+        self.trusted_keys.insert(
+            key.into(),
+            KeyEpochs {
+                from_epoch,
+                until_epoch,
+            },
+        );
         self
     }
 
@@ -764,8 +817,14 @@ impl AttestationVerificationPolicy {
         S: Into<String>,
     {
         for k in keys {
-            self.trusted_keys.insert(k.into());
+            self = self.with_trusted_key(k);
         }
+        self
+    }
+
+    /// Accept any signer and label the result untrusted. Cannot be combined with trusted keys.
+    pub fn with_signature_only(mut self) -> Self {
+        self.signature_only = true;
         self
     }
 
@@ -794,6 +853,36 @@ impl AttestationVerificationPolicy {
         self.max_epoch = Some(active_epoch);
         self
     }
+
+    fn validate(&self) -> Result<(), AttestationError> {
+        if let (Some(min), Some(max)) = (self.min_epoch, self.max_epoch) {
+            if min > max {
+                return Err(AttestationError::InconsistentPolicy(
+                    "minimum epoch is above the maximum epoch",
+                ));
+            }
+        }
+        if self.signature_only {
+            if !self.trusted_keys.is_empty() {
+                return Err(AttestationError::InconsistentPolicy(
+                    "signature-only verification cannot also list trusted keys",
+                ));
+            }
+        } else if self.trusted_keys.is_empty() {
+            return Err(AttestationError::NoTrustAnchor);
+        }
+        for window in self.trusted_keys.values() {
+            if window
+                .until_epoch
+                .is_some_and(|until| until < window.from_epoch)
+            {
+                return Err(AttestationError::InconsistentPolicy(
+                    "a trusted key's window ends before it starts",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Verify a state export provenance attestation against state bytes and verification policy.
@@ -801,7 +890,8 @@ pub fn verify_state_attestation(
     attestation: &StateExportAttestation,
     state_bytes: &[u8],
     policy: &AttestationVerificationPolicy,
-) -> Result<(), AttestationError> {
+) -> Result<AttestationTrust, AttestationError> {
+    policy.validate()?;
     // 1. Verify state digest
     let actual_digest = compute_state_digest(state_bytes);
     if attestation.state_digest != actual_digest {
@@ -849,12 +939,28 @@ pub fn verify_state_attestation(
         }
     }
 
-    // 5. Verify trusted signer keys (if non-empty)
-    if !policy.trusted_keys.is_empty() && !policy.trusted_keys.contains(&attestation.signer_key) {
-        return Err(AttestationError::UntrustedKey {
-            signer_key: attestation.signer_key.clone(),
-        });
-    }
+    // 5. The signer must be a configured trust anchor, in an epoch its record allows,
+    // unless the caller explicitly asked for a signature-only (untrusted) check.
+    let trust = if policy.signature_only {
+        AttestationTrust::SignatureOnly
+    } else {
+        let window = policy
+            .trusted_keys
+            .get(&attestation.signer_key)
+            .ok_or_else(|| AttestationError::UntrustedKey {
+                signer_key: attestation.signer_key.clone(),
+            })?;
+        let epoch = attestation.authority_epoch;
+        if epoch < window.from_epoch || window.until_epoch.is_some_and(|until| epoch > until) {
+            return Err(AttestationError::KeyEpochOutsideWindow {
+                signer_key: attestation.signer_key.clone(),
+                epoch,
+                from_epoch: window.from_epoch,
+                until_epoch: window.until_epoch,
+            });
+        }
+        AttestationTrust::Authority
+    };
 
     // 6. Verify cryptographic signature
     let addr = attestation
@@ -866,35 +972,90 @@ pub fn verify_state_attestation(
         AttestationError::SignatureFailed("Ed25519 signature is invalid for the signer key")
     })?;
 
-    Ok(())
+    Ok(trust)
 }
 
-/// Offline verification of an exported state file and companion attestation file.
+fn read_state_bounded(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("opening state file at {}: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_STATE_EXPORT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_STATE_EXPORT_BYTES,
+        "state file exceeds maximum size limit ({} bytes)",
+        MAX_STATE_EXPORT_BYTES
+    );
+    Ok(bytes)
+}
+
+fn verify_attestation_bytes(
+    state_path: &Path,
+    attestation_path: Option<&Path>,
+    state_bytes: &[u8],
+    policy: &AttestationVerificationPolicy,
+) -> anyhow::Result<(StateExportAttestation, AttestationTrust)> {
+    let attestation = StateExportAttestation::read_companion_file(
+        attestation_path
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| companion_attestation_path(state_path)),
+    )?;
+    let trust = verify_state_attestation(&attestation, state_bytes, policy)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok((attestation, trust))
+}
+
+/// Offline verification of an exported state file and companion attestation file only.
 pub fn verify_state_export_attestation_file<P: AsRef<Path>, Q: AsRef<Path>>(
     state_path: P,
     attestation_path: Option<Q>,
     policy: &AttestationVerificationPolicy,
-) -> anyhow::Result<StateExportAttestation> {
-    let s_path = state_path.as_ref();
-    let a_path = match attestation_path {
-        Some(ref p) => p.as_ref().to_path_buf(),
-        None => companion_attestation_path(s_path),
-    };
-    let attestation = StateExportAttestation::read_companion_file(&a_path)?;
-    let state_file = std::fs::File::open(s_path)
-        .map_err(|e| anyhow::anyhow!("opening state file at {}: {e}", s_path.display()))?;
-    let mut state_bytes = Vec::new();
-    state_file
-        .take(MAX_STATE_EXPORT_BYTES as u64 + 1)
-        .read_to_end(&mut state_bytes)?;
-    anyhow::ensure!(
-        state_bytes.len() <= MAX_STATE_EXPORT_BYTES,
-        "state file exceeds maximum size limit ({} bytes)",
-        MAX_STATE_EXPORT_BYTES
-    );
-    verify_state_attestation(&attestation, &state_bytes, policy)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(attestation)
+) -> anyhow::Result<(StateExportAttestation, AttestationTrust)> {
+    let state_path = state_path.as_ref();
+    let state_bytes = read_state_bounded(state_path)?;
+    verify_attestation_bytes(
+        state_path,
+        attestation_path.as_ref().map(|p| p.as_ref()),
+        &state_bytes,
+        policy,
+    )
+}
+
+/// The ordinary state-export verification (signed manifest, path, full typed state root)
+/// and then the attestation, both over one bounded read, so they describe the same bytes.
+/// The attestation must name the same project and commit the export was checked against.
+pub async fn verify_state_export_and_attestation_file<P: AsRef<Path>, Q: AsRef<Path>>(
+    state_path: P,
+    attestation_path: Option<Q>,
+    expected_project: uuid::Uuid,
+    expected_commit: &Address,
+    expected_path: &str,
+    policy: &AttestationVerificationPolicy,
+) -> anyhow::Result<(
+    VerifiedStateExportReport,
+    StateExportAttestation,
+    AttestationTrust,
+)> {
+    let state_path = state_path.as_ref();
+    let state_bytes = read_state_bounded(state_path)?;
+    let report = verify_state_export(
+        std::io::Cursor::new(&state_bytes),
+        expected_project,
+        expected_commit,
+        expected_path,
+    )
+    .await?;
+    let policy = policy
+        .clone()
+        .with_project(expected_project)
+        .with_commit(expected_commit.clone());
+    let (attestation, trust) = verify_attestation_bytes(
+        state_path,
+        attestation_path.as_ref().map(|p| p.as_ref()),
+        &state_bytes,
+        &policy,
+    )?;
+    Ok((report, attestation, trust))
 }
 
 #[cfg(test)]
@@ -1939,10 +2100,146 @@ mod tests {
             .with_commit(commit)
             .with_trusted_key(&pub_key);
 
-        let verified =
+        let (verified, trust) =
             verify_state_export_attestation_file(&state_file_path, None::<&Path>, &policy)
                 .expect("file verification helper should succeed");
 
         assert_eq!(verified, attestation);
+        assert_eq!(trust, AttestationTrust::Authority);
+    }
+
+    struct Signed {
+        key: Ed25519KeyPair,
+        pub_key: String,
+        project: uuid::Uuid,
+        commit: Address,
+        bytes: &'static [u8],
+        attestation: StateExportAttestation,
+    }
+
+    fn signed_at_epoch(seed: u8, epoch: u32) -> Signed {
+        let key = Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap();
+        let pub_key = super::super::hex(key.public_key().as_ref());
+        let project = uuid::Uuid::new_v4();
+        let commit = Address::try_from("22".repeat(32)).unwrap();
+        let bytes: &'static [u8] = b"{\"format\":\"dynodoc.state-export\",\"version\":1}";
+        let attestation =
+            StateExportAttestation::generate(project, epoch, commit.clone(), bytes, &key, 1)
+                .unwrap();
+        Signed {
+            key,
+            pub_key,
+            project,
+            commit,
+            bytes,
+            attestation,
+        }
+    }
+
+    #[test]
+    fn no_trust_anchor_is_refused_and_signature_only_is_labelled_untrusted() {
+        let s = signed_at_epoch(7, 2);
+        let base = AttestationVerificationPolicy::new()
+            .with_project(s.project)
+            .with_commit(s.commit.clone());
+
+        // An empty trust set trusts nobody; it must not accept a self-signed attestation.
+        assert_eq!(
+            verify_state_attestation(&s.attestation, s.bytes, &base),
+            Err(AttestationError::NoTrustAnchor)
+        );
+        // The weaker check has to be asked for, and says what it does not establish.
+        let signature_only = base.clone().with_signature_only();
+        assert_eq!(
+            verify_state_attestation(&s.attestation, s.bytes, &signature_only),
+            Ok(AttestationTrust::SignatureOnly)
+        );
+        // An attestation signed by another key still fails its own signature.
+        let mut forged = s.attestation.clone();
+        forged.signer_key = signed_at_epoch(8, 2).pub_key;
+        assert!(matches!(
+            verify_state_attestation(&forged, s.bytes, &signature_only),
+            Err(AttestationError::SignatureFailed(_))
+        ));
+        // Trust anchors and signature-only are contradictory.
+        assert!(matches!(
+            verify_state_attestation(
+                &s.attestation,
+                s.bytes,
+                &signature_only.with_trusted_key(&s.pub_key)
+            ),
+            Err(AttestationError::InconsistentPolicy(_))
+        ));
+        // A trusted key does give an authority verdict.
+        assert_eq!(
+            verify_state_attestation(&s.attestation, s.bytes, &base.with_trusted_key(&s.pub_key)),
+            Ok(AttestationTrust::Authority)
+        );
+    }
+
+    #[test]
+    fn a_trusted_key_is_only_trusted_in_its_own_epochs() {
+        let s = signed_at_epoch(7, 5);
+        let policy = |from: u32, until: Option<u32>| {
+            AttestationVerificationPolicy::new()
+                .with_project(s.project)
+                .with_commit(s.commit.clone())
+                .with_trusted_key_epochs(&s.pub_key, from, until)
+        };
+        assert_eq!(
+            verify_state_attestation(&s.attestation, s.bytes, &policy(5, Some(5))),
+            Ok(AttestationTrust::Authority)
+        );
+        // Not yet active, retired (or revoked), and a window that ends before it starts.
+        for (from, until) in [(6, None), (0, Some(4))] {
+            assert!(
+                matches!(
+                    verify_state_attestation(&s.attestation, s.bytes, &policy(from, until)),
+                    Err(AttestationError::KeyEpochOutsideWindow { epoch: 5, .. })
+                ),
+                "window {from}..{until:?}"
+            );
+        }
+        assert!(matches!(
+            verify_state_attestation(&s.attestation, s.bytes, &policy(7, Some(6))),
+            Err(AttestationError::InconsistentPolicy(_))
+        ));
+        // Global limits that contradict each other are refused rather than ignored.
+        let conflicting = policy(0, None).with_min_epoch(9).with_max_epoch(3);
+        assert!(matches!(
+            verify_state_attestation(&s.attestation, s.bytes, &conflicting),
+            Err(AttestationError::InconsistentPolicy(_))
+        ));
+        // Another key is not made trusted by a window that was meant for this one.
+        let other = AttestationVerificationPolicy::new()
+            .with_project(s.project)
+            .with_trusted_key_epochs(signed_at_epoch(9, 5).pub_key, 0, None);
+        assert!(matches!(
+            verify_state_attestation(&s.attestation, s.bytes, &other),
+            Err(AttestationError::UntrustedKey { .. })
+        ));
+        let _ = &s.key;
+    }
+
+    #[test]
+    fn the_wrong_project_or_commit_never_verifies_even_for_a_trusted_key() {
+        let s = signed_at_epoch(7, 2);
+        let trusted = AttestationVerificationPolicy::new().with_trusted_key(&s.pub_key);
+        assert!(matches!(
+            verify_state_attestation(
+                &s.attestation,
+                s.bytes,
+                &trusted.clone().with_project(uuid::Uuid::new_v4())
+            ),
+            Err(AttestationError::ProjectMismatch { .. })
+        ));
+        assert!(matches!(
+            verify_state_attestation(
+                &s.attestation,
+                s.bytes,
+                &trusted.with_commit(Address::try_from("33".repeat(32)).unwrap())
+            ),
+            Err(AttestationError::CommitMismatch { .. })
+        ));
     }
 }
