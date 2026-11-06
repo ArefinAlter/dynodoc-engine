@@ -587,7 +587,7 @@ async fn detail(
 }
 
 #[derive(Deserialize)]
-struct MergeRequest {
+pub(crate) struct MergeRequest {
     team_seq: i64,
     revision: i64,
     #[serde(default)]
@@ -601,7 +601,7 @@ struct MergeRequest {
 }
 /// An editor merges selected changes. Unselected changes stay open in the request.
 #[utoipa::path(post, path="/documents/{id}/change-requests/{draft_id}/merge", tag="reviews", request_body=Value, params(("id" = Uuid, Path, description = "Document identifier"), ("draft_id" = Uuid, Path, description = "Change request identifier")), responses((status=200, description="Selected changes appended to the team version", body=Value),(status=403, description="Editors merge change requests"),(status=409, description="Resolve overlaps or review newer changes first")))]
-async fn merge(
+pub(crate) async fn merge(
     State(state): State<AppState>,
     Path((id, draft)): Path<(Uuid, Uuid)>,
     auth: AuthContext,
@@ -734,7 +734,7 @@ struct NoteRequest {
     #[serde(default)]
     note: String,
 }
-async fn close_request(
+pub(crate) async fn close_request(
     state: &AppState,
     id: Uuid,
     draft: Uuid,

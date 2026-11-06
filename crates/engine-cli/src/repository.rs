@@ -4234,6 +4234,17 @@ mod tests {
         .unwrap();
         assert_eq!(incr_summary.commits, 2); // c2 and c3 only
         assert_eq!(incr_summary.since, Some(c1.clone()));
+        // Review patch: the CLI's offline verifier fails closed on a delta, so it is never
+        // reported as a verified complete history (audit F-05).
+        let err =
+            super::super::archive_verify(incr_out.clone(), f.project, c3.as_str().to_string())
+                .await
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("incremental archive requires target repository"),
+            "{err}"
+        );
 
         // Assert size reduction
         let full_len = std::fs::metadata(&full_out).unwrap().len();

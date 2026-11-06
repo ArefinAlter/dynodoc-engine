@@ -710,6 +710,11 @@ impl<R: Read> ArchiveReader<R> {
 }
 
 /// Verify an archive stream offline against an expected head and limits without buffering.
+///
+/// For an incremental archive (`summary.since` is `Some`) this checks only the frames the
+/// archive contains: the base and its history are absent, and the header's `since` is a
+/// claim. Callers must not present such a result as a verified complete history; the
+/// staged verifier ([`verify_archive`]) refuses incremental archives without a repository.
 pub fn verify_archive_stream<R: Read>(
     reader: R,
     limits: ArchiveLimits,
