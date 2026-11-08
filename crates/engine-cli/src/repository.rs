@@ -498,7 +498,7 @@ pub enum Action {
     Join {
         #[arg(long)]
         from: String,
-        /// DOCUMENT_UUID:PARENT_NODE[:POSITION]
+        /// DOCUMENT_UUID:PARENT_NODE, or DOCUMENT_UUID:PARENT_NODE:POSITION
         #[arg(long)]
         into: String,
         #[arg(long)]

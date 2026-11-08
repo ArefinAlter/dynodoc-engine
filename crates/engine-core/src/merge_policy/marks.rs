@@ -16,7 +16,7 @@
 //! * Unknown mark kinds are kept verbatim and compared by their JSON.
 //!
 //! As a strategy it decides an array of marks (rule `match.aspect: marks`). Text
-//! strategies call [`merge_meta`] for each run of text both sides kept.
+//! strategies call `merge_meta` for each run of text both sides kept.
 
 use super::{
     strategy::{Context, Inputs, Laws, ParamSpec, ParamType, Reason, Resolved, Strategy},

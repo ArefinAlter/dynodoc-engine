@@ -4,7 +4,7 @@
 //! No protocol code lives here: the web tier speaks OpenID Connect and SCIM 2.0 and calls these
 //! generic routes. What this module enforces, whatever the web tier sends:
 //!
-//! - **Sign-in by an identity provider** ([`external_sign_in`], reached through `/auth/exchange`
+//! - **Sign-in by an identity provider** (`external_sign_in`, reached through `/auth/exchange`
 //!   with the service key): an account is found by `(provider, issuer, subject)` only (a link
 //!   belongs to the provider that made it, so a second provider claiming the same issuer finds
 //!   nothing); an organisation's provider signs nobody in until it has a verified domain; email
@@ -20,7 +20,7 @@
 //!   changed or removed; manual memberships are never touched, `owner` is never granted.
 //! - **The organisation record** (`/admin/organisations`, administrators only): its domains, its
 //!   SCIM tokens (shown once, stored as SHA-256) and the AI-agent policy and kill switch that
-//!   [`crate::auth::agent::verify_current`] reads on every agent request.
+//!   `crate::auth::agent::verify_current` reads on every agent request.
 
 use axum::{
     extract::{Path, Query, State},

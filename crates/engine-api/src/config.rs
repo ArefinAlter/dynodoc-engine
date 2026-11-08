@@ -34,7 +34,7 @@ pub struct StartupConfig {
     /// `DYNODOC_OBJECT_STORE` and its settings ([`crate::object_store`]).
     pub objects: crate::object_store::ObjectStore,
     /// `REAUTH_MAX_AGE_SECONDS` (default 600, 60 to 86400, or 0 for none): how old a login may
-    /// be for a sensitive action ([`crate::auth::sessions::require_recent_login`]).
+    /// be for a sensitive action (`crate::auth::sessions::require_recent_login`).
     pub reauth_seconds: i64,
 }
 

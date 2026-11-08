@@ -11,7 +11,7 @@
 //! transaction. Foreign keys from every direct reference still refuse a wrong delete.
 //!
 //! The graph walk is streamed (decision 042): the marked and candidate sets live in
-//! transaction-local temporary tables, and the walk reads at most [`CHUNK`] objects at
+//! transaction-local temporary tables, and the walk reads at most `CHUNK` objects at
 //! a time, so memory does not grow with the document's history.
 use engine_core::shared_checkpoint::{self, Address};
 use ring::digest;

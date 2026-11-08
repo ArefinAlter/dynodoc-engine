@@ -136,7 +136,7 @@ pub struct AppState {
     pub fanout: fanout::Fanout,
     /// Where originals and media bytes live (`DYNODOC_OBJECT_STORE`, [`object_store`]).
     pub objects: std::sync::Arc<object_store::ObjectStore>,
-    /// How old a login may be for a sensitive action ([`auth::sessions::require_recent_login`]).
+    /// How old a login may be for a sensitive action (`auth::sessions::require_recent_login`).
     /// `0` (the value of [`AppState::new`]) is off; the binary reads `REAUTH_MAX_AGE_SECONDS`
     /// (default 600).
     pub reauth_seconds: i64,

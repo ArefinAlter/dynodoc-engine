@@ -494,7 +494,7 @@ pub fn seal_with(
     seal_keys_with(pkcs8, None, secret, keystore, kdf, salt, nonce)
 }
 
-/// [`seal_with`] for either format: v2 when `encryption` is given.
+/// `seal_with` for either format: v2 when `encryption` is given.
 pub fn seal_keys_with(
     pkcs8: &[u8],
     encryption: Option<&[u8]>,

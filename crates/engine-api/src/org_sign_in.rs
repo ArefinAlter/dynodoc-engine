@@ -11,9 +11,9 @@
 //!   `IDENTITY_SECRETS_KEY`, else a key derived from the server key), bound to this installation and
 //!   provider row, and never
 //!   returned to a person. Only the web tier, with the service key, receives it to call the
-//!   provider ([`internal_providers`]).
+//!   provider (`internal_providers`).
 //! - Fields the server decides cannot be set: the domains a provider may link or create accounts
-//!   in are the organisation's verified domains (DNS TXT, [`verified`]), never a list from the
+//!   in are the organisation's verified domains (DNS TXT, `verified`), never a list from the
 //!   settings, and an organisation's mapping can neither grant the instance administrator role nor
 //!   target a space the person saving it does not manage.
 

@@ -106,7 +106,7 @@ fn the_native_key_store_holds_the_secret_and_gives_it_back() {
     let public = text(&created.stdout).trim().to_owned();
     assert_eq!(public.len(), 64, "{public}");
     let file = std::fs::read_to_string(&key).unwrap();
-    assert!(file.contains("\"format\": \"dynodoc-key-v1\""), "{file}");
+    assert!(file.contains("\"format\": \"dynodoc-key-v2\""), "{file}");
     assert!(file.contains(provider()), "{file}");
     // Windows keeps the DPAPI blob in the file; the other providers keep nothing.
     assert_eq!(file.contains("\"blob\""), cfg!(windows), "{file}");

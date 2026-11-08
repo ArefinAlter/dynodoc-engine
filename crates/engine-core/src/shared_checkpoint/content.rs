@@ -422,7 +422,7 @@ pub(super) async fn write_with_writer<S: ObjectStore, R: AsyncRead + Unpin + Sen
 /// offsets where a chunk must end (for example where each part of an OPC package
 /// starts and ends), so bytes after them deduplicate by their own content wherever
 /// they sit in the stream. Boundaries and the chunker affect reuse only, never what
-/// is read back. Same caller duties as [`write`].
+/// is read back. Same caller duties as [`write()`].
 pub async fn write_v2<S: ObjectStore, R: AsyncRead + Unpin + Send>(
     store: &mut S,
     document: DocumentId,

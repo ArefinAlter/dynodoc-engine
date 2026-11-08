@@ -190,7 +190,7 @@ pub struct Written {
 }
 
 /// One content value a write must seal, at its position (the write supplies the project,
-/// document and epoch). [`write`] seals these with ring; a browser seals them with Web Crypto
+/// document and epoch). [`write()`] seals these with ring; a browser seals them with Web Crypto
 /// and hands the bytes to [`assemble`] (decision 041).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Leaf {
