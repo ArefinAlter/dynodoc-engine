@@ -9,7 +9,7 @@
 //! can be replayed as the other.
 use super::{hex, unhex, Error};
 use crate::shared_checkpoint::canonical::CanonicalValue;
-use ring::signature::{self, Ed25519KeyPair, KeyPair};
+use ring::signature;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -141,17 +141,17 @@ impl SessionProof {
         authority: Uuid,
         project: Uuid,
         scopes: &[String],
-        key: &Ed25519KeyPair,
+        key: &(impl super::Signer + ?Sized),
     ) -> Result<Self, Error> {
         if challenge.authority != authority
             || challenge.project != project
             || challenge.scopes != normalize_scopes(scopes)?
-            || challenge.public_key != hex(key.public_key().as_ref())
+            || challenge.public_key != hex(&key.public_key_bytes())
         {
             return Err(Error::Invalid("device session scope or key"));
         }
         unhex(&mac, 32)?;
-        let signature = hex(key.sign(&challenge.message()?).as_ref());
+        let signature = hex(&key.sign_message(&challenge.message()?)?);
         Ok(Self {
             challenge,
             mac,
@@ -175,6 +175,7 @@ impl SessionProof {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
 
     fn signer(seed: u8) -> Ed25519KeyPair {
         Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap()

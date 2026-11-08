@@ -367,6 +367,7 @@ fn commit_from(entry: &Value, project: Uuid) -> (Address, Commit) {
         .collect();
     let recovery = addrs(&entry["recovery"]);
     let commit = Commit {
+        sealed: None,
         version: n(&entry["version"]) as u8,
         project,
         parents: addrs(&entry["parents"]),
@@ -379,6 +380,9 @@ fn commit_from(entry: &Value, project: Uuid) -> (Address, Commit) {
             commit: first.clone(),
             mainline: recovery.get(1).cloned(),
         }),
+        project_resolutions: Vec::new(),
+        relocations: Vec::new(),
+        merge_policy: None,
         same_file_resolutions: entry["inputs"]
             .as_array()
             .unwrap()

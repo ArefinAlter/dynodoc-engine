@@ -1870,3 +1870,178 @@ async fn incremental_v3_concurrent_same_revision(pool: PgPool) -> anyhow::Result
     assert_eq!(state_root, p1.root.as_str());
     Ok(())
 }
+
+/// Decision 034: periodic shared-v3 publication writes only the nodes a tail
+/// changed, and the result equals a full v3 write of the replayed state.
+#[sqlx::test(migrations = "../../migrations")]
+async fn changed_node_publication_matches_full_replay(pool: PgPool) -> anyhow::Result<()> {
+    use engine_core::shared_checkpoint::MemoryStore;
+    let (actor, document, root) = seed(&pool).await?;
+    // Events name their node; the node row must exist first.
+    let row = |id: NodeId| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("insert into node(id,document_id,type,pos) values($1,$2,'item','b')")
+                .bind(&id.0)
+                .bind(document.0)
+                .execute(&pool)
+                .await
+        }
+    };
+    let mut ids = Vec::new();
+    for i in 0..300 {
+        let id = NodeId(ulid::Ulid::generate().to_string());
+        row(id.clone()).await?;
+        append(
+            &pool,
+            document,
+            &EventPayload::NodeCreated {
+                node_id: id.clone(),
+                node_type: NodeType::Item,
+                parent_id: Some(root.clone()),
+                pos: format!("b{i:05}"),
+                fields: json!({"label": format!("Paragraph {i}"), "content": {"type":"paragraph","content":[{"type":"text","text":format!("Paragraph {i}")}]}}),
+                var_name: None,
+            },
+            actor,
+        )
+        .await?;
+        ids.push(id);
+    }
+    let engine = SnapshotEngine::new(pool.clone()).with_periodic_storage(PeriodicStorage::SharedV3);
+    engine.ensure_recent(document, 0).await?; // no v3 base yet: a full v3 write
+    let before = object_count(&pool, document).await;
+    let created = NodeId(ulid::Ulid::generate().to_string());
+    row(created.clone()).await?;
+    let tail = [
+        EventPayload::FieldEdited {
+            node_id: ids[3].clone(),
+            field: "label".into(),
+            value: json!("Edited"),
+        },
+        EventPayload::NodeMoved {
+            node_id: ids[4].clone(),
+            new_parent_id: Some(root.clone()),
+            new_pos: "a5".into(),
+        },
+        EventPayload::NodeDeleted {
+            node_id: ids[5].clone(),
+        },
+        EventPayload::NodeCreated {
+            node_id: created,
+            node_type: NodeType::Item,
+            parent_id: Some(root.clone()),
+            pos: "z0".into(),
+            fields: json!({"label": "New"}),
+            var_name: None,
+        },
+    ];
+    for payload in &tail {
+        append(&pool, document, payload, actor).await?;
+    }
+    engine.ensure_recent(document, 0).await?;
+    let seq = 301 + tail.len() as i64;
+    let (codec, root_address): (i16, String) = sqlx::query_as(
+        "select codec_version,state_root from shared_checkpoint where document_id=$1 and through_seq=$2",
+    )
+    .bind(document.0)
+    .bind(seq)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(codec, 3);
+    let events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id=$1 order by seq")
+            .bind(document.0)
+            .fetch_all(&pool)
+            .await?;
+    let replayed = Materializer::fold(&events)?;
+    let (full, _) = postgres::Codec::V3
+        .write(
+            &mut MemoryStore::default(),
+            document,
+            &replayed,
+            Limits::default(),
+        )
+        .await?;
+    assert_eq!(root_address, full.as_str());
+    let mut connection = pool.acquire().await?;
+    let history = read_state_at(&mut connection, document, seq).await?;
+    assert_eq!(history.checkpoint_format, CheckpointFormat::SharedV3);
+    assert_eq!(history.state, replayed);
+    // Four changed nodes, their map path and the state root, not the document.
+    let added = object_count(&pool, document).await - before;
+    assert!(
+        added > 0 && added < 60,
+        "{added} objects for a four-node change"
+    );
+    // A tail with a comment takes the full incremental path, with the same result.
+    append(
+        &pool,
+        document,
+        &EventPayload::CommentAdded {
+            node_id: Some(ids[1].clone()),
+            body: "Check this".into(),
+        },
+        actor,
+    )
+    .await?;
+    let published = postgres::take_changed_v3(&pool, document, seq + 1, Limits::default()).await?;
+    assert!(published.fallback_ran);
+    let history = read_state_at(&mut connection, document, seq + 1).await?;
+    assert_eq!(history.state.comments.len(), 1);
+    Ok(())
+}
+
+/// Decision 034: a periodic shared write over the stored object budget is rolled back
+/// and a legacy checkpoint is kept, instead of failing the caller.
+#[sqlx::test(migrations = "../../migrations")]
+async fn periodic_publication_over_the_object_budget_keeps_a_legacy_checkpoint(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    let defaults: (i64, i64) = sqlx::query_as(
+        "select (select column_default::bigint from information_schema.columns where table_name='checkpoint_storage_document' and column_name='object_limit'),
+                (select column_default::bigint from information_schema.columns where table_name='checkpoint_storage_account' and column_name='object_limit')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(defaults, (16_000_000, 64_000_000));
+    sqlx::query(
+        "insert into checkpoint_storage_account(identity_id) values($1) on conflict do nothing",
+    )
+    .bind(actor.0)
+    .execute(&pool)
+    .await?;
+    sqlx::query("insert into checkpoint_storage_document(document_id,identity_id,object_limit) values($1,$2,3)")
+        .bind(document.0)
+        .bind(actor.0)
+        .execute(&pool)
+        .await?;
+    append(
+        &pool,
+        document,
+        &EventPayload::FieldEdited {
+            node_id: node,
+            field: "label".into(),
+            value: json!("Over budget"),
+        },
+        actor,
+    )
+    .await?;
+    SnapshotEngine::new(pool.clone())
+        .with_periodic_storage(PeriodicStorage::SharedV3)
+        .ensure_recent(document, 0)
+        .await?;
+    assert_eq!(
+        object_count(&pool, document).await,
+        0,
+        "the shared write rolled back"
+    );
+    let legacy: i64 =
+        sqlx::query_scalar("select count(*) from snapshot where document_id=$1 and through_seq=2")
+            .bind(document.0)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(legacy, 1);
+    Ok(())
+}

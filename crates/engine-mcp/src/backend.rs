@@ -90,6 +90,29 @@ impl ToolOutput {
 /// Where tool calls go.
 pub trait Backend: Send + Sync + 'static {
     fn call(&self, ctx: CallContext, call: ToolCall) -> impl Future<Output = ToolOutput> + Send;
+
+    /// Open the agent session of a connection that can write (decision 026, source `mcp`):
+    /// its id, or `None` when the service refuses (capture off, no write scope) or this
+    /// backend keeps none. Asked at most once per connection.
+    fn open_session(
+        &self,
+        _ctx: CallContext,
+        _product: String,
+        _version: Option<String>,
+    ) -> impl Future<Output = Option<String>> + Send {
+        async { None }
+    }
+
+    /// Record one turn of `session` with the prompt as the client reports it
+    /// (`prompt_source` `agent`): the turn number, or `None`.
+    fn record_turn(
+        &self,
+        _ctx: CallContext,
+        _session: String,
+        _prompt: String,
+    ) -> impl Future<Output = Option<u64>> + Send {
+        async { None }
+    }
 }
 
 /// A configuration the backend refuses to run with.
@@ -355,7 +378,45 @@ impl<S: Session> HttpBackend<S> {
     }
 }
 
+impl<S: Session> HttpBackend<S> {
+    /// One session request (open or turn) and the value of `key` in its DCT header line.
+    async fn session_call(&self, ctx: &CallContext, plan: Plan, key: &str) -> Option<String> {
+        // The session routes need the write scope, as `propose` does.
+        let call = self.execute(ctx, Tool::Propose, &plan);
+        let output = tokio::time::timeout(self.config.call_deadline, call)
+            .await
+            .ok()?;
+        if output.is_error {
+            tracing::warn!(key, "agent session request refused");
+            return None;
+        }
+        header_pairs(output.text.lines().next().unwrap_or(""))
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+}
+
 impl<S: Session> Backend for HttpBackend<S> {
+    async fn open_session(
+        &self,
+        ctx: CallContext,
+        product: String,
+        version: Option<String>,
+    ) -> Option<String> {
+        let plan = request::session_open(self.config.project, &product, version.as_deref());
+        self.session_call(&ctx, plan, "session")
+            .await
+            .filter(|id| Uuid::parse_str(id).is_ok())
+    }
+
+    async fn record_turn(&self, ctx: CallContext, session: String, prompt: String) -> Option<u64> {
+        let plan = request::session_turn(self.config.project, &session, &prompt).ok()?;
+        self.session_call(&ctx, plan, "turn")
+            .await
+            .and_then(|t| t.parse().ok())
+    }
+
     async fn call(&self, ctx: CallContext, call: ToolCall) -> ToolOutput {
         let ToolCall { tool, mut args } = call;
         // One idempotency key per logical call, chosen here and nowhere else: the plan below

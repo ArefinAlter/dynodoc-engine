@@ -30,8 +30,8 @@ pub struct Digest {
 
 impl Digest {
     pub fn of(value: &Value) -> Self {
-        let canonical = crate::log::canonical_json(value);
-        let sha = ring::digest::digest(&ring::digest::SHA256, &canonical);
+        let canonical = crate::hashing::canonical_json(value);
+        let sha = crate::hashing::sha256(&[&canonical]);
         let text = serde_json::to_string(value).unwrap_or_default();
         let mut preview: String = text.chars().take(PREVIEW_CHARS).collect();
         if text.chars().count() > PREVIEW_CHARS {
@@ -50,6 +50,8 @@ impl Digest {
 pub enum DecisionOutcome {
     /// A strategy produced the value that is in the merged state.
     Merged,
+    /// A strategy kept one side's value; the other is preserved as a loser.
+    Preferred,
     /// Left to a human: the plan carries a conflict (or a structural check does).
     Conflict,
     /// A conflict the caller settled with an explicit resolution.
@@ -86,6 +88,8 @@ pub struct Decision {
     pub base: Digest,
     pub team: Digest,
     pub draft: Digest,
+    /// The value an automatic outcome put in the merged state.
+    pub merged: Option<Digest>,
     /// Information the strategy reported as absent from its output.
     pub lost: Vec<Digest>,
 }
@@ -135,6 +139,9 @@ pub struct MergeEvidence {
     pub shortcuts: Shortcuts,
     pub structural: Vec<StructuralConflict>,
     pub invariants: InvariantReport,
+    /// Values automatic outcomes did not use, written to the merged state as
+    /// suggestions or comments (design 7).
+    pub losers: Vec<super::loser::LostValue>,
 }
 
 /// What to call the two sides in the text rendering.
@@ -171,6 +178,7 @@ impl MergeEvidence {
                 preexisting: 0,
                 conflicts: Vec::new(),
             },
+            losers: Vec::new(),
         }
     }
 
@@ -212,6 +220,7 @@ impl MergeEvidence {
             };
             let verdict = match (d.outcome, &d.choice) {
                 (DecisionOutcome::Merged, _) => "merged".to_string(),
+                (DecisionOutcome::Preferred, _) => "preferred (loser kept)".to_string(),
                 (DecisionOutcome::Conflict, _) => "conflict".to_string(),
                 (DecisionOutcome::Legacy, _) => "whole-collection choice".to_string(),
                 (DecisionOutcome::Explicit, Some(c)) => format!("explicit {}", label(c, labels)),

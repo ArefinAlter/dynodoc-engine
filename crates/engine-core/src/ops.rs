@@ -70,6 +70,9 @@ pub enum OpError {
     InvalidWrappedOp(String),
     #[error("invalid discussion: {0}")]
     InvalidDiscussion(String),
+    /// Sealed authorship is appended by the merge itself, never submitted as an op.
+    #[error("ChangeAttributed is recorded by the server at merge and cannot be submitted")]
+    ServerOnly,
 }
 
 /// Validate one operation against the current materialized state.
@@ -229,6 +232,7 @@ pub fn validate_op(state: &DocumentState, op: &EventPayload) -> Result<(), OpErr
         // `Deployed` has no structural precondition here; the referential-integrity
         // gate (docs/16 part 4) is applied in `governance::authorize`.
         EventPayload::Deployed { .. } => Ok(()),
+        EventPayload::ChangeAttributed(_) => Err(OpError::ServerOnly),
     }
 }
 

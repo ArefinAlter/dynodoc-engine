@@ -75,18 +75,45 @@ struct Connection {
     version: Option<String>,
     /// `name/version` of the MCP client, for `X-Dynodoc-Client`.
     client: String,
+    /// `clientInfo.name` and `clientInfo.version`, the product of the agent session.
+    product: Option<(String, Option<String>)>,
+    /// The last prompt the client reported and the turn it was recorded as.
+    turn: Option<(String, u64)>,
 }
 
-/// A trusted host must show the exact tool and validated arguments to a person.
-/// The sink must also bind each decision to its backend project. The agent's own request
-/// or an untrusted MCP client must never implement this decision.
-/// The server asks again for each write and fails closed on denial or timeout.
+/// How long a person has to answer one write before it counts as declined.
+pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
+/// Where a client may put the prompt a write answers: `tools/call` `params._meta`. Recorded
+/// as a turn of the connection's agent session with `prompt_source` `agent` (decision 029).
+pub const PROMPT_META_KEY: &str = "dynodoc/prompt";
+
+/// One write a person is asked to approve: the exact tool and validated arguments that will
+/// be sent, the client's self-description, and for a `propose` the service's dry-run diff.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteRequest<'a> {
+    pub tool: Tool,
+    pub arguments: &'a Map<String, Value>,
+    /// `name/version` the MCP client claims; a claim, shown, never trusted.
+    pub client: &'a str,
+    /// The `dd/1 propose` dry-run answer with `return=diff`; `None` for other tools.
+    pub preview: Option<&'a str>,
+}
+
+/// A trusted host must show the request to a person on a surface the agent cannot reach and
+/// bind each decision to its backend project. The agent's own request, the MCP stream or an
+/// untrusted MCP client must never implement this decision. The server asks again for each
+/// write and fails closed on denial or timeout ([`CONFIRM_TIMEOUT`]).
 pub trait HumanConfirmation: Send + Sync {
     fn confirm<'a>(
         &'a self,
-        tool: Tool,
-        arguments: &'a Map<String, Value>,
+        request: WriteRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
+    /// Run a `propose` as a dry run first, to show its diff. A sink whose service holds every
+    /// write for a person's later confirmation (remote MCP) needs none.
+    fn preview(&self) -> bool {
+        true
+    }
 }
 
 struct Inner<B> {
@@ -94,6 +121,8 @@ struct Inner<B> {
     profile: Profile,
     confirmation: Option<Arc<dyn HumanConfirmation>>,
     connection: Mutex<Connection>,
+    /// The agent session of this connection, opened once (decisions 026 and 029).
+    session: tokio::sync::OnceCell<Option<String>>,
 }
 
 /// A JSON-RPC error to send.
@@ -147,7 +176,10 @@ impl<B: Backend> Server<B> {
                 connection: Mutex::new(Connection {
                     version: None,
                     client: String::new(),
+                    product: None,
+                    turn: None,
                 }),
+                session: tokio::sync::OnceCell::new(),
             }),
         }
     }
@@ -219,6 +251,10 @@ impl<B: Backend> Server<B> {
             "ping" => Ok(json!({})),
             "tools/list" => Ok(self.list_tools(&params)),
             "tools/call" => self.call_tool(params).await,
+            "resources/list" => Ok(self.list_resources(&params)),
+            "resources/read" => self.read_resource(params).await,
+            "prompts/list" => Ok(self.list_prompts(&params)),
+            "prompts/get" => self.get_prompt(params).await,
             _ => Err(failure(rpc::METHOD_NOT_FOUND, "Method not found")),
         }
     }
@@ -239,7 +275,11 @@ impl<B: Backend> Server<B> {
     }
 
     fn capabilities(&self) -> Value {
-        json!({ "tools": { "listChanged": false } })
+        json!({
+            "tools": { "listChanged": false },
+            "resources": { "subscribe": false, "listChanged": false },
+            "prompts": { "listChanged": false }
+        })
     }
 
     fn initialize(&self, params: &Value) -> Result<Value, Failure> {
@@ -263,6 +303,15 @@ impl<B: Backend> Server<B> {
             let mut connection = self.connection();
             connection.version = Some(agreed.to_owned());
             connection.client = client;
+            connection.product =
+                part("name").map(|n| (n.to_owned(), part("version").map(str::to_owned)));
+        }
+        // A connection that can propose opens its agent session now, beside the handshake;
+        // a write waits for it. A read-only connection has none (the route needs the write
+        // scope).
+        if self.writes() {
+            let server = self.clone();
+            tokio::spawn(async move { server.session().await });
         }
         Ok(json!({
             "protocolVersion": agreed,
@@ -316,7 +365,7 @@ impl<B: Backend> Server<B> {
             .and_then(Tool::parse)
             .filter(|t| self.inner.profile.offers(*t))
             .ok_or_else(|| failure(rpc::INVALID_PARAMS, "Unknown tool"))?;
-        let args = match params.remove("arguments") {
+        let mut args = match params.remove("arguments") {
             None | Some(Value::Null) => Map::new(),
             Some(Value::Object(args)) => args,
             Some(_) => {
@@ -326,27 +375,35 @@ impl<B: Backend> Server<B> {
         if let Err(error) = self.inner.profile.validate(tool, &args) {
             return Ok(tool_result(ToolOutput::error(&error)));
         }
-        if tool.is_write() {
-            let approved = match &self.inner.confirmation {
-                Some(sink) => {
-                    tokio::time::timeout(Duration::from_secs(120), sink.confirm(tool, &args))
-                        .await
-                        .unwrap_or(false)
-                }
-                None => false,
-            };
-            if !approved {
-                return Ok(tool_result(ToolOutput::error(&ToolError::new(
-                    "policy_denied",
-                ))));
+        // A dry run stores nothing, so it is not asked about; it is what the person is shown.
+        let dry_run = tool == Tool::Propose && args.get("dry_run") == Some(&Value::Bool(true));
+        if tool.is_write() && !dry_run {
+            if let Err(output) = self.confirm(tool, &args).await {
+                return Ok(tool_result(output));
             }
+            self.link_session(tool, &mut args, &params).await;
         }
-        let ctx = CallContext {
+        let ctx = self.context();
+        Ok(tool_result(
+            self.backend_call(ctx, ToolCall { tool, args }).await,
+        ))
+    }
+
+    fn context(&self) -> CallContext {
+        CallContext {
             client: self.connection().client.clone(),
-        };
+        }
+    }
+
+    /// Can this connection write at all: the full profile and a confirmation sink.
+    fn writes(&self) -> bool {
+        self.inner.profile.writes() && self.inner.confirmation.is_some()
+    }
+
+    async fn backend_call(&self, ctx: CallContext, call: ToolCall) -> ToolOutput {
+        let tool = call.tool;
         let inner = self.inner.clone();
-        let call = ToolCall { tool, args };
-        let output = match tokio::spawn(async move { inner.backend.call(ctx, call).await }).await {
+        match tokio::spawn(async move { inner.backend.call(ctx, call).await }).await {
             Ok(output) => output,
             Err(error) => {
                 tracing::error!(
@@ -356,8 +413,352 @@ impl<B: Backend> Server<B> {
                 );
                 ToolOutput::error(&ToolError::new("internal"))
             }
+        }
+    }
+
+    /// Ask a person about one write. `Err` is the answer to give instead: the person declined
+    /// or did not answer in time, or (for a `propose`) the service's dry run already failed,
+    /// so nobody is asked about a call that cannot succeed.
+    async fn confirm(&self, tool: Tool, args: &Map<String, Value>) -> Result<(), ToolOutput> {
+        let declined =
+            || ToolOutput::error(&ToolError::new("policy_denied").with("policy", "confirmation"));
+        let Some(sink) = self.inner.confirmation.clone() else {
+            return Err(declined());
         };
-        Ok(tool_result(output))
+        let preview = if tool == Tool::Propose && sink.preview() {
+            let mut trial = args.clone();
+            trial.remove("request_id");
+            trial.insert("dry_run".into(), Value::Bool(true));
+            trial.insert("return".into(), json!("diff"));
+            let output = self
+                .backend_call(self.context(), ToolCall { tool, args: trial })
+                .await;
+            if output.is_error {
+                return Err(output);
+            }
+            Some(output.text)
+        } else {
+            None
+        };
+        let client = self.connection().client.clone();
+        let request = WriteRequest {
+            tool,
+            arguments: args,
+            client: &client,
+            preview: preview.as_deref(),
+        };
+        match tokio::time::timeout(CONFIRM_TIMEOUT, sink.confirm(request)).await {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(declined()),
+        }
+    }
+
+    /// The connection's agent session, opened on first use.
+    async fn session(&self) -> Option<String> {
+        self.inner
+            .session
+            .get_or_init(|| async {
+                let (product, version) = self
+                    .connection()
+                    .product
+                    .clone()
+                    .unwrap_or_else(|| ("MCP client".to_owned(), None));
+                let inner = self.inner.clone();
+                let ctx = self.context();
+                tokio::spawn(async move { inner.backend.open_session(ctx, product, version).await })
+                    .await
+                    .ok()
+                    .flatten()
+            })
+            .await
+            .clone()
+    }
+
+    /// Name the connection's session in an approved `propose` or `remember`, and for a
+    /// `propose` the turn of the prompt the client reported, so block blame and memory
+    /// provenance link to them. Added after validation: a model cannot name a session itself.
+    async fn link_session(
+        &self,
+        tool: Tool,
+        args: &mut Map<String, Value>,
+        params: &Map<String, Value>,
+    ) {
+        if !matches!(tool, Tool::Propose | Tool::Remember) {
+            return;
+        }
+        let Some(session) = self.session().await else {
+            return;
+        };
+        args.insert("session".into(), json!(session));
+        let prompt = params
+            .get("_meta")
+            .and_then(|m| m.get(PROMPT_META_KEY))
+            .and_then(Value::as_str)
+            .filter(|p| tool == Tool::Propose && !p.trim().is_empty());
+        let Some(prompt) = prompt else {
+            return;
+        };
+        let known = self
+            .connection()
+            .turn
+            .as_ref()
+            .filter(|(last, _)| last == prompt)
+            .map(|(_, turn)| *turn);
+        let turn = match known {
+            Some(turn) => Some(turn),
+            None => {
+                let inner = self.inner.clone();
+                let (ctx, s, p) = (self.context(), session, prompt.to_owned());
+                let turn = tokio::spawn(async move { inner.backend.record_turn(ctx, s, p).await })
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(turn) = turn {
+                    self.connection().turn = Some((prompt.to_owned(), turn));
+                }
+                turn
+            }
+        };
+        if let Some(turn) = turn {
+            args.insert("turn".into(), json!(turn));
+        }
+    }
+
+    fn list_resources(&self, _params: &Value) -> Value {
+        json!({
+            "resources": [
+                {
+                    "uri": "dynodoc://schema/document-ir",
+                    "name": "Document Event & Block IR Schema",
+                    "description": "JSON Schema describing Dynodoc's tamper-evident SHA-256 hash-chained revisions, structured paragraph/cell blocks, and event records.",
+                    "mimeType": "application/schema+json"
+                },
+                {
+                    "uri": "dynodoc://schema/change-request",
+                    "name": "Change Request & Review Workflow Schema",
+                    "description": "JSON Schema for draft reviews, change comments, approval gates, and human-in-the-loop merge requirements.",
+                    "mimeType": "application/schema+json"
+                },
+                {
+                    "uri": "dynodoc://projects",
+                    "name": "Active Repository Catalog",
+                    "description": "Active repository metadata, branch state, and document outline catalog.",
+                    "mimeType": "application/json"
+                }
+            ]
+        })
+    }
+
+    async fn read_resource(&self, params: Value) -> Result<Value, Failure> {
+        let Value::Object(params) = params else {
+            return Err(failure(rpc::INVALID_PARAMS, "params must be an object"));
+        };
+        let uri = params
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| failure(rpc::INVALID_PARAMS, "uri is required"))?;
+
+        let contents = match uri {
+            "dynodoc://schema/document-ir" => json!({
+                "type": "object",
+                "title": "Dynodoc Document Event IR",
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "description": "Tamper-evident SHA-256 hash-chained document revision events.",
+                "properties": {
+                    "document_id": { "type": "string", "format": "uuid" },
+                    "sequence": { "type": "integer", "minimum": 1 },
+                    "chain_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                    "prev_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                    "blocks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "type": { "type": "string", "enum": ["paragraph", "heading", "cell", "slide", "table"] },
+                                "text": { "type": "string" },
+                                "hash": { "type": "string" }
+                            },
+                            "required": ["id", "type", "text"]
+                        }
+                    }
+                },
+                "required": ["document_id", "sequence", "chain_hash", "blocks"]
+            }),
+            "dynodoc://schema/change-request" => json!({
+                "type": "object",
+                "title": "Dynodoc Change Request Workflow",
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "description": "Draft reviews, approval gates, and conflict choices.",
+                "properties": {
+                    "request_number": { "type": "integer" },
+                    "state": { "type": "string", "enum": ["open", "merged", "closed"] },
+                    "source_branch": { "type": "string" },
+                    "target_branch": { "type": "string" },
+                    "author": { "type": "string" },
+                    "reviews": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reviewer": { "type": "string" },
+                                "status": { "type": "string", "enum": ["approved", "changes_requested", "commented"] },
+                                "comments": { "type": "array" }
+                            }
+                        }
+                    }
+                },
+                "required": ["request_number", "state", "source_branch", "target_branch"]
+            }),
+            "dynodoc://projects" => json!({
+                "protocol": PROTOCOL,
+                "profile": self.inner.profile.name(),
+                "server": SERVER_NAME,
+                "access": if self.inner.profile.offers(Tool::Propose) { "propose" } else { "read" },
+                "available_tools": self.inner.profile.tools().iter().map(|t| t.name()).collect::<Vec<_>>(),
+                "supported_formats": ["docx", "xlsx", "pptx", "markdown", "ir"],
+                "status": "ready"
+            }),
+            _ => {
+                return Err(failure(rpc::INVALID_PARAMS, "Resource not found"));
+            }
+        };
+
+        Ok(json!({
+            "contents": [
+                {
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": serde_json::to_string_pretty(&contents).unwrap_or_default()
+                }
+            ]
+        }))
+    }
+
+    fn list_prompts(&self, _params: &Value) -> Value {
+        json!({
+            "prompts": [
+                {
+                    "name": "audit_document_history",
+                    "description": "Inspect tamper-evident SHA-256 event chains, author signatures, and commit records to audit document provenance.",
+                    "arguments": [
+                        { "name": "file", "description": "File name (e.g. Handbook.docx) or UUID to audit", "required": true },
+                        { "name": "branch", "description": "Branch or draft name to inspect (defaults to main)", "required": false }
+                    ]
+                },
+                {
+                    "name": "review_change_request",
+                    "description": "Guided review prompt template to analyze a change request diff, check conflicts, and draft constructive review comments.",
+                    "arguments": [
+                        { "name": "request_number", "description": "Change request number (e.g. 14)", "required": true }
+                    ]
+                },
+                {
+                    "name": "summarize_document_diff",
+                    "description": "Structured prompt template to compare revisions across branches and draft concise release notes.",
+                    "arguments": [
+                        { "name": "file", "description": "File name or UUID", "required": true },
+                        { "name": "from", "description": "Starting revision number", "required": false },
+                        { "name": "to", "description": "Ending revision number", "required": false }
+                    ]
+                }
+            ]
+        })
+    }
+
+    async fn get_prompt(&self, params: Value) -> Result<Value, Failure> {
+        let Value::Object(params) = params else {
+            return Err(failure(rpc::INVALID_PARAMS, "params must be an object"));
+        };
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| failure(rpc::INVALID_PARAMS, "name is required"))?;
+        let args = params.get("arguments").and_then(Value::as_object);
+
+        let (description, text) = match name {
+            "audit_document_history" => {
+                let file = args
+                    .and_then(|a| a.get("file"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("<file>");
+                let branch = args
+                    .and_then(|a| a.get("branch"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("main");
+                (
+                    "Inspect tamper-evident SHA-256 event chains, author signatures, and commit records.",
+                    format!(
+                        "Perform a comprehensive audit of the event history and hash chain for document '{file}' on branch '{branch}'.\n\
+                         1. Call `outline` or `read` to inspect document structure and verified state.\n\
+                         2. Inspect the sequence, author signatures, and chain hash continuity.\n\
+                         3. Report any gaps or verify that the chain hash tip matches the settled revisions."
+                    )
+                )
+            }
+            "review_change_request" => {
+                let req_num = args
+                    .and_then(|a| a.get("request_number"))
+                    .and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
+                    .unwrap_or(1);
+                (
+                    "Guided review prompt template to analyze a change request diff and check conflicts.",
+                    format!(
+                        "Analyze change request #{req_num}.\n\
+                         1. Inspect the change request summary and review state.\n\
+                         2. Call `diff` to inspect structural paragraph and cell changes.\n\
+                         3. Check for conflicting blocks or rules violations.\n\
+                         4. Keep comments concise, specific, and kind. Note: agents propose changes or comments; human reviewers approve and merge."
+                    )
+                )
+            }
+            "summarize_document_diff" => {
+                let file = args
+                    .and_then(|a| a.get("file"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("<file>");
+                let from = args
+                    .and_then(|a| a.get("from"))
+                    .and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
+                    .unwrap_or(0);
+                let to = args
+                    .and_then(|a| a.get("to"))
+                    .and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
+                    .unwrap_or(0);
+                (
+                    "Structured prompt template to compare revisions across branches.",
+                    format!(
+                        "Summarize the changes in '{file}' between revisions {from} and {to}.\n\
+                         1. Call `diff` to compute paragraph, cell, and slide differences.\n\
+                         2. Provide an executive summary of key modifications.\n\
+                         3. Group changes by document headings or sheet sections."
+                    ),
+                )
+            }
+            _ => return Err(failure(rpc::INVALID_PARAMS, "Unknown prompt")),
+        };
+
+        Ok(json!({
+            "description": description,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {
+                        "type": "text",
+                        "text": text
+                    }
+                }
+            ]
+        }))
     }
 }
 

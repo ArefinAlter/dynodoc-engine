@@ -4,13 +4,12 @@ pub mod cache;
 
 use engine_shared::{DocumentId, Event, EventPayload, Snapshot};
 use futures::TryStreamExt;
-use ring::digest::{Context, SHA256};
 use sqlx::{PgConnection, PgPool};
 use tracing::warn;
 
 use crate::{
-    log::{self, ZERO_HASH},
-    materializer::{DocumentState, MaterializeError, MaterializedNode, Materializer},
+    log,
+    materializer::{DocumentState, MaterializeError, Materializer},
     shared_checkpoint::{self, postgres as shared, Limits},
 };
 
@@ -88,6 +87,9 @@ pub enum PeriodicStorage {
     Legacy,
     SharedV1,
     SharedV2,
+    /// Compact v3 with changed-node publication from the previous v3 checkpoint
+    /// (decision 034); a full v3 write when there is none.
+    SharedV3,
 }
 
 /// Storage for named/deployed/public snapshots; the response shape stays legacy.
@@ -362,6 +364,32 @@ impl SnapshotEngine {
         if exists.is_none() {
             return Ok(());
         }
+        if self.periodic_storage == PeriodicStorage::SharedV3 {
+            sqlx::query("savepoint shared_changed")
+                .execute(&mut *tx)
+                .await?;
+            match shared::publish_changed_in_connection(
+                &mut tx,
+                document_id,
+                seq,
+                Limits::default(),
+            )
+            .await
+            {
+                Ok(Some(_)) => {
+                    tx.commit().await?;
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(error) if over_budget(&error) => {
+                    warn!(document_id=%document_id.0, through_seq=seq, %error, "changed-node publication over budget; writing in full");
+                }
+                Err(error) => return Err(error.into()),
+            }
+            sqlx::query("rollback to savepoint shared_changed")
+                .execute(&mut *tx)
+                .await?;
+        }
         if self.periodic_storage != PeriodicStorage::Legacy {
             let state = read_state_at(&mut tx, document_id, seq).await?.state;
             let chain = shared::chain_at(&mut tx, document_id, seq).await?;
@@ -375,10 +403,10 @@ impl SnapshotEngine {
                 &state,
                 chain.clone(),
                 Limits::default(),
-                if self.periodic_storage == PeriodicStorage::SharedV2 {
-                    shared::Codec::V2
-                } else {
-                    shared::Codec::V1
+                match self.periodic_storage {
+                    PeriodicStorage::SharedV3 => shared::Codec::V3,
+                    PeriodicStorage::SharedV2 => shared::Codec::V2,
+                    _ => shared::Codec::V1,
                 },
             )
             .await
@@ -390,14 +418,14 @@ impl SnapshotEngine {
                     tx.commit().await?;
                     return Ok(());
                 }
-                Err(shared_checkpoint::Error::Limit(reason)) => {
+                Err(error) if over_budget(&error) => {
                     sqlx::query("rollback to savepoint shared_periodic")
                         .execute(&mut *tx)
                         .await?;
                     sqlx::query("release savepoint shared_periodic")
                         .execute(&mut *tx)
                         .await?;
-                    warn!(document_id=%document_id.0, through_seq=seq, reason, "shared checkpoint capacity exceeded; saving legacy checkpoint");
+                    warn!(document_id=%document_id.0, through_seq=seq, %error, "shared checkpoint capacity exceeded; saving legacy checkpoint");
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -429,62 +457,38 @@ impl SnapshotEngine {
     }
 }
 
+/// The snapshot Merkle root; see [`crate::hashing::merkle_root`].
 pub fn merkle_root(state: &DocumentState) -> Result<[u8; 32], SnapshotError> {
-    if state.nodes.is_empty() {
-        return Ok(ZERO_HASH);
-    }
+    Ok(crate::hashing::merkle_root(state)?)
+}
 
-    let mut layer: Vec<[u8; 32]> = state
-        .nodes
-        .values()
-        .map(hash_node)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    while layer.len() > 1 {
-        if layer.len() % 2 == 1 {
-            layer.push(ZERO_HASH);
+/// A per-operation limit or the stored shared-object budget (migration 0034): the
+/// shared write is rolled back and a legacy checkpoint is kept instead.
+fn over_budget(error: &shared_checkpoint::Error) -> bool {
+    match error {
+        shared_checkpoint::Error::Limit(_) => true,
+        shared_checkpoint::Error::Db(sqlx::Error::Database(db)) => {
+            db.code().as_deref() == Some("23514")
+                && db.constraint() == Some("checkpoint_storage_quota")
         }
-
-        layer = layer
-            .chunks(2)
-            .map(|pair| {
-                let mut ctx = Context::new(&SHA256);
-                ctx.update(&[0x01]);
-                ctx.update(&pair[0]);
-                ctx.update(&pair[1]);
-                finish(ctx)
-            })
-            .collect();
+        _ => false,
     }
-
-    Ok(layer[0])
 }
 
-fn hash_node(node: &MaterializedNode) -> Result<[u8; 32], serde_json::Error> {
-    let value = serde_json::to_value(node)?;
-    let canonical = log::canonical_json(&value);
-    let mut ctx = Context::new(&SHA256);
-    ctx.update(&[0x00]);
-    ctx.update(&canonical);
-    Ok(finish(ctx))
-}
-
-fn finish(ctx: Context) -> [u8; 32] {
-    let digest = ctx.finish();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(digest.as_ref());
-    out
+/// The automatic writer named by `DYNODOC_PERIODIC_CHECKPOINT_STORAGE` (legacy by default).
+pub fn periodic_storage() -> PeriodicStorage {
+    match std::env::var("DYNODOC_PERIODIC_CHECKPOINT_STORAGE").as_deref() {
+        Ok("shared-v1") => PeriodicStorage::SharedV1,
+        Ok("shared-v2") => PeriodicStorage::SharedV2,
+        Ok("shared-v3") => PeriodicStorage::SharedV3,
+        _ => PeriodicStorage::Legacy,
+    }
 }
 
 /// Spawn a best-effort background `ensure_recent` task after a successful append.
 pub fn spawn_ensure_recent(pool: PgPool, document_id: DocumentId, max_events_in_tail: i64) {
     tokio::spawn(async move {
-        let storage = match std::env::var("DYNODOC_PERIODIC_CHECKPOINT_STORAGE").as_deref() {
-            Ok("shared-v1") => PeriodicStorage::SharedV1,
-            Ok("shared-v2") => PeriodicStorage::SharedV2,
-            _ => PeriodicStorage::Legacy,
-        };
-        let engine = SnapshotEngine::new(pool).with_periodic_storage(storage);
+        let engine = SnapshotEngine::new(pool).with_periodic_storage(periodic_storage());
         if let Err(err) = engine.ensure_recent(document_id, max_events_in_tail).await {
             warn!(
                 document_id = %document_id.0,

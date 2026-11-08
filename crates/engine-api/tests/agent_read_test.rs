@@ -1951,15 +1951,18 @@ async fn openapi_describes_every_response(pool: PgPool) {
             p.contains("/agent/") || p.contains("dynodoc-agent") || p.ends_with("/agent/files")
         })
         .collect();
-    // Eleven read paths (this file's), the four of the write half (`agent_write_test`) and
-    // the agent's own list of proposals (`reviewer_proposals_test`).
-    assert_eq!(agent_paths.len(), 16, "{agent_paths:?}");
+    // Eleven read paths (this file's), the four of the write half (`agent_write_test`),
+    // the agent's own list of proposals (`reviewer_proposals_test`), the two session paths
+    // (`agent_session_test`) and memory (`agent_memory_test`).
+    assert_eq!(agent_paths.len(), 19, "{agent_paths:?}");
     for path in &agent_paths {
-        for (_, operation) in paths[*path].as_object().unwrap() {
+        for (method, operation) in paths[*path].as_object().unwrap() {
             assert_eq!(operation["tags"], json!(["agent"]), "{path}");
             if !path.contains("dynodoc-agent") {
                 // Each route names the one scope it needs; the reads need content:read.
-                let scope = if path.ends_with("/propose") {
+                let records = path.contains("/agent/sessions")
+                    || (path.ends_with("/agent/memory") && method == "post");
+                let scope = if path.ends_with("/propose") || records {
                     "content:propose"
                 } else if path.ends_with("/submit") || path.ends_with("/withdraw") {
                     "content:submit"

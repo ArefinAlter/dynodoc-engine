@@ -8,7 +8,11 @@ use crate::repository::Error;
 use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
 
+/// The schema a writable open upgrades to.
 pub const SCHEMA_VERSION: i64 = 3;
+/// Schema 4 (history horizons) is written only by the first horizon apply, never by
+/// an open: an unpruned repository stays readable by schema-3 binaries.
+pub const HORIZON_SCHEMA_VERSION: i64 = 4;
 const CAPACITY: &str = "local repository capacity exceeded";
 const HELP: &str = "local storage capacity; inspect repository storage and explicitly increase limits to retain more history";
 
@@ -85,7 +89,15 @@ fn is_capacity(error: &sqlx::Error) -> bool {
 /// Schemas this build opens. A client that predates a number rejects it, exactly
 /// as the schema-1-only clients reject 2 and the schema-2 clients reject 3.
 pub(super) fn supported(version: i64) -> bool {
-    (1..=SCHEMA_VERSION).contains(&version)
+    (1..=HORIZON_SCHEMA_VERSION).contains(&version)
+}
+
+/// Schema 3 -> 4: horizon, skeleton, frontier and released-state tables.
+pub(super) async fn upgrade_horizons(connection: &mut SqliteConnection) -> Result<(), Error> {
+    sqlx::raw_sql(include_str!("storage_v4.sql"))
+        .execute(connection)
+        .await?;
+    Ok(())
 }
 
 /// Schema 1 -> 2.

@@ -29,7 +29,8 @@ pub enum Action {
     Keygen {
         #[arg(long)]
         out: PathBuf,
-        /// Encrypt the key file (dynodoc-key-v1). The passphrase comes from
+        /// Encrypt the key file (dynodoc-key-v2: the signing key and a separate, random
+        /// device encryption key for encrypted projects). The passphrase comes from
         /// --passphrase-file, DYNODOC_KEY_PASSPHRASE_FILE or a hidden prompt (asked
         /// twice); it is never accepted as an argument.
         #[arg(long)]
@@ -79,6 +80,27 @@ pub enum Action {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Give a dynodoc-key-v1 file a separate encryption key: rewrite it as
+    /// dynodoc-key-v2 under the same passphrase or OS key store. Both public keys stay
+    /// the same (the encryption key it derived from the signing key is carried over), so
+    /// nothing needs enrolling again; from then on each key can be rotated alone.
+    UpgradeKey {
+        key: PathBuf,
+        /// Write the upgraded copy here and leave KEY untouched.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Replace one key of a dynodoc-key-v2 file and keep the other, under the same
+    /// passphrase. Written to a new file: keep KEY until the new key is enrolled (a new
+    /// signing key: `device prove`; a new encryption key: `e2ee enroll`) and each
+    /// encrypted project has added it.
+    Rotate {
+        key: PathBuf,
+        #[arg(long, value_enum)]
+        which: Which,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Write the unencrypted key back to disk (the opposite of protect). The
     /// private key will again be readable by anyone who can read the file.
     Unprotect {
@@ -96,12 +118,40 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Which key `device rotate` replaces.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Which {
+    Signing,
+    Encryption,
+}
+
+/// A new random device encryption secret.
+fn new_encryption_key() -> anyhow::Result<Secret> {
+    let key = engine_core::e2ee::keys::Key::random().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(Secret::new(key.as_bytes().to_vec()))
+}
+
+/// The encryption key a v1 or plain file has used until now: derived from its signing seed
+/// (decision 035 before dynodoc-key-v2). Carried into v2 so nothing needs enrolling again.
+fn derived_encryption_key(pkcs8: &[u8]) -> anyhow::Result<Secret> {
+    // RFC 8410: both PKCS#8 versions put the 32-byte seed at offset 16.
+    let seed: &[u8; 32] = pkcs8
+        .get(16..48)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid signing key"))?;
+    let key = engine_core::e2ee::grant::DeviceKey::from_signing_seed(seed)
+        .and_then(|k| k.secret())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(Secret::new(key.as_bytes().to_vec()))
+}
+
 /// Encrypt `pkcs8` for storage. `provider` None locks it with a new passphrase;
 /// Some stores a random wrapping secret in that OS keystore. Returns the file
 /// bytes and, when an external keystore entry was created, its provider so a
 /// failed write can remove it again.
 fn container(
     pkcs8: &[u8],
+    encryption: Option<&[u8]>,
     provider: Option<Provider>,
     sources: &Sources,
     label: &str,
@@ -110,7 +160,10 @@ fn container(
     match provider {
         None => {
             let secret = crate::passphrase::create(sources, label)?;
-            Ok((keyfile::seal(pkcs8, secret.as_bytes(), None)?, None))
+            Ok((
+                keyfile::seal_keys(pkcs8, encryption, secret.as_bytes(), None)?,
+                None,
+            ))
         }
         Some(provider) => {
             let secret = keystore::random_secret()?;
@@ -119,7 +172,7 @@ fn container(
                 provider: provider.name().to_owned(),
                 blob: blob.as_deref().map(keystore::encode_blob),
             };
-            match keyfile::seal(pkcs8, secret.as_bytes(), Some(binding)) {
+            match keyfile::seal_keys(pkcs8, encryption, secret.as_bytes(), Some(binding)) {
                 Ok(bytes) => Ok((bytes, (!provider.blob_in_file()).then_some(provider))),
                 Err(error) => {
                     let _ = keystore::forget(provider, &public);
@@ -155,6 +208,7 @@ fn keygen(
     let (bytes, external) = if encrypt {
         container(
             pkcs8.as_bytes(),
+            Some(new_encryption_key()?.as_bytes()),
             provider,
             sources,
             &out.display().to_string(),
@@ -197,6 +251,7 @@ fn protect(
     };
     let (encrypted, external) = container(
         bytes.as_bytes(),
+        Some(derived_encryption_key(bytes.as_bytes())?.as_bytes()),
         provider,
         sources,
         &path.display().to_string(),
@@ -230,7 +285,8 @@ fn rewrap(path: &Path, out: Option<&Path>, sources: &Sources) -> anyhow::Result<
         "{} is bound to an operating-system key store; it has no passphrase to rewrap",
         path.display()
     );
-    let pkcs8 = crate::signing::unlock(&parsed, path, sources)?;
+    let secret = crate::signing::wrapping_secret(&parsed, path, sources)?;
+    let (pkcs8, encryption) = parsed.open_keys(secret.as_bytes())?;
     let public = parsed.public_key().to_owned();
     let replacement = match out {
         Some(_) => None,
@@ -240,13 +296,124 @@ fn rewrap(path: &Path, out: Option<&Path>, sources: &Sources) -> anyhow::Result<
             Some(replacement)
         }
     };
-    let (encrypted, _) = container(pkcs8.as_bytes(), None, sources, &path.display().to_string())?;
+    let (encrypted, _) = container(
+        pkcs8.as_bytes(),
+        encryption.as_ref().map(Secret::as_bytes),
+        None,
+        sources,
+        &path.display().to_string(),
+    )?;
     match (out, replacement) {
         (Some(out), _) => crate::private_file::write_new(out, &encrypted)?,
         (None, Some(replacement)) => replacement.commit(&encrypted)?,
         (None, None) => unreachable!("in-place rewrap always has a replacement"),
     }
     Ok(public)
+}
+
+/// Rewrite an encrypted key file as dynodoc-key-v2 under the same passphrase or key-store
+/// secret, with the keys `change` makes of its signing key and encryption key (None in a v1
+/// file). In place, or into a new `out`. Returns the signing and encryption public keys.
+fn rekey(
+    path: &Path,
+    out: Option<&Path>,
+    sources: &Sources,
+    change: impl FnOnce(Secret, Option<Secret>) -> anyhow::Result<(Secret, Secret)>,
+) -> anyhow::Result<(String, String)> {
+    let bytes = crate::signing::read_key_file(path)?;
+    anyhow::ensure!(
+        keyfile::is_container(&bytes),
+        "{} is not an encrypted key file (encrypt it with `device protect`)",
+        path.display()
+    );
+    let parsed = keyfile::Container::parse(&bytes)?;
+    let secret = crate::signing::wrapping_secret(&parsed, path, sources)?;
+    let (pkcs8, encryption) = parsed.open_keys(secret.as_bytes())?;
+    let (pkcs8, encryption) = change(pkcs8, encryption)?;
+    let public = keyfile::public_key_of(pkcs8.as_bytes())?;
+    let replacement = match out {
+        Some(_) => None,
+        None => {
+            let replacement = crate::private_file::Replacement::prepare(path)?;
+            replacement.keep_mode_of(path);
+            Some(replacement)
+        }
+    };
+    let (sealed, external) = match parsed.keystore() {
+        // A key-store entry is bound to the signing key, so a new signing key gets its own.
+        Some(binding) if public != parsed.public_key() => container(
+            pkcs8.as_bytes(),
+            Some(encryption.as_bytes()),
+            Some(
+                Provider::parse(&binding.provider)
+                    .ok_or_else(|| anyhow::anyhow!("unknown keystore provider"))?,
+            ),
+            sources,
+            &path.display().to_string(),
+        )?,
+        binding => (
+            keyfile::seal_keys(
+                pkcs8.as_bytes(),
+                Some(encryption.as_bytes()),
+                secret.as_bytes(),
+                binding.cloned(),
+            )?,
+            None,
+        ),
+    };
+    let written = match (out, replacement) {
+        (Some(out), _) => crate::private_file::write_new(out, &sealed),
+        (None, Some(replacement)) => replacement.commit(&sealed),
+        (None, None) => unreachable!("in-place rekeying always has a replacement"),
+    };
+    if let Err(error) = written {
+        if let Some(provider) = external {
+            let _ = keystore::forget(provider, &public);
+        }
+        return Err(error);
+    }
+    Ok((
+        public,
+        keyfile::encryption_public_of(encryption.as_bytes())?,
+    ))
+}
+
+/// dynodoc-key-v1 to v2, both keys unchanged.
+fn upgrade(path: &Path, out: Option<&Path>, sources: &Sources) -> anyhow::Result<(String, String)> {
+    rekey(path, out, sources, |pkcs8, encryption| {
+        anyhow::ensure!(
+            encryption.is_none(),
+            "{} is already a dynodoc-key-v2 file",
+            path.display()
+        );
+        let derived = derived_encryption_key(pkcs8.as_bytes())?;
+        Ok((pkcs8, derived))
+    })
+}
+
+/// One new key in a dynodoc-key-v2 file, the other kept.
+fn rotate(
+    path: &Path,
+    which: Which,
+    out: &Path,
+    sources: &Sources,
+) -> anyhow::Result<(String, String)> {
+    rekey(path, Some(out), sources, |pkcs8, encryption| {
+        let encryption = encryption.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} is a dynodoc-key-v1 file; run `device upgrade-key` first",
+                path.display()
+            )
+        })?;
+        Ok(match which {
+            Which::Encryption => (pkcs8, new_encryption_key()?),
+            Which::Signing => {
+                let fresh = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+                    .map_err(|_| anyhow::anyhow!("system random generator failed"))?;
+                (Secret::new(fresh.as_ref().to_vec()), encryption)
+            }
+        })
+    })
 }
 
 /// Decrypt an encrypted key file back to plain DER (in place, or into `out`).
@@ -304,8 +471,8 @@ pub fn run(action: Action) -> anyhow::Result<()> {
             println!("{}", keygen(&out, encrypt, provider, &Sources::current())?);
         }
         Action::PublicKey { key } => {
-            let key = crate::signing::load(&key)?;
-            println!("{}", hex(key.public_key().as_ref()));
+            let key = crate::signing::load_signer(&key)?;
+            println!("{}", hex(&key.public_key_bytes()));
         }
         Action::Prove {
             challenge,
@@ -327,7 +494,8 @@ pub fn run(action: Action) -> anyhow::Result<()> {
                         .as_millis(),
                 "challenge expired; request a fresh challenge"
             );
-            let proof = Proof::sign(challenge, authority, identity, &crate::signing::load(&key)?)?;
+            let signer = crate::signing::load_signer(&key)?;
+            let proof = Proof::sign(challenge, authority, identity, &*signer)?;
             // Never overwrite a key or an unrelated existing file by mistake.
             let file = std::fs::OpenOptions::new()
                 .write(true)
@@ -348,7 +516,7 @@ pub fn run(action: Action) -> anyhow::Result<()> {
             };
             let public = protect(&key, out.as_deref(), provider, &Sources::current())?;
             eprintln!(
-                "The key file is now encrypted (dynodoc-key-v1). Its public key is unchanged:"
+                "The key file is now encrypted (dynodoc-key-v2). Its public key is unchanged:"
             );
             println!("{public}");
         }
@@ -358,6 +526,21 @@ pub fn run(action: Action) -> anyhow::Result<()> {
                 "The key file is re-encrypted with the current key derivation. Its public key is unchanged:"
             );
             println!("{public}");
+        }
+        Action::UpgradeKey { key, out } => {
+            let (signing, encryption) = upgrade(&key, out.as_deref(), &Sources::current())?;
+            eprintln!("The key file is now dynodoc-key-v2 with a separate encryption key. Both public keys are unchanged (signing, then encryption):");
+            println!("{signing}\n{encryption}");
+        }
+        Action::Rotate { key, which, out } => {
+            let (signing, encryption) = rotate(&key, which, &out, &Sources::current())?;
+            eprintln!(
+                "{} written with a new {} key; the other key is unchanged. Enroll the new key, then add it to each encrypted project before deleting {} (signing, then encryption):",
+                out.display(),
+                if which == Which::Signing { "signing" } else { "encryption" },
+                key.display()
+            );
+            println!("{signing}\n{encryption}");
         }
         Action::Unprotect {
             key,
@@ -694,5 +877,104 @@ mod tests {
             "hunter2-hunter2",
         ]);
         assert!(attempt.is_err());
+    }
+
+    /// dynodoc-key-v2 (decision 035, OQ-CR-5): a v1 file still opens with the encryption key
+    /// derived from its signing key; `upgrade-key` carries both keys into v2 unchanged; then
+    /// each key rotates without the other, under the same passphrase.
+    #[test]
+    fn v1_still_opens_upgrades_to_v2_and_each_key_rotates_alone() {
+        let dir = dir();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let v1 = dir.join("v1.json");
+        crate::private_file::write_private_test(
+            &v1,
+            keyfile::seal(pkcs8.as_ref(), PASSPHRASE, None).unwrap(),
+        )
+        .unwrap();
+        let old = crate::signing::load_device_keys(&v1, &sources()).unwrap();
+        assert!(old.legacy, "a v1 file derives its encryption key");
+        let signing = public_of(&crate::signing::load_with(&v1, &sources()).unwrap());
+        let encryption = old.encryption.public_hex();
+        assert!(
+            rotate(&v1, Which::Encryption, &dir.join("no.json"), &sources()).is_err(),
+            "rotation needs v2"
+        );
+
+        let v2 = dir.join("v2.json");
+        assert_eq!(
+            upgrade(&v1, Some(&v2), &sources()).unwrap(),
+            (signing.clone(), encryption.clone())
+        );
+        assert!(String::from_utf8(std::fs::read(&v2).unwrap())
+            .unwrap()
+            .contains("\"dynodoc-key-v2\""));
+        let upgraded = crate::signing::load_device_keys(&v2, &sources()).unwrap();
+        assert!(!upgraded.legacy);
+        assert_eq!(upgraded.encryption.public_hex(), encryption);
+        assert!(upgrade(&v2, None, &sources()).is_err(), "already v2");
+
+        // A new encryption key keeps the signing key, and the reverse.
+        let enc = dir.join("enc.json");
+        let (s1, e1) = rotate(&v2, Which::Encryption, &enc, &sources()).unwrap();
+        assert_eq!(s1, signing);
+        assert_ne!(e1, encryption);
+        let sig = dir.join("sig.json");
+        let (s2, e2) = rotate(&enc, Which::Signing, &sig, &sources()).unwrap();
+        assert_ne!(s2, signing);
+        assert_eq!(e2, e1);
+        let rotated = crate::signing::load_device_keys(&sig, &sources()).unwrap();
+        assert_eq!(rotated.encryption.public_hex(), e1);
+        assert_eq!(
+            public_of(&crate::signing::load_with(&sig, &sources()).unwrap()),
+            s2
+        );
+        // The new encryption key is random, not derived from either signing key.
+        assert_ne!(
+            e1,
+            derived_encryption_key(pkcs8.as_ref())
+                .map(|k| keyfile::encryption_public_of(k.as_bytes()).unwrap())
+                .unwrap()
+        );
+        // The rotated file stays under the same passphrase; the original is untouched.
+        assert_eq!(
+            crate::signing::load_device_keys(&v2, &sources())
+                .unwrap()
+                .encryption
+                .public_hex(),
+            encryption
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// New encrypted keys are v2 with a random encryption key; a swapped encryption key or an
+    /// edited v2 label fails with the generic message.
+    #[test]
+    fn encrypted_keygen_writes_v2_and_its_encryption_key_is_authenticated() {
+        let dir = dir();
+        let path = dir.join("new.json");
+        let signing = keygen(&path, true, None, &sources()).unwrap();
+        let keys = crate::signing::load_device_keys(&path, &sources()).unwrap();
+        assert!(!keys.legacy);
+        let text = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        assert!(text.contains(&keys.encryption.public_hex()));
+        assert!(text.contains(&signing));
+        let other =
+            keyfile::encryption_public_of(new_encryption_key().unwrap().as_bytes()).unwrap();
+        for edited in [
+            text.replace(&keys.encryption.public_hex(), &other),
+            text.replace("dynodoc-key-v2", "dynodoc-key-v1"),
+        ] {
+            let error = keyfile::Container::parse(edited.as_bytes())
+                .and_then(|c| c.open_keys(PASSPHRASE))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                error.contains("wrong passphrase") || error.contains("not a valid"),
+                "{error}"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

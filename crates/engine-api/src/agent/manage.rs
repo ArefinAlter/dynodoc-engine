@@ -63,7 +63,15 @@ pub fn router() -> Router<AppState> {
         )
         .route("/projects/{id}/agent-policy/kill", post(kill))
         .route("/projects/{id}/agent-usage", get(usage))
+        .route("/projects/{id}/agent-audit", get(agent_audit))
         .route("/documents/{id}/agent-policy", put(put_file_policy))
+        .route(
+            "/projects/{id}/agent-capture",
+            get(get_capture).put(put_capture),
+        )
+        .merge(super::memory::people_routes())
+        .merge(super::session::people_routes())
+        .merge(super::held::people_routes())
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
 }
 
@@ -621,6 +629,10 @@ async fn kill(
 pub(super) struct UsageQuery {
     from: Option<String>,
     to: Option<String>,
+    /// Only keys of this client kind (from the key's class row, not the client's claim).
+    client_kind: Option<String>,
+    /// Only calls of agents acting for this person.
+    principal: Option<Uuid>,
 }
 
 /// One day of one client claim.
@@ -666,14 +678,16 @@ fn parse_day(raw: &str) -> Result<NaiveDate, ApiError> {
         .and_then(in_range)
 }
 
-#[utoipa::path(operation_id="agent_usage", get, path="/projects/{id}/agent-usage", tag="agent policy", params(("id"=Uuid,Path,description="Project"),("from"=Option<String>,Query,description="First UTC day, YYYY-MM-DD (default: six days before to)"),("to"=Option<String>,Query,description="Last UTC day, inclusive (default: today)")), security(("paseto"=[])), responses((status=200, description="Calls, response bytes and denials of the project's agent grants by UTC day and client claim, from the call ledger (metadata only: no document text, title or request value). The range is at most 31 days and 500 rows", body=UsageView),(status=400, description="Bad date, a year outside 2000 to 2200, from after to, or a range over 31 days"),(status=401, description="Account sign-in required; a device, agent or connector token is refused"),(status=403, description="Not a project owner or manager"),(status=429, description="The caller's management budget (120 a minute, 2 at once) is used up")))]
+#[utoipa::path(operation_id="agent_usage", get, path="/projects/{id}/agent-usage", tag="agent policy", params(("id"=Uuid,Path,description="Project"),("from"=Option<String>,Query,description="First UTC day, YYYY-MM-DD (default: six days before to)"),("to"=Option<String>,Query,description="Last UTC day, inclusive (default: today)"),("client_kind"=Option<String>,Query,description="Only keys of this client kind"),("principal"=Option<Uuid>,Query,description="Only agents acting for this person")), security(("paseto"=[])), responses((status=200, description="Calls, response bytes and denials of the project's agent grants by UTC day and client claim, from the call ledger (metadata only: no document text, title or request value). The range is at most 31 days and 500 rows", body=UsageView),(status=400, description="Bad date, a year outside 2000 to 2200, from after to, or a range over 31 days"),(status=401, description="Account sign-in required; a device, agent or connector token is refused"),(status=403, description="Not a project owner or manager"),(status=429, description="The caller's management budget (120 a minute, 2 at once) is used up")))]
 async fn usage(
     State(state): State<AppState>,
     auth: AuthContext,
     Path(project): Path<Uuid>,
     parsed: Result<Query<UsageQuery>, QueryRejection>,
 ) -> Result<Json<UsageView>, ApiError> {
-    let Query(range) = parsed.map_err(|_| bad("Use from and to as YYYY-MM-DD"))?;
+    let Query(range) =
+        parsed.map_err(|_| bad("Use from and to as YYYY-MM-DD, client_kind and principal"))?;
+    let kind = super::inbox::kind_filter(range.client_kind.as_deref())?;
     let to = match range.to.as_deref() {
         Some(raw) => parse_day(raw)?,
         None => in_range(Utc::now().date_naive())?,
@@ -693,11 +707,13 @@ async fn usage(
     let mut db = state.pool.acquire().await?;
     require_manager(&mut db, project, auth.identity_id).await?;
     let _permit = charge(&state, auth.identity_id)?;
-    let rows: Vec<(NaiveDate, Option<String>, i64, i64, i64, i64)> = sqlx::query_as("select (a.at at time zone 'utc')::date,a.client,count(*)::bigint,coalesce(sum(a.bytes_out),0)::bigint,(count(*) filter (where a.outcome in ('forbidden','policy_denied','budget_exceeded','unauthorized')))::bigint,(count(*) filter (where a.outcome not in ('ok','forbidden','policy_denied','budget_exceeded','unauthorized')))::bigint from agent_call a where a.project_id=$1 and a.at>=($2::date)::timestamp at time zone 'utc' and a.at<(($3::date)+1)::timestamp at time zone 'utc' group by 1,2 order by 1 desc,3 desc,2 nulls last limit $4")
+    let rows: Vec<(NaiveDate, Option<String>, i64, i64, i64, i64)> = sqlx::query_as("select (a.at at time zone 'utc')::date,a.client,count(*)::bigint,coalesce(sum(a.bytes_out),0)::bigint,(count(*) filter (where a.outcome in ('forbidden','policy_denied','budget_exceeded','unauthorized')))::bigint,(count(*) filter (where a.outcome not in ('ok','forbidden','policy_denied','budget_exceeded','unauthorized')))::bigint from agent_call a where a.project_id=$1 and a.at>=($2::date)::timestamp at time zone 'utc' and a.at<(($3::date)+1)::timestamp at time zone 'utc' and ($5::text is null or exists(select 1 from device_key_class c where c.key_id=a.key_id and coalesce(c.client_kind,'device')=$5)) and ($6::uuid is null or a.principal_id=$6) group by 1,2 order by 1 desc,3 desc,2 nulls last limit $4")
         .bind(project)
         .bind(from)
         .bind(to)
         .bind(MAX_USAGE_ROWS as i64 + 1)
+        .bind(kind)
+        .bind(range.principal)
         .fetch_all(&mut *db)
         .await?;
     let truncated = rows.len() > MAX_USAGE_ROWS;
@@ -721,6 +737,68 @@ async fn usage(
             .collect(),
         truncated,
     }))
+}
+
+// --- GET /projects/{id}/agent-audit ---------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AuditQuery {
+    client_kind: Option<String>,
+    principal: Option<Uuid>,
+    offset: Option<i64>,
+    limit: Option<i64>,
+}
+
+/// A uuid inside audit detail text, or null.
+const AS_UUID: &str = "case when {} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then ({})::uuid end";
+
+fn as_uuid(expr: &str) -> String {
+    AS_UUID.replace("{}", expr)
+}
+
+/// What AI agents and the people deciding about them did in a project: the `agent.*` audit
+/// rows and merges of agents' requests, newest first, with the client kind and the person the
+/// agent acted for as the server recorded them, filtered by either. Project owners and
+/// managers only; metadata only (no detail values beyond the two names).
+#[utoipa::path(operation_id="agent_audit", get, path="/projects/{id}/agent-audit", tag="agent policy", params(("id"=Uuid,Path,description="Project"),("client_kind"=Option<String>,Query,description="Only this client kind"),("principal"=Option<Uuid>,Query,description="Only agents acting for this person"),("offset"=Option<i64>,Query,description="0 to 1000"),("limit"=Option<i64>,Query,description="1 to 50, default 25")), security(("paseto"=[])), responses((status=200, description="items {id, action, at, actor {id,name,agent}, resource_id, client_kind, principal {id,name}}, more, offset", body=Value),(status=400, description="Bad filter or page"),(status=401, description="Account sign-in required"),(status=403, description="Not a project owner or manager")))]
+async fn agent_audit(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(project): Path<Uuid>,
+    parsed: Result<Query<AuditQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(q) = parsed
+        .map_err(|_| bad("client_kind, principal, offset and limit are the query parameters"))?;
+    let kind = super::inbox::kind_filter(q.client_kind.as_deref())?;
+    let (offset, limit) = super::inbox::paging(q.offset, q.limit, 25)?;
+    let mut db = state.pool.begin().await?;
+    require_manager(&mut db, project, auth.identity_id).await?;
+    let _permit = charge(&state, auth.identity_id)?;
+    // shortcut: scans agent audit rows by action under a 5 s limit; add an index on
+    // (action, id) when projects keep many thousands of them.
+    sqlx::query("set local statement_timeout='5s'")
+        .execute(&mut *db)
+        .await?;
+    let file = as_uuid("a.detail->>'file'");
+    let key = as_uuid("a.detail->>'key_id'");
+    let principal = as_uuid("coalesce(a.detail->>'principal',a.detail->'agent'->>'principal')");
+    let sql = format!(
+        "select jsonb_build_object('id',x.id,'action',x.action,'at',x.created_at,'actor',jsonb_build_object('id',x.actor_id,'name',case when ac.erased_at is null then ac.display_name end,'agent',exists(select 1 from agent_identity ai where ai.identity_id=x.actor_id)),'resource_id',x.resource_id,'client_kind',x.kind,'principal',case when x.principal is null then null else jsonb_build_object('id',x.principal,'name',(select case when p.erased_at is null then p.display_name end from identity p where p.id=x.principal)) end)          from (select a.*,coalesce(a.detail->>'client_kind',a.detail->'agent'->>'client_kind',(select coalesce(c.client_kind,'device') from device_key_class c where c.key_id={key})) as kind,coalesce({principal},case when a.action like 'agent.held.%' then a.actor_id end) as principal                from operation_audit a                where (a.action like 'agent.%' or (a.action='document.change_request_merged' and a.detail->>'contributor_kind'='agent'))                  and (a.resource_id=$1 or document_project(a.resource_id)=$1 or ({file}) is not null and document_project({file})=$1)) x          left join identity ac on ac.id=x.actor_id          where ($2::text is null or x.kind=$2) and ($3::uuid is null or x.principal=$3)          order by x.id desc limit $5 offset $4"
+    );
+    let mut items: Vec<Value> = sqlx::query_scalar(&sql)
+        .bind(project)
+        .bind(kind)
+        .bind(q.principal)
+        .bind(offset)
+        .bind(limit + 1)
+        .fetch_all(&mut *db)
+        .await?;
+    let more = items.len() as i64 > limit;
+    items.truncate(limit as usize);
+    Ok(Json(
+        json!({"items": items, "more": more, "offset": offset}),
+    ))
 }
 
 // --- PUT /documents/{id}/agent-policy -----------------------------------------------
@@ -827,9 +905,121 @@ async fn put_file_policy(
     }))
 }
 
+// --- capture policy of agent sessions (decision 026) -----------------------------------
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct CaptureBody {
+    /// `off` (no agent sessions), `actions` (sessions and tool calls, no text) or `full`.
+    capture: String,
+    /// Who may read stored prompts: `author` (the person the agent acted for), `reviewers`
+    /// (also the document's reviewers, editors and managers) or `members`.
+    prompt_visibility: String,
+}
+
+async fn capture_view(db: &mut PgConnection, project: Uuid) -> Result<Value, ApiError> {
+    let row: Option<(String, String, i64, DateTime<Utc>)> = sqlx::query_as("select capture,prompt_visibility,revision,updated_at from project_agent_capture where project_id=$1")
+        .bind(project)
+        .fetch_optional(db)
+        .await?;
+    Ok(match row {
+        Some((capture, visibility, revision, at)) => {
+            json!({"capture":capture,"prompt_visibility":visibility,"revision":revision,"configured":true,"updated_at":at})
+        }
+        None => {
+            json!({"capture":"full","prompt_visibility":"author","revision":0,"configured":false})
+        }
+    })
+}
+
+#[utoipa::path(operation_id="agent_capture_get", get, path="/projects/{id}/agent-capture", tag="agent policy", params(("id"=Uuid,Path,description="Project")), security(("paseto"=[])), responses((status=200, description="What agent sessions record in this project (default: full capture, prompts visible to their author). Sets ETag to the revision", body=Value),(status=403, description="Not a project owner or manager")))]
+async fn get_capture(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(project): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let mut db = state.pool.acquire().await?;
+    require_manager(&mut db, project, auth.identity_id).await?;
+    let view = capture_view(&mut db, project).await?;
+    Ok((
+        [
+            (header::ETAG, format!("\"{}\"", view["revision"])),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        Json(view),
+    ))
+}
+
+#[utoipa::path(operation_id="agent_capture_put", put, path="/projects/{id}/agent-capture", tag="agent policy", params(("id"=Uuid,Path,description="Project")), request_body=CaptureBody, security(("paseto"=[])), responses((status=200, description="Saved; audited", body=Value),(status=403, description="Not a project owner or manager"),(status=409, description="The capture policy changed since the revision in If-Match")))]
+async fn put_capture(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(project): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<CaptureBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    if !["off", "actions", "full"].contains(&body.capture.as_str())
+        || !["author", "reviewers", "members"].contains(&body.prompt_visibility.as_str())
+    {
+        return Err(bad(
+            "capture is off, actions or full; prompt_visibility is author, reviewers or members",
+        ));
+    }
+    let expected = if_match(&headers)?;
+    let mut tx = begin(&state).await?;
+    lock_project(&mut tx, project).await?;
+    require_manager(&mut tx, project, auth.identity_id).await?;
+    let _permit = charge(&state, auth.identity_id)?;
+    let before: Option<(String, String, i64)> = sqlx::query_as("select capture,prompt_visibility,revision from project_agent_capture where project_id=$1 for update")
+        .bind(project)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let revision = before.as_ref().map_or(0, |b| b.2);
+    if expected != revision {
+        return Err(ApiError::Conflict {
+            reason: "The capture policy changed since you read it. Reload and try again.".into(),
+        });
+    }
+    sqlx::query("insert into project_agent_capture(project_id,capture,prompt_visibility,updated_by) values($1,$2,$3,$4) on conflict(project_id) do update set capture=excluded.capture,prompt_visibility=excluded.prompt_visibility,revision=project_agent_capture.revision+1,updated_by=excluded.updated_by,updated_at=now()")
+        .bind(project)
+        .bind(&body.capture)
+        .bind(&body.prompt_visibility)
+        .bind(auth.identity_id)
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        auth.identity_id,
+        "project.agent_capture.changed",
+        project,
+        json!({"before":before.map(|b| json!({"capture":b.0,"prompt_visibility":b.1})),"after":{"capture":body.capture,"prompt_visibility":body.prompt_visibility}}),
+    )
+    .await?;
+    let view = capture_view(&mut tx, project).await?;
+    tx.commit().await?;
+    Ok(Json(view))
+}
+
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(get_policy, put_policy, kill, usage, put_file_policy),
+    paths(
+        get_policy,
+        put_policy,
+        kill,
+        usage,
+        agent_audit,
+        put_file_policy,
+        get_capture,
+        put_capture,
+        super::memory::people_list,
+        super::memory::people_write,
+        super::memory::people_edit,
+        super::memory::people_action,
+        super::session::verify_session,
+        super::held::list,
+        super::held::confirm,
+        super::held::decline
+    ),
     components(schemas(
         PolicyBody,
         PolicyView,
@@ -838,7 +1028,8 @@ async fn put_file_policy(
         UsageRow,
         UsageView,
         FilePolicyBody,
-        FilePolicyView
+        FilePolicyView,
+        CaptureBody
     ))
 )]
 pub struct AgentManageApi;

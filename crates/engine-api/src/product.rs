@@ -331,6 +331,7 @@ async fn move_document(
         json!({"space_id":input.space_id,"previous_space_id":previous}),
     )
     .await?;
+    crate::ledger::adopt_project_default(&mut tx, id, auth.identity_id).await?;
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }

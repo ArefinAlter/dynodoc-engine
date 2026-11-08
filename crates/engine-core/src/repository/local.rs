@@ -19,14 +19,18 @@ use std::{
 
 mod collector;
 mod compact;
+mod horizon_apply;
 mod horizon_plan;
 mod pack;
 mod retention;
 mod storage;
 pub use collector::{GcApplyOptions, GcReport};
 pub use compact::{CompactOptions, CompactReport, MAX_BATCH_OBJECTS};
+pub use horizon_apply::{
+    ApplyReport, RehydrateReport, RemoteSkeletonReport, StoredHorizon, VerifyReport,
+};
 pub use retention::{GcPlan, GcPlanOptions, Physical};
-pub use storage::{StorageLimits, StorageUsage, SCHEMA_VERSION};
+pub use storage::{StorageLimits, StorageUsage, HORIZON_SCHEMA_VERSION, SCHEMA_VERSION};
 
 const SCHEMA: &str = "
 create table if not exists local_meta(singleton integer primary key check(singleton=1), version integer not null, project text not null);
@@ -146,17 +150,23 @@ fn decode_commit(
     Ok(signed)
 }
 
+/// A stored body, or [`Error::HistoryPruned`] when a horizon released it (schema 4),
+/// or [`Error::Missing`].
 async fn load_commit(
     connection: &mut SqliteConnection,
     project: uuid::Uuid,
     address: &Address,
 ) -> Result<(SignedCommit, i64), Error> {
-    let (bytes, height): (Vec<u8>, i64) =
+    let row: Option<(Vec<u8>, i64)> =
         sqlx::query_as("select body,height from commits where address=? and length(body)<=1049600")
             .bind(address.as_str())
-            .fetch_optional(connection)
+            .fetch_optional(&mut *connection)
+            .await?;
+    let Some((bytes, height)) = row else {
+        return Err(horizon_apply::pruned(connection, address)
             .await?
-            .ok_or_else(|| Error::Missing(address.clone()))?;
+            .unwrap_or_else(|| Error::Missing(address.clone())));
+    };
     Ok((decode_commit(&bytes, address, project)?, height))
 }
 
@@ -234,12 +244,19 @@ async fn collect_ancestors(
         if found.len() == MAX_ANCESTORS {
             return Err(Error::Limit("ancestor count"));
         }
-        let (commit, _) = load_commit(connection, project, &address).await?;
-        bytes = bytes
-            .checked_sub(commit.commit.bytes()?.len())
-            .ok_or(Error::Limit("ancestor bytes"))?;
-        queue.extend(commit.commit.parents.iter().cloned());
-        found.insert(address, commit.commit.parents);
+        let parents = match load_commit(connection, project, &address).await {
+            Ok((commit, _)) => {
+                bytes = bytes
+                    .checked_sub(commit.commit.bytes()?.len())
+                    .ok_or(Error::Limit("ancestor bytes"))?;
+                commit.commit.parents
+            }
+            // Released history keeps its topology: walk on through the skeleton.
+            Err(Error::HistoryPruned { parents, .. }) => parents,
+            Err(error) => return Err(error),
+        };
+        queue.extend(parents.iter().cloned());
+        found.insert(address, parents);
     }
     Ok(found)
 }
@@ -259,6 +276,81 @@ fn best_common(
         .flat_map(|key| left[key].iter().cloned())
         .collect();
     common.difference(&dominated).cloned().collect()
+}
+
+/// A v4 merge's records must describe its actual parents and their unique merge
+/// base: every recorded state and path is the one those commits hold for the
+/// record's documents, and an edit-follows-move names a relocation made on the side
+/// it follows since the base. The algorithm is not re-run (`verify-merge` does).
+async fn check_project_provenance(
+    connection: &mut SqliteConnection,
+    project: uuid::Uuid,
+    commit: &Commit,
+    parents: &[SignedCommit],
+) -> Result<(), Error> {
+    let [left, right] = parents else {
+        return Err(Error::Invalid("project resolution requires two parents"));
+    };
+    let left_ancestors = collect_ancestors(connection, project, &commit.parents[0]).await?;
+    let right_ancestors = collect_ancestors(connection, project, &commit.parents[1]).await?;
+    let bases = best_common(&left_ancestors, &right_ancestors);
+    let [base_address] = bases.as_slice() else {
+        return Err(Error::Invalid(
+            "project resolution requires a unique merge base",
+        ));
+    };
+    let base = load_commit(connection, project, base_address).await?.0;
+    let base_ancestors = collect_ancestors(connection, project, base_address).await?;
+    let state = |c: &SignedCommit, d: DocumentId| {
+        c.commit
+            .files
+            .values()
+            .find(|f| f.document == d)
+            .map(|f| f.state.clone())
+    };
+    let path = |c: &SignedCommit, d: DocumentId| {
+        c.commit
+            .files
+            .iter()
+            .find(|(_, f)| f.document == d)
+            .map(|(p, _)| p.clone())
+    };
+    for r in &commit.project_resolutions {
+        let mut ok = state(&base, r.document) == r.base
+            && state(left, r.document) == r.left
+            && state(right, r.document) == r.right;
+        if let Some(s) = &r.source {
+            ok &= state(&base, s.document).as_ref() == Some(&s.base)
+                && state(left, s.document) == s.left
+                && state(right, s.document) == s.right;
+        }
+        if let Some(p) = &r.path {
+            ok &= path(&base, r.document).as_deref() == Some(p.base.as_str())
+                && path(left, r.document).as_deref() == Some(p.left.as_str())
+                && path(right, r.document).as_deref() == Some(p.right.as_str());
+        }
+        if let (Some(id), Some(side)) = (&r.relocation, r.follows) {
+            let range = match side {
+                super::project::Parent::Left => &left_ancestors,
+                super::project::Parent::Right => &right_ancestors,
+            };
+            let mut found = false;
+            for address in range.keys().filter(|a| !base_ancestors.contains_key(*a)) {
+                let c = load_commit(connection, project, address).await?.0;
+                if c.commit.relocations.iter().any(|x| x.id == *id) {
+                    found = true;
+                    break;
+                }
+            }
+            ok &= found;
+        }
+        if !ok {
+            return Err(Error::Invalid(
+                "project resolution does not match its parents",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A v3 commit's records must describe its actual parents and their unique merge
@@ -346,7 +438,7 @@ impl LocalRepository {
         Ok(Self {
             pool,
             project,
-            schema: SCHEMA_VERSION,
+            schema: version.max(SCHEMA_VERSION),
             options,
         })
     }
@@ -453,7 +545,7 @@ impl LocalRepository {
         root: &Address,
     ) -> Result<DocumentState, Error> {
         let mut connection = self.pool.acquire().await?;
-        Ok(typed::read_state(
+        let result = typed::read_state(
             &mut Store {
                 connection: &mut connection,
                 read_budget: None,
@@ -464,7 +556,20 @@ impl LocalRepository {
             Limits::default(),
             Default::default(),
         )
-        .await?)
+        .await;
+        match result {
+            Ok(state) => Ok(state),
+            Err(shared_checkpoint::Error::Missing(missing)) => {
+                match horizon_apply::released_state(&mut connection, document, root).await? {
+                    Some(horizon) => Err(Error::ContentPruned {
+                        root: root.clone(),
+                        horizon,
+                    }),
+                    None => Err(shared_checkpoint::Error::Missing(missing).into()),
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Import a signed commit only after all parents and complete file graphs are
@@ -487,17 +592,38 @@ impl LocalRepository {
             .await?;
         let mut height = 0;
         let mut parents = Vec::new();
+        // Attested mode (design section 5.5): a parent whose body a verified horizon
+        // released still gives its height, and the recovery and same-file checks that
+        // need released bodies are skipped. Signature, address, project and every
+        // file state are still verified; the horizon's signer attests the rest.
+        let mut attested = false;
         for parent in &signed.commit.parents {
-            let (loaded, parent_height) = load_commit(&mut tx, self.project, parent).await?;
+            let parent_height = match load_commit(&mut tx, self.project, parent).await {
+                Ok((loaded, parent_height)) => {
+                    parents.push(loaded);
+                    parent_height
+                }
+                Err(Error::HistoryPruned { height, .. }) => {
+                    attested = true;
+                    i64::try_from(height).map_err(|_| Error::Limit("commit height"))?
+                }
+                Err(error) => return Err(error),
+            };
             height = height.max(
                 parent_height
                     .checked_add(1)
                     .ok_or(Error::Limit("commit height"))?,
             );
-            parents.push(loaded);
         }
-        if !signed.commit.same_file_resolutions.is_empty() {
-            check_same_file_provenance(&mut tx, self.project, &signed.commit, &parents).await?;
+        if !signed.commit.same_file_resolutions.is_empty() && !attested {
+            match check_same_file_provenance(&mut tx, self.project, &signed.commit, &parents).await
+            {
+                Ok(()) | Err(Error::HistoryPruned { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if !signed.commit.project_resolutions.is_empty() {
+            check_project_provenance(&mut tx, self.project, &signed.commit, &parents).await?;
         }
         if let Some(source) = &signed.commit.recovery {
             let plan = load_recovery_plan(
@@ -508,19 +634,61 @@ impl LocalRepository {
                 &signed.commit.parents[0],
                 source.mainline.as_ref(),
             )
-            .await?;
-            // A signed source must record the actual selected mainline, including
-            // the automatic sole-parent selection made by local preview commands.
-            if plan.source != *source {
-                return Err(Error::Invalid("recovery mainline must be recorded"));
+            .await;
+            match plan {
+                Ok(plan) => {
+                    // A signed source must record the actual selected mainline, including
+                    // the automatic sole-parent selection made by local preview commands.
+                    if plan.source != *source {
+                        return Err(Error::Invalid("recovery mainline must be recorded"));
+                    }
+                    plan.validate_files(&signed.commit.files)?;
+                }
+                Err(Error::HistoryPruned { .. }) => {}
+                Err(error) => return Err(error),
             }
-            plan.validate_files(&signed.commit.files)?;
+        }
+        // A released state stays released (H8): its objects are not admitted again.
+        for file in signed.commit.files.values() {
+            if let Some(horizon) =
+                horizon_apply::released_state(&mut tx, file.document, &file.state).await?
+            {
+                return Err(Error::ContentPruned {
+                    root: file.state.clone(),
+                    horizon,
+                });
+            }
         }
         let mut store = Store {
             connection: &mut tx,
             read_budget: Some(Limits::default()),
             packed: self.schema >= 3,
         };
+        // A relocation is accepted only if it re-applies to the parent's states.
+        if !signed.commit.relocations.is_empty() {
+            let [parent] = parents.as_slice() else {
+                return Err(Error::Invalid("a relocation commit has one parent"));
+            };
+            let specs: Vec<_> = signed
+                .commit
+                .relocations
+                .iter()
+                .map(super::relocation::Relocation::spec)
+                .collect();
+            let mut states = BTreeMap::new();
+            for f in super::relocation::involved(&parent.commit.files, &specs) {
+                let state = typed::read_state(
+                    &mut store,
+                    f.document,
+                    &f.state,
+                    Limits::default(),
+                    Default::default(),
+                )
+                .await?;
+                states.insert(f.document.0, state);
+            }
+            super::relocation::verify_commit(&parent.commit, &signed.commit, states).await?;
+        }
         for file in signed.commit.files.values() {
             typed::read_state(
                 &mut store,
@@ -531,6 +699,7 @@ impl LocalRepository {
             )
             .await?;
         }
+        horizon_apply::admit_released(&mut tx, &address, height).await?;
         sqlx::query("insert into commits(address,body,height) values(?,?,?) on conflict(address) do nothing")
             .bind(address.as_str()).bind(&bytes).bind(height).execute(&mut *tx).await.map_err(storage::error)?;
         let existing = load_commit(&mut tx, self.project, &address).await?;
@@ -644,7 +813,10 @@ impl LocalRepository {
         })
     }
 
-    async fn ancestors(&self, head: &Address) -> Result<BTreeMap<Address, Vec<Address>>, Error> {
+    pub(crate) async fn ancestors(
+        &self,
+        head: &Address,
+    ) -> Result<BTreeMap<Address, Vec<Address>>, Error> {
         let mut connection = self.pool.acquire().await?;
         collect_ancestors(&mut connection, self.project, head).await
     }
@@ -757,6 +929,8 @@ mod collector_tests;
 #[cfg(test)]
 mod convergence_tests;
 #[cfg(test)]
+mod horizon_apply_tests;
+#[cfg(test)]
 mod horizon_plan_tests;
 #[cfg(test)]
 mod merge_tests;
@@ -766,6 +940,8 @@ mod pack_tests;
 mod retention_tests;
 #[cfg(test)]
 mod storage_tests;
+#[cfg(test)]
+mod xdoc_tests;
 
 #[cfg(test)]
 mod tests {

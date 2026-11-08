@@ -1,0 +1,31 @@
+[package]
+name = "dynodoc-engine-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "The engine's pure core (hashing, fold, operations, three-way merge) for WebAssembly hosts (decision 036)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Paths, not `workspace = true`: only the pure modules, without sqlx, tokio or ring.
+engine-core = { path = "../engine-core", default-features = false }
+engine-shared = { path = "../engine-shared", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+uuid = { workspace = true }
+# Exact pin: the generated JavaScript glue (`wasm-bindgen` command, same version) must match.
+wasm-bindgen = "=0.2.125"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# uuid and ulid can generate identifiers from getrandom. The engine never calls them, but
+# getrandom must still name a source to build for wasm32-unknown-unknown.
+getrandom = { version = "0.4", features = ["wasm_js"] }
+uuid = { workspace = true, features = ["js"] }

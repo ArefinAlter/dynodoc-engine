@@ -270,7 +270,8 @@ pub fn apply_payload(state: &mut DocumentState, payload: &EventPayload) -> Resul
             suggestion.accepted = false;
             suggestion.rejected_reason = Some(reason.clone().unwrap_or_else(|| "rejected".into()));
         }
-        EventPayload::Deployed { .. } => {}
+        // Sealed authorship (decision 038) names events; it changes no node.
+        EventPayload::Deployed { .. } | EventPayload::ChangeAttributed(_) => {}
     }
     Ok(())
 }
@@ -459,7 +460,7 @@ mod tests {
             document_id: DocumentId(Uuid::nil()),
             through_seq: 4,
             state: serde_json::to_value(&prefix).unwrap(),
-            merkle_root: crate::snapshot::merkle_root(&prefix).unwrap().to_vec(),
+            merkle_root: crate::hashing::merkle_root(&prefix).unwrap().to_vec(),
             event_chain_hash: vec![0; 32],
             event_merkle_root: None,
             created_at: chrono::Utc::now(),

@@ -168,6 +168,7 @@ impl LocalRepository {
             });
         }
         let commit = Commit {
+            sealed: None,
             version: if applied.is_empty() { 1 } else { 3 },
             project: self.project(),
             parents: vec![left.clone(), right.clone()],
@@ -176,6 +177,9 @@ impl LocalRepository {
             authored_at_ms,
             message,
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: applied.clone(),
         };
         commit.bytes()?; // Shared identity, namespace and size validation.

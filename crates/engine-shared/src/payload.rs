@@ -101,6 +101,111 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         snapshot_id: Option<SnapshotId>,
     },
+    /// Sealed authorship of an AI agent's merged change request (attribution layer C,
+    /// decision 038). The server appends it in the merge transaction, right after the
+    /// content events it names; no client op, role or route can append one. It changes no
+    /// node, so readers fold it as a no-op, and its fields are covered by `content_hash` and
+    /// the chain like every other event.
+    ChangeAttributed(Box<Attribution>),
+}
+
+/// Who wrote the events of one merged agent change request (decision 038). Ids are the
+/// canonical hyphenated UUIDs; no document text, prompt or model output is carried, so an
+/// erasure never needs to rewrite it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attribution {
+    /// The change request (workspace draft) whose merge appended the events.
+    pub draft_id: String,
+    /// The agent identity that wrote the request.
+    pub agent: String,
+    /// The person the agent acted for.
+    pub principal: String,
+    /// The client product recorded on the agent's key at enrolment (not a model claim).
+    pub client_kind: String,
+    /// The person who merged (also the events' `actor_id`).
+    pub merger: String,
+    /// The first and last seq of the events described: `last_seq` is the seq just before
+    /// this event, and the range starts after the previous seal of the document.
+    pub first_seq: i64,
+    pub last_seq: i64,
+    /// Every seq of the range exactly once, grouped by the turn that produced it.
+    pub parts: Vec<AttributedPart>,
+    /// The agent sessions the parts name, with their turn count and chain head at the merge,
+    /// which ties the session record (decision 029 section 4) to this chain.
+    #[serde(default)]
+    pub sessions: Vec<SealedSession>,
+    /// The people whose approvals counted.
+    #[serde(default)]
+    pub approvals: Vec<String>,
+    /// The merge bypassed the required approvals.
+    #[serde(default)]
+    pub rules_overridden: bool,
+}
+
+/// Events of one origin: an agent session turn, or a person who took the blocks over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttributedPart {
+    /// Ascending, inside the seal's range.
+    pub seqs: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<i32>,
+    /// A person's edit in the draft kept under half of the agent's text, so the blocks
+    /// are this person's (decision 029 section 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person: Option<String>,
+    /// A person edited the agent's text and kept at least half of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_by: Option<String>,
+}
+
+/// An agent session as it stood when the merge sealed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedSession {
+    pub id: String,
+    pub turns: i32,
+    /// Lowercase hex of the session's 32-byte chain head.
+    pub head: String,
+}
+
+impl Attribution {
+    /// The structural rules a verifier checks against the event's own `seq` and the seq of
+    /// the document's previous seal (0 for none): the range ends just before the seal, starts
+    /// after the previous one, and the parts name each seq of it exactly once, ascending.
+    pub fn check(&self, seq: i64, previous_seal: i64) -> Result<(), String> {
+        if self.last_seq != seq - 1 {
+            return Err("the sealed range does not end just before the seal".into());
+        }
+        if self.first_seq <= previous_seal || self.first_seq > self.last_seq {
+            return Err("the sealed range overlaps an earlier seal or is empty".into());
+        }
+        let mut seen = 0i64;
+        let mut all: Vec<i64> = Vec::new();
+        for part in &self.parts {
+            if part.seqs.is_empty() || part.seqs.windows(2).any(|w| w[0] >= w[1]) {
+                return Err("a sealed part is empty or not ascending".into());
+            }
+            if part.person.is_some() && (part.session.is_some() || part.turn.is_some()) {
+                return Err("a part taken over by a person names an agent turn".into());
+            }
+            seen += part.seqs.len() as i64;
+            all.extend(&part.seqs);
+        }
+        all.sort_unstable();
+        all.dedup();
+        let span = self.last_seq - self.first_seq + 1;
+        if seen != span
+            || all.len() as i64 != span
+            || all.first() != Some(&self.first_seq)
+            || all.last() != Some(&self.last_seq)
+        {
+            return Err(
+                "the sealed parts do not name every event of the range exactly once".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl EventPayload {
@@ -123,6 +228,7 @@ impl EventPayload {
             EventPayload::SuggestionAccepted { .. } => EventType::SuggestionAccepted,
             EventPayload::SuggestionRejected { .. } => EventType::SuggestionRejected,
             EventPayload::Deployed { .. } => EventType::Deployed,
+            EventPayload::ChangeAttributed(_) => EventType::ChangeAttributed,
         }
     }
 
@@ -145,7 +251,8 @@ impl EventPayload {
             | EventPayload::CommentReplied { .. }
             | EventPayload::CommentResolved { .. }
             | EventPayload::SuggestionRejected { .. }
-            | EventPayload::Deployed { .. } => None,
+            | EventPayload::Deployed { .. }
+            | EventPayload::ChangeAttributed(_) => None,
         }
     }
 }
@@ -187,5 +294,60 @@ mod tests {
             .event_type(),
             EventType::SuggestionAccepted
         );
+    }
+
+    fn seal(first: i64, last: i64, parts: Vec<Vec<i64>>) -> Attribution {
+        Attribution {
+            draft_id: "d".into(),
+            agent: "a".into(),
+            principal: "p".into(),
+            client_kind: "claude".into(),
+            merger: "m".into(),
+            first_seq: first,
+            last_seq: last,
+            parts: parts
+                .into_iter()
+                .map(|seqs| AttributedPart {
+                    seqs,
+                    session: Some("s".into()),
+                    turn: Some(1),
+                    person: None,
+                    edited_by: None,
+                })
+                .collect(),
+            sessions: Vec::new(),
+            approvals: Vec::new(),
+            rules_overridden: false,
+        }
+    }
+
+    #[test]
+    fn a_seal_names_each_event_of_its_range_once() {
+        assert_eq!(seal(4, 6, vec![vec![4, 6], vec![5]]).check(7, 3), Ok(()));
+        // The range must end just before the seal and start after the previous seal.
+        assert!(seal(4, 6, vec![vec![4, 5, 6]]).check(8, 3).is_err());
+        assert!(seal(3, 6, vec![vec![3, 4, 5, 6]]).check(7, 3).is_err());
+        // Missing, repeated, unordered or outside seqs.
+        assert!(seal(4, 6, vec![vec![4, 5]]).check(7, 0).is_err());
+        assert!(seal(4, 6, vec![vec![4, 5, 6], vec![5]])
+            .check(7, 0)
+            .is_err());
+        assert!(seal(4, 6, vec![vec![5, 4, 6]]).check(7, 0).is_err());
+        assert!(seal(4, 6, vec![vec![4, 5, 7]]).check(7, 0).is_err());
+        assert!(seal(4, 6, vec![vec![]]).check(7, 0).is_err());
+        let mut person = seal(4, 4, vec![vec![4]]);
+        person.parts[0].person = Some("p2".into());
+        assert!(person.check(5, 0).is_err());
+    }
+
+    #[test]
+    fn a_seal_round_trips_internally_tagged() {
+        let p = EventPayload::ChangeAttributed(Box::new(seal(1, 1, vec![vec![1]])));
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["type"], "ChangeAttributed");
+        assert_eq!(json["parts"][0]["turn"], 1);
+        assert_eq!(p.event_type(), EventType::ChangeAttributed);
+        assert_eq!(p.target_node_id(), None);
+        assert_eq!(serde_json::from_value::<EventPayload>(json).unwrap(), p);
     }
 }

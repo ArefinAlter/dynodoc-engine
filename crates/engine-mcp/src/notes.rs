@@ -39,6 +39,7 @@ fn state_note(state: &str) -> &'static str {
         "merged" => "merged by a person after review.",
         "withdrawn" => "withdrawn; nothing is live. A person can still reopen it.",
         "awaiting_person" => "waiting for a person to submit; nothing is live. Tell the user to open the proposal in Dynodoc and submit it.",
+        "held" => "held: nothing is stored yet. The person you act for must confirm it in Dynodoc (Waiting for your confirmation) within 7 days; only then does it go to review. Tell the user.",
         _ => "state not recognised; do not assume anything is live.",
     }
 }
@@ -105,6 +106,14 @@ fn note_for(tool: Tool, text: &str) -> Option<String> {
                 .to_owned(),
             )
         }
+        Tool::Remember => Some(
+            match get("state")? {
+                "proposed" => "proposed: a person accepts this memory before agents see it.",
+                "held" => state_note("held"),
+                _ => "already a memory of this project; nothing was added.",
+            }
+            .to_owned(),
+        ),
         Tool::Status => match get("what")? {
             "proposal" => Some(state_note(get("state")?).to_owned()),
             "access" if get("write_mode") == Some("none") => Some(
@@ -148,6 +157,14 @@ mod tests {
             assert!(
                 said.contains("nothing is live") || said.contains("do not assume"),
                 "{state}: {said}"
+            );
+        }
+        // A remote agent's write is held for its person (decision 029).
+        for tool in [Tool::Propose, Tool::Submit, Tool::Remember] {
+            let said = note(tool, "dd/1 propose state=held held=x").unwrap();
+            assert!(
+                said.contains("nothing is stored yet") && said.contains("confirm it in Dynodoc"),
+                "{tool:?}: {said}"
             );
         }
         // No state word at all (it cannot happen) reads as a draft.

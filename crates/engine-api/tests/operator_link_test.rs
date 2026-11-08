@@ -1675,13 +1675,13 @@ async fn the_reserved_agent_domain_is_refused_by_its_own_guard_even_for_an_exist
 ) {
     let principal = account(&pool, "principal@example.test").await;
     let agent = Uuid::new_v4();
+    // Since schema 117 an agent has no address; the old synthetic one is still refused.
     let email = format!("agent+{agent}@agents.invalid");
     let mut tx = pool.begin().await.unwrap();
     sqlx::query(
-        "insert into identity(id,email,display_name,disabled_at) values($1,$2,'Agent',now())",
+        "insert into identity(id,kind,email,display_name,disabled_at) values($1,'agent',null,'Agent',now())",
     )
     .bind(agent)
-    .bind(&email)
     .execute(&mut *tx)
     .await
     .unwrap();

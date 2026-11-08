@@ -18,7 +18,7 @@ use sqlx::{Connection, PgPool};
 use std::{collections::BTreeMap, time::Duration};
 use uuid::Uuid;
 
-const TARGETS: [&str; 8] = [
+const TARGETS: [&str; 11] = [
     "magic_link",
     "refresh_token",
     "auth_request_window",
@@ -27,6 +27,9 @@ const TARGETS: [&str; 8] = [
     "web_metric",
     "idempotency_key",
     "operator_sign_in_link",
+    "login_session",
+    "mail_outbox",
+    "mcp_http_session",
 ];
 
 async fn new_identity(pool: &PgPool) -> Uuid {
@@ -153,6 +156,47 @@ async fn seed(pool: &PgPool, identity: Uuid) {
     ] {
         sql += &format!("insert into idempotency_key(identity_id,idempotency_key,request_path,response_status,response_body,created_at) values('{identity}','{key}','/x',{status},'{{}}',{created});");
     }
+    // Logins (schema 110): (tag, last used, revoked). Each holds a sealed ID token; H = its ID token
+    // is cleared (over for more than the 7-day window), kept otherwise.
+    for (n, used, revoked) in [
+        (
+            1,
+            "now() - interval '500 days'",
+            "now() - interval '500 days'",
+        ), // P revoked long ago
+        (
+            2,
+            "now() - interval '10 days'",
+            "now() - interval '10 days'",
+        ), // K, H
+        (3, "now() - interval '1 hour'", "now() - interval '1 hour'"), // K revoked just now
+        (4, "now() - interval '500 days'", "null"), // P no live refresh row, unused for long
+        (5, "now() - interval '500 days'", "null"), // K its refresh row 3 is live
+        (6, "now() - interval '20 days'", "null"),  // K, H inside the 400-day record window
+    ] {
+        sql += &format!("insert into login_session(session_id,identity_id,provider,id_token_hint,started_at,last_refresh_at,revoked_at) values({},'{identity}','email',decode('aa','hex'),{used},{used},{revoked});", uuid_tag(n));
+    }
+    sql += &format!(
+        "update refresh_token set session_id={} where token_hash={};",
+        uuid_tag(5),
+        tag(3)
+    );
+    // Mail outbox (schema 111): (tag, sent, failed)
+    for (n, sent, failed) in [
+        (1, "now() - interval '10 days'", "null"), // P sent long ago
+        (2, "now() - interval '1 day'", "null"),   // K sent inside the window
+        (3, "null", "now() - interval '10 days'"), // P given up long ago
+        (4, "null", "null"),                       // K still queued
+    ] {
+        sql += &format!("insert into mail_outbox(id,kind,recipient,subject,text_body,html_body,sent_at,failed_at,created_at) values({},'notice','a@retention.test','','','',{sent},{failed},now() - interval '30 days');", uuid_tag(n));
+    }
+    // Remote MCP sessions (schema 114): (tag, seen)
+    for (n, seen) in [
+        (1, "now() - interval '2 hours'"),    // P idle past the hour
+        (2, "now() - interval '10 minutes'"), // K
+    ] {
+        sql += &format!("insert into mcp_http_session(id_hash,identity_id,key_id,project_id,writes,seen_at) values({},'{identity}',gen_random_uuid(),gen_random_uuid(),false,{seen});", tag(n));
+    }
     sqlx::raw_sql(&sql).execute(pool).await.unwrap();
 }
 
@@ -206,6 +250,10 @@ async fn seed_operator_links(owner: &PgPool, identity: Uuid) {
     sqlx::raw_sql(&sql).execute(owner).await.unwrap();
 }
 
+fn tags_of(table: &str, column: &str) -> String {
+    format!("select get_byte({column},0)::text from {table} order by 1")
+}
+
 async fn survivors(pool: &PgPool, query: &str) -> Vec<String> {
     sqlx::query_scalar(query).fetch_all(pool).await.unwrap()
 }
@@ -250,8 +298,29 @@ async fn only_expired_rows_are_pruned_under_the_restricted_login(pool: PgPool) {
         .unwrap();
     // Table order: magic_link, refresh_token, auth_request_window,
     // device_enrollment_challenge, app_handover_code, web_metric, idempotency_key,
-    // operator_sign_in_link.
-    assert_eq!(outcome, Outcome::Ran([2, 2, 2, 1, 2, 1, 2, 2]));
+    // operator_sign_in_link, login_session, mail_outbox, mcp_http_session.
+    assert_eq!(outcome, Outcome::Ran([2, 2, 2, 1, 2, 1, 2, 2, 2, 2, 1]));
+    assert_eq!(
+        survivors(
+            &runtime.pool,
+            "select right(session_id::text,1) || ':' || (id_token_hint is not null)::text from login_session order by 1"
+        )
+        .await,
+        ["2:false", "3:true", "5:true", "6:false"],
+        "ended logins lose their ID token after the window, their record much later"
+    );
+    assert_eq!(
+        survivors(
+            &runtime.pool,
+            "select right(id::text,1) from mail_outbox order by 1"
+        )
+        .await,
+        ["2", "4"]
+    );
+    assert_eq!(
+        survivors(&runtime.pool, &tags_of("mcp_http_session", "id_hash")).await,
+        ["2"]
+    );
     // The unused links past their time (1 and 2) were marked expired, each with one audit row,
     // before the old one (1) was pruned; the others are as they were.
     assert_eq!(
@@ -271,9 +340,7 @@ async fn only_expired_rows_are_pruned_under_the_restricted_login(pool: PgPool) {
         ["auth.operator_link.expired", "auth.operator_link.expired"]
     );
 
-    let tags = |table: &str, column: &str| {
-        format!("select get_byte({column},0)::text from {table} order by 1")
-    };
+    let tags = tags_of;
     assert_eq!(
         survivors(&runtime.pool, &tags("magic_link", "token_hash")).await,
         ["2", "3", "5"]
@@ -323,7 +390,7 @@ async fn only_expired_rows_are_pruned_under_the_restricted_login(pool: PgPool) {
     let outcome = retention::run_once(&runtime.pool, &config(1000), &stats)
         .await
         .unwrap();
-    assert_eq!(outcome, Outcome::Ran([0; 8]));
+    assert_eq!(outcome, Outcome::Ran([0; 11]));
     // ... and no second audit row for a link that was already swept.
     let swept: i64 = sqlx::query_scalar(
         "select count(*) from operation_audit where action='auth.operator_link.expired'",
@@ -358,7 +425,8 @@ async fn windows_are_configurable(pool: PgPool) {
         .unwrap();
     // A year of grace keeps every auth row except the request windows (always 15
     // minutes) and the 25-hour-old idempotency keys; metrics older than 10 days go.
-    assert_eq!(outcome, Outcome::Ran([0, 0, 2, 0, 0, 2, 2, 0]));
+    // The login record window is at least 400 days; the idle MCP session always goes.
+    assert_eq!(outcome, Outcome::Ran([0, 0, 2, 0, 0, 2, 2, 0, 2, 0, 1]));
     runtime.close().await;
 }
 
@@ -403,7 +471,7 @@ async fn batches_are_bounded_and_the_pass_drains_the_backlog(pool: PgPool) {
     let outcome = retention::run_once(&runtime.pool, &config(10), &Stats::default())
         .await
         .unwrap();
-    assert_eq!(outcome, Outcome::Ran([0, 0, 0, 0, 0, 25, 0, 0]));
+    assert_eq!(outcome, Outcome::Ran([0, 0, 0, 0, 0, 25, 0, 0, 0, 0, 0]));
     // An unknown table name is refused rather than interpolated.
     let mut connection = runtime.pool.acquire().await.unwrap();
     assert!(retention::prune_batch(&mut connection, "event", &cfg)
@@ -541,7 +609,7 @@ async fn only_one_instance_prunes_at_a_time(pool: PgPool) {
     let outcome = retention::run_once(&runtime.pool, &config(1000), &stats)
         .await
         .unwrap();
-    assert_eq!(outcome, Outcome::Ran([0, 0, 0, 0, 0, 40, 0, 0]));
+    assert_eq!(outcome, Outcome::Ran([0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0]));
 
     // Two passes started together: one runs, the other skips, nothing is deleted twice.
     sqlx::raw_sql(expired).execute(&runtime.pool).await.unwrap();
@@ -553,7 +621,7 @@ async fn only_one_instance_prunes_at_a_time(pool: PgPool) {
     let outcomes = [first.unwrap(), second.unwrap()];
     assert!(outcomes.contains(&Outcome::Skipped), "{outcomes:?}");
     assert!(
-        outcomes.contains(&Outcome::Ran([0, 0, 0, 0, 0, 40, 0, 0])),
+        outcomes.contains(&Outcome::Ran([0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0])),
         "{outcomes:?}"
     );
     runtime.close().await;

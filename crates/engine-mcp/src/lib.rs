@@ -137,6 +137,16 @@
 //! 20. **The validator goes deeper.** `ops` items are objects in an array, so the validator now
 //!     checks `properties`, `required` and `additionalProperties: false` at any depth and
 //!     `minItems`, and a failing item is named as `field=<name> op=<index>`.
+//! 21. **A person confirms every write** (decision 029). The write tools are listed only with a
+//!     [`server::HumanConfirmation`] sink. Before a `propose` the server runs it as a dry run
+//!     with `return=diff` and shows the answer; a failing dry run is returned without asking,
+//!     and a `dry_run` call is never asked about. A decline or no answer within
+//!     [`server::CONFIRM_TIMEOUT`] is `policy_denied policy=confirmation`.
+//! 22. **The server keeps the agent session** (decisions 026 and 029). A connection that can
+//!     write opens one at `initialize` ([`Backend::open_session`]); a prompt the client names in
+//!     `params._meta["dynodoc/prompt"]` becomes a turn with `prompt_source` `agent`
+//!     ([`Backend::record_turn`]); approved `propose` and `remember` calls carry `session` (and
+//!     `turn`), added after validation, so a model cannot name one.
 //!
 //! # Verification
 //!

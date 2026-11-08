@@ -16,9 +16,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{
-    random_token, sha256, store, token, AuthError, MAGIC_LINK_TTL_SECONDS, REFRESH_TTL_SECONDS,
-};
+use super::{random_token, sha256, store, token, AuthError, Login, MAGIC_LINK_TTL_SECONDS};
 use crate::AppState;
 
 /// The authenticated caller, extracted from a validated bearer token. A handler that
@@ -80,6 +78,7 @@ pub fn router() -> Router<AppState> {
         .route("/auth/me", get(me))
         .route("/auth/exchange", post(exchange))
         .merge(super::handover::router())
+        .merge(super::sessions::router())
 }
 
 // --- magic link request ---------------------------------------------------------
@@ -107,7 +106,7 @@ async fn magic_link_request(
     Json(req): Json<MagicLinkRequest>,
 ) -> Result<Json<MagicLinkResponse>, AuthError> {
     require_service(&state, &headers)?;
-    if req.email.len() > 254 || !req.email.contains('@') {
+    if req.email.len() > 254 || !req.email.contains('@') || is_service_email(&req.email) {
         return Err(AuthError::Forbidden);
     }
     let rate_key = sha256(req.email.trim().to_lowercase().as_bytes());
@@ -151,46 +150,103 @@ pub struct TokenResponse {
 pub(super) async fn mint_session(
     state: &AppState,
     identity_id: Uuid,
+    login: &Login<'_>,
 ) -> Result<TokenResponse, AuthError> {
     let generation = store::session_generation(&state.pool, identity_id).await?;
-    mint_session_with(state, &state.pool, identity_id, generation)
+    mint_session_with(state, &state.pool, identity_id, generation, login)
         .await
         .map(|(tokens, _)| tokens)
+}
+
+/// The domain of service-account addresses (`svc-<name>@service.invalid`, a reserved name that
+/// can never receive mail). No emailed link is ever issued for one.
+pub const SERVICE_DOMAIN: &str = "service.invalid";
+
+/// Whether `email` is a service-account address.
+pub fn is_service_email(email: &str) -> bool {
+    email
+        .trim()
+        .rsplit_once('@')
+        .is_some_and(|(_, d)| d.trim_end_matches('.').eq_ignore_ascii_case(SERVICE_DOMAIN))
 }
 
 /// A new login for `identity_id` at `generation`, written through `executor` (a pool, or a
 /// transaction that also does other work, as the app hand-over's redeem does). Returns the
 /// tokens and the id of the login (the refresh-token lineage), which an audit row can name.
-pub(super) async fn mint_session_with(
+///
+/// The `login_session` row is written by the same statement as the refresh row, with the
+/// lifetimes of [`super::SessionPolicy`]. A service account (`identity.kind = 'service'`) gets a
+/// login only from the administrators' enrolment route, never from any sign-in.
+pub(crate) async fn mint_session_with(
     state: &AppState,
     executor: impl sqlx::PgExecutor<'_>,
     identity_id: Uuid,
     generation: i64,
+    login: &Login<'_>,
 ) -> Result<(TokenResponse, Uuid), AuthError> {
     let session_id = Uuid::new_v4();
+    let now = Utc::now();
+    let policy = state.session_policy;
+    let absolute = match login.lifetime_seconds {
+        Some(seconds) => Some(now + Duration::seconds(seconds)),
+        None => policy.absolute_end(now),
+    };
+    let refresh_expires = policy.refresh_expiry(now, absolute);
+    let ttl = state
+        .auth
+        .token_ttl_seconds
+        .min((refresh_expires - now).num_seconds().max(1));
     let access_token = token::mint_bound_session(
         &state.auth.paseto_key,
         identity_id,
-        state.auth.token_ttl_seconds,
+        ttl,
         generation,
         Some(session_id),
     )?;
+    let id_token_hint = match login
+        .id_token
+        .filter(|t| !t.is_empty() && t.len() <= 12_000)
+    {
+        Some(id_token) => {
+            let installation = state.installation().await?;
+            Some(
+                crate::identity_secrets::seal(
+                    &state.identity_sealing_key(),
+                    installation,
+                    "login_session",
+                    "id_token_hint",
+                    session_id.as_bytes(),
+                    id_token.as_bytes(),
+                )
+                .map_err(|e| AuthError::TokenMint(e.to_string()))?,
+            )
+        }
+        None => None,
+    };
     let (refresh_plain, refresh_hash) = random_token()?;
-    let refresh_expires = Utc::now() + Duration::seconds(REFRESH_TTL_SECONDS);
-    store::issue_bound_refresh(
-        executor,
-        identity_id,
-        &refresh_hash,
-        refresh_expires,
-        generation,
-        Some(session_id),
-    )
-    .await?;
+    let written = sqlx::query("with r as (insert into refresh_token(identity_id,token_hash,expires_at,session_generation,session_id) select id,$2,$3,$4,$5 from identity where id=$1 and disabled_at is null and session_generation=$4 and (kind='person' or $6='service-enrolment') returning identity_id,session_id) insert into login_session(session_id,identity_id,provider,issuer,subject,idp_session,id_token_hint,auth_time,absolute_expires_at) select session_id,identity_id,$6,$7,$8,$9,$10,$11,$12 from r")
+        .bind(identity_id)
+        .bind(&refresh_hash)
+        .bind(refresh_expires)
+        .bind(generation)
+        .bind(session_id)
+        .bind(login.provider)
+        .bind(login.issuer)
+        .bind(login.subject)
+        .bind(login.idp_session)
+        .bind(id_token_hint)
+        .bind(login.auth_time)
+        .bind(absolute)
+        .execute(executor)
+        .await?;
+    if written.rows_affected() != 1 {
+        return Err(AuthError::TokenInvalid);
+    }
     Ok((
         TokenResponse {
             access_token,
             token_type: "Bearer",
-            expires_in: state.auth.token_ttl_seconds,
+            expires_in: ttl,
             refresh_token: refresh_plain,
         },
         session_id,
@@ -211,7 +267,11 @@ async fn verify(
     Json(req): Json<VerifyRequest>,
 ) -> Result<Json<TokenResponse>, AuthError> {
     match store::consume_magic_link(&state.pool, &sha256(req.token.as_bytes())).await {
-        Ok(identity_id) => Ok(Json(mint_session(&state, identity_id).await?)),
+        Ok(identity_id) => {
+            let tokens = mint_session(&state, identity_id, &Login::plain("email")).await?;
+            join_by_domain(&state, identity_id).await;
+            Ok(Json(tokens))
+        }
         Err(AuthError::MagicLinkInvalid) => {
             Ok(Json(super::operator::redeem(&state, &req.token).await?))
         }
@@ -224,29 +284,40 @@ pub struct RefreshRequest {
     refresh_token: String,
 }
 
-/// Rotate a refresh token and mint a fresh access token.
+/// Rotate a refresh token and mint a fresh access token. The successor's expiry follows the
+/// session policy and never passes the login's absolute cap.
 async fn refresh(
     State(state): State<AppState>,
     Json(req): Json<RefreshRequest>,
 ) -> Result<Json<TokenResponse>, AuthError> {
     let presented = sha256(req.refresh_token.as_bytes());
     let (new_plain, new_hash) = random_token()?;
-    let refresh_expires = Utc::now() + Duration::seconds(REFRESH_TTL_SECONDS);
+    let now = Utc::now();
+    let refresh_expires = state.session_policy.refresh_expiry(now, None);
     let (identity_id, generation, session_id) =
         store::rotate_bound_refresh(&state.pool, &presented, &new_hash, refresh_expires).await?;
+    let expires: DateTime<Utc> =
+        sqlx::query_scalar("select expires_at from refresh_token where token_hash=$1")
+            .bind(&new_hash)
+            .fetch_one(&state.pool)
+            .await?;
+    let ttl = state
+        .auth
+        .token_ttl_seconds
+        .min((expires - now).num_seconds().max(1));
 
     // The successor keeps the session generation of the presented credential.
     let access_token = token::mint_bound_session(
         &state.auth.paseto_key,
         identity_id,
-        state.auth.token_ttl_seconds,
+        ttl,
         generation,
         session_id,
     )?;
     Ok(Json(TokenResponse {
         access_token,
         token_type: "Bearer",
-        expires_in: state.auth.token_ttl_seconds,
+        expires_in: ttl,
         refresh_token: new_plain,
     }))
 }
@@ -258,13 +329,41 @@ async fn refresh(
 #[utoipa::path(post,path="/auth/logout",request_body=RefreshRequest,responses((status=200,description="Login revoked; legacy sessions revoke the account generation",body=serde_json::Value)))]
 pub async fn logout(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<RefreshRequest>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
     if req.refresh_token.len() != 64 || !req.refresh_token.bytes().all(|c| c.is_ascii_hexdigit()) {
         return Ok(Json(serde_json::json!({"ok":true})));
     }
-    store::revoke_login(&state.pool, &sha256(req.refresh_token.as_bytes())).await?;
-    Ok(Json(serde_json::json!({"ok":true})))
+    let ended = store::revoke_login(&state.pool, &sha256(req.refresh_token.as_bytes())).await?;
+    // Only the web tier (service key) learns how the login was made, for RP-initiated logout at
+    // the identity provider; the ID token is opened here and never kept in a cookie.
+    let mut body = serde_json::json!({"ok":true});
+    if let (Some(session), Ok(())) = (ended, require_service(&state, &headers)) {
+        let row: Option<(String, Option<String>, Option<Vec<u8>>)> = sqlx::query_as(
+            "select provider,issuer,id_token_hint from login_session where session_id=$1",
+        )
+        .bind(session)
+        .fetch_optional(&state.pool)
+        .await?;
+        if let Some((provider, issuer, sealed)) = row {
+            let installation = state.installation().await?;
+            let hint = sealed.and_then(|sealed| {
+                crate::identity_secrets::open(
+                    &state.identity_opening_keys(),
+                    installation,
+                    "login_session",
+                    "id_token_hint",
+                    session.as_bytes(),
+                    &sealed,
+                )
+                .and_then(|plain| String::from_utf8(plain).ok())
+            });
+            body["login"] =
+                serde_json::json!({"provider": provider, "issuer": issuer, "id_token_hint": hint});
+        }
+    }
+    Ok(Json(body))
 }
 
 #[derive(Serialize)]
@@ -289,19 +388,33 @@ async fn me(
 
 // Only the web server may exchange a provider-verified identity. This route is
 // unavailable without a configured service credential, including local development.
+// With `external` (an identity provider's validated issuer and subject, and the provider's
+// policy), the account is found by that link, never by email alone ([`crate::directory`]).
 #[derive(Deserialize)]
 struct ExchangeRequest {
     email: String,
     display_name: Option<String>,
+    external: Option<crate::directory::ExternalSignIn>,
 }
 async fn exchange(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<ExchangeRequest>,
-) -> Result<Json<TokenResponse>, AuthError> {
+) -> Result<Json<serde_json::Value>, crate::error::ApiError> {
     require_service(&state, &headers)?;
+    if let Some(external) = req.external {
+        return Ok(Json(
+            crate::directory::external_sign_in(
+                &state,
+                Some(&req.email),
+                req.display_name.as_deref(),
+                external,
+            )
+            .await?,
+        ));
+    }
     if req.email.len() > 254 || !req.email.contains('@') {
-        return Err(AuthError::Forbidden);
+        return Err(AuthError::Forbidden.into());
     }
     let identity = store::upsert_identity(
         &state.pool,
@@ -309,9 +422,20 @@ async fn exchange(
         req.display_name.as_deref(),
     )
     .await?;
-    Ok(Json(mint_session(&state, identity.id.0).await?))
+    let tokens = mint_session(&state, identity.id.0, &Login::plain("google")).await?;
+    join_by_domain(&state, identity.id.0).await;
+    Ok(Json(serde_json::to_value(tokens).map_err(|e| {
+        crate::error::ApiError::Internal(e.to_string())
+    })?))
 }
-pub(super) fn require_service(state: &AppState, headers: &HeaderMap) -> Result<(), AuthError> {
+/// Domain routing (migration 0077) after a sign-in; a failure is logged, never a refused sign-in.
+async fn join_by_domain(state: &AppState, identity: Uuid) {
+    if let Err(error) = crate::org_sign_in::join_by_domain(&state.pool, identity).await {
+        tracing::warn!(%error, "domain routing after sign-in failed");
+    }
+}
+
+pub(crate) fn require_service(state: &AppState, headers: &HeaderMap) -> Result<(), AuthError> {
     match &state.auth.service_key {
         Some(expected) if expected.len() >= 32 && !expected.trim().is_empty() => {
             let presented = headers

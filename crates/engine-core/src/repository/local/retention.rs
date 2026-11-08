@@ -458,9 +458,23 @@ pub(super) async fn analyze(
             ));
         }
     }
+    // Schema 4: an edge into a released commit (local or remote skeleton) ends the
+    // walk there, and a released state has no objects to attribute.
+    let prior = super::horizon_apply::prior(&mut *tx)
+        .await
+        .map_err(|_| Error::Invalid("stored horizon rows"))?;
+    let released_commits: HashSet<[u8; 32]> = prior
+        .skeleton
+        .iter()
+        .chain(&prior.remote)
+        .map(|e| raw(&e.address))
+        .collect::<Result<_, _>>()?;
     for (i, (parents, sources)) in raw_edges.iter().enumerate() {
         let resolve = |list: &[[u8; 32]]| -> Result<Vec<u32>, Error> {
-            list.iter().map(|a| index_of(&nodes, a)).collect()
+            list.iter()
+                .filter(|a| !released_commits.contains(*a))
+                .map(|a| index_of(&nodes, a))
+                .collect()
         };
         let (parents, sources) = (resolve(parents)?, resolve(sources)?);
         nodes[i].parents = parents;
@@ -615,6 +629,15 @@ pub(super) async fn analyze(
         // Phase 1 verified these exact rows in this same snapshot.
         let signed: SignedCommit = serde_json::from_slice(&body)?;
         for file in signed.commit.files.values() {
+            if prior
+                .released
+                .contains(&crate::repository::horizon::StateKey {
+                    document: file.document.0,
+                    state_root: file.state.clone(),
+                })
+            {
+                continue;
+            }
             let root = (file.document.0.as_u128(), raw(&file.state)?);
             let record = if class_of == superseded {
                 Some(&mut dead_objects[0])

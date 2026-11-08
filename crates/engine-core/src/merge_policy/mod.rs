@@ -1,32 +1,43 @@
 //! Merge policy, strategy framework and evidence for the node-conflict design
 //! (`docs/DESIGN-NODE-CONFLICT-RESOLUTION.md`, phases N0 and N1).
 //!
-//! What is built here is a behavioural no-op: the policy `dynodoc.default.v1`
-//! ([`default::policy`]) routes every decision of `workspace_merge::merge` through
-//! strategies that call the existing logic, so
+//! The policy `dynodoc.default.v1` ([`default::policy`]) is a behavioural no-op: it
+//! routes every decision of `workspace_merge::merge` through strategies that call
+//! the existing logic, so
 //! [`workspace_merge::merge_with_policy`](crate::workspace_merge::merge_with_policy)
 //! with it returns the plan `merge` returns, and the evidence says how each
-//! decision was taken. The strategies of N2 onwards (grapheme text, marks, lists
-//! and tables, sheets, slides), loser preservation and review gating are not built.
+//! decision was taken. Phases N2 to N5 add opt-in strategies (grapheme text,
+//! marks, same-shape lists and tables, sheet cells and column shifts, slide
+//! shapes), loser preservation ([`loser`]), the family invariants and the
+//! resolution-set hash that binds a review to the automatic choices ([`review`]).
 //!
 //! * [`policy`]: the `dynodoc.merge-policy.v1` data format, strict loader,
 //!   canonical form and hash.
 //! * [`strategy`]: the [`Strategy`] trait and what it returns.
 //! * [`registry`]: the closed set of strategies a policy may name.
-//! * [`default`], [`collections`]: the strategies that exist.
+//! * [`default`], [`collections`], [`text`], [`marks`], [`block`], [`sheet`],
+//!   [`slide`]: the strategies that exist.
 //! * [`laws`]: the harness that checks a strategy against the laws of design 4.1.
 //! * [`evidence`]: the record of each decision and its deterministic rendering.
 //! * [`invariants`]: the post-merge checks INV-G1 to INV-G8.
 
+pub mod block;
 pub mod collections;
 pub mod default;
 pub(crate) mod engine;
 pub mod evidence;
+pub mod family;
 pub mod invariants;
 pub mod laws;
+pub mod loser;
+pub mod marks;
 pub mod policy;
 pub mod registry;
+pub mod review;
+pub mod sheet;
+pub mod slide;
 pub mod strategy;
+pub mod text;
 
 pub use evidence::MergeEvidence;
 pub use policy::{MergePolicy, PolicyError};

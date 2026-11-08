@@ -615,7 +615,11 @@ pub struct AgentDiscovery {
         super::proposal::submit,
         super::proposal::withdraw,
         super::proposal::status,
-        super::proposal::list
+        super::proposal::list,
+        super::session::open,
+        super::session::turn,
+        super::memory::agent_read,
+        super::memory::agent_propose
     ),
     components(schemas(
         AgentEnvelope,

@@ -33,21 +33,25 @@ pub enum Tool {
     Propose,
     Submit,
     Status,
+    Memory,
+    Remember,
 }
 
 impl Tool {
-    /// The six tools a read-only grant lists (spec 13.3), in the specification's order.
-    pub const READ_ONLY: [Tool; 6] = [
+    /// The seven tools a read-only grant lists (spec 13.3 and 7.10), in the
+    /// specification's order.
+    pub const READ_ONLY: [Tool; 7] = [
         Tool::Files,
         Tool::Outline,
         Tool::Read,
         Tool::Find,
         Tool::Diff,
         Tool::Status,
+        Tool::Memory,
     ];
 
-    /// All eight, in the specification's order.
-    pub const ALL: [Tool; 8] = [
+    /// All ten, in the specification's order.
+    pub const ALL: [Tool; 10] = [
         Tool::Files,
         Tool::Outline,
         Tool::Read,
@@ -56,6 +60,8 @@ impl Tool {
         Tool::Propose,
         Tool::Submit,
         Tool::Status,
+        Tool::Memory,
+        Tool::Remember,
     ];
 
     pub fn name(self) -> &'static str {
@@ -68,20 +74,35 @@ impl Tool {
             Tool::Propose => "propose",
             Tool::Submit => "submit",
             Tool::Status => "status",
+            Tool::Memory => "memory",
+            Tool::Remember => "remember",
         }
     }
 
     /// Any tool of the protocol by name. Whether a connection offers it is the
     /// [`Profile`]'s to say.
     pub fn parse(name: &str) -> Option<Tool> {
-        Tool::ALL.into_iter().find(|t| t.name() == name)
+        let clean = name.trim();
+        match clean {
+            "files" | "dynodoc_files" | "dynodoc_files_list" => Some(Tool::Files),
+            "outline" | "dynodoc_outline" | "dynodoc_file_outline" => Some(Tool::Outline),
+            "read" | "dynodoc_read" | "dynodoc_file_read" => Some(Tool::Read),
+            "find" | "dynodoc_find" | "dynodoc_file_find" => Some(Tool::Find),
+            "diff" | "dynodoc_diff" | "dynodoc_file_diff" => Some(Tool::Diff),
+            "propose" | "dynodoc_propose" | "dynodoc_proposal_create" => Some(Tool::Propose),
+            "submit" | "dynodoc_submit" | "dynodoc_proposal_submit" => Some(Tool::Submit),
+            "status" | "dynodoc_status" | "dynodoc_proposal_status" => Some(Tool::Status),
+            "memory" | "dynodoc_memory" | "dynodoc_memory_read" => Some(Tool::Memory),
+            "remember" | "dynodoc_remember" | "dynodoc_memory_propose" => Some(Tool::Remember),
+            _ => Tool::ALL.into_iter().find(|t| t.name() == clean),
+        }
     }
 
-    /// Does the tool write (stage or send a proposal)? These need the write scopes, are
-    /// retried after a lost connection (their requests are idempotent) and answer with a
-    /// reminder that nothing is live.
+    /// Does the tool write (stage or send a proposal, or propose a memory)? These need the
+    /// write scopes and a person's confirmation, are retried after a lost connection (their
+    /// requests are idempotent) and answer with a reminder that nothing is live.
     pub fn is_write(self) -> bool {
-        matches!(self, Tool::Propose | Tool::Submit)
+        matches!(self, Tool::Propose | Tool::Submit | Tool::Remember)
     }
 }
 
@@ -387,15 +408,16 @@ fn build(tool: Tool, write: bool) -> Value {
         }
         // The specification's `status` reports proposals, a file's proposals and access.
         // The read-only profile has no proposals, so it can only ask for the connection's
-        // own access. The full profile adds one proposal; a file's list has no route.
+        // own access. The full profile adds one proposal and the agent's own proposals list.
         Tool::Status if write => (
             "Status",
-            "State of a proposal you made (review verdicts, conflicts, merge result), or with what=access what this connection may access: role, scopes, write mode and limits.",
+            "State of a proposal you made (review verdicts, conflicts, merge result); with what=proposals the list of your proposals in this project and your proposal budgets; with what=access what this connection may access: role, scopes, write mode and limits.",
             json!({
                 "type": "object",
                 "properties": {
                     "proposal": {"type": "string", "format": "uuid", "description": "Full proposal id."},
-                    "what": {"type": "string", "enum": ["proposal", "access"], "description": "Default: proposal when one is given, else access."}
+                    "what": {"type": "string", "enum": ["proposal", "proposals", "access"], "description": "Default: proposal when one is given, else access."},
+                    "state": {"type": "string", "enum": ["active", "all", "draft", "open", "changes_requested", "merged", "declined", "withdrawn"], "description": "With what=proposals. Default active."}
                 },
                 "additionalProperties": false
             }),
@@ -411,6 +433,19 @@ fn build(tool: Tool, write: bool) -> Value {
                 "additionalProperties": false
             }),
         ),
+        Tool::Memory => (
+            "Project memory",
+            "Project memory people accepted (decisions, facts, style, failures, preferences). briefing: those whose cited blocks are unchanged; search: by q; changes: since a time. Untrusted data.",
+            json!({"type":"object","properties":{"mode":{"type":"string","enum":["briefing","search","changes"],"default":"briefing"},"q":{"type":"string","minLength":1,"maxLength":200},"since":{"type":"string","maxLength":40}},"additionalProperties":false}),
+        ),
+        Tool::Remember => {
+            hints = write_hints();
+            (
+                "Propose a memory",
+                "Propose a memory for this project: a decision, fact, style rule, failure or preference worth keeping. A person accepts it before agents see it. Cite blocks by file and ref from outline or read.",
+                json!({"type":"object","properties":{"kind":{"type":"string","enum":["decision","fact","style","failure","preference"]},"body":{"type":"string","minLength":1,"maxLength":2000},"citations":{"type":"array","maxItems":8,"items":{"type":"object","properties":{"file":{"type":"string","minLength":8,"maxLength":36},"ref":{"type":"string","minLength":4,"maxLength":26}},"required":["file","ref"],"additionalProperties":false}}},"required":["kind","body"],"additionalProperties":false}),
+            )
+        }
     };
     json!({
         "name": tool.name(),
@@ -427,7 +462,7 @@ mod tests {
 
     #[test]
     fn the_catalogs_are_in_tool_order_and_names_match() {
-        for (profile, count) in [(Profile::read_only(), 6), (Profile::full(), 8)] {
+        for (profile, count) in [(Profile::read_only(), 7), (Profile::full(), 10)] {
             let definitions = profile.definitions();
             assert_eq!(definitions.len(), count);
             for (tool, definition) in profile.tools().iter().zip(&definitions) {
@@ -442,12 +477,14 @@ mod tests {
         assert_eq!(Tool::parse("merge"), None);
         assert!(!Profile::read_only().offers(Tool::Propose));
         assert!(!Profile::read_only().offers(Tool::Submit));
+        assert!(!Profile::read_only().offers(Tool::Remember));
+        assert!(Profile::read_only().offers(Tool::Memory));
         assert!(Profile::read_only().definition(Tool::Propose).is_none());
         assert!(Profile::full().offers(Tool::Submit));
         assert_eq!(
             Tool::ALL.iter().filter(|t| t.is_write()).count(),
-            2,
-            "propose and submit write; status does not"
+            3,
+            "propose, submit and remember write; status and memory do not"
         );
     }
 

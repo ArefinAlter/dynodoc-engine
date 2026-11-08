@@ -1,4 +1,5 @@
 //! Dedicated login in the disposable SQLx database; never tests via SET ROLE.
+#![allow(dead_code)]
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
 pub struct RuntimeDatabase {

@@ -30,10 +30,14 @@ pub enum Tool {
     Submit,
     Status,
     Error,
+    /// Shared project memory (decision 026). Ledgered as `status` or `propose`.
+    Memory,
+    /// Agent session records (decision 026). Ledgered as `propose`.
+    Session,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 9] = [
+    pub const ALL: [Tool; 11] = [
         Tool::Files,
         Tool::Outline,
         Tool::Read,
@@ -43,6 +47,8 @@ impl Tool {
         Tool::Submit,
         Tool::Status,
         Tool::Error,
+        Tool::Memory,
+        Tool::Session,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -56,6 +62,8 @@ impl Tool {
             Tool::Submit => "submit",
             Tool::Status => "status",
             Tool::Error => "error",
+            Tool::Memory => "memory",
+            Tool::Session => "session",
         }
     }
 

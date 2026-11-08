@@ -101,7 +101,7 @@ fn encrypted_keys_are_created_loaded_converted_and_never_leak_the_passphrase() {
     let public = text(&created.stdout).trim().to_owned();
     assert_eq!(public.len(), 64, "{public}");
     let file = std::fs::read_to_string(&key).unwrap();
-    assert!(file.contains("\"format\": \"dynodoc-key-v1\""));
+    assert!(file.contains("\"format\": \"dynodoc-key-v2\""));
     assert!(file.contains(&public));
     assert!(!all_output(&created).contains(PASSPHRASE));
 
@@ -284,7 +284,7 @@ fn encrypted_keys_are_created_loaded_converted_and_never_leak_the_passphrase() {
     assert!(in_place.status.success(), "{}", all_output(&in_place));
     assert!(std::fs::read_to_string(&plain_copy)
         .unwrap()
-        .contains("dynodoc-key-v1"));
+        .contains("dynodoc-key-v2"));
     assert_eq!(
         std::fs::read_dir(&dir)
             .unwrap()

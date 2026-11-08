@@ -73,6 +73,52 @@ paths:
           description: Refresh the current revision
       security:
       - paseto: []
+  /admin/e2ee/legacy-erasures:
+    get:
+      tags: []
+      operationId: legacy_erasure_list
+      responses:
+        '200':
+          description: Erasures of legacy plaintext waiting for an administrator
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Administrators only
+      security:
+      - paseto: []
+  /admin/e2ee/legacy-erasures/{id}/confirm:
+    post:
+      tags: []
+      operationId: legacy_erasure_confirm
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: The file's plaintext rows and stored objects are erased through the audited whole-document erasure, with its receipt
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Confirmation missing
+        '403':
+          description: Not an administrator, an agent, or the person who asked
+        '404':
+          description: No waiting request
+        '409':
+          description: No longer legacy plaintext
+      security:
+      - paseto: []
   /admin/erase:
     post:
       tags:
@@ -233,6 +279,82 @@ paths:
           description: Refresh the current revision
       security:
       - paseto: []
+  /agent-held:
+    get:
+      tags:
+      - agent memory
+      summary: Every write held for you, newest first, in every project.
+      operationId: agent_held_list
+      responses:
+        '200':
+          description: 'Waiting for your confirmation: id, project, tool (propose, submit, withdraw or remember), client (the agent''s self-description), client_name (the OAuth client''s name), document, summary of the ops, preview (the dry-run diff of a propose), created_at, expires_at'
+          content:
+            application/json:
+              schema: {}
+        '401':
+          description: Sign in required (device sessions, OAuth access tokens and connector keys are refused)
+        '403':
+          description: An agent identity
+      security:
+      - paseto: []
+  /agent-held/{held}/confirm:
+    post:
+      tags:
+      - agent memory
+      summary: |-
+        Confirm a held write: it is carried out now as the agent, with every check of a direct
+        call, and a confirmed `propose` goes to review. A replay the checks refuse is `failed`.
+      operationId: agent_held_confirm
+      parameters:
+      - name: held
+        in: path
+        description: Held write
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: 'state confirmed (result: what the call answered; a propose is also submitted for review) or failed (result.error: the agent code of the refusal)'
+          content:
+            application/json:
+              schema: {}
+        '401':
+          description: Sign in required (device sessions, OAuth access tokens and connector keys are refused)
+        '403':
+          description: An agent identity
+        '404':
+          description: Not yours, already decided or expired
+      security:
+      - paseto: []
+  /agent-held/{held}/decline:
+    post:
+      tags:
+      - agent memory
+      summary: 'Decline a held write: nothing is carried out and its text is removed.'
+      operationId: agent_held_decline
+      parameters:
+      - name: held
+        in: path
+        description: Held write
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: state declined
+          content:
+            application/json:
+              schema: {}
+        '401':
+          description: Sign in required (device sessions, OAuth access tokens and connector keys are refused)
+        '403':
+          description: An agent identity
+        '404':
+          description: Not yours, already decided or expired
+      security:
+      - paseto: []
   /auth/app-handover:
     post:
       tags:
@@ -310,6 +432,16 @@ paths:
       responses:
         '200':
           description: Login revoked; legacy sessions revoke the account generation
+          content:
+            application/json:
+              schema: {}
+  /capabilities:
+    get:
+      tags: []
+      operationId: capabilities
+      responses:
+        '200':
+          description: Encrypted-project formats and suites this server stores and checks
           content:
             application/json:
               schema: {}
@@ -414,6 +546,112 @@ paths:
           description: Revision outside history
       security:
       - connector_key: []
+  /connector/documents/{id}/e2ee/grants:
+    get:
+      tags: []
+      operationId: connector_grants
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: recipient_key
+        in: query
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Add-in delegation grants for this file and the pane's one-time key
+          content:
+            application/json:
+              schema: {}
+      security:
+      - connector_key: []
+  /connector/documents/{id}/events:
+    get:
+      tags: []
+      operationId: connector_events
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: after_seq
+        in: query
+        description: Revision the client already trusts
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: through_seq
+        in: query
+        description: Last revision to return, at most 1,000 after after_seq
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: Event rows after_seq < seq <= through_seq in order, as the documents events route returns them, so the client verifies the hash chain and the fold itself (decision 036)
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Range outside history or too long
+      security:
+      - connector_key: []
+  /connector/documents/{id}/manifest:
+    get:
+      tags: []
+      operationId: manifest
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: seq
+        in: query
+        description: Revision; omitted means the head
+        required: false
+        schema:
+          type: integer
+          format: int64
+      - name: level
+        in: query
+        description: Only the hashes of this level of the Merkle tree (0 is the leaves), at most 4,096
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: from
+        in: query
+        description: Only the entries from this index
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: to
+        in: query
+        description: Only the entries before this index, at most 4,096 after from
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      responses:
+        '200':
+          description: The block-hash manifest of a revision and its Merkle root
+          content:
+            application/json:
+              schema: {}
+      security:
+      - connector_key: []
   /connector/documents/{id}/media:
     post:
       tags: []
@@ -515,6 +753,115 @@ paths:
               schema: {}
       security:
       - connector_key: []
+  /connector/documents/{id}/relay:
+    post:
+      tags: []
+      operationId: relay_ask
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AskInput'
+        required: true
+      responses:
+        '200':
+          description: Open requests for these hashes; an online member answers them
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Not a ledger document, bad hashes or too many open requests
+      security:
+      - connector_key: []
+  /connector/documents/{id}/relay/wanted:
+    get:
+      tags: []
+      operationId: relay_wanted
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Other members' open requests this pane may answer from its copy; the requester is not named
+          content:
+            application/json:
+              schema: {}
+      security:
+      - connector_key: []
+  /connector/documents/{id}/relay/{request}:
+    get:
+      tags: []
+      operationId: relay_take
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: request
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: The answer, deleted from the server by this download; or waiting
+          content:
+            application/json:
+              schema: {}
+        '404':
+          description: Not your request, expired or already downloaded
+      security:
+      - connector_key: []
+    post:
+      tags: []
+      operationId: relay_serve
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: request
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServeInput'
+        required: true
+      responses:
+        '200':
+          description: Held until the requester downloads it, at most an hour
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Too large, or the document's relay space is full
+        '403':
+          description: Your own request
+        '404':
+          description: Answered, expired or not in this document
+      security:
+      - connector_key: []
   /connector/documents/{id}/requests/{draft}/merge:
     post:
       tags: []
@@ -577,6 +924,25 @@ paths:
           description: Not your connector request
         '409':
           description: Already closed
+      security:
+      - connector_key: []
+  /connector/documents/{id}/storage:
+    get:
+      tags: []
+      operationId: connector_storage
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Storage mode and the bytes the server keeps for this file
+          content:
+            application/json:
+              schema: {}
       security:
       - connector_key: []
   /copies/{match_id}:
@@ -696,6 +1062,36 @@ paths:
           description: Sign in required
         '403':
           description: Key is not active for this account
+      security:
+      - paseto: []
+  /devices/{id}/encryption-key:
+    post:
+      tags: []
+      operationId: register_key
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '201':
+          description: X25519 key bound to this active signing key of yours
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Binding or signature invalid
+        '403':
+          description: Not your active key
+        '409':
+          description: This signing key already has an encryption key
       security:
       - paseto: []
   /devices/{id}/revoke:
@@ -1687,6 +2083,31 @@ paths:
           description: Only the contributor can withdraw
         '409':
           description: Already closed, or an unsent draft that is not an AI agent's
+  /documents/{id}/e2ee/legacy-erasure:
+    post:
+      tags: []
+      operationId: legacy_erasure_request
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '201':
+          description: Erasure asked for; it waits for an administrator other than you
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Not the file's owner, or an agent
+        '404':
+          description: No such file
+        '409':
+          description: Not legacy plaintext of an encrypted project, or already asked for
+      security:
+      - paseto: []
   /documents/{id}/events:
     get:
       tags:
@@ -2124,6 +2545,33 @@ paths:
               schema: {}
         '404':
           description: No such document or node
+  /documents/{id}/nodes/{node}/history:
+    get:
+      tags: []
+      summary: The same block history for a signed-in member (the desktop revision viewer, decision 030).
+      operationId: node_history
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: node
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: 'Newest first: each event of the block with who appended it and, for merged change requests, the contributor, message and agent session as the capture policy lets this reader see it'
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Document membership required
+      security:
+      - paseto: []
   /documents/{id}/ops/comment:
     post:
       tags:
@@ -2646,6 +3094,53 @@ paths:
           description: Unknown revision
         '403':
           description: Document membership required
+  /documents/{id}/storage:
+    get:
+      tags: []
+      operationId: storage_get
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Storage mode, media policy, whether it is fixed, and the bytes the server keeps
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+    post:
+      tags: []
+      operationId: storage_set
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StorageInput'
+        required: true
+      responses:
+        '200':
+          description: Saved and audited
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Owners and managers choose the storage mode
+        '409':
+          description: The mode is fixed once the document has a commit
+      security:
+      - paseto: []
   /documents/{id}/structure:
     get:
       tags:
@@ -2963,6 +3458,65 @@ paths:
           description: Sign in required
       security:
       - paseto: []
+  /organisations/{id}/merge-floor:
+    get:
+      tags:
+      - merge policy
+      operationId: organisation_merge_floor
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: The organisation's merge floor (empty when none was saved) and its revision
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Not an organisation member
+      security:
+      - paseto: []
+    put:
+      tags:
+      - merge policy
+      operationId: organisation_merge_floor_put
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: If-Match
+        in: header
+        description: The revision you read; 0 when none was saved
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MergeFloorBody'
+        required: true
+      responses:
+        '200':
+          description: Saved floor and its new revision; every policy of a project an organisation member owns must keep it from now on (stored policies are checked again when saved, and every v4 merge at publication)
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid floor or a missing If-Match
+        '403':
+          description: A person's account session as organisation owner or admin is required
+        '409':
+          description: Changed since the revision in If-Match
+      security:
+      - paseto: []
   /profile:
     get:
       tags:
@@ -3192,6 +3746,257 @@ paths:
       - paseto: []
       - device_session:
         - project:read
+  /projects/{id}/agent-audit:
+    get:
+      tags:
+      - agent policy
+      summary: |-
+        What AI agents and the people deciding about them did in a project: the `agent.*` audit
+        rows and merges of agents' requests, newest first, with the client kind and the person the
+        agent acted for as the server recorded them, filtered by either. Project owners and
+        managers only; metadata only (no detail values beyond the two names).
+      operationId: agent_audit
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: client_kind
+        in: query
+        description: Only this client kind
+        required: false
+        schema:
+          type: string
+      - name: principal
+        in: query
+        description: Only agents acting for this person
+        required: false
+        schema:
+          type: string
+          format: uuid
+      - name: offset
+        in: query
+        description: 0 to 1000
+        required: false
+        schema:
+          type: integer
+          format: int64
+      - name: limit
+        in: query
+        description: 1 to 50, default 25
+        required: false
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: items {id, action, at, actor {id,name,agent}, resource_id, client_kind, principal {id,name}}, more, offset
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Bad filter or page
+        '401':
+          description: Account sign-in required
+        '403':
+          description: Not a project owner or manager
+      security:
+      - paseto: []
+  /projects/{id}/agent-capture:
+    get:
+      tags:
+      - agent policy
+      operationId: agent_capture_get
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: 'What agent sessions record in this project (default: full capture, prompts visible to their author). Sets ETag to the revision'
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Not a project owner or manager
+      security:
+      - paseto: []
+    put:
+      tags:
+      - agent policy
+      operationId: agent_capture_put
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaptureBody'
+        required: true
+      responses:
+        '200':
+          description: Saved; audited
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Not a project owner or manager
+        '409':
+          description: The capture policy changed since the revision in If-Match
+      security:
+      - paseto: []
+  /projects/{id}/agent-memory:
+    get:
+      tags:
+      - agent memory
+      operationId: agent_memory_list
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: state
+        in: query
+        description: 'Comma-separated: proposed, active, archived (default proposed,active)'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Memories with their revision, author kind, citations (pinned hash and validity now)
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Not a project member, or an agent identity
+      security:
+      - paseto: []
+    post:
+      tags:
+      - agent memory
+      operationId: agent_memory_write
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: 'Written as active; audited. Body: kind, body, optional citations of readable blocks'
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid kind, body or citation
+        '403':
+          description: Not a project owner, manager or editor
+      security:
+      - paseto: []
+  /projects/{id}/agent-memory/{memory}:
+    put:
+      tags:
+      - agent memory
+      operationId: agent_memory_edit
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: memory
+        in: path
+        description: Memory
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: The next revision; citations given are pinned again. Needs If-Match with the revision read
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid field or If-Match missing
+        '403':
+          description: Not a project owner, manager or editor
+        '404':
+          description: No such memory, or deleted
+        '409':
+          description: The memory changed since the revision in If-Match
+      security:
+      - paseto: []
+  /projects/{id}/agent-memory/{memory}/{action}:
+    post:
+      tags:
+      - agent memory
+      operationId: agent_memory_action
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: memory
+        in: path
+        description: Memory
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: action
+        in: path
+        description: accept, archive, restore or delete
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The new state and revision; audited. Deleted memories keep their history; agents see a tombstone
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Not a project owner, manager or editor
+        '404':
+          description: No such memory or action
+        '409':
+          description: The action does not apply to the current state
+      security:
+      - paseto: []
   /projects/{id}/agent-policy:
     get:
       tags:
@@ -3327,6 +4132,19 @@ paths:
         schema:
           type: integer
           format: int64
+      - name: client_kind
+        in: query
+        description: Only this client kind
+        required: false
+        schema:
+          type: string
+      - name: principal
+        in: query
+        description: Only agents acting for this person
+        required: false
+        schema:
+          type: string
+          format: uuid
       responses:
         '200':
           description: 'items (newest activity first, open ones before closed), more, offset, state and the budgets the viewer''s own agents have used (null when the viewer has none). Each item is metadata: id, name (the agent''s words: untrusted text), state, revision, base_seq, head_seq, behind, stale_base, created_at, submitted_at, closed_at, document {id,title,kind}, agent {id,client_kind,display_name,principal{id,name},revoked}, mine, edits and ops {proposed,compiled}. Drafts only reach the person the agent acts for'
@@ -3339,6 +4157,43 @@ paths:
           description: Not an account session
         '403':
           description: Not a member of the project
+      security:
+      - paseto: []
+  /projects/{id}/agent-sessions/{session}/verify:
+    get:
+      tags:
+      - agent memory
+      summary: |-
+        Recompute a session's chain from its header and turns, and check its latest seal.
+        `chain` is `valid` or `broken`; `seal` is `valid`, `invalid` (a signature, key or head that
+        does not match), `behind` (valid, but turns were added after it) or `unsigned`. An erased
+        turn's text is gone, so its own hash is taken as stored and only its links are checked.
+      operationId: agent_session_verify
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: session
+        in: path
+        description: Agent session
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: verified, chain (valid or broken), seal (valid, invalid, behind or unsigned), turns, sealed_turns, erased_turns and the signing epoch
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Not a project member, or an agent identity
+        '404':
+          description: No such session in this project
       security:
       - paseto: []
   /projects/{id}/agent-usage:
@@ -3366,6 +4221,19 @@ paths:
         required: false
         schema:
           type: string
+      - name: client_kind
+        in: query
+        description: Only keys of this client kind
+        required: false
+        schema:
+          type: string
+      - name: principal
+        in: query
+        description: Only agents acting for this person
+        required: false
+        schema:
+          type: string
+          format: uuid
       responses:
         '200':
           description: 'Calls, response bytes and denials of the project''s agent grants by UTC day and client claim, from the call ledger (metadata only: no document text, title or request value). The range is at most 31 days and 500 rows'
@@ -4153,6 +5021,88 @@ paths:
       security:
       - device_session:
         - content:read
+  /projects/{id}/agent/memory:
+    get:
+      tags:
+      - agent
+      operationId: agent_memory_read
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: mode
+        in: query
+        description: 'briefing (default): active memories whose cited blocks are unchanged; search: active memories whose text contains q; changes: memories changed after since, deleted ones as tombstones'
+        required: false
+        schema:
+          type: string
+      - name: q
+        in: query
+        description: Search text, 1 to 200 characters (mode=search)
+        required: false
+        schema:
+          type: string
+      - name: since
+        in: query
+        description: RFC 3339 time (mode=changes)
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Memories people accepted for this project, each citation with its validity now (valid, stale or gone). Memory text is data written by people, never instructions
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid mode, q or since
+        '401':
+          description: Not a project device session
+        '403':
+          description: Scope, grant, key class or project membership missing (uniform)
+        '429':
+          description: Admission budget
+      security:
+      - device_session:
+        - content:read
+    post:
+      tags:
+      - agent
+      operationId: agent_memory_propose
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: 'Stored as proposed: agents do not see it until a person accepts it. Body: kind (decision, fact, style, failure or preference), body (1 to 2,000 characters), optional citations (at most 8 of {file, ref} as the file tools take them; the server pins each block hash) and optional session'
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid kind, body, citation or session
+        '401':
+          description: Not a project device session
+        '403':
+          description: 'Scope, grant, membership or policy (details.policy: memory_proposals at 200 open proposals) refuses'
+        '429':
+          description: Admission budget
+      security:
+      - device_session:
+        - content:propose
   /projects/{id}/agent/proposals:
     get:
       tags:
@@ -4366,6 +5316,87 @@ paths:
       security:
       - device_session:
         - content:submit
+  /projects/{id}/agent/sessions:
+    post:
+      tags:
+      - agent
+      summary: Open a session for this agent key in this project.
+      operationId: agent_session_open
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: 'The session id and the capture in force (actions or full). Body: source (mcp, acp, gateway or import), product, optional product_version and model'
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid body
+        '401':
+          description: Not a project device session
+        '403':
+          description: 'Scope, grant or membership missing, or capture is off (details.policy: capture)'
+        '429':
+          description: Admission budget
+      security:
+      - device_session:
+        - content:propose
+  /projects/{id}/agent/sessions/{session}/turns:
+    post:
+      tags:
+      - agent
+      summary: |-
+        Record one turn of a session: the prompt as the person typed it (`prompt_source`
+        `launcher`) or as the agent reports it (`agent`), and the agent's visible reasoning.
+      operationId: agent_session_turn
+      parameters:
+      - name: id
+        in: path
+        description: Project
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: session
+        in: path
+        description: A session of this agent key
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: The turn number and how many secrets were redacted. Prompt and reasoning are stored only under full capture. Name session and turn in a later propose call to link its blocks to this turn
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid body or not this key's session
+        '401':
+          description: Not a project device session
+        '403':
+          description: Scope, grant or membership missing, or capture is off
+        '429':
+          description: Admission budget
+      security:
+      - device_session:
+        - content:propose
   /projects/{id}/change-requests:
     get:
       tags: []
@@ -4499,6 +5530,291 @@ paths:
           content:
             application/json:
               schema: {}
+      security:
+      - paseto: []
+  /projects/{id}/e2ee:
+    get:
+      tags: []
+      operationId: status
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Mode, epoch, log head and policy flags; no secrets
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
+  /projects/{id}/e2ee/begin:
+    post:
+      tags: []
+      operationId: begin
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '201':
+          description: Mode migrating; the signed genesis entry stored
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Owners only, or creation not enabled on this server
+        '409':
+          description: Already encrypted or migrating
+      security:
+      - paseto: []
+  /projects/{id}/e2ee/complete:
+    post:
+      tags: []
+      operationId: complete
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Mode sealed; legacy plaintext files are archived and labelled
+          content:
+            application/json:
+              schema: {}
+        '409':
+          description: No epoch yet, or live plaintext files remain
+        '422':
+          description: recovery_required
+      security:
+      - paseto: []
+  /projects/{id}/e2ee/directory:
+    get:
+      tags: []
+      operationId: directory
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Members' active device encryption keys with bindings and fingerprints; clients verify them against the signed log
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
+  /projects/{id}/e2ee/documents:
+    post:
+      tags: []
+      operationId: document_create
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '201':
+          description: A sealed file in this project; its title is a placeholder, the real name is sealed in commits
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+  /projects/{id}/e2ee/epochs:
+    get:
+      tags: []
+      operationId: epochs_list
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: after
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int32
+      responses:
+        '200':
+          description: Signed epoch records in order
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
+    post:
+      tags: []
+      operationId: epoch_open
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '201':
+          description: Epoch e+1 with its record, log entry and grants stored atomically; with `removal`, the member or device is removed in the same transaction
+          content:
+            application/json:
+              schema: {}
+        '409':
+          description: 'epoch_conflict: not exactly current + 1'
+        '422':
+          description: recipient_set_mismatch
+      security:
+      - paseto: []
+  /projects/{id}/e2ee/grants:
+    get:
+      tags: []
+      operationId: grants_list
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: recipient_key
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: epoch
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int32
+      responses:
+        '200':
+          description: Sealed grants addressed to this key; the service cannot open them
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
+    post:
+      tags: []
+      operationId: grants_add
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '201':
+          description: 'Grants to existing epochs: a new device of a member, recovery, escrow, an invitee or a delegation'
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+  /projects/{id}/e2ee/log:
+    get:
+      tags: []
+      operationId: log_list
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: after
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: Signed membership log entries in order, at most 256
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
+    post:
+      tags: []
+      operationId: log_append
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '201':
+          description: Entry verified by the log's rules and the service's records, then stored
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Refused by a rule
+        '409':
+          description: The log moved; fetch and re-sign
       security:
       - paseto: []
   /projects/{id}/files:
@@ -4898,6 +6214,273 @@ paths:
           description: Project membership or document scope permission denied
         '404':
           description: One or both commits not published, or file not found in either commit
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
+  /projects/{id}/history/holds:
+    get:
+      tags:
+      - project history
+      operationId: project_history_holds
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: History holds of the project, those in force first, newest first; at most 200
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
+    post:
+      tags:
+      - project history
+      operationId: project_history_hold_create
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HoldInput'
+        required: true
+      responses:
+        '200':
+          description: 'The hold, in force at once: a project hold refuses every horizon and release batch, a commit hold pins its commit'
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Reason empty, too long or with control characters, or a legal hold on one commit
+        '403':
+          description: A person's account session as project owner or manager (owner for a legal hold) is required
+        '404':
+          description: The commit is not published in this project
+      security:
+      - paseto: []
+  /projects/{id}/history/holds/{hold}/release:
+    post:
+      tags:
+      - project history
+      operationId: project_history_hold_release
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: hold
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: The hold, released; releasing it again changes nothing
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: A person's account session as project owner or manager (owner for a legal hold) is required
+        '404':
+          description: No such hold in this project
+      security:
+      - paseto: []
+  /projects/{id}/history/horizons:
+    get:
+      tags:
+      - project history
+      operationId: project_history_horizons
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: after_sequence
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: Signed horizon envelopes with their normalized policies, ascending, at most 64 per page
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
+    post:
+      tags:
+      - project history
+      operationId: project_history_horizon_create
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Horizon recorded with the authority's countersignature; released commits answer 410 at once and their bytes stay until the quarantine ends
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Owner account session, an active owner device key signature and an installed receipt authority are required
+        '409':
+          description: Stale plan or a record that does not describe it
+      security:
+      - paseto: []
+  /projects/{id}/history/horizons/plan:
+    post:
+      tags:
+      - project history
+      operationId: project_history_horizon_plan
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        required: true
+      responses:
+        '200':
+          description: Read-only horizon plan and the draft record each owner signs offline; nothing changes
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Project owner on an account session required
+      security:
+      - paseto: []
+  /projects/{id}/history/horizons/{sequence}/progress:
+    get:
+      tags:
+      - project history
+      operationId: project_history_horizon_progress
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: sequence
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: Quarantine, batches and what is still stored
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+      - device_session:
+        - history:read
+  /projects/{id}/history/horizons/{sequence}/release:
+    post:
+      tags:
+      - project history
+      operationId: project_history_horizon_release
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: sequence
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: One hard-release batch after the quarantine (idempotent once nothing remains)
+          content:
+            application/json:
+              schema: {}
+        '409':
+          description: Still in quarantine
+      security:
+      - paseto: []
+  /projects/{id}/history/horizons/{sequence}/skeleton:
+    get:
+      tags:
+      - project history
+      operationId: project_history_horizon_skeleton
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: sequence
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: after
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: Skeleton entries of one horizon by address, at most 256 per page; the client checks them against the signed skeleton root
+          content:
+            application/json:
+              schema: {}
       security:
       - paseto: []
       - device_session:
@@ -5655,6 +7238,65 @@ paths:
           description: Deadline exceeded
       security:
       - paseto: []
+  /projects/{id}/merge-policy:
+    get:
+      tags:
+      - merge policy
+      operationId: project_merge_policy
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: The stored policy (null when the project merges by the default policy), its hash and revision, the organisation floor its owners' organisations set, and the effective floor a v4 merge must keep at publication
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Not a project member
+      security:
+      - paseto: []
+    put:
+      tags:
+      - merge policy
+      operationId: project_merge_policy_put
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: If-Match
+        in: header
+        description: The revision you read; 0 when none was saved
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MergePolicyBody'
+        required: true
+      responses:
+        '200':
+          description: 'Saved: the canonical policy, its hash and the new revision; an audit row records the old and new hashes. Unchanged when the canonical policy equals the stored one'
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: 'Invalid policy, a missing If-Match, or `below_floor`: weaker than the organisation floor'
+        '403':
+          description: A person's account session as project owner or manager is required; a manager may not lower the project's floors
+        '409':
+          description: Changed since the revision in If-Match
+      security:
+      - paseto: []
   /projects/{id}/settings:
     post:
       tags: []
@@ -5954,6 +7596,51 @@ paths:
           description: Too many requests
         '504':
           description: Deadline exceeded
+      security:
+      - paseto: []
+  /projects/{id}/storage:
+    get:
+      tags: []
+      operationId: project_storage_get
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: The storage mode new files of this project take
+          content:
+            application/json:
+              schema: {}
+      security:
+      - paseto: []
+    post:
+      tags: []
+      operationId: project_storage_set
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StorageInput'
+        required: true
+      responses:
+        '200':
+          description: Saved and audited; files that join the project before their first commit take it
+          content:
+            application/json:
+              schema: {}
+        '403':
+          description: Project owners and managers choose the default
       security:
       - paseto: []
   /projects/{id}/watch:
@@ -7533,6 +9220,25 @@ components:
           type: string
         trust:
           type: string
+    AskInput:
+      type: object
+      required:
+      - kind
+      - hashes
+      properties:
+        hashes:
+          type: array
+          items:
+            type: string
+        kind:
+          type: string
+          description: '`block` (a block state by its manifest hash) or `media` (an image by SHA-256).'
+        recipient_key:
+          type:
+          - string
+          - 'null'
+          description: The requester's X25519 public key (base64url), for end-to-end encrypted answers later.
+      additionalProperties: false
     BlocksReadBody:
       type: object
       description: 'Body of `POST .../blocks:read`: the selection and the hashes the caller already holds.'
@@ -7574,6 +9280,21 @@ components:
           - string
           - 'null'
           description: Heading ref, instead of `refs`.
+      additionalProperties: false
+    CaptureBody:
+      type: object
+      required:
+      - capture
+      - prompt_visibility
+      properties:
+        capture:
+          type: string
+          description: '`off` (no agent sessions), `actions` (sessions and tool calls, no text) or `full`.'
+        prompt_visibility:
+          type: string
+          description: |-
+            Who may read stored prompts: `author` (the person the agent acted for), `reviewers`
+            (also the document's reviewers, editors and managers) or `members`.
       additionalProperties: false
     ChallengeRequest:
       type: object
@@ -7921,6 +9642,14 @@ components:
       required:
       - scopes
       properties:
+        expires_in_days:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The grant lapses after this many days (1 to 366), so an unattended credential such as a
+            service account's does not hold access for ever. No expiry when absent.
         scopes:
           type: array
           items:
@@ -7930,6 +9659,23 @@ components:
             `history:review`. An agent key: `content:read`, alone or with `content:propose` and
             `content:submit` (which imply neither each other nor the read scope, but need it: a
             preview shows the text it changes). The two sets never mix.
+      additionalProperties: false
+    HoldInput:
+      type: object
+      required:
+      - reason
+      properties:
+        commit:
+          type:
+          - string
+          - 'null'
+          description: A published commit to pin; leave it out to hold the whole project.
+        legal:
+          type: boolean
+          description: A legal hold holds the whole project, and only an owner sets or releases it.
+        reason:
+          type: string
+          description: 'Shown to project members: 1 to 200 bytes, no control characters, no personal data.'
       additionalProperties: false
     Issue:
       type: object
@@ -8343,6 +10089,24 @@ components:
         open_issue_count:
           type: integer
           format: int64
+    MergeFloorBody:
+      type: object
+      required:
+      - floors
+      properties:
+        floors:
+          type: object
+          description: '`{"gate_at_least": {"<strategy id>": "auto" | "auto-with-review" | "blocked"}}`.'
+      additionalProperties: false
+    MergePolicyBody:
+      type: object
+      required:
+      - policy
+      properties:
+        policy:
+          type: object
+          description: A `dynodoc.merge-policy.v1` document (JSON).
+      additionalProperties: false
     MissingInput:
       type: object
       required:
@@ -8846,6 +10610,19 @@ components:
           format: uuid
         revoked:
           type: boolean
+    ServeInput:
+      type: object
+      required:
+      - encoding
+      - data
+      properties:
+        data:
+          type: string
+          description: The payload, base64. Never read by the server.
+        encoding:
+          type: string
+          description: '`plain` (the requester checks the hash) or `x25519-aes256gcm-v1` (reserved).'
+      additionalProperties: false
     SessionAnswer:
       type: object
       required:
@@ -8874,6 +10651,20 @@ components:
           format: int64
         starred:
           type: boolean
+    StorageInput:
+      type: object
+      required:
+      - mode
+      properties:
+        media:
+          type:
+          - string
+          - 'null'
+          description: '`stored` or `hash_only` (ledger mode only). Omitted: `stored`.'
+        mode:
+          type: string
+          description: '`repository` or `ledger`.'
+      additionalProperties: false
     SubmitRequest:
       type: object
       properties:

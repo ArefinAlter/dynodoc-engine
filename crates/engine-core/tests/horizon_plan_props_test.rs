@@ -235,6 +235,7 @@ fn generate(seed: u64, shape: Shape) -> History {
             _ => {}
         }
         let commit = Commit {
+            sealed: None,
             version: versions[i],
             project,
             parents: parents[i]
@@ -247,6 +248,9 @@ fn generate(seed: u64, shape: Shape) -> History {
             authored_at_ms: (10 + i as i64) * DAY_MS,
             message: format!("commit {i}"),
             recovery,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: resolutions,
         };
         let authored_at_ms = commit.authored_at_ms;
@@ -934,6 +938,7 @@ fn project() -> Uuid {
 /// A v1 commit without files; `tag` makes it distinct.
 fn plain(parents: &[&Address], tag: i64) -> (Address, Commit) {
     let commit = Commit {
+        sealed: None,
         version: 1,
         project: project(),
         parents: parents.iter().map(|a| (*a).clone()).collect(),
@@ -942,6 +947,9 @@ fn plain(parents: &[&Address], tag: i64) -> (Address, Commit) {
         authored_at_ms: tag,
         message: format!("c{tag}"),
         recovery: None,
+        project_resolutions: Vec::new(),
+        relocations: Vec::new(),
+        merge_policy: None,
         same_file_resolutions: Vec::new(),
     };
     let signed = SignedCommit::sign(commit, &key()).unwrap();
@@ -1138,6 +1146,7 @@ fn a_merge_commit_without_a_unique_base_cannot_be_kept_and_is_refused() {
     let document = DocumentId(Uuid::from_u128(5));
     let state = address(&[1]);
     let merge = Commit {
+        sealed: None,
         version: 3,
         parents: vec![d.0.clone(), e.0.clone()],
         files: BTreeMap::from([(
@@ -1149,6 +1158,9 @@ fn a_merge_commit_without_a_unique_base_cannot_be_kept_and_is_refused() {
         )]),
         message: "merge".into(),
         authored_at_ms: 6,
+        project_resolutions: Vec::new(),
+        relocations: Vec::new(),
+        merge_policy: None,
         same_file_resolutions: vec![Resolution {
             path: "a".into(),
             document,
@@ -1271,4 +1283,82 @@ fn planning_a_hundred_thousand_commits_takes_seconds() {
         p.commits.released
     );
     assert_eq!(p.commits.total, 100_000);
+}
+
+/// Decision 042 trust boundary: a relocation commit that a kept v4 merge's
+/// edit-follows-move record names is pinned (an ancestor of a parent, not a parent),
+/// so pruning never releases what `verify-merge` and publication re-run the record from.
+#[test]
+fn relocation_commits_a_kept_merge_follows_are_never_released() {
+    use engine_core::repository::{
+        project::{Parent, ProjectResolution, SourceStates, EDIT_FOLLOWS_MOVE},
+        relocation::{Destination, Kind as RelocationKind, Relocation, Source as From},
+    };
+    let at = |n: u8| Address::try_from(format!("{n:02x}").repeat(32)).unwrap();
+    let docs = (
+        DocumentId(Uuid::from_u128(1)),
+        DocumentId(Uuid::from_u128(2)),
+    );
+    let base = plain(&[], 1);
+    let mut relocation = plain(&[&base.0], 2).1;
+    relocation.version = 4;
+    relocation.relocations = vec![Relocation {
+        id: "ab".repeat(32),
+        kind: RelocationKind::Move,
+        from: From {
+            document: docs.0,
+            roots: vec![engine_shared::NodeId("01ARZ3NDEKTSV4RRFFQ69G5FAV".into())],
+        },
+        to: Destination {
+            document: docs.1,
+            parent: engine_shared::NodeId("01ARZ3NDEKTSV4RRFFQ69G5FAW".into()),
+            position: "a0".into(),
+        },
+        count: 1,
+        source_state_after: Some(at(3)),
+        dest_state_after: at(4),
+    }];
+    let relocation = (at(10), relocation);
+    let later = plain(&[&relocation.0], 3);
+    let edit = plain(&[&base.0], 4);
+    let mut merge = plain(&[&later.0, &edit.0], 5).1;
+    merge.version = 4;
+    merge.project_resolutions = vec![ProjectResolution {
+        id: "r1".into(),
+        strategy: EDIT_FOLLOWS_MOVE.into(),
+        document: docs.1,
+        base: Some(at(5)),
+        left: Some(at(4)),
+        right: Some(at(5)),
+        merged: at(6),
+        path: None,
+        relocation: Some("ab".repeat(32)),
+        follows: Some(Parent::Left),
+        source: Some(SourceStates {
+            document: docs.0,
+            base: at(7),
+            left: Some(at(3)),
+            right: Some(at(8)),
+            merged: Some(at(9)),
+        }),
+        needs_review: false,
+        resolution_set: Some("cd".repeat(32)),
+    }];
+    let merge = (at(11), merge);
+    let view = view_with(
+        &[&base, &relocation, &later, &edit, &merge],
+        &[("main", &merge.0)],
+    );
+    let p = plan(&view, &load(FLOOR), &PlanOptions::default()).unwrap();
+    assert!(
+        p.sets.retained.contains(&relocation.0),
+        "{:?}",
+        p.sets.retained
+    );
+    assert!(!p.sets.released.contains(&relocation.0));
+    // The parents and the merge base stay too; nothing else is released.
+    for kept in [&merge.0, &later.0, &edit.0, &base.0] {
+        assert!(p.sets.retained.contains(kept));
+    }
+    assert!(p.sets.released.is_empty());
 }

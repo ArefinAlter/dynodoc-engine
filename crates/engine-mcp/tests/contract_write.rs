@@ -38,8 +38,11 @@ fn the_read_only_profile_is_the_default_and_byte_for_byte_what_it_was() {
         serde_json::from_str(include_str!("golden/read_only_tools.json")).unwrap();
     let now = Profile::read_only().definitions();
     let as_text = |v: &Vec<Value>| serde_json::to_string(v).unwrap();
-    assert_eq!(as_text(&now), as_text(&before));
-    assert_eq!(as_text(&now).len(), 4_990);
+    // Decision 026 added one read tool, `memory` (spec 7.10), after the six; they are unchanged.
+    assert_eq!(as_text(&now[..6].to_vec()), as_text(&before));
+    assert_eq!(as_text(&before).len(), 4_990);
+    assert_eq!(now[6]["name"], "memory");
+    assert_eq!(now.len(), 7);
     let names: Vec<&str> = Profile::read_only()
         .tools()
         .iter()
@@ -47,7 +50,7 @@ fn the_read_only_profile_is_the_default_and_byte_for_byte_what_it_was() {
         .collect();
     assert_eq!(
         names,
-        ["files", "outline", "read", "find", "diff", "status"]
+        ["files", "outline", "read", "find", "diff", "status", "memory"]
     );
     assert_eq!(
         Profile::read_only().instructions(),
@@ -63,7 +66,10 @@ fn the_read_only_profile_is_the_default_and_byte_for_byte_what_it_was() {
     let order: Vec<&str> = all.iter().map(|d| d["name"].as_str().unwrap()).collect();
     assert_eq!(
         order,
-        ["files", "outline", "read", "find", "diff", "propose", "submit", "status"]
+        [
+            "files", "outline", "read", "find", "diff", "propose", "submit", "status", "memory",
+            "remember"
+        ]
     );
     assert_ne!(all[7], before[5], "status widens in the full profile");
 }
@@ -231,7 +237,7 @@ fn the_write_definitions_are_the_specifications_apart_from_the_stated_deviations
         &mut expected,
         "/properties/what",
         "enum",
-        json!(["proposal", "access"]),
+        json!(["proposal", "proposals", "access"]),
     );
     set(
         &mut expected,
@@ -240,11 +246,19 @@ fn the_write_definitions_are_the_specifications_apart_from_the_stated_deviations
         json!("Default: proposal when one is given, else access."),
     );
     remove(&mut expected, "/properties/what", &["default"]);
+    // Decision 038: `what=proposals` lists the agent's own proposals (the list route), with a
+    // state filter; the spec's per-file list still has no route.
+    set(
+        &mut expected,
+        "/properties",
+        "state",
+        json!({"type": "string", "enum": ["active", "all", "draft", "open", "changes_requested", "merged", "declined", "withdrawn"], "description": "With what=proposals. Default active."}),
+    );
     assert_eq!(ours["inputSchema"], expected);
 }
 
 #[test]
-fn the_full_profile_has_eight_tools_and_a_pinned_size() {
+fn the_full_profile_has_ten_tools_and_a_pinned_size() {
     let full = Profile::full();
     let mut counted_total = 0;
     let mut published_total = 0;
@@ -268,9 +282,11 @@ fn the_full_profile_has_eight_tools_and_a_pinned_size() {
     // 444, status 477); ours are 597 more: the read tools carry the deviations of the
     // crate documentation (383), the write tools theirs (propose 72, submit 66, status 76).
     // The default profile's six are 4,845 on this measure and 4,983 published, pinned by
-    // `the_read_only_profile_is_the_default_and_byte_for_byte_what_it_was`.
-    assert_eq!(counted_total, 8_396, "{sizes:?}");
-    assert_eq!(published_total, 8_580);
+    // `the_read_only_profile_is_the_default_and_byte_for_byte_what_it_was`. Decision 026
+    // added `memory` (553) and `remember` (821): 8,396 and 8,580 before. Decision 038 added
+    // `what=proposals` and its `state` to `status` (269).
+    assert_eq!(counted_total, 10_039, "{sizes:?}");
+    assert_eq!(published_total, 10_275);
 }
 
 // --- section 16: the transcript's write steps ------------------------------------------------------
@@ -425,8 +441,19 @@ fn status_refuses_the_combinations_it_cannot_answer() {
     assert!(go(json!({"what": "access", "proposal": PROPOSAL})).contains("field=proposal"));
     // The 8-character prefix of the spec's examples is not an id the routes take.
     assert!(go(json!({"proposal": "4d0e9b1c"})).contains("field=proposal"));
-    // What the spec lists and no route answers: the list of a file's proposals.
-    assert!(go(json!({"what": "proposals"})).contains("field=what"));
+    // The agent's own proposals list (decision 038); a proposal id or an unknown state with it
+    // is refused. What the spec lists and no route answers: the list of a file's proposals.
+    let listed = route(Tool::Status, json!({"what": "proposals", "state": "all"})).unwrap();
+    assert_eq!(listed, "GET projects/<P>/agent/proposals");
+    let planned = plan(
+        Tool::Status,
+        &args(json!({"what": "proposals", "state": "all"})),
+        PROJECT,
+    )
+    .unwrap();
+    assert_eq!(planned.query, vec![("state", "all".to_owned())]);
+    assert!(go(json!({"what": "proposals", "proposal": PROPOSAL})).contains("field=proposal"));
+    assert!(go(json!({"what": "proposals", "state": "stale"})).contains("field=state"));
     assert!(go(json!({"file": "7034d450"})).contains("field=file"));
 }
 

@@ -336,7 +336,7 @@ fn without_the_flag_nothing_asks_for_a_write_scope_and_the_write_tools_do_not_ex
     assert!(output.status.success(), "{}", text(&output.stderr));
     assert_eq!(
         names(&replies[0]),
-        ["files", "outline", "read", "find", "diff", "status"]
+        ["files", "outline", "read", "find", "diff", "status", "memory"]
     );
     assert!(replies[1]["result"].get("isError").is_none());
     // A hidden tool is a protocol error and sends nothing anywhere.
@@ -349,38 +349,58 @@ fn without_the_flag_nothing_asks_for_a_write_scope_and_the_write_tools_do_not_ex
 }
 
 #[test]
-fn write_mode_is_refused_before_any_key_or_network_use_and_only_a_clear_yes_asks_for_it() {
-    // The stock command has no per-request human confirmation surface, so it refuses write
-    // mode outright: from the flag and from DYNODOC_WRITE=on|1, before it reads the key or
-    // asks the service for anything. Every other value of the variable leaves a read-only
-    // session with the six read tools.
-    let service = start(false);
+fn only_a_clear_yes_serves_the_write_tools_and_asks_for_the_write_scopes() {
+    // Decision 029: write mode serves the write tools and each write is confirmed by a person
+    // in the desktop app or a system dialog (not exercised here: it would open a dialog). Only
+    // the flag or DYNODOC_WRITE=on|1 turns it on (the flag wins over "off"); every other value
+    // of the variable leaves a read-only session that never asks for a write scope.
     for (extra, environment) in [
         (&["--write"][..], &[][..]),
         (&[][..], &[("DYNODOC_WRITE", "on")][..]),
         (&[][..], &[("DYNODOC_WRITE", "1")][..]),
         (&["--write"][..], &[("DYNODOC_WRITE", "off")][..]),
     ] {
-        let (output, replies) = converse(&service, extra, environment, &[list(1)]);
-        assert!(!output.status.success(), "{extra:?} {environment:?}");
-        assert!(replies.is_empty(), "nothing on stdout: {replies:?}");
+        let service = start(false);
+        let (output, replies) = converse(
+            &service,
+            extra,
+            environment,
+            &[list(1), call(2, "status", json!({}))],
+        );
         assert!(
-            text(&output.stderr).contains("human confirmation"),
-            "{}",
+            output.status.success(),
+            "{extra:?} {environment:?}: {}",
             text(&output.stderr)
+        );
+        let tools = names(&replies[0]);
+        assert!(
+            tools.contains(&"propose") && tools.contains(&"submit"),
+            "{extra:?} {environment:?}: {tools:?}"
+        );
+        assert_eq!(
+            service.log(|l| l.challenges.clone()),
+            [["content:read", "content:propose", "content:submit"]],
+            "{extra:?} {environment:?}"
         );
         assert_no_secrets(&output);
     }
-    assert!(
-        service.log(|l| l.requests.is_empty() && l.challenges.is_empty()),
-        "a refused write mode reaches nothing"
-    );
     for value in ["off", "0", "", "maybe"] {
-        let (output, replies) = converse(&service, &[], &[("DYNODOC_WRITE", value)], &[list(1)]);
+        let service = start(false);
+        let (output, replies) = converse(
+            &service,
+            &[],
+            &[("DYNODOC_WRITE", value)],
+            &[list(1), call(2, "status", json!({}))],
+        );
         assert!(output.status.success(), "{}", text(&output.stderr));
         assert_eq!(
             names(&replies[0]),
-            ["files", "outline", "read", "find", "diff", "status"],
+            ["files", "outline", "read", "find", "diff", "status", "memory"],
+            "DYNODOC_WRITE={value:?}"
+        );
+        assert_eq!(
+            service.log(|l| l.challenges.clone()),
+            [["content:read"]],
             "DYNODOC_WRITE={value:?}"
         );
     }

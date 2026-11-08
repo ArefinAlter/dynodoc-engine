@@ -115,6 +115,60 @@ impl TileStore for MemoryTileStore {
     }
 }
 
+/// A store that records which objects a read needs, so a caller can fetch only those
+/// (decision 042: on-demand tiles instead of the whole tree in memory). Which tiles a
+/// proof or an append reads depends only on the indexes and the tree size, never on
+/// the bytes, so running the operation once against placeholders (zero hashes, empty
+/// entries) names exactly the tiles the real run reads. Writes are dropped.
+#[derive(Debug, Default)]
+pub struct ProbeStore {
+    size: u64,
+    wanted: std::cell::RefCell<std::collections::BTreeSet<String>>,
+}
+
+impl ProbeStore {
+    pub fn new(size: u64) -> Self {
+        Self {
+            size,
+            wanted: Default::default(),
+        }
+    }
+
+    /// Every path read so far.
+    pub fn wanted(&self) -> std::collections::BTreeSet<String> {
+        self.wanted.borrow().clone()
+    }
+}
+
+impl TileStore for ProbeStore {
+    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, Error> {
+        self.wanted.borrow_mut().insert(path.to_string());
+        let width = match path.rsplit_once(".p/") {
+            Some((_, w)) => w
+                .parse::<usize>()
+                .map_err(|_| Error::CorruptTile(path.to_string()))?,
+            None => TILE_WIDTH as usize,
+        };
+        // A hash tile of `width` zero hashes, or a bundle of `width` empty entries.
+        let unit = if path.starts_with("tile/entries/") {
+            2
+        } else {
+            32
+        };
+        Ok(Some(vec![0; width * unit]))
+    }
+    fn put(&mut self, _: &str, _: &[u8]) -> Result<(), Error> {
+        Ok(())
+    }
+    fn size(&self) -> Result<u64, Error> {
+        Ok(self.size)
+    }
+    fn set_size(&mut self, size: u64) -> Result<(), Error> {
+        self.size = size;
+        Ok(())
+    }
+}
+
 /// Directory-backed store: each object is a file under the root, replaced through a
 /// temporary file and a rename; the size is the file `size` holding a decimal. One
 /// writer at a time (no locking is attempted here).
@@ -364,6 +418,20 @@ impl<S: TileStore> TileLog<S> {
     }
 }
 
+/// The entries of one entry bundle (`u16` big-endian length, then the entry), in
+/// order. A client fetching `tile/entries/...` recomputes leaf hashes from these.
+pub fn parse_entry_bundle(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    let mut entries = Vec::new();
+    while !bytes.is_empty() {
+        let corrupt = || Error::CorruptTile("entry bundle".into());
+        let (len, tail) = bytes.split_first_chunk::<2>().ok_or_else(corrupt)?;
+        let len = usize::from(u16::from_be_bytes(*len));
+        entries.push(tail.get(..len).ok_or_else(corrupt)?.to_vec());
+        bytes = &tail[len..];
+    }
+    Ok(entries)
+}
+
 fn count_entries(mut bytes: &[u8]) -> Result<u64, Error> {
     let mut count = 0;
     while !bytes.is_empty() {
@@ -516,6 +584,47 @@ mod tests {
         assert_eq!(log.root(), tree_root(&memory, 300).unwrap());
         log.append_batch(&all[300..]).unwrap();
         assert_eq!(log.root(), memory.root());
+    }
+
+    #[test]
+    fn a_probe_names_every_tile_an_append_or_a_proof_reads() {
+        let all = entries(0..70_000);
+        let mut full = TileLog::open(MemoryTileStore::new()).unwrap();
+        full.append_batch(&all[..66_000]).unwrap();
+        let only = |full: &TileLog<MemoryTileStore>, wanted: std::collections::BTreeSet<String>| {
+            let mut store = MemoryTileStore::new();
+            for path in wanted {
+                store.put(&path, &full.store().files()[&path]).unwrap();
+            }
+            store.set_size(full.size()).unwrap();
+            store
+        };
+        // Append: open plus append on the probe, then the same on just those tiles.
+        let mut probe = TileLog::open(ProbeStore::new(66_000)).unwrap();
+        probe.append_batch(&all[66_000..]).unwrap();
+        let wanted = probe.store().wanted();
+        assert!(wanted.len() < 12, "{wanted:?}");
+        let mut partial = TileLog::open(only(&full, wanted)).unwrap();
+        partial.append_batch(&all[66_000..]).unwrap();
+        full.append_batch(&all[66_000..]).unwrap();
+        assert_eq!(partial.root(), full.root());
+        // Proofs: the probe's paths suffice for inclusion and consistency.
+        let probe = TileLog::open(ProbeStore::new(70_000)).unwrap();
+        let path = inclusion_proof(&probe, 1_234, 70_000).unwrap();
+        consistency_proof(&probe, 66_000, 70_000).unwrap();
+        let partial = TileLog::open(only(&full, probe.store().wanted())).unwrap();
+        assert_eq!(
+            inclusion_proof(&partial, 1_234, 70_000).unwrap().len(),
+            path.len()
+        );
+        assert_eq!(
+            inclusion_proof(&partial, 1_234, 70_000).unwrap(),
+            inclusion_proof(&full, 1_234, 70_000).unwrap()
+        );
+        assert_eq!(
+            consistency_proof(&partial, 66_000, 70_000).unwrap(),
+            consistency_proof(&full, 66_000, 70_000).unwrap()
+        );
     }
 
     #[test]

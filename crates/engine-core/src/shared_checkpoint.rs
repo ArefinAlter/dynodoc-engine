@@ -7,13 +7,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 
 use engine_shared::{DocumentId, NodeId};
-use ring::digest::{digest, Context, SHA256};
 use serde::{Deserialize, Serialize};
 
 use crate::materializer::{CommentState, DocumentState, MaterializedNode, SuggestionState};
 
 pub(crate) mod canonical;
 pub mod content;
+#[cfg(feature = "persistence")]
 pub mod postgres;
 pub mod typed;
 use canonical::ObjectRef;
@@ -74,8 +74,10 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("checkpoint content I/O: {0}")]
     Io(#[from] std::io::Error),
+    #[cfg(feature = "persistence")]
     #[error("checkpoint database: {0}")]
     Db(#[from] sqlx::Error),
+    #[cfg(feature = "persistence")]
     #[error("checkpoint history: {0}")]
     History(#[from] crate::snapshot::SnapshotError),
 }
@@ -90,7 +92,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_objects: 1_000_000,
+            // Raised with SemanticLimits::values (decision 043); max_bytes is unchanged.
+            max_objects: 3_000_000,
             max_bytes: 512 * 1024 * 1024,
         }
     }
@@ -168,6 +171,13 @@ impl MemoryStore {
 
     pub fn stored_bytes(&self) -> usize {
         self.objects.values().map(Vec::len).sum()
+    }
+
+    /// Every stored object with its address, ordered by document and address.
+    pub fn objects(&self) -> impl Iterator<Item = (&Address, &[u8])> {
+        self.objects
+            .iter()
+            .map(|((_, address), bytes)| (address, bytes.as_slice()))
     }
 }
 
@@ -250,10 +260,7 @@ struct Envelope {
 }
 
 fn address(bytes: &[u8]) -> Address {
-    let mut hash = Context::new(&SHA256);
-    hash.update(DOMAIN);
-    hash.update(bytes);
-    Address(hex(hash.finish().as_ref()))
+    Address(hex(&crate::hashing::sha256(&[DOMAIN, bytes])))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -261,7 +268,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn route(key: &str) -> String {
-    hex(digest(&SHA256, key.as_bytes()).as_ref())
+    hex(&crate::hashing::sha256(&[key.as_bytes()]))
 }
 
 #[cfg(test)]
@@ -307,6 +314,16 @@ fn decode(expected: &Address, bytes: &[u8]) -> Result<Object, Error> {
 /// Verify one encoded object and its address. This does not verify a complete
 /// reachable graph and never grants access to an object or its document.
 pub fn validate_stored(expected: &Address, bytes: &[u8]) -> Result<(), Error> {
+    // Encrypted projects (decision 035): header, bounds, refs and address; never decrypted.
+    if bytes.starts_with(crate::e2ee::seal::MAGIC) {
+        return crate::e2ee::seal::validate(expected, bytes)
+            .map(|_| ())
+            .map_err(|_| Error::Invalid("sealed object"));
+    }
+    if bytes.starts_with(crate::e2ee::state::MAGIC) {
+        return crate::e2ee::state::validate(expected, bytes)
+            .map_err(|_| Error::Invalid("sealed structural object"));
+    }
     if bytes.starts_with(content::MAGIC) {
         content::validate(expected, bytes)
     } else if bytes.starts_with(b"DYNOTYP\0") {
@@ -327,6 +344,14 @@ pub fn validate_stored(expected: &Address, bytes: &[u8]) -> Result<(), Error> {
 /// walk a graph without reconstructing `DocumentState`; it grants no access and
 /// does not verify that the referenced objects exist.
 pub fn references(expected: &Address, bytes: &[u8]) -> Result<Vec<Address>, Error> {
+    if bytes.starts_with(crate::e2ee::seal::MAGIC) {
+        return crate::e2ee::seal::references(expected, bytes)
+            .map_err(|_| Error::Invalid("sealed object"));
+    }
+    if bytes.starts_with(crate::e2ee::state::MAGIC) {
+        return crate::e2ee::state::references(expected, bytes)
+            .map_err(|_| Error::Invalid("sealed structural object"));
+    }
     if bytes.starts_with(content::MAGIC) {
         content::references(expected, bytes)
     } else if bytes.starts_with(b"DYNOTYP\0") {

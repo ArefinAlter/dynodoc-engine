@@ -20,6 +20,10 @@
 //! write tools then answer with a plain refusal and the read tools keep working. Nothing here
 //! can merge or approve: an agent only proposes, and a person reviews.
 //!
+//! **Each write is confirmed by a person** (decision 029, [`confirm`]): the Dynodoc desktop
+//! app shows it when it runs, else a native dialog does. The MCP client on standard input
+//! has no way to answer; a decline or no answer within two minutes refuses the call.
+//!
 //! Standard output carries protocol messages and nothing else. Logs go to standard error
 //! (`main` points the subscriber there for this verb), the passphrase prompt writes to
 //! standard error and appears only when standard input is a terminal, which it never is
@@ -39,7 +43,6 @@ use engine_mcp::{
     parse_base, BackendConfig, HttpBackend, Profile, Server, Session, SessionError, Token,
 };
 use reqwest::{Method, StatusCode, Url};
-use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -61,19 +64,21 @@ const MIN_RENEW_GAP: Duration = Duration::from_secs(3);
 #[derive(Args)]
 pub struct Options {
     /// Independently prepared JSON with version, url, authority and public_key: the file
-    /// `sync --remote` reads.
-    #[arg(long)]
+    /// `sync --remote` reads. Or the variable DYNODOC_REMOTE.
+    #[arg(long, env = "DYNODOC_REMOTE")]
     remote: PathBuf,
     /// The project this server reads. The key must be enrolled for an AI agent and granted
-    /// this project with the content:read scope in your profile (signing keys).
-    #[arg(long)]
+    /// this project with the content:read scope in your profile (signing keys). Or the
+    /// variable DYNODOC_PROJECT.
+    #[arg(long, env = "DYNODOC_PROJECT")]
     project: Uuid,
     /// Enrolled Ed25519 agent key file: unencrypted DER PKCS#8 or an encrypted
     /// dynodoc-key-v1 file (passphrase from --passphrase-file, the
     /// DYNODOC_KEY_PASSPHRASE_FILE variable, or an OS keystore binding; there is no prompt
     /// when standard input is the MCP stream). Obtains and renews one-hour tokens in
-    /// memory. On Unix a key readable by group or others is refused.
-    #[arg(long)]
+    /// memory. On Unix a key readable by group or others is refused. Or the variable
+    /// DYNODOC_KEY.
+    #[arg(long, env = "DYNODOC_KEY")]
     device_key: PathBuf,
     /// Synthetic local tests only. HTTPS is required for other addresses.
     #[arg(long)]
@@ -83,8 +88,15 @@ pub struct Options {
     /// profile (signing keys) and the project's write_mode must not be none. An agent only
     /// proposes: a person reviews and merges, and nothing it sends is live before that. Off
     /// unless given; the variable DYNODOC_WRITE set to on, yes, true or 1 has the same effect.
+    /// Each write is shown to you for approval in the Dynodoc desktop app, or in a system
+    /// dialog when the app is not running.
     #[arg(long)]
     write: bool,
+    /// With --write: the desktop app's confirmation file (mcp-confirm.json in its local data
+    /// folder). Needed only for a portable copy of the app. Or the variable
+    /// DYNODOC_CONFIRM_FILE.
+    #[arg(long, env = "DYNODOC_CONFIRM_FILE")]
+    confirm_file: Option<PathBuf>,
 }
 
 /// `DYNODOC_WRITE` as an operator would set it: on, yes, true or 1 turn writing on. Anything
@@ -114,7 +126,6 @@ fn read_capped(path: &Path, cap: usize) -> anyhow::Result<Vec<u8>> {
 
 pub async fn run(options: Options) -> anyhow::Result<()> {
     let write = options.write || write_from_environment();
-    ensure!(!write, "MCP write tools require a trusted per-request human confirmation surface; this CLI currently supports read-only access");
     let remote: Remote = serde_json::from_slice(
         &read_capped(&options.remote, 8192).context("cannot read the --remote file")?,
     )
@@ -126,7 +137,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
     let base = parse_base(&remote.url, options.allow_loopback_http)?;
     // Before anything is served: a wrong path or passphrase should stop the launch with a
     // message on stderr, not surface as a tool error on every call.
-    let key = crate::signing::load(&options.device_key)?;
+    let key = crate::signing::SharedSigner::load(&options.device_key)?;
     let owned = |scopes: &[&str]| scopes.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
     let mut session = DeviceSession::new(
         base.clone(),
@@ -145,7 +156,16 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
         (Profile::read_only(), "read-only")
     };
     tracing::info!(project = %options.project, mode, "dynodoc MCP server ready on stdio");
-    Server::new(backend, profile)
+    let server = if write {
+        let confirmer = confirm::Confirmer {
+            project: options.project,
+            file: options.confirm_file.or_else(confirm::default_file),
+        };
+        Server::with_human_confirmation(backend, profile, std::sync::Arc::new(confirmer))
+    } else {
+        Server::new(backend, profile)
+    };
+    server
         .serve_stdio()
         .await
         .context("standard input/output failed")?;
@@ -175,7 +195,8 @@ struct DeviceSession {
     base: Url,
     project: Uuid,
     authority: Uuid,
-    key: Ed25519KeyPair,
+    /// A key file or a PKCS#11 token key (`pkcs11:` URI).
+    key: crate::signing::SharedSigner,
     scopes: Vec<String>,
     /// What to ask for instead when the service refuses `scopes` (the read scope, for a
     /// session that asked for the write scopes); `None` for a session with nothing to fall
@@ -193,7 +214,7 @@ impl DeviceSession {
         base: Url,
         project: Uuid,
         authority: Uuid,
-        key: Ed25519KeyPair,
+        key: crate::signing::SharedSigner,
         scopes: Vec<String>,
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
@@ -288,7 +309,7 @@ impl DeviceSession {
             .post(
                 &format!("projects/{}/device-sessions/challenge", self.project),
                 &json!({
-                    "public_key": lower_hex(self.key.public_key().as_ref()),
+                    "public_key": lower_hex(&engine_core::repository::Signer::public_key_bytes(&self.key)),
                     "scopes": scopes,
                 }),
             )
@@ -384,5 +405,6 @@ impl Session for DeviceSession {
     }
 }
 
+mod confirm;
 #[cfg(test)]
 mod tests;

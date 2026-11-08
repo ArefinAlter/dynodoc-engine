@@ -207,9 +207,9 @@ impl LocalRepository {
         let schema: i64 = sqlx::query_scalar("select version from local_meta where singleton=1")
             .fetch_one(&mut *tx)
             .await?;
-        if schema != storage::SCHEMA_VERSION {
+        if schema < storage::SCHEMA_VERSION {
             return Err(Error::Invalid(
-                "retention collection requires local schema 3",
+                "retention collection requires local schema 3 or later",
             ));
         }
         let before = storage::usage(&mut tx, schema).await?;

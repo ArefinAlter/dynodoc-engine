@@ -324,6 +324,7 @@ async fn without_the_flag_the_commit_is_the_manual_manifest_and_explicit_choices
     let mut files = plan.files;
     files.insert("Report.docx".into(), choice);
     let manual = Commit {
+        sealed: None,
         version: 1,
         project: s.repo.project(),
         parents: vec![s.left.clone(), s.right.clone()],
@@ -332,6 +333,9 @@ async fn without_the_flag_the_commit_is_the_manual_manifest_and_explicit_choices
         authored_at_ms: 1_700_000_000_500,
         message: "merge".into(),
         recovery: None,
+        project_resolutions: Vec::new(),
+        relocations: Vec::new(),
+        merge_policy: None,
         same_file_resolutions: Vec::new(),
     };
     let signed_auto = SignedCommit::sign(auto.commit.unwrap(), &key()).unwrap();

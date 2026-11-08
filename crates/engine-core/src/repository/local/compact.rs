@@ -244,8 +244,10 @@ impl LocalRepository {
         let schema: i64 = sqlx::query_scalar("select version from local_meta where singleton=1")
             .fetch_one(&mut *tx)
             .await?;
-        if schema != storage::SCHEMA_VERSION {
-            return Err(Error::Invalid("compaction requires local schema 3"));
+        if schema < storage::SCHEMA_VERSION {
+            return Err(Error::Invalid(
+                "compaction requires local schema 3 or later",
+            ));
         }
         let before = storage::usage(&mut tx, schema).await?;
         sqlx::query("insert into local_compaction(singleton) values(1)")

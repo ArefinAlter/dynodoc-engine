@@ -455,7 +455,7 @@ async fn unknown_schemas_are_refused_by_every_open_mode() {
         .unwrap();
     assert_eq!(version, 3);
     assert!(!matches!(version, 1 | 2));
-    sqlx::query("update local_meta set version=4")
+    sqlx::query("update local_meta set version=5")
         .execute(&repo.pool)
         .await
         .unwrap();

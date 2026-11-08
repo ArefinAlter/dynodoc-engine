@@ -532,6 +532,7 @@ mod tests {
     fn test_commit() -> SignedCommit {
         let key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
         let commit = Commit {
+            sealed: None,
             version: 1,
             project: uuid::Uuid::new_v4(),
             parents: vec![],
@@ -540,6 +541,9 @@ mod tests {
             authored_at_ms: 1000,
             message: "test commit".into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: vec![],
         };
         SignedCommit::sign(commit, &key).expect("signing commit")
@@ -807,6 +811,7 @@ mod tests {
 
         let key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
         let commit = Commit {
+            sealed: None,
             version: 1,
             project,
             parents: vec![],
@@ -821,6 +826,9 @@ mod tests {
             authored_at_ms: 1000,
             message: "valid test export commit".into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: vec![],
         };
         let signed = SignedCommit::sign(commit, &key).unwrap();

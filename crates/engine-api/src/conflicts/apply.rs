@@ -93,6 +93,7 @@ pub async fn resolve_conflict(
         }
     };
 
+    crate::ledger::refuse_direct(&mut tx, document_id.0).await?;
     let field_edit = engine_core::richtext::compact_event(&current, &field_edit);
     // One transaction: materialize the field edit, append it, then append every
     // lifecycle event. All land or none does (mirrors apply::accept_proposal).

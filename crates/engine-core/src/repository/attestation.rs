@@ -92,11 +92,9 @@ pub struct SignedReceipt {
 impl SignedReceipt {
     /// The authority must first verify and atomically record its accepted ref.
     /// Signing arbitrary supplied fields alone is not server acceptance.
-    pub fn sign(mut receipt: Receipt, key: &Ed25519KeyPair) -> Result<Self, Error> {
-        receipt.issuer_key = hex(key.public_key().as_ref());
-        let signature = hex(key
-            .sign(&message(SIGN_DOMAIN, &receipt.address()?)?)
-            .as_ref());
+    pub fn sign(mut receipt: Receipt, key: &(impl super::Signer + ?Sized)) -> Result<Self, Error> {
+        receipt.issuer_key = hex(&key.public_key_bytes());
+        let signature = hex(&key.sign_message(&message(SIGN_DOMAIN, &receipt.address()?)?)?);
         Ok(Self { receipt, signature })
     }
     pub fn verify(&self) -> Result<Address, Error> {

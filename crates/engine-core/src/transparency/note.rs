@@ -285,7 +285,9 @@ impl NoteSignature {
         self.key_id
     }
 
-    fn encode(&self) -> String {
+    /// The signature line, `— name base64(key id || body)` and a newline: what a
+    /// witness answers to `add-checkpoint`.
+    pub fn encode(&self) -> String {
         let mut raw = self.key_id.to_vec();
         raw.extend_from_slice(&self.body);
         format!("{DASH}{} {}\n", self.name, b64(&raw))
@@ -295,7 +297,8 @@ impl NoteSignature {
         clippy::expect_used,
         reason = "the digest prefix or checked signature prefix contains four bytes"
     )]
-    fn parse(line: &str) -> Result<Self, Error> {
+    /// One signature line without its newline.
+    pub fn parse(line: &str) -> Result<Self, Error> {
         let rest = line.strip_prefix(DASH).ok_or(Error::MalformedNote(
             "signature line must start with an em dash and a space",
         ))?;

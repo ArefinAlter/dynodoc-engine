@@ -8,7 +8,12 @@ use super::{
     read_state, validate_stored, write_state, Address, Error, Limits, ObjectStore, WriteStats,
     READ_BATCH_OBJECTS, WRITE_BATCH_BYTES, WRITE_BATCH_OBJECTS,
 };
-use crate::{log::ZERO_HASH, materializer::DocumentState, snapshot::read_legacy_state_at};
+use crate::{
+    at_rest::store::{open_object, seal_object},
+    log::ZERO_HASH,
+    materializer::DocumentState,
+    snapshot::read_legacy_state_at,
+};
 
 /// Explicit publication format. Changing this never rewrites an existing root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +63,7 @@ impl Codec {
 
 /// Internal document-scoped store. Use a transaction when writing graphs;
 /// individual `put` calls do not publish a checkpoint or check authorization.
+/// With at-rest encryption configured, rows are `DYNOENC` envelopes (`at_rest::store`).
 pub struct PgStore<'a> {
     connection: &'a mut PgConnection,
     prefetched: BTreeMap<(uuid::Uuid, Address), Vec<u8>>,
@@ -84,10 +90,14 @@ impl<'a> PgStore<'a> {
         self.write_queries
     }
 
+    /// Existing rows equal to the inputs. `objects` are the bytes as they would be stored;
+    /// `plain` the object bytes, for rows stored in another form (legacy plaintext or an older
+    /// data key), which are opened and compared here.
     async fn matching_objects(
         &mut self,
         document: DocumentId,
         objects: &[(&str, &[u8])],
+        plain: &BTreeMap<&str, &[u8]>,
     ) -> Result<BTreeSet<String>, Error> {
         // Compare exact bytes in PostgreSQL and return only addresses/booleans.
         // A corrupt stored row can be much larger than its expected value; do
@@ -110,11 +120,43 @@ impl<'a> PgStore<'a> {
         let mut matching = BTreeSet::new();
         for (address, matches) in rows {
             if !matches {
-                return Err(Error::HashMismatch);
+                let expected = plain.get(address.as_str()).copied();
+                let stored = self.stored_plain(document, &address, expected).await?;
+                if stored.as_deref() != expected {
+                    return Err(Error::HashMismatch);
+                }
             }
             matching.insert(address);
         }
         Ok(matching)
+    }
+
+    /// The opened bytes of a row stored in another form than the input, when its stored size
+    /// could hold `expected` (a corrupt oversized row is not hydrated).
+    async fn stored_plain(
+        &mut self,
+        document: DocumentId,
+        address: &str,
+        expected: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let Some(expected) = expected else {
+            return Ok(None);
+        };
+        self.read_queries += 1;
+        let stored: Option<Vec<u8>> = sqlx::query_scalar(
+            "select bytes from checkpoint_object where document_id=$1 and address=$2 and octet_length(bytes)<=$3",
+        )
+        .bind(document.0)
+        .bind(address)
+        .bind(expected.len() as i64 + crate::at_rest::MIN_ENVELOPE_LEN as i64)
+        .fetch_optional(&mut *self.connection)
+        .await?;
+        Ok(match stored {
+            Some(bytes) => {
+                Some(open_object(&mut *self.connection, document.0, address, bytes).await?)
+            }
+            None => None,
+        })
     }
 }
 
@@ -133,17 +175,26 @@ impl ObjectStore for PgStore<'_> {
             return Ok(Vec::new());
         }
         self.prefetched.clear();
-        let mut unique = BTreeMap::new();
+        let mut plain = BTreeMap::new();
         for (address, bytes) in objects {
             validate_stored(address, bytes)?;
-            if let Some(prior) = unique.insert(address.as_str(), bytes.as_slice()) {
+            if let Some(prior) = plain.insert(address.as_str(), bytes.as_slice()) {
                 if prior != bytes {
                     return Err(Error::HashMismatch);
                 }
             }
         }
+        let mut sealed = BTreeMap::new();
+        for (address, bytes) in &plain {
+            sealed.insert(
+                *address,
+                seal_object(&mut *self.connection, document.0, address, bytes).await?,
+            );
+        }
+        let unique: BTreeMap<&str, &[u8]> =
+            sealed.iter().map(|(a, b)| (*a, b.as_slice())).collect();
         let expected: Vec<_> = unique.iter().map(|(key, bytes)| (*key, *bytes)).collect();
-        let existing = self.matching_objects(document, &expected).await?;
+        let existing = self.matching_objects(document, &expected, &plain).await?;
         let missing: Vec<_> = unique
             .iter()
             .filter(|(key, _)| !existing.contains(**key))
@@ -173,7 +224,7 @@ impl ObjectStore for PgStore<'_> {
                 .map(|(key, bytes)| (**key, **bytes))
                 .collect();
             if !raced.is_empty() {
-                let rows = self.matching_objects(document, &raced).await?;
+                let rows = self.matching_objects(document, &raced, &plain).await?;
                 for (key, _) in raced {
                     if !rows.contains(key) {
                         return Err(Error::Missing(key.to_owned()));
@@ -207,6 +258,7 @@ impl ObjectStore for PgStore<'_> {
         .fetch_all(&mut *self.connection)
         .await?;
         for (address, bytes) in rows {
+            let bytes = open_object(&mut *self.connection, document.0, &address, bytes).await?;
             self.prefetched
                 .insert((document.0, Address::try_from(address)?), bytes);
         }
@@ -220,6 +272,8 @@ impl ObjectStore for PgStore<'_> {
         bytes: &[u8],
     ) -> Result<bool, Error> {
         validate_stored(address, bytes)?;
+        let stored =
+            seal_object(&mut *self.connection, document.0, address.as_str(), bytes).await?;
         self.write_queries += 1;
         let result = sqlx::query(
             "insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)
@@ -227,7 +281,7 @@ impl ObjectStore for PgStore<'_> {
         )
         .bind(document.0)
         .bind(address.as_str())
-        .bind(bytes)
+        .bind(&stored)
         .execute(&mut *self.connection)
         .await?;
         if result.rows_affected() == 0 && self.get(document, address).await? != bytes {
@@ -241,14 +295,15 @@ impl ObjectStore for PgStore<'_> {
             return Ok(bytes.clone());
         }
         self.read_queries += 1;
-        sqlx::query_scalar(
+        let stored: Vec<u8> = sqlx::query_scalar(
             "select bytes from checkpoint_object where document_id=$1 and address=$2",
         )
         .bind(document.0)
         .bind(address.as_str())
         .fetch_optional(&mut *self.connection)
         .await?
-        .ok_or_else(|| Error::Missing(address.as_str().to_owned()))
+        .ok_or_else(|| Error::Missing(address.as_str().to_owned()))?;
+        open_object(&mut *self.connection, document.0, address.as_str(), stored).await
     }
 }
 
@@ -703,6 +758,179 @@ pub(crate) async fn publish_incremental_in_connection(
         base_seq: Some(base_seq),
         fallback_ran: false,
     })
+}
+
+/// Longest event tail changed-node publication applies; longer tails take the
+/// full incremental path.
+pub const MAX_CHANGED_TAIL: i64 = 5_000;
+
+/// Changed-node publication (decision 034): publish the checkpoint at
+/// `through_seq` from the latest earlier v3 checkpoint by applying the tail's
+/// events only to the nodes they touch. Steady-state cost follows the tail, not
+/// the document. Falls back to [`take_incremental_v3`] when there is no v3 base,
+/// the tail is long, or it carries comments, suggestions or deploys.
+pub async fn take_changed_v3(
+    pool: &PgPool,
+    document: DocumentId,
+    through_seq: i64,
+    limits: Limits,
+) -> Result<PublishedCheckpoint, Error> {
+    if through_seq < 0 {
+        return Err(Error::Invalid("negative revision"));
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(publication_lock_key(document))
+        .execute(&mut *tx)
+        .await?;
+    protect_document(&mut tx, document).await?;
+    if let Some(published) =
+        publish_changed_in_connection(&mut tx, document, through_seq, limits).await?
+    {
+        tx.commit().await?;
+        return Ok(published);
+    }
+    drop(tx);
+    let mut published = take_incremental_v3(pool, document, through_seq, limits).await?;
+    published.fallback_ran = true;
+    Ok(published)
+}
+
+/// Caller holds the publication lock and protects the document. `None` means
+/// the tail is not one this path handles; nothing was written.
+pub(crate) async fn publish_changed_in_connection(
+    connection: &mut PgConnection,
+    document: DocumentId,
+    through_seq: i64,
+    limits: Limits,
+) -> Result<Option<PublishedCheckpoint>, Error> {
+    use engine_shared::{Event, EventPayload};
+    use futures::TryStreamExt;
+    let exists: bool = sqlx::query_scalar(
+        "select exists(select 1 from shared_checkpoint where document_id=$1 and through_seq=$2)",
+    )
+    .bind(document.0)
+    .bind(through_seq)
+    .fetch_one(&mut *connection)
+    .await?;
+    let base: Option<(i64, String, Vec<u8>)> = sqlx::query_as(
+        "select through_seq,state_root,event_chain_hash from shared_checkpoint
+         where document_id=$1 and through_seq<$2 and codec_version=3
+         order by through_seq desc limit 1",
+    )
+    .bind(document.0)
+    .bind(through_seq)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some((base_seq, base_root, base_chain)) = base.filter(|_| !exists) else {
+        return Ok(None);
+    };
+    if through_seq - base_seq > MAX_CHANGED_TAIL {
+        return Ok(None);
+    }
+    if base_chain != chain_at(connection, document, base_seq).await? {
+        return Err(Error::Invalid("checkpoint version or chain position"));
+    }
+    let base_root = Address::try_from(base_root)?;
+    let mut payloads = Vec::new();
+    let mut previous = base_chain;
+    {
+        let mut tail = sqlx::query_as::<_, Event>(
+            "select * from event where document_id=$1 and seq>$2 and seq<=$3 order by seq",
+        )
+        .bind(document.0)
+        .bind(base_seq)
+        .bind(through_seq)
+        .fetch(&mut *connection);
+        let mut expected = base_seq + 1;
+        while let Some(event) = tail.try_next().await? {
+            crate::log::verify_event(&event, document, expected, &previous)
+                .map_err(|e| Error::History(e.into()))?;
+            previous = event.chain_hash.clone();
+            payloads.push(serde::Deserialize::deserialize(&event.payload)?);
+            expected += 1;
+        }
+        if expected != through_seq + 1 {
+            return Err(Error::Invalid("revision outside event history"));
+        }
+    }
+    let mut touched = BTreeSet::new();
+    for payload in &payloads {
+        use EventPayload::*;
+        let id = match payload {
+            NodeCreated { node_id, .. }
+            | FieldEdited { node_id, .. }
+            | RichTextPatched { node_id, .. }
+            | NodeMoved { node_id, .. }
+            | NodeDeleted { node_id }
+            | NodeRestored { node_id } => node_id,
+            ChoiceAdded { choice_id, .. } | ChoiceRemoved { choice_id, .. } => choice_id,
+            // Thread replies and resolutions change no structural state.
+            CommentReplied { .. } | CommentResolved { .. } => continue,
+            _ => return Ok(None),
+        };
+        touched.insert(id.clone());
+    }
+    let mut store = PgStore::new(connection);
+    let before =
+        super::typed::read_nodes_v3(&mut store, document, &base_root, &touched, limits).await?;
+    let mut partial = DocumentState {
+        nodes: before.nodes.clone(),
+        removed_choices: before
+            .removed_choices
+            .iter()
+            .filter(|(_, removed)| **removed)
+            .map(|(id, _)| id.clone())
+            .collect(),
+        ..Default::default()
+    };
+    for payload in &payloads {
+        crate::materializer::apply_payload(&mut partial, payload)
+            .map_err(|_| Error::Invalid("tail does not apply to the checkpoint"))?;
+    }
+    let changes = super::typed::NodeChanges {
+        removed_choices: touched
+            .iter()
+            .map(|id| (id.clone(), partial.removed_choices.contains(id)))
+            .filter(|(id, now)| before.removed_choices.get(id) != Some(now))
+            .collect(),
+        nodes: partial
+            .nodes
+            .into_iter()
+            .filter(|(id, node)| before.nodes.get(id) != Some(node))
+            .collect(),
+    };
+    let (root, stats) = super::typed::apply_changes_v3(
+        &mut store,
+        document,
+        &base_root,
+        &changes,
+        limits,
+        Default::default(),
+    )
+    .await?;
+    let (object_read_queries, object_write_queries) = (store.read_queries(), store.write_queries());
+    let event_chain_hash = previous;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,$2,3,$3,$4)",
+    )
+    .bind(document.0)
+    .bind(through_seq)
+    .bind(root.as_str())
+    .bind(&event_chain_hash)
+    .execute(&mut *connection)
+    .await?;
+    Ok(Some(PublishedCheckpoint {
+        through_seq,
+        root,
+        event_chain_hash,
+        stats,
+        object_read_queries,
+        object_write_queries,
+        base_seq: Some(base_seq),
+        fallback_ran: false,
+    }))
 }
 
 /// Load an exact published checkpoint, checking chain-position metadata and every

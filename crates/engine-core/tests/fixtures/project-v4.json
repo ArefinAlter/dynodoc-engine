@@ -1,0 +1,161 @@
+{
+  "generator": "Independent Python SHA-256, canonical JSON, Crockford ULID and RFC 8032 Ed25519 (3 RFC vectors checked); public synthetic seed 7; placeholder states",
+  "relocation": {
+    "spec": {
+      "kind": "split",
+      "from_document": "00000000-0000-0000-0000-0000000000a1",
+      "roots": [
+        "01JS2000000000000000000000"
+      ],
+      "to_document": "00000000-0000-0000-0000-0000000000a2",
+      "parent": "01JR0000000000000000000000",
+      "position": "a3"
+    },
+    "id": "809793e653a73f3c2b5552daec6278625887c4227852df1e20df3c5a3cfcba29",
+    "dest_ids": {
+      "01JR0000000000000000000000": "6F1JN0C0MEDHM82XS45MMM1M37",
+      "01JS2000000000000000000000": "1MF4ZYBG5X6K1272HQ9BQGTX20",
+      "01JN5000000000000000000000": "7R8011MS1T0RHZWAB6JFXYZA4C"
+    }
+  },
+  "split_commit": {
+    "canonical": "{\"author_key\":\"ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c\",\"authored_at_ms\":1700000000000,\"files\":{\"Appendix.docx\":{\"document\":\"00000000-0000-0000-0000-0000000000a2\",\"state\":\"4444444444444444444444444444444444444444444444444444444444444444\"},\"Proposal.docx\":{\"document\":\"00000000-0000-0000-0000-0000000000a1\",\"state\":\"3333333333333333333333333333333333333333333333333333333333333333\"}},\"message\":\"Split the methods section into an appendix\",\"parents\":[\"1111111111111111111111111111111111111111111111111111111111111111\"],\"project\":\"00000000-0000-0000-0000-000000000005\",\"relocations\":[{\"count\":14,\"dest_state_after\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"from\":{\"document\":\"00000000-0000-0000-0000-0000000000a1\",\"roots\":[\"01JS2000000000000000000000\"]},\"id\":\"809793e653a73f3c2b5552daec6278625887c4227852df1e20df3c5a3cfcba29\",\"kind\":\"split\",\"source_state_after\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"to\":{\"document\":\"00000000-0000-0000-0000-0000000000a2\",\"parent\":\"01JR0000000000000000000000\",\"position\":\"a3\"}}],\"version\":4}",
+    "address": "73276aef05e5ab2848361be450d80676c6463760741804c41940f9475b109cf9",
+    "signed": {
+      "commit": {
+        "version": 4,
+        "project": "00000000-0000-0000-0000-000000000005",
+        "parents": [
+          "1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        "files": {
+          "Proposal.docx": {
+            "document": "00000000-0000-0000-0000-0000000000a1",
+            "state": "3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          "Appendix.docx": {
+            "document": "00000000-0000-0000-0000-0000000000a2",
+            "state": "4444444444444444444444444444444444444444444444444444444444444444"
+          }
+        },
+        "authored_at_ms": 1700000000000,
+        "message": "Split the methods section into an appendix",
+        "relocations": [
+          {
+            "id": "809793e653a73f3c2b5552daec6278625887c4227852df1e20df3c5a3cfcba29",
+            "kind": "split",
+            "from": {
+              "document": "00000000-0000-0000-0000-0000000000a1",
+              "roots": [
+                "01JS2000000000000000000000"
+              ]
+            },
+            "to": {
+              "document": "00000000-0000-0000-0000-0000000000a2",
+              "parent": "01JR0000000000000000000000",
+              "position": "a3"
+            },
+            "count": 14,
+            "source_state_after": "3333333333333333333333333333333333333333333333333333333333333333",
+            "dest_state_after": "4444444444444444444444444444444444444444444444444444444444444444"
+          }
+        ],
+        "author_key": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+      },
+      "signature": "176e15771aee00c44c2185e98bc5cff2db0f4e9926b10d1f32bf419bc20ce846d8226db25e8a83f684753b1e6cb1efead924bf797f385510d2c13335ed035e0d"
+    }
+  },
+  "merge_commit": {
+    "canonical": "{\"author_key\":\"ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c\",\"authored_at_ms\":1700000000001,\"files\":{\"Appendix.docx\":{\"document\":\"00000000-0000-0000-0000-0000000000a2\",\"state\":\"6666666666666666666666666666666666666666666666666666666666666666\"},\"Finance/Budget.xlsx\":{\"document\":\"00000000-0000-0000-0000-0000000000a3\",\"state\":\"5555555555555555555555555555555555555555555555555555555555555555\"},\"Proposal.docx\":{\"document\":\"00000000-0000-0000-0000-0000000000a1\",\"state\":\"7777777777777777777777777777777777777777777777777777777777777777\"}},\"merge_policy\":{\"hash\":\"555c253aef337cc446b306775c24ca7af552ab5ab7ec6c3456813b20aa0a91bf\",\"policy\":{\"defaults\":{\"invariants\":\"flag\",\"loser\":\"suggestion\",\"roles_rank\":[\"owner\",\"manager\",\"editor\",\"contributor\",\"reviewer\"],\"unknown\":\"manual\"},\"floors\":{\"gate_at_least\":{}},\"id\":\"minimal\",\"rules\":[],\"version\":1}},\"message\":\"Merge the appendix split and the budget rename\",\"parents\":[\"1111111111111111111111111111111111111111111111111111111111111111\",\"2222222222222222222222222222222222222222222222222222222222222222\"],\"project\":\"00000000-0000-0000-0000-000000000005\",\"project_resolutions\":[{\"base\":\"5050505050505050505050505050505050505050505050505050505050505050\",\"document\":\"00000000-0000-0000-0000-0000000000a3\",\"id\":\"r1\",\"left\":\"5050505050505050505050505050505050505050505050505050505050505050\",\"merged\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"path\":{\"base\":\"Budget.xlsx\",\"left\":\"Finance/Budget.xlsx\",\"merged\":\"Finance/Budget.xlsx\",\"right\":\"Budget.xlsx\"},\"right\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"strategy\":\"dynodoc.project.rename-follow.v1\"},{\"base\":null,\"document\":\"00000000-0000-0000-0000-0000000000a2\",\"follows\":\"left\",\"id\":\"r2\",\"left\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"merged\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"needs_review\":true,\"relocation\":\"809793e653a73f3c2b5552daec6278625887c4227852df1e20df3c5a3cfcba29\",\"resolution_set\":\"abababababababababababababababababababababababababababababababab\",\"right\":null,\"source\":{\"base\":\"8888888888888888888888888888888888888888888888888888888888888888\",\"document\":\"00000000-0000-0000-0000-0000000000a1\",\"left\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"merged\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"right\":\"9999999999999999999999999999999999999999999999999999999999999999\"},\"strategy\":\"dynodoc.project.edit-follows-move.v1\"}],\"version\":4}",
+    "address": "6d129752686004e3d38d22d63d4f386c0764ca5300f883f7d7bf786187d233de",
+    "signed": {
+      "commit": {
+        "version": 4,
+        "project": "00000000-0000-0000-0000-000000000005",
+        "parents": [
+          "1111111111111111111111111111111111111111111111111111111111111111",
+          "2222222222222222222222222222222222222222222222222222222222222222"
+        ],
+        "files": {
+          "Finance/Budget.xlsx": {
+            "document": "00000000-0000-0000-0000-0000000000a3",
+            "state": "5555555555555555555555555555555555555555555555555555555555555555"
+          },
+          "Appendix.docx": {
+            "document": "00000000-0000-0000-0000-0000000000a2",
+            "state": "6666666666666666666666666666666666666666666666666666666666666666"
+          },
+          "Proposal.docx": {
+            "document": "00000000-0000-0000-0000-0000000000a1",
+            "state": "7777777777777777777777777777777777777777777777777777777777777777"
+          }
+        },
+        "authored_at_ms": 1700000000001,
+        "message": "Merge the appendix split and the budget rename",
+        "project_resolutions": [
+          {
+            "id": "r1",
+            "strategy": "dynodoc.project.rename-follow.v1",
+            "document": "00000000-0000-0000-0000-0000000000a3",
+            "base": "5050505050505050505050505050505050505050505050505050505050505050",
+            "left": "5050505050505050505050505050505050505050505050505050505050505050",
+            "right": "5555555555555555555555555555555555555555555555555555555555555555",
+            "merged": "5555555555555555555555555555555555555555555555555555555555555555",
+            "path": {
+              "base": "Budget.xlsx",
+              "left": "Finance/Budget.xlsx",
+              "right": "Budget.xlsx",
+              "merged": "Finance/Budget.xlsx"
+            }
+          },
+          {
+            "id": "r2",
+            "strategy": "dynodoc.project.edit-follows-move.v1",
+            "document": "00000000-0000-0000-0000-0000000000a2",
+            "base": null,
+            "left": "4444444444444444444444444444444444444444444444444444444444444444",
+            "right": null,
+            "merged": "6666666666666666666666666666666666666666666666666666666666666666",
+            "relocation": "809793e653a73f3c2b5552daec6278625887c4227852df1e20df3c5a3cfcba29",
+            "follows": "left",
+            "source": {
+              "document": "00000000-0000-0000-0000-0000000000a1",
+              "base": "8888888888888888888888888888888888888888888888888888888888888888",
+              "left": "3333333333333333333333333333333333333333333333333333333333333333",
+              "right": "9999999999999999999999999999999999999999999999999999999999999999",
+              "merged": "7777777777777777777777777777777777777777777777777777777777777777"
+            },
+            "needs_review": true,
+            "resolution_set": "abababababababababababababababababababababababababababababababab"
+          }
+        ],
+        "merge_policy": {
+          "hash": "555c253aef337cc446b306775c24ca7af552ab5ab7ec6c3456813b20aa0a91bf",
+          "policy": {
+            "defaults": {
+              "invariants": "flag",
+              "loser": "suggestion",
+              "roles_rank": [
+                "owner",
+                "manager",
+                "editor",
+                "contributor",
+                "reviewer"
+              ],
+              "unknown": "manual"
+            },
+            "floors": {
+              "gate_at_least": {}
+            },
+            "id": "minimal",
+            "rules": [],
+            "version": 1
+          }
+        },
+        "author_key": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+      },
+      "signature": "edad8ecb7206b57bcaa11cd420bd8fcd2848d5a415340940f9a2f1f24442cf96964972e68120a8b62dd0a12dd2110394bf86a7072fd0c58f6f967e5036e10e0b"
+    },
+    "resolution_set_hash": "92263edea28efe651f3826301c21c2120d645ff281daad9b1b1ebbabbd5a7267"
+  }
+}

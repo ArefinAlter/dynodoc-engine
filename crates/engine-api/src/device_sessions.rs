@@ -85,16 +85,7 @@ fn now_ms() -> i64 {
 /// The installation ID is immutable, so one read per process is enough and an
 /// unauthenticated challenge request needs no database work at all after it.
 async fn authority(state: &AppState) -> Result<Uuid, ApiError> {
-    state
-        .device_authority
-        .get_or_try_init(|| async {
-            sqlx::query_scalar::<_, Uuid>("select id from device_authority where singleton")
-                .fetch_one(&state.pool)
-                .await
-        })
-        .await
-        .copied()
-        .map_err(ApiError::from)
+    state.installation().await.map_err(ApiError::from)
 }
 
 /// Answerable now, by this installation: not expired and not from the future.
@@ -219,6 +210,33 @@ async fn issue(
     if revoked || redeemed {
         return Err(refused());
     }
+    let (access_token, expires_at) =
+        issue_for_key(&state, key_id, identity, project, &c.scopes, c.id).await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "access_token":access_token,
+            "token_type":"Bearer",
+            "expires_in":DEVICE_SESSION_TTL_SECONDS,
+            "expires_at":expires_at,
+            "project":project,
+            "scopes":c.scopes,
+        })),
+    ))
+}
+
+/// Issue a project device session for an enrolled, unrevoked key whose possession the
+/// caller has proven (a signed challenge, or an OAuth grant's refresh token): account and
+/// key checks, role gates, the key's grant, the issuance budget, the ledger row the kill
+/// switch reads, the audit entry and the token. `session` is the ledger id (one use).
+pub(crate) async fn issue_for_key(
+    state: &AppState,
+    key_id: Uuid,
+    identity: Uuid,
+    project: Uuid,
+    scopes: &[String],
+    session: Uuid,
+) -> Result<(String, chrono::DateTime<chrono::Utc>), ApiError> {
     // Admission is keyed by the key's account, reached only with a valid signature
     // of an enrolled, unrevoked key and an unused challenge: invented projects or
     // replays cannot fill the registry or burn the account's budget.
@@ -247,7 +265,7 @@ async fn issue(
     // request re-reads it. All refusals are the same 403: the key holder is not
     // told whether the role, the review rank or the key's grant was missing.
     let role = projects::require(&mut tx, project, identity).await?;
-    if c.scopes.iter().any(|s| s == "history:write")
+    if scopes.iter().any(|s| s == "history:write")
         && !matches!(
             role.as_str(),
             "owner" | "manager" | "editor" | "reviewer" | "approver"
@@ -255,14 +273,14 @@ async fn issue(
     {
         return Err(ApiError::Forbidden);
     }
-    if c.scopes.iter().any(|s| s == "history:review")
+    if scopes.iter().any(|s| s == "history:review")
         && !matches!(role.as_str(), "owner" | "manager" | "editor" | "approver")
     {
         return Err(ApiError::Forbidden);
     }
     // A viewer cannot stage drafts (`create_draft` refuses auditors), so a token that could
     // only ever be refused is not issued. Every request reads the role again.
-    if c.scopes
+    if scopes
         .iter()
         .any(|s| s == "content:propose" || s == "content:submit")
         && !matches!(
@@ -281,13 +299,13 @@ async fn issue(
     ))
     .bind(key_id)
     .bind(project)
-    .bind(&c.scopes)
+    .bind(scopes)
     .fetch_one(&mut *tx)
     .await?;
     // An agent key obtains agent scopes only, and only an agent key obtains them: the
     // same uniform refusal as a missing grant.
-    let agent_scopes = c.scopes.iter().any(|s| is_agent_scope(s));
-    let other_scopes = c.scopes.iter().any(|s| !is_agent_scope(s));
+    let agent_scopes = scopes.iter().any(|s| is_agent_scope(s));
+    let other_scopes = scopes.iter().any(|s| !is_agent_scope(s));
     if !reaches || (agent_key && other_scopes) || (!agent_key && agent_scopes) {
         return Err(ApiError::Forbidden);
     }
@@ -309,14 +327,14 @@ async fn issue(
     }
     // One use: the challenge ID is the primary key.
     let inserted = sqlx::query("insert into device_session(id,key_id,identity_id,project_id,scopes,expires_at) values($1,$2,$3,$4,$5,now()+make_interval(secs=>$6)) on conflict do nothing")
-        .bind(c.id).bind(key_id).bind(identity).bind(project).bind(&c.scopes).bind(DEVICE_SESSION_TTL_SECONDS as f64)
+        .bind(session).bind(key_id).bind(identity).bind(project).bind(scopes).bind(DEVICE_SESSION_TTL_SECONDS as f64)
         .execute(&mut *tx).await?;
     if inserted.rows_affected() != 1 {
         return Err(refused());
     }
     let expires_at: chrono::DateTime<chrono::Utc> =
         sqlx::query_scalar("select expires_at from device_session where id=$1")
-            .bind(c.id)
+            .bind(session)
             .fetch_one(&mut *tx)
             .await?;
     // `key_id`, not `key`: the administrator audit view redacts a field named key.
@@ -325,7 +343,7 @@ async fn issue(
         identity,
         "device.session_issued",
         project,
-        json!({"session":c.id,"key_id":key_id,"scopes":c.scopes,"expires_at":expires_at}),
+        json!({"session":session,"key_id":key_id,"scopes":scopes,"expires_at":expires_at}),
     )
     .await?;
     let access_token = token::mint_project_device(
@@ -334,24 +352,14 @@ async fn issue(
             identity,
             key: key_id,
             project,
-            session: c.id,
-            scopes: c.scopes.clone(),
+            session,
+            scopes: scopes.to_vec(),
             generation,
         },
         DEVICE_SESSION_TTL_SECONDS,
     )?;
     tx.commit().await?;
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({
-            "access_token":access_token,
-            "token_type":"Bearer",
-            "expires_in":DEVICE_SESSION_TTL_SECONDS,
-            "expires_at":expires_at,
-            "project":project,
-            "scopes":c.scopes,
-        })),
-    ))
+    Ok((access_token, expires_at))
 }
 
 #[derive(utoipa::OpenApi)]

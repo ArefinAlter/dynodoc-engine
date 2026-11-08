@@ -282,7 +282,7 @@ pub(super) async fn submit(
     ctx.finish(call, result).await
 }
 
-async fn submit_call(
+pub(super) async fn submit_call(
     ctx: &Ctx<'_>,
     call: &mut Call,
     proposal: Uuid,
@@ -301,6 +301,9 @@ async fn submit_call(
     }
     if !policy.can_propose() {
         return Err(denied(call, "write_mode"));
+    }
+    if super::held::must_hold(ctx).await? {
+        return super::held::hold(ctx, call, held_note("submit", found, note)).await;
     }
     let served = |text: String| Served {
         bytes: text.len(),
@@ -390,6 +393,24 @@ async fn submit_call(
     )))
 }
 
+/// A remote agent's submit or withdraw, held for its person (decision 029).
+fn held_note(tool: &'static str, found: &Found, note: String) -> super::held::Held {
+    let action = if tool == "submit" {
+        "Send to its reviewers"
+    } else {
+        "Withdraw"
+    };
+    super::held::Held {
+        tool,
+        target: found.id.to_string(),
+        document: Some(found.document),
+        summary: format!("{action}: proposal {}", found.id),
+        digest: ledger::request_digest(&[tool.as_bytes(), found.id.as_bytes(), note.as_bytes()]),
+        body: json!({ "note": note }),
+        preview: None,
+    }
+}
+
 /// The team version's head revision of a file.
 async fn head_of(ctx: &Ctx<'_>, document: Uuid) -> Result<u64, AgentFail> {
     let head: i64 =
@@ -422,7 +443,7 @@ pub(super) async fn withdraw(
     ctx.finish(call, result).await
 }
 
-async fn withdraw_call(
+pub(super) async fn withdraw_call(
     ctx: &Ctx<'_>,
     call: &mut Call,
     proposal: Uuid,
@@ -449,6 +470,9 @@ async fn withdraw_call(
     }
     if found.closed() {
         return Err(AgentError::ProposalClosed.into());
+    }
+    if super::held::must_hold(ctx).await? {
+        return super::held::hold(ctx, call, held_note("withdraw", found, note)).await;
     }
     // The lock, not the state: nothing here reads the file's content.
     let (mut tx, role) = begin_locked(ctx, found.document).await?;
@@ -495,6 +519,7 @@ async fn withdraw_call(
         .execute(&mut *tx)
         .await
         .map_err(ApiError::from)?;
+    crate::ledger::release_agent_states(&mut tx, found.document, found.id).await?;
     // The existing audit vocabulary: a request withdrawn, or a draft that never became one.
     audit(
         &mut tx,
@@ -754,7 +779,7 @@ async fn list_call(
         let matches = super::inbox::state_matches("k.state", "$7");
         let states = reviews::state_sql("d");
         let sql = format!(
-            "select jsonb_build_object('proposal',c.id,'file',c.document_id,'state',c.state,'base',c.base_seq,'head',x.head,'behind',greatest(x.head-c.base_seq,0),'revision',c.revision,'edits',(select count(*) from draft_edit e where e.draft_id=c.id),'created_at',c.created_at,'submitted_at',c.submitted_at) \
+            "select jsonb_build_object('proposal',c.id,'file',c.document_id,'state',c.state,'base',c.base_seq,'head',x.head,'behind',greatest(x.head-c.base_seq,0),'revision',c.revision,'edits',coalesce((select lc.edits from ledger_compaction lc where lc.draft_id=c.id),(select count(*) from draft_edit e where e.draft_id=c.id)),'created_at',c.created_at,'submitted_at',c.submitted_at) \
              from (select k.* from (select d.id,d.revision,d.base_seq,d.created_at,d.submitted_at,d.document_id,{states} as state \
                    from workspace_draft d join document f on f.id=d.document_id \
                    where d.created_by=$1 and document_project(d.document_id)=$2 and f.deleted_at is null and coalesce(f.settings->>'kind','questionnaire')=any($6::text[]) and document_member_role(f.id,$3) is not null and not exists(select 1 from file_agent_policy fp where fp.document_id=f.id and fp.access='none') \

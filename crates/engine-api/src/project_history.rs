@@ -33,7 +33,9 @@ use engine_core::{
             first_parent_log, CommitLoader, FirstParentLogOptions, LoadedEnvelope,
             DEFAULT_LOG_PAGE_LIMIT,
         },
-        server_authority, valid_branch, Head, SignedCommit,
+        project, relocation, server_authority, valid_branch,
+        xdoc::{self, ResolutionInputs},
+        Commit, Error as RepoError, Head, SignedCommit,
     },
     shared_checkpoint::{self, typed, Address, ObjectStore},
 };
@@ -123,7 +125,7 @@ pub(crate) async fn load(
 // Called only after document/space SHARE locks; membership/settings writers never
 // take this advisory lock. Serializes shared mutations without upgrading a space
 // lock (which would deadlock two contributors holding SHARE).
-async fn serial(db: &mut PgConnection, project: Uuid) -> Result<(), ApiError> {
+pub(crate) async fn serial(db: &mut PgConnection, project: Uuid) -> Result<(), ApiError> {
     sqlx::query("select pg_advisory_xact_lock(hashtextextended($1::text,367291))")
         .bind(project.to_string())
         .execute(db)
@@ -170,9 +172,32 @@ async fn publish(
     let _permit = state.workloads.enter(auth.identity_id, Some(id))?;
     let device =
         devices::current_key(&mut tx, auth.identity_id, &stored.signed.commit.author_key).await?;
+    let mut dependencies = Vec::new();
+    let mut released = false;
     for dependency in stored.signed.commit.dependencies() {
-        load(&mut tx, id, &dependency).await?;
+        match load(&mut tx, id, &dependency).await {
+            Ok(parent) => dependencies.push(parent),
+            // A parent a horizon released is published history (design 5.5).
+            Err(ApiError::NotFound)
+                if stored.signed.commit.parents.contains(&dependency)
+                    && crate::project_horizons::skeleton_entry(&mut tx, id, &dependency)
+                        .await?
+                        .is_some() =>
+            {
+                released = true;
+            }
+            Err(error) => return Err(error),
+        }
     }
+    // Version 4 records are checked against parent content; a released parent has none.
+    if !released {
+        Box::pin(check_v4(&mut tx, id, &stored.signed.commit, &dependencies)).await?;
+    } else if stored.signed.commit.version == 4 {
+        return Err(bad(
+            "A version 4 commit cannot be checked against a parent a history horizon released",
+        ));
+    }
+    let sealed = crate::e2ee::check_commit(&mut tx, id, &stored.signed.commit).await?;
     // Traverse verified typed roots, never promote an account's upload inventory.
     let mut objects = PrivateStore {
         db: &mut tx,
@@ -184,15 +209,21 @@ async fn publish(
     };
     let mut reachable = Vec::new();
     for file in stored.signed.commit.files.values() {
-        typed::read_state(
-            &mut objects,
-            file.document,
-            &file.state,
-            READ_LIMIT,
-            Default::default(),
-        )
-        .await
-        .map_err(content_error)?;
+        if sealed {
+            engine_core::e2ee::state::traverse(&mut objects, file.document, &file.state, 1_000_000)
+                .await
+                .map_err(content_error)?;
+        } else {
+            typed::read_state(
+                &mut objects,
+                file.document,
+                &file.state,
+                READ_LIMIT,
+                Default::default(),
+            )
+            .await
+            .map_err(content_error)?;
+        }
         reachable.extend(
             std::mem::take(&mut objects.seen)
                 .into_iter()
@@ -238,6 +269,11 @@ async fn commit(
 ) -> Result<Json<Value>, ApiError> {
     let mut tx = start(&state, &auth).await?;
     member(&mut tx, &auth, id).await?;
+    // A released commit is unreadable from its horizon on, quarantine included.
+    if let Some(entry) = crate::project_horizons::skeleton_entry(&mut tx, id, &address).await? {
+        authorize(&mut tx, &auth, id, &[], false).await?;
+        return Err(crate::project_horizons::pruned(&address, entry));
+    }
     let stored = load(&mut tx, id, &address).await?;
     authorize(&mut tx, &auth, id, &stored.scope, false).await?;
     tx.commit().await?;
@@ -502,6 +538,225 @@ async fn compare(
     Ok(Json(json!(report)))
 }
 
+/// 400 with a code: a merge's recorded automatic resolutions are refused.
+fn refused(code: &'static str, reason: &str) -> ApiError {
+    ApiError::Coded {
+        status: axum::http::StatusCode::BAD_REQUEST,
+        code,
+        reason: reason.into(),
+        details: json!({}),
+    }
+}
+
+/// Published history as the inputs of a merge's recorded resolutions (decision 042).
+struct PublishedInputs<'a> {
+    db: &'a mut PgConnection,
+    project: Uuid,
+}
+
+impl PublishedInputs<'_> {
+    /// Every ancestor of `head` with its parents, through released commits' skeleton.
+    async fn ancestors(
+        &mut self,
+        head: &Address,
+    ) -> Result<BTreeMap<String, Vec<String>>, RepoError> {
+        // shortcut: the whole ancestry is loaded (bounded by the height limit of 100,000);
+        // walk generations from both sides at once if publication of v4 merges gets slow.
+        let rows: Vec<(String, Vec<String>)> = sqlx::query_as(
+            "with recursive a(address) as (select $2::text union select unnest(coalesce(c.parents,s.parents)) from a
+               left join project_published_commit c on c.project_id=$1 and c.address=a.address
+               left join project_history_skeleton s on s.project_id=$1 and s.address=a.address)
+             select a.address,coalesce(c.parents,s.parents,'{}') from a
+               left join project_published_commit c on c.project_id=$1 and c.address=a.address
+               left join project_history_skeleton s on s.project_id=$1 and s.address=a.address",
+        )
+        .bind(self.project)
+        .bind(head.as_str())
+        .fetch_all(&mut *self.db)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+}
+
+impl ResolutionInputs for PublishedInputs<'_> {
+    async fn state(
+        &mut self,
+        document: DocumentId,
+        at: &Address,
+    ) -> Result<engine_core::materializer::DocumentState, RepoError> {
+        let mut store = PublishedStore {
+            db: &mut *self.db,
+            project: self.project,
+            state_root: at.clone(),
+            budget: READ_LIMIT,
+            prefetched: BTreeMap::new(),
+        };
+        Ok(typed::read_state(&mut store, document, at, READ_LIMIT, Default::default()).await?)
+    }
+
+    async fn merge_bases(
+        &mut self,
+        left: &Address,
+        right: &Address,
+    ) -> Result<Vec<Address>, RepoError> {
+        let l = self.ancestors(left).await?;
+        let r = self.ancestors(right).await?;
+        let common: BTreeSet<&String> = l.keys().filter(|a| r.contains_key(*a)).collect();
+        // A common ancestor of another common ancestor is not a best one.
+        let mut below: BTreeSet<&String> = BTreeSet::new();
+        let mut queue: Vec<&String> = common.iter().flat_map(|a| l[*a].iter()).collect();
+        while let Some(next) = queue.pop() {
+            if below.insert(next) {
+                queue.extend(l.get(next).into_iter().flatten());
+            }
+        }
+        common
+            .into_iter()
+            .filter(|a| !below.contains(a))
+            .map(|a| Address::try_from(a.clone()).map_err(RepoError::from))
+            .collect()
+    }
+
+    async fn relocations_since(
+        &mut self,
+        base: &Address,
+        side: &Address,
+    ) -> Result<Vec<relocation::Relocation>, RepoError> {
+        let known = self.ancestors(base).await?;
+        let new: Vec<String> = self
+            .ancestors(side)
+            .await?
+            .into_iter()
+            .filter(|(a, p)| p.len() == 1 && !known.contains_key(a))
+            .map(|(a, _)| a)
+            .collect();
+        let bodies: Vec<Vec<u8>> = sqlx::query_scalar(
+            "select body from project_published_commit where project_id=$1 and address=any($2)",
+        )
+        .bind(self.project)
+        .bind(&new)
+        .fetch_all(&mut *self.db)
+        .await?;
+        let mut out = Vec::new();
+        for body in bodies {
+            let signed: SignedCommit = serde_json::from_slice(&body)?;
+            out.extend(signed.commit.relocations);
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+}
+
+/// Commit format v4 at publication (decision 033). A relocation commit is
+/// re-applied to its published parent's states and must give exactly its own files
+/// and records (a forged lineage claim is refused); a v4 merge's records must name
+/// its parents' states. Writing to every destination is the scope check
+/// `authorize` already made (R8: the destinations and a join's source are in it).
+///
+/// Decision 042: the service also re-runs every recorded resolution (same-file v3
+/// records and v4 project records) from the published inputs under the embedded
+/// policy, so a forged or altered automatic resolution is refused here and not only
+/// by `verify-merge`, and a v4 merge whose embedded policy is below the project's
+/// effective floor (its organisation floor and its stored policy's floors) is refused.
+async fn check_v4(
+    db: &mut PgConnection,
+    project_id: Uuid,
+    commit: &Commit,
+    parents: &[Stored],
+) -> Result<(), ApiError> {
+    if !commit.same_file_resolutions.is_empty() {
+        Box::pin(xdoc::verify_same_file_records(
+            commit,
+            &mut PublishedInputs {
+                db: &mut *db,
+                project: project_id,
+            },
+        ))
+        .await
+        .map_err(|_| {
+            refused(
+                "resolution_not_reproduced",
+                "A recorded same-file resolution does not reproduce from its inputs",
+            )
+        })?;
+    }
+    // A v4 commit without decision 033's records is a sealed commit (decision 035 section 4;
+    // `Commit::validate` allows no other shape): nothing here to check against its parents.
+    let records = !commit.project_resolutions.is_empty()
+        || !commit.relocations.is_empty()
+        || commit.merge_policy.is_some();
+    if commit.version != 4 || !records {
+        return Ok(());
+    }
+    match parents {
+        [parent] => {
+            let specs: Vec<_> = commit
+                .relocations
+                .iter()
+                .map(relocation::Relocation::spec)
+                .collect();
+            let mut states = BTreeMap::new();
+            for file in relocation::involved(&parent.signed.commit.files, &specs) {
+                let mut store = PublishedStore {
+                    db: &mut *db,
+                    project: project_id,
+                    state_root: file.state.clone(),
+                    budget: READ_LIMIT,
+                    prefetched: BTreeMap::new(),
+                };
+                let state = typed::read_state(
+                    &mut store,
+                    file.document,
+                    &file.state,
+                    READ_LIMIT,
+                    Default::default(),
+                )
+                .await
+                .map_err(content_error)?;
+                states.insert(file.document.0, state);
+            }
+            relocation::verify_commit(&parent.signed.commit, commit, states)
+                .await
+                .map_err(|_| bad("Relocation records do not match the states they claim"))
+        }
+        [left, right] => {
+            project::check_parents(commit, &left.signed.commit, &right.signed.commit)
+                .map_err(|_| bad("Project resolution records do not match the merge parents"))?;
+            if let Some(embedded) = &commit.merge_policy {
+                let policy = embedded
+                    .load()
+                    .map_err(|_| bad("The embedded merge policy does not load"))?;
+                let floor = crate::merge_policies::effective_floor(db, project_id).await?;
+                policy.check_floor(&floor).map_err(|e| {
+                    refused(
+                        "below_floor",
+                        &format!(
+                            "The merge policy is below this project's floor: {}",
+                            e.message
+                        ),
+                    )
+                })?;
+            }
+            Box::pin(xdoc::verify_records(
+                commit,
+                &mut PublishedInputs {
+                    db,
+                    project: project_id,
+                },
+            ))
+            .await
+            .map(drop)
+            .map_err(|_| {
+                refused(
+                    "resolution_not_reproduced",
+                    "A recorded automatic resolution does not reproduce under its policy; the merge is refused",
+                )
+            })
+        }
+        _ => Err(bad("Invalid signed project history or recovery")),
+    }
+}
+
 struct PublishedStore<'a> {
     db: &'a mut PgConnection,
     project: Uuid,
@@ -534,6 +789,13 @@ impl ObjectStore for PublishedStore<'_> {
         .fetch_all(&mut *self.db)
         .await?;
         for (address, bytes) in rows {
+            let bytes = engine_core::at_rest::store::open_object(
+                &mut *self.db,
+                document.0,
+                &address,
+                bytes,
+            )
+            .await?;
             self.prefetched
                 .insert((document.0, Address::try_from(address)?), bytes);
         }
@@ -562,7 +824,7 @@ impl ObjectStore for PublishedStore<'_> {
         let bytes = if let Some(bytes) = self.prefetched.get(&(document.0, address.clone())) {
             bytes.clone()
         } else {
-            sqlx::query_scalar::<_, Vec<u8>>(
+            let stored = sqlx::query_scalar::<_, Vec<u8>>(
                 "select o.bytes from project_published_object p join checkpoint_object o using(document_id,address) where p.project_id=$1 and p.state_root=$2 and p.document_id=$3 and p.address=$4"
             )
             .bind(self.project)
@@ -571,7 +833,14 @@ impl ObjectStore for PublishedStore<'_> {
             .bind(address.as_str())
             .fetch_optional(&mut *self.db)
             .await?
-            .ok_or_else(|| shared_checkpoint::Error::Missing(address.as_str().into()))?
+            .ok_or_else(|| shared_checkpoint::Error::Missing(address.as_str().into()))?;
+            engine_core::at_rest::store::open_object(
+                &mut *self.db,
+                document.0,
+                address.as_str(),
+                stored,
+            )
+            .await?
         };
         self.budget.max_objects = self
             .budget
@@ -729,6 +998,7 @@ async fn compare_file(
     }
 
     let doc_id = from_entry.document;
+    crate::e2ee::refuse_sealed(&mut tx, doc_id.0, "server_diff").await?;
     let from_root = from_entry.state.clone();
     let to_root = to_entry.state.clone();
 
@@ -869,6 +1139,9 @@ async fn object(
         .as_str();
     let bytes: Vec<u8> = sqlx::query_scalar("select o.bytes from project_published_object p join checkpoint_object o using(document_id,address) where p.project_id=$1 and p.state_root=$2 and p.document_id=$3 and p.address=$4")
         .bind(id).bind(root).bind(document).bind(object.as_str()).fetch_optional(&mut *tx).await?.ok_or(ApiError::NotFound)?;
+    let bytes = engine_core::at_rest::store::open_object(&mut tx, document, object.as_str(), bytes)
+        .await
+        .map_err(content_error)?;
     shared_checkpoint::validate_stored(&object, &bytes).map_err(content_error)?;
     tx.commit().await?;
     Ok(Json(
@@ -1050,8 +1323,10 @@ async fn fast_forward(
         if seen.len() > 10_000 {
             return Err(bad("Fast-forward check exceeds 10,000 commits"));
         }
+        // Released commits keep their topology in the horizon skeleton.
         let parents: Vec<Vec<String>> = sqlx::query_scalar(
-            "select parents from project_published_commit where project_id=$1 and address=any($2)",
+            "select parents from (select address,parents from project_published_commit where project_id=$1 and address=any($2)
+             union select address,parents from project_history_skeleton where project_id=$1 and address=any($2)) x",
         )
         .bind(project)
         .bind(&batch)
@@ -1098,12 +1373,18 @@ async fn is_reviewer(
         .bind(scope).bind(actor).fetch_one(db).await?;
     Ok(count == scope.len() as i64)
 }
+/// The resolution-set hash an approval of `commit` must bind, when its automatic
+/// resolutions ask for review (node-conflict design 6.4).
+fn review_binding(commit: &Commit) -> Option<String> {
+    project::needs_review(commit).then(|| project::resolution_set_hash(commit))
+}
+
 async fn latest_reviews(
     db: &mut PgConnection,
     project: Uuid,
     target: &Target,
-) -> Result<Vec<(Uuid, String)>, ApiError> {
-    Ok(sqlx::query_as("select distinct on (reviewer) reviewer,decision from project_history_review where project_id=$1 and branch=$2 and candidate=$3 and expected_generation=$4 and expected_commit is not distinct from $5 order by reviewer,id desc limit 257")
+) -> Result<Vec<(Uuid, String, Option<String>)>, ApiError> {
+    Ok(sqlx::query_as("select distinct on (reviewer) reviewer,decision,resolution_set from project_history_review where project_id=$1 and branch=$2 and candidate=$3 and expected_generation=$4 and expected_commit is not distinct from $5 order by reviewer,id desc limit 257")
         .bind(project).bind(&target.branch).bind(target.candidate.as_str()).bind(target.generation()).bind(target.previous()).fetch_all(db).await?)
 }
 #[utoipa::path(operation_id="project_history_advance",post,path="/projects/{id}/history/refs",tag="project history",params(("id"=Uuid,Path)),request_body=Value,security(("paseto"=[]),("device_session"=["history:write"])),responses((status=200,description="Atomic fast-forward branch CAS; main enforces current project/file merge roles and approvals; no centralized document edits",body=Value),(status=409,description="Stale head, unavailable ancestry, non-fast-forward or unmet reviews")))]
@@ -1164,8 +1445,11 @@ async fn advance(
         if latest.len() > 256 {
             return Err(bad("Too many reviewers"));
         }
+        // Automatic resolutions under an `auto-with-review` gate need at least one
+        // approval that binds the resolution set the reviewer was shown.
+        let binding = review_binding(&candidate.signed.commit);
         let mut approvals = 0;
-        for (reviewer, decision) in latest {
+        for (reviewer, decision, bound) in latest {
             if reviewer == publisher
                 || !is_reviewer(&mut tx, id, &candidate.scope, reviewer).await?
             {
@@ -1176,7 +1460,15 @@ async fn advance(
                     reason: "An eligible reviewer requested changes".into(),
                 });
             }
+            if binding.is_some() && bound != binding {
+                continue;
+            }
             approvals += 1;
+        }
+        if binding.is_some() && approvals == 0 {
+            return Err(ApiError::Conflict {
+                reason: "This merge has automatic resolutions that need an approval bound to their resolution set".into(),
+            });
         }
         if approvals < policy.required_approvals {
             return Err(ApiError::Conflict {
@@ -1234,6 +1526,16 @@ async fn advance(
         serde_json::to_vec(&signed_receipt).map_err(|e| ApiError::Internal(e.to_string()))?;
     sqlx::query("insert into project_ref_event(project_id,branch,generation,commit_address,previous_commit,actor,receipt,receipt_address) values($1,$2,$3,$4,$5,$6,$7,$8)")
         .bind(id).bind(&target.branch).bind(generation).bind(target.candidate.as_str()).bind(target.previous()).bind(auth.identity_id).bind(receipt).bind(receipt_address.as_str()).execute(&mut *tx).await?;
+    // The receipt's transparency leaf commits in the same transaction (design 4.7).
+    crate::transparency::enqueue_receipt(
+        &mut tx,
+        &state,
+        id,
+        &target.branch,
+        generation,
+        &receipt_address,
+    )
+    .await?;
     audit(
         &mut tx,
         auth.identity_id,
@@ -1318,6 +1620,10 @@ async fn refs(
 struct Review {
     target: Target,
     decision: String,
+    /// For a merge with automatic resolutions under review: the resolution-set
+    /// hash the reviewer was shown. An approval must carry the candidate's.
+    #[serde(default)]
+    resolution_set: Option<String>,
 }
 #[utoipa::path(operation_id="project_history_review",post,path="/projects/{id}/history/reviews",tag="project history",params(("id"=Uuid,Path)),request_body=Value,security(("paseto"=[]),("device_session"=["history:review"])),responses((status=200,description="Append approve/request_changes for exact branch base generation and candidate; independent current reviewer required. A device token needs history:review (history:write does not suffice)",body=Value),(status=403,description="Not a current reviewer, the publisher, or the token/key lacks history:review"),(status=409,description="Base changed")))]
 async fn review(
@@ -1350,19 +1656,31 @@ async fn review(
     {
         return Err(ApiError::Forbidden);
     }
+    // An approval binds the automatic choices it was shown, or nothing is recorded.
+    let binding = review_binding(&candidate.signed.commit);
+    if input
+        .resolution_set
+        .as_ref()
+        .is_some_and(|given| Some(given) != binding.as_ref())
+        || (input.decision == "approve" && binding.is_some() && input.resolution_set != binding)
+    {
+        return Err(ApiError::Conflict {
+            reason: "The approval must bind the candidate's resolution set; review the automatic resolutions again".into(),
+        });
+    }
     let latest = latest_reviews(&mut tx, id, &input.target).await?;
     if latest
         .iter()
-        .any(|(who, decision)| *who == auth.identity_id && decision == &input.decision)
+        .any(|(who, decision, _)| *who == auth.identity_id && decision == &input.decision)
     {
         tx.commit().await?;
         return Ok(Json(json!({"recorded":true,"unchanged":true})));
     }
-    if latest.len() >= 256 && !latest.iter().any(|(who, _)| *who == auth.identity_id) {
+    if latest.len() >= 256 && !latest.iter().any(|(who, _, _)| *who == auth.identity_id) {
         return Err(bad("At most 256 reviewers per candidate/base"));
     }
-    let review_id: i64=sqlx::query_scalar("insert into project_history_review(project_id,candidate,branch,expected_generation,expected_commit,reviewer,decision) values($1,$2,$3,$4,$5,$6,$7) returning id")
-        .bind(id).bind(input.target.candidate.as_str()).bind(&input.target.branch).bind(input.target.generation()).bind(input.target.previous()).bind(auth.identity_id).bind(&input.decision).fetch_one(&mut *tx).await?;
+    let review_id: i64=sqlx::query_scalar("insert into project_history_review(project_id,candidate,branch,expected_generation,expected_commit,reviewer,decision,resolution_set) values($1,$2,$3,$4,$5,$6,$7,$8) returning id")
+        .bind(id).bind(input.target.candidate.as_str()).bind(&input.target.branch).bind(input.target.generation()).bind(input.target.previous()).bind(auth.identity_id).bind(&input.decision).bind(&input.resolution_set).fetch_one(&mut *tx).await?;
     audit(
         &mut tx,
         auth.identity_id,
@@ -1393,7 +1711,7 @@ async fn reviews(
     member(&mut tx, &auth, id).await?;
     let candidate = load(&mut tx, id, &page.candidate).await?;
     authorize(&mut tx, &auth, id, &candidate.scope, false).await?;
-    let items:Vec<Value>=sqlx::query_scalar("select jsonb_build_object('id',id,'branch',branch,'expected_generation',expected_generation,'expected_commit',expected_commit,'reviewer',reviewer,'decision',decision,'created_at',created_at) from project_history_review where project_id=$1 and candidate=$2 and id>$3 order by id limit $4")
+    let items:Vec<Value>=sqlx::query_scalar("select jsonb_build_object('id',id,'branch',branch,'expected_generation',expected_generation,'expected_commit',expected_commit,'reviewer',reviewer,'decision',decision,'resolution_set',resolution_set,'created_at',created_at) from project_history_review where project_id=$1 and candidate=$2 and id>$3 order by id limit $4")
         .bind(id).bind(page.candidate.as_str()).bind(page.after.unwrap_or(0)).bind(limit).fetch_all(&mut *tx).await?;
     tx.commit().await?;
     Ok(Json(
@@ -1705,6 +2023,7 @@ async fn create_release(
     .bind(auth.identity_id)
     .fetch_one(&mut *tx)
     .await?;
+    crate::transparency::enqueue_release(&mut tx, &state, id, &main_head.commit).await?;
 
     audit(
         &mut tx,

@@ -84,9 +84,48 @@ pub async fn run_once(pool: &PgPool) -> Result<usize, ApiError> {
     .fetch_all(pool)
     .await?;
     for id in &stale {
-        index_and_detect(pool, *id).await?;
+        // One document that cannot be read (too large for the read budgets, or damaged) must not
+        // stop the pass or be read again on every pass (decision 043): it is recorded as skipped
+        // until it changes, and the reason is logged without content.
+        match index(pool, *id).await {
+            Ok(Some(fingerprint)) => {
+                detect(pool, *id, &fingerprint).await?;
+            }
+            Ok(None) => {}
+            Err(ApiError::Internal(reason)) => {
+                tracing::warn!(document = %id, %reason, "copy index skipped a document it cannot read; it is tried again after its next change");
+                skip(pool, *id).await?;
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(stale.len())
+}
+
+/// Record `id` as indexed with an empty fingerprint through its newest event, so it is neither
+/// compared nor read again until it changes.
+async fn skip(pool: &PgPool, id: Uuid) -> Result<(), ApiError> {
+    let empty = similarity::fingerprint_state(&Default::default());
+    sqlx::query(
+        "insert into document_fingerprint(document_id,version,through_seq,title,title_key,content_hash,signature,block_count,substantive_count,word_count,shingle_count,updated_at)
+         select d.id,$2,coalesce((select max(seq) from event e where e.document_id=d.id),0),d.title,'',$3,$4,0,0,0,0,now() from document d where d.id=$1
+         on conflict(document_id) do update set version=excluded.version,through_seq=excluded.through_seq,title=excluded.title,title_key=excluded.title_key,content_hash=excluded.content_hash,signature=excluded.signature,block_count=0,substantive_count=0,word_count=0,shingle_count=0,updated_at=now()",
+    )
+    .bind(id)
+    .bind(similarity::VERSION)
+    .bind(empty.content_hash)
+    .bind(empty.signature_bytes())
+    .execute(pool)
+    .await?;
+    sqlx::query("delete from document_fingerprint_band where document_id=$1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    sqlx::query("delete from document_block_hash where document_id=$1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Fingerprint one document now and report copies it resembles.

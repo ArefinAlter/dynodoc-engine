@@ -347,7 +347,7 @@ async fn newer_schema_and_missing_accounting_fail_closed() {
     let file = path();
     let project = uuid::Uuid::new_v4();
     let repo = LocalRepository::open(&file, project).await.unwrap();
-    sqlx::query("update local_meta set version=4")
+    sqlx::query("update local_meta set version=5")
         .execute(&repo.pool)
         .await
         .unwrap();

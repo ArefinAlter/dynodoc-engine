@@ -17,9 +17,15 @@ path = "src/lib.rs"
 name = "engine-api"
 path = "src/main.rs"
 
+# Transparency witness: a separate small service on its own host and key (decision 032).
+[[bin]]
+name = "dynodoc-witness"
+path = "src/bin/dynodoc-witness.rs"
+
 [dependencies]
-engine-core = { workspace = true }
+engine-core = { workspace = true, features = ["kms"] }
 engine-agent = { workspace = true }
+engine-mcp = { workspace = true }
 engine-shared = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -37,6 +43,7 @@ thiserror = { workspace = true }
 # Auth (stage 17): Paseto v4 tokens, hashing/CSPRNG, time and id types.
 pasetors = { workspace = true }
 hex = { workspace = true }
+url = { workspace = true }
 ring = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
@@ -46,7 +53,11 @@ uuid = { workspace = true }
 ulid = { workspace = true }
 base64 = { workspace = true }
 utoipa = { workspace = true }
+# S3-compatible object storage (object_store.rs); the same spec engine-cli uses, so no new package.
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 # `ServiceExt::oneshot` (tower `util`) drives the router in integration tests.
 tower = { workspace = true, features = ["util"] }
+# The browser's commit path (decision 039) natively: the same Rust the page runs as WebAssembly.
+dynodoc-engine-wasm = { path = "../engine-wasm" }

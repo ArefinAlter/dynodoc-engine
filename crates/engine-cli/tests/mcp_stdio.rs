@@ -179,7 +179,7 @@ fn a_session_over_the_pipes_keeps_stdout_for_the_protocol() {
         .collect();
     assert_eq!(
         names,
-        ["files", "outline", "read", "find", "diff", "status"]
+        ["files", "outline", "read", "find", "diff", "status", "memory"]
     );
     // The status call could not reach the service: a tool error, not a protocol error.
     assert_eq!(messages[8]["result"]["isError"], true);

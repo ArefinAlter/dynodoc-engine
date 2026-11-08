@@ -36,8 +36,34 @@ const HISTORY: &[&str] = &[
     "device_key_class",
     "agent_call",
     "agent_proposal_receipt",
+    "agent_memory_revision",
+    "oauth_client",
+    // Signed agent session heads (schema 65).
+    "agent_session_seal",
+    // Ledger mode (schema 61): one receipt per compacted change request.
+    "ledger_compaction",
+    // Ledger mode (schema 125): one receipt per rebased, partly merged change request.
+    "ledger_request_rebase",
+    // Shared history horizons (schema 80): written once with the authority's
+    // countersignature; a release batch is a row whose trigger deletes released rows.
+    "project_history_horizon",
+    "project_history_skeleton",
+    "project_history_released_state",
+    "project_history_horizon_batch",
+    // Transparency (schema 82): leaves enter in the transaction that causes them.
+    "transparency_project_key",
+    "transparency_outbox",
+    // Merge policy history (schema 137): one row per saved revision.
+    "project_merge_policy_revision",
+    "organisation_merge_floor_revision",
+    // Encrypted projects (schema 95): bindings, the signed membership log, epoch records.
+    "device_encryption_key",
+    "project_e2ee_log",
+    "project_key_epoch",
 ];
 const MUTABLE: &[&str] = &[
+    // OAuth (schema 58): a grant rotates its refresh token; a revoked one is replaced.
+    "oauth_grant",
     "document",
     "node",
     "identity",
@@ -66,6 +92,33 @@ const MUTABLE: &[&str] = &[
     "project_label",
     // Single-use ledger: created, used up once (a trigger refuses any other edit), pruned.
     "app_handover_code",
+    // Ledger mode (schema 60): the storage choice, and the member relay whose rows are
+    // answered once and deleted after delivery.
+    "document_storage",
+    "ledger_relay",
+    // Enterprise identity (schema 75): directory rows a SCIM client adds and removes.
+    "organisation_member",
+    // Organisation sign-in settings (schema 77): edited and removed on the settings screen.
+    "organisation_domain",
+    "organisation_sign_in_provider",
+    "directory_group",
+    "directory_group_member",
+    "identity_instance_role",
+    // At-rest data keys (schema 97): rewrapped and retired in place (a trigger keeps them
+    // moving forward); crypto-erasure deletes them.
+    "data_key",
+    // Logins (schema 110): refreshed and revoked in place, pruned by retention.
+    "login_session",
+    // Mail outbox (schema 111): claimed, marked sent or failed (content cleared), pruned.
+    "mail_outbox",
+    // Remote MCP sessions shared by replicas (schema 114): seen, ended, pruned when idle.
+    "mcp_http_session",
+    // Resumable uploads (schema 90): offset and state move; expired sessions are pruned.
+    "upload_session",
+    // Server import jobs (schema 91): cursor and state move with each committed batch.
+    "import_job",
+    // Object-store keys an erasure left to delete (migration 0140): queued, retried, removed.
+    "object_deletion",
 ];
 /// Rows are created and pruned but never edited: a replay ledger, not a record.
 const INSERT_DELETE: &[&str] = &[
@@ -74,6 +127,17 @@ const INSERT_DELETE: &[&str] = &[
     "project_star",
     // Content-addressed images of host-native blocks: stored once, pruned when unreferenced.
     "connector_media",
+    // OAuth codes (schema 58): single use, consumed by delete.
+    "oauth_code",
+    // Sign-in flow values accepted once (schema 76): recorded, pruned when expired.
+    "auth_flow_once",
+    // SCIM deactivations held by the circuit breaker (schema 110): confirmed or discarded.
+    "scim_held_deactivation",
+    // Ledger mode (schema 125): block states members' panes sent for agents, checked against
+    // their block hashes; deleted once the agents' change requests close (decision 040).
+    "ledger_block_state",
+    // Staged upload chunks (schema 90): immutable, deleted once used or expired.
+    "upload_chunk",
 ];
 /// Rows the runtime login may read, end and prune but NEVER create: only the operator's owner
 /// credential inserts them (operator-issued sign-in links, schema 47; a trigger lets a row be
@@ -87,13 +151,41 @@ const CONSUME_PRUNE: &[&str] = &["operator_sign_in_link"];
 /// identity row is created once and only ever gains `revoked_at` (a trigger refuses the rest).
 const INSERT_UPDATE: &[&str] = &[
     "project_issue",
+    // Legacy plaintext erasure requests (schema 99): asked once, confirmed once.
+    "legacy_erasure_request",
     "project_issue_counter",
     "device_key_access",
     "device_key_project_grant",
+    // Held remote agent writes (schema 66): decided once by their person.
+    "agent_held_write",
     "project_agent_policy",
+    // History holds (schema 135): set by a person, released once by a person (trigger).
+    "project_history_hold",
+    // Merge policies and organisation floors (schema 137): current value plus revision.
+    "project_merge_policy",
+    "organisation_merge_floor",
     "file_agent_policy",
     "agent_identity",
     "export_node_token",
+    // Agent provenance (schema 56): the capture policy holds its current value; a session
+    // only gains turns and a turn only loses its text on erasure (triggers refuse the rest).
+    "project_agent_capture",
+    "agent_session",
+    "agent_turn",
+    // Shared agent memory (schema 57): the current row moves only with a recorded revision.
+    "agent_memory",
+    // Enterprise identity (schema 75): an organisation's policy and kill switch are edited in
+    // place (audited); a provider link only records its last sign-in
+    // (and goes with its organisation's provider, schema 141); a SCIM token is revoked.
+    "organisation",
+    "identity_external",
+    "scim_token",
+    // Encrypted projects (schema 95): a grant only gains superseded_at (trigger); a migration
+    // row records its steps.
+    "project_key_grant",
+    "project_e2ee_migration",
+    // At-rest key-encryption keys (schema 97): status moves on rotation, never deleted.
+    "kms_key",
 ];
 const FUNCTIONS: &[&str] = &[
     "access_role_rank(text)",
@@ -109,6 +201,9 @@ const SEQUENCES: &[&str] = &[
     "operation_audit_id_seq",
     "project_history_review_id_seq",
     "change_request_review_seq_seq",
+    "transparency_outbox_seq_seq",
+    "project_key_grant_id_seq",
+    "data_key_id_seq",
 ];
 const READ_ONLY: &[&str] = &[
     "_sqlx_migrations",
@@ -121,6 +216,16 @@ const READ_ONLY: &[&str] = &[
     "project_ref_authority",
     "project_ref_authority_epoch",
     "project_ref_authority_revocation",
+    // Shared object collection (schema 81) is an operator act; the runtime only reads it.
+    "shared_object_collection",
+    // The log worker writes these with the operator credential.
+    "transparency_leaf",
+    "transparency_installation_key",
+    "transparency_tile",
+    "transparency_checkpoint",
+    "transparency_cosignature",
+    "transparency_event_anchor",
+    "transparency_event_heads",
 ];
 
 /// Read-only exact version/checksum check. Both missing and newer schemas fail.

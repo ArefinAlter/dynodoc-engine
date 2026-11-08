@@ -54,11 +54,27 @@ pub(crate) async fn encode(
     Ok(json!({"$dynodoc_state":2,"root":root}))
 }
 
+/// A draft base that names a revision of the document's own event log instead of copying its
+/// state (ledger mode, decision 028): replayed on read, so a change request keeps no copy.
+pub(crate) fn at_seq(seq: i64) -> Value {
+    json!({ "$dynodoc_log": seq })
+}
+
 pub(crate) async fn decode(
     connection: &mut PgConnection,
     document: DocumentId,
     value: &Value,
 ) -> Result<DocumentState, ApiError> {
+    if let Some(seq) = value.get("$dynodoc_log") {
+        let seq = seq
+            .as_i64()
+            .filter(|s| *s >= 0 && value.as_object().is_some_and(|o| o.len() == 1))
+            .ok_or_else(|| internal("invalid draft log reference"))?;
+        return engine_core::snapshot::read_state_at(connection, document, seq)
+            .await
+            .map(|at| at.state)
+            .map_err(internal);
+    }
     if value.get("$dynodoc_state").is_some() {
         if value["$dynodoc_state"] != 2 || value.as_object().is_none_or(|object| object.len() != 2)
         {

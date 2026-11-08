@@ -10,6 +10,7 @@ use axum::{
     Json, Router,
 };
 use ring::rand::SystemRandom;
+use ring::signature::Ed25519KeyPair;
 use std::sync::{
     atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -118,7 +119,7 @@ async fn serve() -> (Arc<Mock>, DeviceSession) {
         base,
         PROJECT,
         AUTHORITY,
-        key,
+        crate::signing::SharedSigner::new(key),
         vec!["history:read".to_owned()],
     )
     .unwrap();

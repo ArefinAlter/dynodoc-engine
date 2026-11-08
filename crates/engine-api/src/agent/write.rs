@@ -243,11 +243,30 @@ pub(super) fn json_body(parsed: Result<Json<Value>, JsonRejection>) -> Result<Va
 
 /// The arguments of a `propose` call. The route names the file, so the body may leave `file`
 /// out; if it says one it must be this one.
-fn parse_call(body: &Value, document: Uuid) -> Result<ProposeArgs, CompileError> {
+/// The agent session and turn a `propose` call names (decision 026); outside the protocol
+/// grammar of the call itself.
+pub(super) type Link = (Option<Uuid>, Option<i32>);
+
+fn parse_call(body: &Value, document: Uuid) -> Result<(ProposeArgs, Link), CompileError> {
     let mut map = body
         .as_object()
         .cloned()
         .ok_or(AgentError::BadRequest { field: "body" })?;
+    let session = match map.remove("session") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            Some(Uuid::parse_str(&s).map_err(|_| AgentError::BadRequest { field: "session" })?)
+        }
+        Some(_) => return Err(AgentError::BadRequest { field: "session" }.into()),
+    };
+    let turn = match map.remove("turn") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_i64()
+                .filter(|t| (1..=10_000).contains(t))
+                .ok_or(AgentError::BadRequest { field: "turn" })? as i32,
+        ),
+    };
     match map.get("file") {
         None => {
             map.insert("file".into(), json!(document));
@@ -255,7 +274,7 @@ fn parse_call(body: &Value, document: Uuid) -> Result<ProposeArgs, CompileError>
         Some(named) if named.as_str().and_then(|s| Uuid::parse_str(s).ok()) == Some(document) => {}
         Some(_) => return Err(AgentError::BadRequest { field: "file" }.into()),
     }
-    parse_propose(&Value::Object(map))
+    Ok((parse_propose(&Value::Object(map))?, (session, turn)))
 }
 
 // --- answers ---------------------------------------------------------------------------
@@ -555,7 +574,7 @@ async fn propose(
     ctx.finish(call, result).await
 }
 
-async fn propose_call(
+pub(super) async fn propose_call(
     ctx: &Ctx<'_>,
     call: &mut Call,
     file: &str,
@@ -574,9 +593,39 @@ async fn propose_call(
         .map_err(ApiError::from)?
         .ok_or(ApiError::Forbidden)?;
     let body = json_body(parsed)?;
-    let args = parse_call(&body, document)?;
+    let (args, link) = parse_call(&body, document)?;
     let digest = request_digest(document, args.rev, args.proposal, &body["ops"], args.strict);
     call.digest = Some(digest);
+    // A remote agent's proposal waits for its person (decision 029): compiled as a dry run
+    // with its diff, for the person to read, and held. Nothing is staged.
+    if !args.dry_run && super::held::must_hold(ctx).await? {
+        let summary = super::held::propose_summary(&body, document);
+        let mut trial = args.clone();
+        trial.dry_run = true;
+        trial.ret = engine_agent::grammar::ReturnKind::Diff;
+        let preview = dry_run_proposal(
+            ctx,
+            call,
+            &agent,
+            document,
+            kind,
+            trial,
+            admitted.db,
+            &admitted.allowed.policy,
+            admitted._permit,
+        )
+        .await?;
+        let held = super::held::Held {
+            tool: "propose",
+            target: document.to_string(),
+            document: Some(document),
+            body,
+            digest,
+            summary,
+            preview: Some(preview),
+        };
+        return super::held::hold(ctx, call, held).await;
+    }
     // The permit is held until the compiler is done, even if the caller gives up.
     let permit = admitted._permit;
     let body = if args.dry_run {
@@ -597,7 +646,10 @@ async fn propose_call(
     } else {
         // The connection goes back to the pool.
         drop(admitted.db);
-        write_proposal(ctx, call, &agent, document, kind, args, digest, permit).await?
+        write_proposal(
+            ctx, call, &agent, document, kind, args, link, digest, permit,
+        )
+        .await?
     };
     Ok(Served {
         bytes: body.len(),
@@ -883,10 +935,12 @@ async fn write_proposal(
     document: Uuid,
     kind: FileKind,
     mut args: ProposeArgs,
+    link: Link,
     digest: [u8; 32],
     permit: ReadPermit,
 ) -> Result<String, AgentFail> {
     let (mut tx, role) = begin_locked(ctx, document).await?;
+    let link = super::session::check_link(&mut tx, ctx.project, agent.id, link.0, link.1).await?;
     let (head, _) = engine_core::snapshot::read_current_state(&mut tx, DocumentId(document))
         .await
         .map_err(ApiError::from)?;
@@ -947,8 +1001,8 @@ async fn write_proposal(
 
     // What the ops apply to: the state the agent read for a new proposal, the proposal's own
     // current state for an extension (spec 9.1).
-    let head = Arc::new(head);
-    let (before, proposal_id, revision_after) = match &existing {
+    let mut head = Arc::new(head);
+    let (mut before, proposal_id, revision_after) = match &existing {
         None => {
             let base = if point.rev == point.head {
                 head.clone()
@@ -963,12 +1017,22 @@ async fn write_proposal(
             (Arc::new(ctxd.local), e.id, e.revision + 1)
         }
     };
+    // Ledger mode: blocks never changed since the first commit are hashes here; the states
+    // members' panes sent for agents fill them in (decision 040).
+    let ledger = crate::ledger::storage(&mut tx, document).await?.ledger;
+    let mut held_before = BTreeSet::new();
+    if ledger {
+        let held = crate::ledger::held(&mut tx, document, &before).await?;
+        held_before = crate::ledger::fill(Arc::make_mut(&mut before), held);
+        let held = crate::ledger::held(&mut tx, document, &head).await?;
+        crate::ledger::fill(Arc::make_mut(&mut head), held);
+    }
     let stamp = id_timestamp(&mut tx, document, point.rev)
         .await
         .map_err(ApiError::from)?;
     let ops = std::mem::take(&mut args.ops);
     let Staged {
-        compiled,
+        mut compiled,
         shown,
         base_seq,
         extras,
@@ -993,16 +1057,36 @@ async fn write_proposal(
     )
     .await?;
 
-    // Store. A new proposal is a new draft owned by the agent identity, with the base state
-    // the agent read; every proposal gets the compiled ops, in order, as draft edits by it.
-    if existing.is_none() {
-        let base_json = crate::draft_storage::encode(
-            &mut tx,
-            DocumentId(document),
+    // A ledger document's proposal carries full block states and their hashes (decision 028).
+    // A block whose state no pane has sent yet is refused; members' panes are asked for it, so
+    // the agent can propose again once one of them has been open (decision 040).
+    if ledger {
+        let missing = crate::ledger::unheld(&before, &compiled.ops);
+        if !missing.is_empty() {
+            crate::ledger::ask_states(&ctx.state.pool, document, agent.id, &missing).await;
+        }
+        compiled.ops = crate::ledger::agent_ops(
             &before,
-            ctx.state.shared_draft_bases,
-        )
-        .await?;
+            matches!(kind, FileKind::Document),
+            &compiled.ops,
+            &held_before,
+        )?;
+    }
+    // Store. A new proposal is a new draft owned by the agent identity, with the base state
+    // the agent read (in ledger mode, its revision of the log); every proposal gets the
+    // compiled ops, in order, as draft edits by it.
+    if existing.is_none() {
+        let base_json = if ledger {
+            crate::draft_storage::at_seq(point.rev as i64)
+        } else {
+            crate::draft_storage::encode(
+                &mut tx,
+                DocumentId(document),
+                &before,
+                ctx.state.shared_draft_bases,
+            )
+            .await?
+        };
         let name = args.name.clone().unwrap_or_else(|| {
             format!("Proposal from {}", agent.display_name)
                 .chars()
@@ -1066,7 +1150,15 @@ async fn write_proposal(
         .take(5)
         .map(|s| s.at.clone())
         .collect();
-    let stored = sqlx::query("insert into agent_proposal_receipt(draft_id,document_id,project_id,agent_identity_id,principal_id,key_id,kind,request_id,opened,rev,base_seq,head_seq,ops_in,ops_engine,stale,stale_refs,revision,request_digest,outcome,why) values($1,$2,$3,$4,$5,$6,'propose',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'ok',$18)")
+    // The blocks this call touched, for agent blame (decision 026).
+    let mut nodes: Vec<String> = compiled
+        .ops
+        .iter()
+        .filter_map(|op| op.target_node_id().map(|n| n.0.clone()))
+        .collect();
+    nodes.sort();
+    nodes.dedup();
+    let stored = sqlx::query("insert into agent_proposal_receipt(draft_id,document_id,project_id,agent_identity_id,principal_id,key_id,kind,request_id,opened,rev,base_seq,head_seq,ops_in,ops_engine,stale,stale_refs,revision,request_digest,outcome,why,session_id,turn,nodes) values($1,$2,$3,$4,$5,$6,'propose',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'ok',$18,$19,$20,$21)")
         .bind(proposal_id)
         .bind(document)
         .bind(ctx.project)
@@ -1085,6 +1177,9 @@ async fn write_proposal(
         .bind(revision)
         .bind(&digest[..])
         .bind(Value::Array(whys))
+        .bind(link.map(|l| l.0))
+        .bind(link.and_then(|l| l.1))
+        .bind(&nodes)
         .execute(&mut *tx)
         .await;
     match stored {
@@ -1245,8 +1340,22 @@ mod tests {
         let doc = Uuid::from_u128(7);
         let body =
             json!({"rev":3,"request_id":Uuid::from_u128(8),"ops":[{"op":"delete","ref":"7C02"}]});
-        let args = parse_call(&body, doc).unwrap();
+        let (args, link) = parse_call(&body, doc).unwrap();
         assert_eq!(args.file, doc);
+        assert_eq!(link, (None, None));
+        // The session and turn are taken out before the grammar sees the call.
+        let mut linked = body.clone();
+        linked["session"] = json!(Uuid::from_u128(5));
+        linked["turn"] = json!(2);
+        assert_eq!(
+            parse_call(&linked, doc).unwrap().1,
+            (Some(Uuid::from_u128(5)), Some(2))
+        );
+        linked["turn"] = json!(0);
+        assert!(parse_call(&linked, doc).is_err());
+        linked["turn"] = json!(1);
+        linked["session"] = json!("not-a-uuid");
+        assert!(parse_call(&linked, doc).is_err());
         let mut named = body.clone();
         named["file"] = json!(doc);
         assert!(parse_call(&named, doc).is_ok());

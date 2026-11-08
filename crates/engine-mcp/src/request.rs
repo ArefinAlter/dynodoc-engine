@@ -15,7 +15,9 @@
 //! | `diff` | `GET files/{file}/diff` |
 //! | `propose` | `POST files/{file}/propose` (the service's name; the spec says `proposals`) |
 //! | `submit` | `POST proposals/{proposal}/submit`, or `.../withdraw` for `action=withdraw` |
-//! | `status` | `GET proposals/{proposal}` for a proposal, else `GET access` |
+//! | `status` | `GET proposals/{proposal}` for a proposal, `GET proposals` for `what=proposals`, else `GET access` |
+//! | `memory` | `GET memory` |
+//! | `remember` | `POST memory` |
 //!
 //! The sheet-profile route (6) is not used: the outline route answers a sheet's profile
 //! for `under=<sheet>`, which is what the `outline` tool's `under` argument carries.
@@ -216,6 +218,27 @@ pub fn plan(tool: Tool, args: &Args, project: Uuid) -> Result<Plan, ToolError> {
             Ok(plan)
         }
         Tool::Read => read(args, &root),
+        Tool::Memory => Ok(get(
+            format!("{root}/memory"),
+            pairs(args, &["mode", "q", "since"]),
+        )),
+        Tool::Remember => {
+            let mut body = Map::new();
+            for key in ["kind", "body", "citations", "session"] {
+                if let Some(value) = args.get(key) {
+                    body.insert(key.into(), value.clone());
+                }
+            }
+            Ok(Plan {
+                method: Method::Post,
+                path: format!("{root}/memory"),
+                query: Vec::new(),
+                body: Some(Value::Object(body)),
+                if_none_match: None,
+                request_id: None,
+                file: None,
+            })
+        }
     }
 }
 
@@ -378,7 +401,10 @@ fn propose(args: &Args, root: &str) -> Result<Plan, ToolError> {
     if let Some(proposal) = uuid_arg(args, "proposal")? {
         body.insert("proposal".into(), json!(proposal.to_string()));
     }
-    for key in ["name", "ops", "dry_run", "strict", "return"] {
+    // `session` and `turn` are never the model's: the server adds them after validation.
+    for key in [
+        "name", "ops", "dry_run", "strict", "return", "session", "turn",
+    ] {
         if let Some(value) = args.get(key) {
             body.insert(key.into(), value.clone());
         }
@@ -394,6 +420,38 @@ fn propose(args: &Args, root: &str) -> Result<Plan, ToolError> {
     plan.file = Some(file[..8].to_owned());
     plan.request_id = Some(request_id);
     Ok(plan)
+}
+
+/// Open the connection's agent session (`source` `mcp`). The product is the MCP client's
+/// self-description, cut to the route's limits and stripped of control characters.
+pub fn session_open(project: Uuid, product: &str, version: Option<&str>) -> Plan {
+    let clean = |text: &str, max: usize| -> String {
+        let kept: String = text.chars().filter(|c| !c.is_control()).take(max).collect();
+        kept.trim().to_owned()
+    };
+    let product = Some(clean(product, 80))
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "MCP client".to_owned());
+    let mut body = Map::new();
+    body.insert("source".into(), json!("mcp"));
+    body.insert("product".into(), json!(product));
+    if let Some(version) = version.map(|v| clean(v, 40)).filter(|v| !v.is_empty()) {
+        body.insert("product_version".into(), json!(version));
+    }
+    post(format!("projects/{project}/agent/sessions"), body)
+}
+
+/// Record a turn of `session` with the prompt the client reported. Over MCP the prompt is
+/// always the agent's account of it (`prompt_source` `agent`), never the launcher's.
+pub fn session_turn(project: Uuid, session: &str, prompt: &str) -> Result<Plan, ToolError> {
+    let session = Uuid::parse_str(session).map_err(|_| ToolError::bad_request("session"))?;
+    let mut body = Map::new();
+    body.insert("prompt".into(), json!(prompt));
+    body.insert("prompt_source".into(), json!("agent"));
+    Ok(post(
+        format!("projects/{project}/agent/sessions/{session}/turns"),
+        body,
+    ))
 }
 
 /// `submit` and `withdraw` are two routes of one tool; both take an optional note.
@@ -425,6 +483,20 @@ fn status(args: &Args, root: &str) -> Result<Plan, ToolError> {
     };
     match (text(args, "what"), proposal) {
         (None | Some("access"), None) => Ok(get(format!("{root}/access"))),
+        // The agent's own proposals in the project (the list route of the service).
+        (Some("proposals"), None) => {
+            let mut plan = get(format!("{root}/proposals"));
+            match text(args, "state") {
+                Some(
+                    state @ ("active" | "all" | "draft" | "open" | "changes_requested" | "merged"
+                    | "declined" | "withdrawn"),
+                ) => plan.query.push(("state", state.to_owned())),
+                Some(_) => return Err(ToolError::bad_request("state")),
+                None => {}
+            }
+            Ok(plan)
+        }
+        (Some("proposals"), Some(_)) => Err(ToolError::bad_request("proposal")),
         (None | Some("proposal"), Some(proposal)) => {
             Ok(get(format!("{root}/proposals/{proposal}")))
         }
@@ -567,5 +639,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(url(&ok), format!("projects/{PROJECT}/agent/files?q=Q3"));
+    }
+
+    #[test]
+    fn memory_reads_and_remember_posts_only_its_own_fields() {
+        let read = plan(
+            Tool::Memory,
+            &args(json!({"mode": "search", "q": "style"})),
+            PROJECT,
+        )
+        .unwrap();
+        assert_eq!(
+            url(&read),
+            format!("projects/{PROJECT}/agent/memory?mode=search&q=style")
+        );
+        let write = plan(
+            Tool::Remember,
+            &args(json!({"kind": "fact", "body": "Euros.", "citations": [{"file": "7034d450", "ref": "7C02"}]})),
+            PROJECT,
+        )
+        .unwrap();
+        assert_eq!(write.method, Method::Post);
+        assert_eq!(write.path, format!("projects/{PROJECT}/agent/memory"));
+        assert_eq!(
+            write.body,
+            Some(
+                json!({"kind": "fact", "body": "Euros.", "citations": [{"file": "7034d450", "ref": "7C02"}]})
+            )
+        );
     }
 }

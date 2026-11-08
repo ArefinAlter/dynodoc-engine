@@ -52,6 +52,9 @@ pub struct VerifyResult {
     /// Human-readable detail when broken.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Sealed AI-agent authorship records checked (decision 038), when the chain is whole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributions: Option<usize>,
 }
 
 /// Verify the chain and legacy snapshots by replay. `[document member]`, no-store.
@@ -80,10 +83,11 @@ pub async fn verify(
         match engine_core::snapshot_verification::verify_document(&state.pool, document_id, false)
             .await
         {
-            Ok(_) => VerifyResult {
+            Ok(report) => VerifyResult {
                 ok: true,
                 broken_at_seq: None,
                 detail: None,
+                attributions: Some(report.attributions),
             },
             Err(engine_core::snapshot::SnapshotError::Event(
                 engine_core::log::EventError::ChainBroken { seq, detail },
@@ -91,12 +95,14 @@ pub async fn verify(
                 ok: false,
                 broken_at_seq: Some(seq),
                 detail: Some(detail),
+                attributions: None,
             },
             Err(engine_core::snapshot::SnapshotError::Unverified { seq, detail, .. }) => {
                 VerifyResult {
                     ok: false,
                     broken_at_seq: Some(seq),
                     detail: Some(detail),
+                    attributions: None,
                 }
             }
             Err(other) => return Err(other.into()),

@@ -3,24 +3,10 @@
 //! Same-file edits and shared path/identity constraints require explicit choices.
 use super::{compare, Commit, Error, FileEntry};
 use crate::shared_checkpoint::Address;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Kind {
-    CherryPick,
-    Revert,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Source {
-    pub kind: Kind,
-    pub commit: Address,
-    /// None only for a root commit. A merge requires an explicit chosen parent.
-    pub mainline: Option<Address>,
-}
+pub use super::records::{Kind, Source};
 
 #[derive(Debug, Serialize)]
 pub struct Plan {
@@ -112,6 +98,7 @@ impl Plan {
         }
         self.validate_files(&files)?;
         let result = Commit {
+            sealed: None,
             version: 2,
             project: self.project,
             parents: vec![self.onto.clone()],
@@ -120,6 +107,9 @@ impl Plan {
             authored_at_ms,
             message,
             recovery: Some(self.source.clone()),
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         };
         result.bytes()?; // Shared identity, namespace and size validation.

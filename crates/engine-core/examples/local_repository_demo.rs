@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
     let root_b = a.write_state(second, &state("Initial budget")).await?.0;
     let initial = SignedCommit::sign(
         Commit {
+            sealed: None,
             version: 1,
             project,
             parents: vec![],
@@ -90,6 +91,9 @@ async fn main() -> anyhow::Result<()> {
             authored_at_ms: 1,
             message: "Initial two-file project".into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         },
         &key_a,

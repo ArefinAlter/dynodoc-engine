@@ -61,6 +61,7 @@ pub async fn apply_checked_op(
 ) -> Result<Event, ApiError> {
     let (mut tx, role, current) = begin_write(state, document_id, actor).await?;
     governance::authorize(role, &op, &current).map_err(ApiError::from)?;
+    crate::ledger::refuse_direct(&mut tx, document_id.0).await?;
     if crate::access::changes_content(&op) {
         crate::access::ensure_team_edit(&mut tx, document_id.0, actor.0).await?;
     }
@@ -209,7 +210,8 @@ pub(crate) async fn materialize_node_change(
         | EventPayload::SuggestionProposed { .. }
         | EventPayload::SuggestionAccepted { .. }
         | EventPayload::SuggestionRejected { .. }
-        | EventPayload::Deployed { .. } => return Ok(()),
+        | EventPayload::Deployed { .. }
+        | EventPayload::ChangeAttributed(_) => return Ok(()),
     };
     type Row = (
         String,

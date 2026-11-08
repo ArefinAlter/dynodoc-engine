@@ -87,8 +87,13 @@ struct ViewCommit {
     stored_height: Option<u64>,
     /// Interned states of the file entries, sorted and unique.
     files: Vec<u32>,
-    /// v3 records: interned `[base, left, right]` states.
-    inputs: Vec<[u32; 3]>,
+    /// Interned record input states: v3 `[base, left, right]`, and every state a v4
+    /// record names (base, both parents' and the source's).
+    inputs: Vec<u32>,
+    /// Relocation ids this commit's edit-follows-move records follow (v4 merge).
+    follows: Vec<String>,
+    /// Relocation ids this commit's own relocation records define (v4 relocation).
+    defines: Vec<String>,
 }
 
 /// Everything the planner reads, held in memory. Build it with the `add_*`
@@ -99,6 +104,9 @@ pub struct HistoryView {
     commits: Vec<ViewCommit>,
     seen: HashSet<Raw>,
     skeleton: Vec<SkeletonEntry>,
+    /// States an earlier horizon released: their objects are gone, and a new plan
+    /// neither releases nor measures them again.
+    released: HashSet<(uuid::Uuid, Raw)>,
     holds: Vec<Hold>,
     states: Vec<(uuid::Uuid, Raw)>,
     state_index: HashMap<(uuid::Uuid, Raw), u32>,
@@ -115,6 +123,7 @@ impl HistoryView {
             commits: Vec::new(),
             seen: HashSet::new(),
             skeleton: Vec::new(),
+            released: HashSet::new(),
             holds: Vec::new(),
             states: Vec::new(),
             state_index: HashMap::new(),
@@ -169,14 +178,36 @@ impl HistoryView {
         }
         files.sort_unstable();
         files.dedup();
-        let mut inputs = Vec::with_capacity(commit.same_file_resolutions.len());
+        let mut inputs = Vec::with_capacity(3 * commit.same_file_resolutions.len());
         for record in &commit.same_file_resolutions {
             let document = record.document.0;
-            inputs.push([
-                self.intern(document, raw(&record.base)),
-                self.intern(document, raw(&record.left)),
-                self.intern(document, raw(&record.right)),
-            ]);
+            for state in [&record.base, &record.left, &record.right] {
+                inputs.push(self.intern(document, raw(state)));
+            }
+        }
+        let mut follows = Vec::new();
+        for record in &commit.project_resolutions {
+            let document = record.document.0;
+            for state in [&record.base, &record.left, &record.right]
+                .into_iter()
+                .flatten()
+            {
+                inputs.push(self.intern(document, raw(state)));
+            }
+            if let Some(source) = &record.source {
+                let document = source.document.0;
+                for state in [
+                    Some(&source.base),
+                    source.left.as_ref(),
+                    source.right.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    inputs.push(self.intern(document, raw(state)));
+                }
+            }
+            follows.extend(record.relocation.iter().cloned());
         }
         self.commits.push(ViewCommit {
             address,
@@ -193,6 +224,8 @@ impl HistoryView {
             stored_height,
             files,
             inputs,
+            follows,
+            defines: commit.relocations.iter().map(|r| r.id.clone()).collect(),
         });
         Ok(())
     }
@@ -200,6 +233,11 @@ impl HistoryView {
     /// A commit already released by an earlier horizon (design: the skeleton).
     pub fn add_prior_skeleton(&mut self, entry: SkeletonEntry) {
         self.skeleton.push(entry);
+    }
+
+    /// A file state an earlier horizon released (its objects are no longer stored).
+    pub fn add_prior_released_state(&mut self, document: uuid::Uuid, root: &Address) {
+        self.released.insert((document, raw(root)));
     }
 
     pub fn add_hold(&mut self, hold: Hold) -> Result<(), Error> {
@@ -825,6 +863,16 @@ pub fn plan(
         .filter(|n| keep[*n as usize].is_some())
         .collect();
     let mut evidence: Vec<(u32, Reason)> = Vec::new();
+    // The commit that defines each relocation id (decision 042).
+    let defined: HashMap<&str, u32> = (0..bodies as u32)
+        .flat_map(|n| {
+            graph
+                .commit(n as usize)
+                .defines
+                .iter()
+                .map(move |id| (id.as_str(), n))
+        })
+        .collect();
     for &node in &primary {
         let commit = graph.commit(node as usize);
         let parents = &graph.parents[node as usize];
@@ -842,7 +890,9 @@ pub fn plan(
                     evidence.push((*first, Reason::EvidenceRecovery));
                 }
             }
-            3 => {
+            // A v4 merge pins like v3; a v4 relocation commit pins its parent, whose
+            // states re-verify the record (decision 033 section 2).
+            3 | 4 => {
                 for parent in parents {
                     evidence.push((*parent, Reason::EvidenceMerge));
                 }
@@ -850,6 +900,18 @@ pub fn plan(
                     match graph.merge_bases(*left, *right, &mut scratch)?.as_slice() {
                         [base] => evidence.push((*base, Reason::EvidenceMerge)),
                         _ => return Err(Error::Plan("a merge commit has no unique merge base")),
+                    }
+                }
+                // The relocation commits its edit-follows-move records name: ancestors
+                // of a parent that `verify-merge` and publication read the record from.
+                for id in &commit.follows {
+                    match defined.get(id.as_str()) {
+                        Some(n) => evidence.push((*n, Reason::EvidenceMerge)),
+                        None => {
+                            warnings.insert(format!(
+                                "the relocation {id} a kept merge follows has no stored body"
+                            ));
+                        }
                     }
                 }
             }
@@ -919,14 +981,19 @@ pub fn plan(
     }
     if !history && policy.protect.merge_inputs == MergeInputs::States {
         for &node in &primary {
-            for inputs in &graph.commit(node as usize).inputs {
-                retained_states.extend(inputs.iter().copied());
-            }
+            retained_states.extend(graph.commit(node as usize).inputs.iter().copied());
         }
     }
     let mut all_states: BTreeSet<u32> = BTreeSet::new();
     for node in 0..bodies {
-        all_states.extend(graph.commit(node).files.iter().copied());
+        all_states.extend(
+            graph
+                .commit(node)
+                .files
+                .iter()
+                .copied()
+                .filter(|s| !view.released.contains(&view.states[*s as usize])),
+        );
     }
     let released_ids: Vec<u32> = all_states
         .iter()

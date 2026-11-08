@@ -190,6 +190,7 @@ async fn world(runtime: &PgPool, app: &Router) -> World {
     for message in ["one", "two", "three"] {
         let signed = SignedCommit::sign(
             Commit {
+                sealed: None,
                 version: 1,
                 project,
                 parents: commits.last().cloned().into_iter().collect(),
@@ -204,6 +205,9 @@ async fn world(runtime: &PgPool, app: &Router) -> World {
                 authored_at_ms: 1,
                 message: message.into(),
                 recovery: None,
+                project_resolutions: Vec::new(),
+                relocations: Vec::new(),
+                merge_policy: None,
                 same_file_resolutions: Vec::new(),
             },
             &key,

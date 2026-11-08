@@ -233,6 +233,8 @@ pub fn check(state: &DocumentState) -> Vec<Violation> {
             ));
         }
     }
+    // INV-T, INV-S and INV-P (design 5.2 to 5.4).
+    super::family::check(state, &mut found);
     found.into_iter().collect()
 }
 

@@ -187,6 +187,7 @@ fn signed(
 ) -> SignedCommit {
     SignedCommit::sign(
         Commit {
+            sealed: None,
             version: 1,
             project,
             parents,
@@ -201,6 +202,9 @@ fn signed(
             authored_at_ms: 1,
             message: message.into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         },
         key,
@@ -2399,4 +2403,554 @@ async fn project_history_log_paged_traversal_continuation_and_authorization(pool
     assert_eq!(st_revoked, StatusCode::FORBIDDEN);
 
     runtime.close().await;
+}
+
+/// The typed-state root and objects of `state` for `doc`.
+async fn objects_of(doc: Uuid, state: &DocumentState) -> (Address, Vec<Value>) {
+    let mut store = Collect::default();
+    let (root, _) = typed::write_state(
+        &mut store,
+        DocumentId(doc),
+        state,
+        Limits::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let objects = store
+        .objects
+        .into_iter()
+        .map(|(address, bytes)| json!({"address":address,"bytes":STANDARD.encode(bytes)}))
+        .collect();
+    (root, objects)
+}
+
+fn tree(nodes: &[(&str, Option<&str>, &str, &str)]) -> DocumentState {
+    let mut state = DocumentState::default();
+    for (id, parent, kind, label) in nodes {
+        let node = engine_core::materializer::MaterializedNode {
+            id: engine_shared::NodeId((*id).into()),
+            parent_id: parent.map(|p| engine_shared::NodeId(p.into())),
+            node_type: (*kind).into(),
+            pos: format!("p{id}"),
+            var_name: None,
+            deleted: false,
+            current_fields: json!({ "label": label }),
+        };
+        state.nodes.insert(node.id.clone(), node);
+    }
+    state
+}
+
+fn v4(project: Uuid, parents: Vec<Address>, files: BTreeMap<String, FileEntry>) -> Commit {
+    Commit {
+        version: 4,
+        project,
+        parents,
+        files,
+        author_key: String::new(),
+        authored_at_ms: 2,
+        message: "v4".into(),
+        recovery: None,
+        same_file_resolutions: Vec::new(),
+        sealed: None,
+        project_resolutions: Vec::new(),
+        relocations: Vec::new(),
+        merge_policy: None,
+    }
+}
+
+/// `request` with an `If-Match` header.
+async fn request_if(
+    app: &Router,
+    method: &str,
+    path: &str,
+    token: &str,
+    revision: i64,
+    body: Value,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("if-match", format!("\"{revision}\""))
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// The default policy with page setup merges marked for review.
+const REVIEW_POLICY: &str = r#"{"version":1,"id":"test.review.v1","defaults":{"unknown":"manual","loser":"none","roles_rank":["owner","manager","editor","contributor","reviewer"],"invariants":"flag"},
+  "rules":[{"id":"content","match":{"field":"content"},"strategy":"dynodoc.default.richtext.v1","gate":"auto"},
+           {"id":"page-setup","match":{"field":"page_setup"},"strategy":"dynodoc.default.property.v1","gate":"auto-with-review"},
+           {"id":"whole","match":{},"strategy":"dynodoc.default.whole-value.v1","gate":"auto"}],
+  "floors":{"gate_at_least":{"dynodoc.default.property.v1":"auto-with-review"}}}"#;
+
+/// Decision 033 at the service: a relocation commit is re-applied to its published
+/// parent and a forged lineage claim is refused; a v4 merge with automatic
+/// resolutions under review reaches `main` only through an approval bound to the
+/// resolution-set hash the reviewer was shown, never by the publisher.
+///
+/// Decision 042 trust boundaries: the service re-runs every recorded resolution, so a
+/// forged or altered automatic resolution (another merged state, another set hash, a
+/// cleared review flag) is refused at publication; a project policy below the
+/// organisation floor is refused when saved, and so is a v4 merge whose embedded policy
+/// is below it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn v4_relocations_are_rechecked_and_reviewed_merges_bind_their_resolution_set(pool: PgPool) {
+    use engine_core::{
+        merge_policy::{review, MergePolicy, Registry},
+        repository::{convergence, project, relocation},
+    };
+    install_receipts(&pool).await;
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let (app, owner, login, project_id, report, key) = setup(&runtime.pool).await;
+    let (_, review_login) = member(&runtime.pool, project_id, "reviewer", "approver").await;
+    let appendix: Uuid = sqlx::query_scalar(
+        "insert into document(title,created_by,space_id) values('Appendix',$1,$2) returning id",
+    )
+    .bind(owner)
+    .bind(project_id)
+    .fetch_one(&runtime.pool)
+    .await
+    .unwrap();
+    let source = tree(&[
+        ("R", None, "form", "Report"),
+        ("S2", Some("R"), "section", "Methods"),
+        ("n1", Some("S2"), "item", "Sampling"),
+    ]);
+    let mut dest = tree(&[
+        ("A", None, "form", "Appendix"),
+        ("B", Some("A"), "section", "Annex"),
+    ]);
+    let a = engine_shared::NodeId("A".into());
+    dest.nodes.get_mut(&a).unwrap().current_fields["page_setup"] = json!({"size":"A4","margin":25});
+    let (source_root, objects) = objects_of(report, &source).await;
+    upload(&app, &login, project_id, report, &objects).await;
+    let (dest_root, objects) = objects_of(appendix, &dest).await;
+    upload(&app, &login, project_id, appendix, &objects).await;
+    let entry = |doc: Uuid, state: &Address| FileEntry {
+        document: DocumentId(doc),
+        state: state.clone(),
+    };
+    let files = BTreeMap::from([
+        ("Report.docx".to_string(), entry(report, &source_root)),
+        ("Appendix.docx".to_string(), entry(appendix, &dest_root)),
+    ]);
+    let mut base_commit = v4(project_id, vec![], files.clone());
+    base_commit.version = 1;
+    let sign = |c: Commit| SignedCommit::sign(c, &key).unwrap();
+    let base = publish_commit(&app, &login, project_id, &sign(base_commit)).await;
+    let history = format!("/projects/{project_id}/history");
+    let staging = format!("/projects/{project_id}/staging/commits");
+    let commits = format!("{history}/commits");
+    let refs = format!("{history}/refs");
+    let reviews = format!("{history}/reviews");
+    ok(
+        &app,
+        "POST",
+        &refs,
+        &login,
+        json!({"branch":"main","candidate":base,"expected":null}),
+    )
+    .await;
+
+    // An honest move of S2 into the appendix.
+    let spec = relocation::Spec {
+        kind: relocation::Kind::Move,
+        from: relocation::Source {
+            document: DocumentId(report),
+            roots: vec![engine_shared::NodeId("S2".into())],
+        },
+        to: relocation::Destination {
+            document: DocumentId(appendix),
+            parent: engine_shared::NodeId("B".into()),
+            position: "a3".into(),
+        },
+    };
+    let states = BTreeMap::from([(report, source.clone()), (appendix, dest.clone())]);
+    let (moved_files, records, written) =
+        relocation::plan_commit(&files, &[spec], &BTreeMap::new(), states)
+            .await
+            .unwrap();
+    for (doc, state) in &written {
+        let (_, objects) = objects_of(doc.0, state).await;
+        upload(&app, &login, project_id, doc.0, &objects).await;
+    }
+    let mut moved = v4(project_id, vec![base.clone()], moved_files.clone());
+    moved.relocations = records;
+    // The same record with the appendix left at its old state is a forgery.
+    let mut forged = moved.clone();
+    forged.message = "forged".into();
+    forged.files.get_mut("Appendix.docx").unwrap().state = dest_root.clone();
+    forged.relocations[0].dest_state_after = dest_root.clone();
+    let forged = sign(forged);
+    ok(&app, "POST", &staging, &login, json!(forged)).await;
+    let address = forged.verify().unwrap();
+    let (status, _) = request(&app, "POST", &commits, &login, json!({"address":address})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    publish_commit(&app, &login, project_id, &sign(moved)).await;
+
+    // A v4 merge of two page-setup edits of the appendix, under review.
+    let setup_edit = |page_setup: Value| {
+        let mut state = dest.clone();
+        state.nodes.get_mut(&a).unwrap().current_fields["page_setup"] = page_setup;
+        state
+    };
+    let left_state = setup_edit(json!({"size":"A4","margin":20}));
+    let right_state = setup_edit(json!({"size":"A4","margin":25,"landscape":true}));
+    let side = |state: DocumentState| {
+        let mut files = files.clone();
+        async move {
+            let (root, objects) = objects_of(appendix, &state).await;
+            files.insert(
+                "Appendix.docx".into(),
+                FileEntry {
+                    document: DocumentId(appendix),
+                    state: root.clone(),
+                },
+            );
+            (root, objects, files)
+        }
+    };
+    let (left_root, objects, left_files) = side(left_state.clone()).await;
+    upload(&app, &login, project_id, appendix, &objects).await;
+    let (right_root, objects, right_files) = side(right_state.clone()).await;
+    upload(&app, &login, project_id, appendix, &objects).await;
+    let mut left_commit = v4(project_id, vec![base.clone()], left_files);
+    left_commit.version = 1;
+    let left = publish_commit(&app, &login, project_id, &sign(left_commit)).await;
+    let mut right_commit = v4(project_id, vec![base.clone()], right_files);
+    right_commit.version = 1;
+    let right = publish_commit(&app, &login, project_id, &sign(right_commit)).await;
+    let policy = MergePolicy::from_json(REVIEW_POLICY.as_bytes(), &Registry::builtin()).unwrap();
+    let (result, evidence) = convergence::converge_with_policy(
+        &dest,
+        &left_state,
+        &right_state,
+        &left_root,
+        &right_root,
+        &policy,
+    );
+    let entries = review::entries(
+        &evidence.evidence,
+        evidence.team,
+        Some(DocumentId(appendix)),
+    );
+    assert!(review::needs_review(&entries));
+    let (merged_root, objects) = objects_of(appendix, &result.merged.unwrap()).await;
+    upload(&app, &login, project_id, appendix, &objects).await;
+    let mut merged_files = files.clone();
+    merged_files.insert("Appendix.docx".into(), entry(appendix, &merged_root));
+    let mut merge = v4(project_id, vec![left, right], merged_files);
+    merge.merge_policy = Some(project::EmbeddedPolicy::of(&policy));
+    merge.project_resolutions = vec![project::ProjectResolution {
+        id: "r1".into(),
+        strategy: project::SAME_FILE.into(),
+        document: DocumentId(appendix),
+        base: Some(dest_root.clone()),
+        left: Some(left_root.clone()),
+        right: Some(right_root.clone()),
+        merged: merged_root.clone(),
+        path: None,
+        relocation: None,
+        follows: None,
+        source: None,
+        needs_review: true,
+        resolution_set: Some(review::hash_hex(&entries)),
+    }];
+    let hash = project::resolution_set_hash(&merge);
+    let refused = async |commit: Commit, code: &str| {
+        let signed = sign(commit);
+        ok(&app, "POST", &staging, &login, json!(signed)).await;
+        let address = signed.verify().unwrap();
+        let (status, body) =
+            request(&app, "POST", &commits, &login, json!({"address":address})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], code, "{body}");
+    };
+    // Records that misname a parent's state are refused at publication.
+    let mut lying = merge.clone();
+    lying.project_resolutions[0].right = Some(source_root.clone());
+    let lying = sign(lying);
+    ok(&app, "POST", &staging, &login, json!(lying)).await;
+    let address = lying.verify().unwrap();
+    let (status, _) = request(&app, "POST", &commits, &login, json!({"address":address})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // A forged outcome (the left side's state claimed as the merge), an altered set hash
+    // and a cleared review flag do not reproduce under the policy: refused.
+    let mut forged = merge.clone();
+    forged.files.get_mut("Appendix.docx").unwrap().state = left_root.clone();
+    forged.project_resolutions[0].merged = left_root.clone();
+    refused(forged, "resolution_not_reproduced").await;
+    let mut altered = merge.clone();
+    altered.project_resolutions[0].resolution_set = Some("ab".repeat(32));
+    refused(altered, "resolution_not_reproduced").await;
+    let mut unflagged = merge.clone();
+    unflagged.project_resolutions[0].needs_review = false;
+    refused(unflagged, "resolution_not_reproduced").await;
+
+    // An organisation of the owner sets a floor the policy is below.
+    let organisation: Uuid = sqlx::query_scalar(
+        "insert into organisation(name,created_by) values('Acme',$1) returning id",
+    )
+    .bind(owner)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("insert into organisation_member(organisation_id,identity_id,source,role) values($1,$2,'manual','owner')")
+        .bind(organisation)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let floor = format!("/organisations/{organisation}/merge-floor");
+    let blocked = json!({"floors":{"gate_at_least":{"dynodoc.default.property.v1":"blocked"}}});
+    let (status, body) = request_if(&app, "PUT", &floor, &login, 0, blocked).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let policy_path = format!("/projects/{project_id}/merge-policy");
+    let body = json!({"policy":serde_json::from_str::<Value>(REVIEW_POLICY).unwrap()});
+    let (status, refusal) = request_if(&app, "PUT", &policy_path, &login, 0, body.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert_eq!(refusal["code"], "below_floor");
+    refused(merge.clone(), "below_floor").await;
+    // At the floor the policy saves (by an owner, not a reviewer) and the merge publishes.
+    let review_floor =
+        json!({"floors":{"gate_at_least":{"dynodoc.default.property.v1":"auto-with-review"}}});
+    let (status, _) = request_if(&app, "PUT", &floor, &login, 1, review_floor).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request_if(&app, "PUT", &policy_path, &review_login, 0, body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, saved) = request_if(&app, "PUT", &policy_path, &login, 0, body).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["hash"], json!(policy.hash_hex()));
+    let read = ok(&app, "GET", &policy_path, &review_login, Value::Null).await;
+    assert_eq!(read["revision"], 1);
+    let merge = publish_commit(&app, &login, project_id, &sign(merge)).await;
+
+    let target =
+        json!({"branch":"main","candidate":merge,"expected":{"commit":base,"generation":1}});
+    // No bound approval yet: main refuses even without an approval floor.
+    let (status, _) = request(&app, "POST", &refs, &login, target.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // The publisher cannot approve their own merge, even with the hash.
+    let own = json!({"target":target,"decision":"approve","resolution_set":hash});
+    assert_eq!(
+        request(&app, "POST", &reviews, &login, own).await.0,
+        StatusCode::FORBIDDEN
+    );
+    // An approval that binds nothing, or another set, is not recorded.
+    for wrong in [Value::Null, json!("cd".repeat(32))] {
+        let body = json!({"target":target,"decision":"approve","resolution_set":wrong});
+        let (status, _) = request(&app, "POST", &reviews, &review_login, body).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+    let (status, _) = request(&app, "POST", &refs, &login, target.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let bound = json!({"target":target,"decision":"approve","resolution_set":hash});
+    ok(&app, "POST", &reviews, &review_login, bound).await;
+    let listed = ok(
+        &app,
+        "GET",
+        &format!("{reviews}?candidate={}", merge.as_str()),
+        &login,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(listed["items"][0]["resolution_set"], json!(hash));
+    ok(&app, "POST", &refs, &login, target).await;
+    runtime.close().await;
+}
+
+/// Decision 039: a commit built by the browser path (the WebAssembly engine's typed writer
+/// and commit encoder, here the same Rust natively) and signed outside the engine with an
+/// enrolled key is accepted, published and can open a branch. One whose signed bytes were
+/// changed, or that an unenrolled key signed, is refused. Ed25519 is deterministic, so
+/// `ring` signing the engine's message stands in for WebCrypto exactly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn browser_made_commit_is_accepted_and_a_tampered_one_refused(pool: PgPool) {
+    use dynodoc_engine_wasm::engine;
+    install_receipts(&pool).await;
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let (app, _actor, login, project, doc, _) = setup(&runtime.pool).await;
+    let sign = |key: &Ed25519KeyPair, message_hex: &str| {
+        hex::encode(key.sign(&hex::decode(message_hex).unwrap()).as_ref())
+    };
+    // Enrol a "browser" key through the ordinary challenge, signing the engine's bytes.
+    let browser = Ed25519KeyPair::from_seed_unchecked(&[21; 32]).unwrap();
+    let public = hex::encode(browser.public_key().as_ref());
+    let challenge = ok(
+        &app,
+        "POST",
+        "/devices/challenge",
+        &login,
+        json!({"public_key":public}),
+    )
+    .await;
+    let message = engine::enrollment_message(&challenge.to_string()).unwrap();
+    ok(
+        &app,
+        "POST",
+        "/devices",
+        &login,
+        json!({"challenge":challenge,"signature":sign(&browser, &message),"label":"Browser","class":"person"}),
+    )
+    .await;
+
+    let graph: Value = serde_json::from_str(
+        &engine::write_state(&doc.to_string(), &json!(document_state()).to_string()).unwrap(),
+    )
+    .unwrap();
+    // The page's graph is the server's: the same root the native writer produces.
+    assert_eq!(graph["state"], json!(self::graph(doc).await.0));
+    upload(
+        &app,
+        &login,
+        project,
+        doc,
+        graph["objects"].as_array().unwrap(),
+    )
+    .await;
+    let commit = json!({"version":1,"project":project,"parents":[],"files":{"Report.docx":{"document":doc,"state":graph["state"]}},"author_key":public,"authored_at_ms":1_700_000_000_000_i64,"message":"From the browser"});
+    let encoded: Value =
+        serde_json::from_str(&engine::commit_address(&commit.to_string()).unwrap()).unwrap();
+    let signature = sign(&browser, encoded["signing_message"].as_str().unwrap());
+    let staging = format!("/projects/{project}/staging/commits");
+
+    // Tampered after signing: the message no longer matches the signature.
+    let mut tampered = commit.clone();
+    tampered["message"] = json!("From someone else");
+    let (status, _) = request(
+        &app,
+        "POST",
+        &staging,
+        &login,
+        json!({"commit":tampered,"signature":signature}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Signed correctly, but by a key this account never enrolled.
+    let stranger = Ed25519KeyPair::from_seed_unchecked(&[22; 32]).unwrap();
+    let mut foreign = commit.clone();
+    foreign["author_key"] = json!(hex::encode(stranger.public_key().as_ref()));
+    let foreign_message: Value =
+        serde_json::from_str(&engine::commit_address(&foreign.to_string()).unwrap()).unwrap();
+    let (status, _) = request(
+        &app,
+        "POST",
+        &staging,
+        &login,
+        json!({"commit":foreign,"signature":sign(&stranger, foreign_message["signing_message"].as_str().unwrap())}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let staged = ok(
+        &app,
+        "POST",
+        &staging,
+        &login,
+        json!({"commit":commit,"signature":signature}),
+    )
+    .await;
+    assert_eq!(staged["address"], encoded["address"]);
+    ok(
+        &app,
+        "POST",
+        &format!("/projects/{project}/history/commits"),
+        &login,
+        json!({"address":encoded["address"]}),
+    )
+    .await;
+    ok(
+        &app,
+        "POST",
+        &format!("/projects/{project}/history/refs"),
+        &login,
+        json!({"branch":"browser/draft","candidate":encoded["address"],"expected":null}),
+    )
+    .await;
+}
+
+/// Upload deduplication (decision 043): `staging/objects/missing` answers only from the caller's
+/// own uploads of that project and file. Another file, another member, an outsider and a file of
+/// another project learn nothing about objects uploaded elsewhere.
+#[sqlx::test(migrations = "../../migrations")]
+async fn missing_objects_never_reveal_uploads_of_another_file_or_person(pool: PgPool) {
+    let runtime = common::RuntimeDatabase::new(pool.clone()).await;
+    let (app, owner, login, project, doc, _) = setup(&runtime.pool).await;
+    let second: Uuid = sqlx::query_scalar(
+        "insert into document(title,created_by,space_id) values('Budget',$1,$2) returning id",
+    )
+    .bind(owner)
+    .bind(project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (_, objects) = graph(doc).await;
+    let addresses: Vec<Value> = objects.iter().map(|o| o["address"].clone()).collect();
+    upload(&app, &login, project, doc, &objects).await;
+    let missing = |project: Uuid, document: Uuid| {
+        (
+            format!("/projects/{project}/staging/objects/missing"),
+            json!({"document":document,"addresses":addresses.clone()}),
+        )
+    };
+    // The uploader's own file: nothing is missing.
+    let (path, body) = missing(project, doc);
+    assert_eq!(
+        ok(&app, "POST", &path, &login, body).await["missing"],
+        json!([])
+    );
+    // The same bytes asked for another file of the same project: all missing.
+    let (path, body) = missing(project, second);
+    assert_eq!(
+        ok(&app, "POST", &path, &login, body).await["missing"],
+        json!(addresses)
+    );
+    // Another member of the project asking about the uploader's file: all missing.
+    let (member, member_login) = new_actor(&runtime.pool, "member").await;
+    sqlx::query("insert into space_member(space_id,identity_id,role) values($1,$2,'editor')")
+        .bind(project)
+        .bind(member)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (path, body) = missing(project, doc);
+    assert_eq!(
+        ok(&app, "POST", &path, &member_login, body).await["missing"],
+        json!(addresses)
+    );
+    // An outsider is refused, and so is a file named under a project it is not in.
+    let (_, outsider) = new_actor(&runtime.pool, "outsider").await;
+    let (path, body) = missing(project, doc);
+    let (status, _) = request(&app, "POST", &path, &outsider, body).await;
+    assert!(matches!(status.as_u16(), 403 | 404), "{status}");
+    let elsewhere: Uuid = serde_json::from_value(
+        ok(
+            &app,
+            "POST",
+            "/projects",
+            &outsider,
+            json!({"name":"Elsewhere"}),
+        )
+        .await["id"]
+            .clone(),
+    )
+    .unwrap();
+    let (path, body) = missing(elsewhere, doc);
+    let (status, _) = request(&app, "POST", &path, &outsider, body).await;
+    assert!(matches!(status.as_u16(), 403 | 404), "{status}");
+    let (path, body) = missing(elsewhere, doc);
+    let (status, _) = request(&app, "POST", &path, &login, body).await;
+    assert!(matches!(status.as_u16(), 403 | 404), "{status}");
 }

@@ -1766,15 +1766,30 @@ async fn t10_the_agent_identity_is_no_member_no_reviewer_and_no_account(pool: Pg
     refused("key", sqlx::query("insert into device_signing_key(id,identity_id,public_key,proof) values(gen_random_uuid(),$1,repeat('ab',32),'{}')").bind(agent).execute(runtime).await);
     // The same as the owner of the database: the triggers hold for everyone.
     refused("owner review", sqlx::query("insert into change_request_review(document_id,draft_id,reviewer_id,verdict,note,draft_revision) values($1,$2,$3,'approved','',(select revision from workspace_draft where id=$2))").bind(doc).bind(p).bind(agent).execute(&w.runtime.owner).await);
-    // Born disabled, with the reserved address; never enabled, erased or renamed.
-    let (email, disabled): (String, bool) =
-        sqlx::query_as("select email,disabled_at is not null from identity where id=$1")
+    // Born disabled, of kind agent and without an address (schema 117); never enabled,
+    // erased, given an address or turned into a person.
+    let (email, disabled, kind): (Option<String>, bool, String) =
+        sqlx::query_as("select email,disabled_at is not null,kind from identity where id=$1")
             .bind(agent)
             .fetch_one(runtime)
             .await
             .unwrap();
     assert!(disabled);
-    assert_eq!(email, format!("agent+{agent}@agents.invalid"));
+    assert_eq!(email, None);
+    assert_eq!(kind, "agent");
+    refused(
+        "become a person",
+        sqlx::query("update identity set kind='person',email='agent@example.test' where id=$1")
+            .bind(agent)
+            .execute(runtime)
+            .await,
+    );
+    refused(
+        "person without an address",
+        sqlx::query("insert into identity(email) values(null)")
+            .execute(runtime)
+            .await,
+    );
     refused(
         "enable",
         sqlx::query("update identity set disabled_at=null where id=$1")
@@ -4668,4 +4683,215 @@ async fn the_ledgers_tool_check_is_not_valid_and_names_the_write_tools(pool: PgP
         "{definition}"
     );
     w.close().await;
+}
+
+// ------------------------------------------------------------ ledger mode (decision 028)
+
+/// The block hash the server checks: SHA-256 of a block's fields without `block_hash`, as
+/// compact JSON with sorted keys.
+fn ledger_hash(fields: &Value) -> String {
+    let mut rest = fields.clone();
+    rest.as_object_mut().unwrap().remove("block_hash");
+    hex::encode(ring::digest::digest(
+        &ring::digest::SHA256,
+        rest.to_string().as_bytes(),
+    ))
+}
+
+/// One commit from a person's editor pane, merged by that person.
+async fn pane_commit(w: &World, doc: Uuid, pane: &str, message: &str, ops: Vec<Value>) {
+    let (_, base) = call(
+        &w.app,
+        "GET",
+        &format!("/connector/documents/{doc}/checkpoint"),
+        Some(pane),
+        Value::Null,
+    )
+    .await;
+    let body = json!({"name":message,"note":"","submit":true,"bundle":{
+        "format":"dynodoc.change-bundle","version":1,"bundle_id":Uuid::new_v4(),"client_id":Uuid::new_v4(),"document_id":doc,
+        "base_seq":base["through_seq"],"base_chain_hash":base["chain_hash"],
+        "capture":{"host":"word","mode":"observed_snapshot","document_name":"plan.docx"},
+        "changes":ops.into_iter().map(|op| json!({"id":Uuid::new_v4(),"observed_at":"2026-11-05T08:00:00Z","operation":op})).collect::<Vec<_>>()
+    }});
+    let (status, receipt) = call(
+        &w.app,
+        "POST",
+        &format!("/connector/documents/{doc}/bundles"),
+        Some(pane),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let id = receipt["id"].as_str().unwrap();
+    let (status, merged) = call(
+        &w.app,
+        "POST",
+        &format!("/connector/documents/{doc}/requests/{id}/merge"),
+        Some(pane),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+}
+
+/// An agent proposes on a ledger document: its request carries full block states and the
+/// server's block hashes (no baseline), it can change only blocks the server holds whole, it
+/// never merges, a person merges it, and the merged request keeps no copy of its content.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_proposes_on_a_ledger_document_and_only_a_person_merges(pool: PgPool) {
+    let s = setup(pool, full()).await;
+    let w = &s.w;
+    let (status, body) = call(
+        &w.app,
+        "POST",
+        &format!("/projects/{}/storage", w.project),
+        Some(&w.owner_login),
+        json!({"mode":"ledger"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut ops = Ops::default();
+    let root = ops.node("form", None, 0, json!({"label":"Ledger plan"}));
+    let doc = w.file("Ledger plan", "document", ops).await;
+    let (_, storage) = call(
+        &w.app,
+        "GET",
+        &format!("/documents/{doc}/storage"),
+        Some(&w.owner_login),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        storage["storage"]["mode"], "ledger",
+        "the file took the project default"
+    );
+
+    // The owner binds a file (hashes only), then commits one paragraph whole.
+    let (status, grant) = call(
+        &w.app,
+        "POST",
+        &format!("/documents/{doc}/connectors"),
+        Some(&w.owner_login),
+        json!({"host":"word"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{grant}");
+    let pane = grant["token"].as_str().unwrap().to_owned();
+    let (a, b) = (ulid(), ulid());
+    pane_commit(w, doc, &pane, "Bind the plan", vec![
+        json!({"type":"NodeCreated","node_id":a,"node_type":"item","parent_id":root,"pos":"B","fields":{"block_hash":"1".repeat(64)}}),
+        json!({"type":"NodeCreated","node_id":b,"node_type":"item","parent_id":root,"pos":"D","fields":{"block_hash":"2".repeat(64)}}),
+    ])
+    .await;
+    let whole = json!({"content":para("Alpha policy paragraph."),"label":"Alpha policy paragraph.","native":{"host":"word","v":1,"xml":"<w:p>Alpha policy paragraph.</w:p>","media":[],"content_hash":"0".repeat(64)}});
+    let mut edit: Vec<Value> = ["content", "label", "native"]
+        .iter()
+        .map(|f| json!({"type":"FieldEdited","node_id":a,"field":f,"value":whole[*f]}))
+        .collect();
+    edit.push(
+        json!({"type":"FieldEdited","node_id":a,"field":"block_hash","value":ledger_hash(&whole)}),
+    );
+    pane_commit(w, doc, &pane, "Write the opening", edit).await;
+
+    // The agent sees the block the server holds whole, not the hash-only one.
+    let o = outline(w, &s.token, doc).await;
+    assert_eq!(o["blocks"].as_array().unwrap().len(), 1, "{o}");
+    let (r, h) = block(&o, 0);
+    let reply = propose(
+        w,
+        &s.token,
+        doc,
+        call_body(
+            o["rev"].as_u64().unwrap(),
+            json!([
+                {"op":"set_text","ref":r,"text":"Alpha procedure paragraph.","base":h,"why":"clearer"},
+                {"op":"insert","after":r,"blocks":[{"t":"p","text":"A paragraph from the agent."}]}
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(reply.code(), 200, "{}", reply.text());
+    let proposal = Uuid::parse_str(reply.json()["proposal"].as_str().unwrap()).unwrap();
+    let hashes: i64 = sqlx::query_scalar(
+        "select count(*) from draft_edit where draft_id=$1 and payload->>'field'='block_hash'",
+    )
+    .bind(proposal)
+    .fetch_one(w.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        hashes, 2,
+        "one new block hash per block the proposal changes"
+    );
+    let base: Value = sqlx::query_scalar("select base_state from workspace_draft where id=$1")
+        .bind(proposal)
+        .fetch_one(w.pool())
+        .await
+        .unwrap();
+    assert!(
+        base.get("$dynodoc_log").is_some(),
+        "no copy of the state: {base}"
+    );
+    let submitted = submit_p(w, &s.token, proposal, json!({})).await;
+    assert_eq!(submitted.code(), 200, "{}", submitted.text());
+
+    // The agent cannot merge; a person does.
+    let head = w.head(doc).await;
+    let (status, _) = call(
+        &w.app,
+        "POST",
+        &format!("/documents/{doc}/change-requests/{proposal}/merge"),
+        Some(&s.token),
+        json!({"team_seq":head,"revision":2}),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(w.head(doc).await, head);
+    let detail = request_detail(w, &format!("/documents/{doc}/change-requests/{proposal}")).await;
+    let (status, merged) = call(
+        &w.app,
+        "POST",
+        &format!("/documents/{doc}/change-requests/{proposal}/merge"),
+        Some(&w.owner_login),
+        json!({"team_seq":head,"revision":detail["revision"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+
+    // Every block the agent changed is whole on the server and its hash checks; the rewritten
+    // paragraph lost its Word form, which no longer matched its text.
+    let blocks: Vec<(String, Value)> = sqlx::query_as("select id,current_fields from node where document_id=$1 and parent_id is not null and not deleted")
+        .bind(doc)
+        .fetch_all(w.pool())
+        .await
+        .unwrap();
+    assert_eq!(blocks.len(), 3);
+    for (id, fields) in &blocks {
+        if *id == b {
+            assert_eq!(
+                fields,
+                &json!({"block_hash":"2".repeat(64)}),
+                "untouched and never sent"
+            );
+            continue;
+        }
+        assert_eq!(
+            fields["block_hash"].as_str().unwrap(),
+            ledger_hash(fields),
+            "{id}: {fields}"
+        );
+    }
+    let opening = &blocks.iter().find(|(id, _)| *id == a).unwrap().1;
+    assert!(opening["native"].is_null());
+    assert_eq!(opening["label"], "Alpha procedure paragraph.");
+    // The merged request keeps no copy of its content.
+    let (edits, compacted): (i64, i32) = sqlx::query_as("select (select count(*) from draft_edit where draft_id=$1),(select edits from ledger_compaction where draft_id=$1)")
+        .bind(proposal)
+        .fetch_one(w.pool())
+        .await
+        .unwrap();
+    assert_eq!(edits, 0);
+    assert!(compacted > 0);
+    s.w.close().await;
 }

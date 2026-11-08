@@ -38,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
     let commit = |parents, message: &str| {
         SignedCommit::sign(
             Commit {
+                sealed: None,
                 version: 1,
                 project,
                 parents,
@@ -46,6 +47,9 @@ async fn main() -> anyhow::Result<()> {
                 authored_at_ms: 1_700_000_000_000,
                 message: message.into(),
                 recovery: None,
+                project_resolutions: Vec::new(),
+                relocations: Vec::new(),
+                merge_policy: None,
                 same_file_resolutions: Vec::new(),
             },
             &actor,

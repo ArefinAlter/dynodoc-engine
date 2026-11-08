@@ -264,6 +264,7 @@ fn signed_commit(
 ) -> SignedCommit {
     SignedCommit::sign(
         Commit {
+            sealed: None,
             version: 1,
             project,
             parents: vec![],
@@ -272,6 +273,9 @@ fn signed_commit(
             authored_at_ms: 1_700_000_000_000,
             message: message.into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         },
         key,

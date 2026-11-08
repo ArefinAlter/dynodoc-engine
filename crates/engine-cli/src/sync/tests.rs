@@ -165,6 +165,7 @@ async fn commit(
         .unwrap();
     let signed = SignedCommit::sign(
         Commit {
+            sealed: None,
             version: 1,
             project: repo.project(),
             parents,
@@ -179,6 +180,9 @@ async fn commit(
             authored_at_ms: 1,
             message: text.into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         },
         key,
@@ -828,7 +832,7 @@ fn device(url: &str, authority: Uuid, project: Uuid, seed: u8, scopes: &[&str]) 
         remote(url.to_owned(), authority),
         project,
         Credential::Device {
-            key: key(seed),
+            key: crate::signing::SharedSigner::new(key(seed)),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
         },
         None,
@@ -2475,6 +2479,8 @@ async fn release_cli_options_execution_and_local_state_untouched(pool: PgPool) {
         branch: "main".into(),
         allow_loopback_http: true,
         accept_authority_break: None,
+        transparency_policy: None,
+        require_level: None,
         action: Action::Release {
             action: ReleaseAction::List {
                 after: None,
@@ -2498,6 +2504,8 @@ async fn release_cli_options_execution_and_local_state_untouched(pool: PgPool) {
         branch: "main".into(),
         allow_loopback_http: true,
         accept_authority_break: None,
+        transparency_policy: None,
+        require_level: None,
         action: Action::Release {
             action: ReleaseAction::Show {
                 name: "v1.0.0".into(),
@@ -3066,6 +3074,8 @@ async fn remote_history_log_cli_options_execution_and_local_state_untouched() {
         branch: "main".into(),
         allow_loopback_http: true,
         accept_authority_break: None,
+        transparency_policy: None,
+        require_level: None,
         action: Action::Log {
             head: Some(a0.clone()),
             limit: None,
@@ -3089,6 +3099,8 @@ async fn remote_history_log_cli_options_execution_and_local_state_untouched() {
         branch: "main".into(),
         allow_loopback_http: true,
         accept_authority_break: None,
+        transparency_policy: None,
+        require_level: None,
         action: Action::Log {
             head: Some(a0.clone()),
             limit: None,
@@ -3135,6 +3147,7 @@ fn make_test_commit(
 ) -> SignedCommit {
     SignedCommit::sign(
         engine_core::repository::Commit {
+            sealed: None,
             version: 1,
             project,
             parents,
@@ -3143,6 +3156,9 @@ fn make_test_commit(
             authored_at_ms,
             message: message.to_string(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         },
         signer,
@@ -3996,6 +4012,8 @@ async fn verify_remote_history_cli_options_execution_and_local_state_untouched()
         branch: "main".into(),
         allow_loopback_http: true,
         accept_authority_break: None,
+        transparency_policy: None,
+        require_level: None,
         action: Action::Log {
             head: None,
             limit: None,
@@ -4019,6 +4037,8 @@ async fn verify_remote_history_cli_options_execution_and_local_state_untouched()
         branch: "main".into(),
         allow_loopback_http: true,
         accept_authority_break: None,
+        transparency_policy: None,
+        require_level: None,
         action: Action::Log {
             head: Some(served_a0.clone()),
             limit: None,
@@ -4518,6 +4538,8 @@ async fn remote_compare_cli_options_execution() {
         branch: "main".into(),
         allow_loopback_http: true,
         accept_authority_break: None,
+        transparency_policy: None,
+        require_level: None,
         action: Action::Compare {
             from: from.clone(),
             to: to.clone(),
@@ -4539,6 +4561,8 @@ async fn remote_compare_cli_options_execution() {
         branch: "main".into(),
         allow_loopback_http: true,
         accept_authority_break: None,
+        transparency_policy: None,
+        require_level: None,
         action: Action::Compare {
             from: from.clone(),
             to: to.clone(),
@@ -5265,6 +5289,8 @@ async fn remote_file_compare_cli_options_execution() {
         branch: "main".into(),
         allow_loopback_http: true,
         accept_authority_break: None,
+        transparency_policy: None,
+        require_level: None,
         action: Action::Compare {
             from: from.clone(),
             to: to.clone(),
@@ -5286,6 +5312,8 @@ async fn remote_file_compare_cli_options_execution() {
         branch: "main".into(),
         allow_loopback_http: true,
         accept_authority_break: None,
+        transparency_policy: None,
+        require_level: None,
         action: Action::Compare {
             from: from.clone(),
             to: to.clone(),
@@ -5418,6 +5446,8 @@ async fn export_file_equivalence_with_local_export_and_leaves_local_repo_unmodif
         branch: "main".into(),
         allow_loopback_http: true,
         accept_authority_break: None,
+        transparency_policy: None,
+        require_level: None,
         action: Action::ExportFile {
             commit: commit_addr.as_str().to_string(),
             path: "Report.docx".into(),

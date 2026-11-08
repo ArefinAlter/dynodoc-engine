@@ -31,6 +31,8 @@ use http::{Client, Credential, Remote};
 #[cfg(test)]
 mod tests;
 mod transfer;
+mod transparency;
+pub use transparency::RequiredLevel;
 const MAX_COMMITS: usize = 4096;
 const MAX_PLAN_BYTES: usize = 64 * 1024 * 1024;
 const GRAPH_OBJECTS: usize = 65536;
@@ -73,6 +75,14 @@ pub struct Options {
     /// receipt must extend this journal's pinned chain; the break stays recorded.
     #[arg(long, value_name = "PUBLIC_KEY")]
     accept_authority_break: Option<String>,
+    /// Transparency trust policy (log key, witnesses, quorum, freshness). With it,
+    /// fetch, pull and push report the head receipt's assurance level (L0 to L3) and
+    /// the journal remembers checkpoints that reached L2. Without it nothing changes.
+    #[arg(long)]
+    transparency_policy: Option<PathBuf>,
+    /// Refuse to advance the tracked pin (fetch, pull) below this level.
+    #[arg(long, value_enum, requires = "transparency_policy")]
+    require_level: Option<RequiredLevel>,
     #[command(subcommand)]
     action: Action,
 }
@@ -160,6 +170,14 @@ pub enum Action {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Fetch the remote's signed history horizons, verify them against the pinned
+    /// authority (rollback and fork refused by the journal), and store each verified
+    /// skeleton so history above a released commit imports. Changes no branch.
+    Horizons,
+    /// Member monitor: verify the log's checkpoint against the journal, read every
+    /// leaf and check each receipt of --branch is logged once under its blinded tag.
+    /// Fails on an equivocation; needs --transparency-policy.
+    Monitor,
     /// Inspect or create immutable named releases on the remote.
     Release {
         #[command(subcommand)]
@@ -247,7 +265,7 @@ fn credentials(options: &Options, remote: Remote) -> anyhow::Result<Client> {
     let loopback = options.allow_loopback_http;
     if let Some(path) = &options.device_key {
         let scopes = device_scopes(&options.action);
-        let key = crate::signing::load(path)?;
+        let key = crate::signing::SharedSigner::load(path)?;
         return Client::with_credential(
             remote,
             options.project,
@@ -342,6 +360,8 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
         if !matches!(options.action, Action::AuthorityProof { .. }) {
             client.authority().await?;
         }
+        let transparency_policy = options.transparency_policy.clone();
+        let require_level = options.require_level;
         match options.action {
             Action::Compare {
                 from,
@@ -439,16 +459,40 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
             }
             Action::Push { plan: input } => {
                 let approved: Plan = serde_json::from_slice(&read(&input, MAX_PLAN_BYTES)?)?;
-                Ok(SyncOutput::Json(push(&repo, &client, &journal, &scope, approved).await?))
+                let mut result = push(&repo, &client, &journal, &scope, approved).await?;
+                // The inclusion of the new receipt is usually pending: report, never fail.
+                if transparency_policy.is_some() {
+                    if let Some(receipt) = client.head(&scope).await? {
+                        result["transparency"] =
+                            match assurance(transparency_policy.as_deref(), require_level, &client, &journal, &scope, &receipt, false).await {
+                                Ok(level) => level,
+                                Err(error) => json!({"error": error.to_string()}),
+                            };
+                    }
+                }
+                Ok(SyncOutput::Json(result))
             }
             Action::Fetch => {
                 let receipt = client.head(&scope).await?.ok_or_else(|| {
                     anyhow!("remote branch is absent; local tracking is retained")
                 })?;
                 proof(&client, &journal, &scope, &receipt).await?;
+                let level = assurance(transparency_policy.as_deref(), require_level, &client, &journal, &scope, &receipt, true).await?;
                 let count = transfer::fetch(&repo, &client, &receipt.receipt.head.commit).await?;
                 track(&client, &journal, &scope, receipt.clone()).await?;
-                Ok(SyncOutput::Json(json!({"head":receipt.receipt.head,"new_commits":count,"local_branches_changed":false})))
+                Ok(SyncOutput::Json(json!({"head":receipt.receipt.head,"new_commits":count,"local_branches_changed":false,"transparency":level})))
+            }
+            Action::Horizons => Ok(SyncOutput::Json(
+                transparency::horizons(&repo, &client, &journal).await?,
+            )),
+            Action::Monitor => {
+                let path = transparency_policy
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("monitor needs --transparency-policy"))?;
+                let policy = transparency::load_policy(path)?;
+                Ok(SyncOutput::Json(
+                    transparency::monitor(&client, &journal, &scope, &policy).await?,
+                ))
             }
             Action::Pull {
                 local_branch,
@@ -465,6 +509,10 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
                         "expected local address and generation must be supplied together"
                     ),
                 };
+                if let Some(receipt) = client.head(&scope).await? {
+                    proof(&client, &journal, &scope, &receipt).await?;
+                    assurance(transparency_policy.as_deref(), require_level, &client, &journal, &scope, &receipt, true).await?;
+                }
                 Ok(SyncOutput::Json(pull(
                     &repo,
                     &client,
@@ -500,6 +548,34 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
     let output: SyncOutput = result?;
     println!("{output}");
     Ok(())
+}
+
+/// The transparency level of `receipt` under `--transparency-policy` (`null` without
+/// one). With `enforce` and `--require-level`, a lower level is a refusal, before any
+/// pin moves.
+async fn assurance(
+    policy: Option<&Path>,
+    require_level: Option<RequiredLevel>,
+    client: &Client,
+    journal: &ReceiptJournal,
+    scope: &Scope,
+    receipt: &SignedReceipt,
+    enforce: bool,
+) -> anyhow::Result<Value> {
+    let Some(path) = policy else {
+        return Ok(Value::Null);
+    };
+    let policy = transparency::load_policy(path)?;
+    let report = transparency::check_receipt(client, journal, scope, receipt, &policy).await?;
+    if let (true, Some(required)) = (enforce, require_level) {
+        let level = report["level"].as_str().unwrap_or("L0");
+        let required = engine_core::transparency::Level::from(required).to_string();
+        ensure!(
+            level >= required.as_str(),
+            "head receipt reaches transparency level {level}, below the required {required}; the pin was not advanced"
+        );
+    }
+    Ok(report)
 }
 
 async fn pull(

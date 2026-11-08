@@ -36,6 +36,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::json;
 
 pub use routes::{router, AuthContext, DeviceBinding};
+pub mod sessions;
 
 /// Process-wide auth configuration, derived from environment at boot.
 #[derive(Clone)]
@@ -52,6 +53,80 @@ pub struct AuthConfig {
 /// Refresh tokens outlive access tokens so a session continues without re-emailing a
 /// link. 30 days for the PoC.
 pub const REFRESH_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+
+/// How long logins last (docs/SELF-HOSTED-IDENTITY-AND-ACCESS.md 12.2): the refresh lifetime, an
+/// idle timeout and an absolute cap, in seconds (`0`: none for the last two). Enforced through the
+/// expiry of each refresh row, which every authenticated request already checks: a login that was
+/// not refreshed within the idle timeout, or reached its cap, ends on every route at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionPolicy {
+    /// `REFRESH_TTL_SECONDS` (default 30 days).
+    pub refresh_ttl_seconds: i64,
+    /// `SESSION_IDLE_TIMEOUT_SECONDS` (default 0, none).
+    pub idle_timeout_seconds: i64,
+    /// `SESSION_ABSOLUTE_TIMEOUT_SECONDS` (default 0, none).
+    pub absolute_timeout_seconds: i64,
+}
+
+impl Default for SessionPolicy {
+    fn default() -> Self {
+        Self {
+            refresh_ttl_seconds: REFRESH_TTL_SECONDS,
+            idle_timeout_seconds: 0,
+            absolute_timeout_seconds: 0,
+        }
+    }
+}
+
+impl SessionPolicy {
+    /// The absolute end of a login that starts at `now`, if there is a cap.
+    pub fn absolute_end(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        (self.absolute_timeout_seconds > 0)
+            .then(|| now + chrono::Duration::seconds(self.absolute_timeout_seconds))
+    }
+
+    /// The expiry of a refresh row written at `now` for a login that ends at `absolute`.
+    pub fn refresh_expiry(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        absolute: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        let mut end = now + chrono::Duration::seconds(self.refresh_ttl_seconds);
+        if self.idle_timeout_seconds > 0 {
+            end = end.min(now + chrono::Duration::seconds(self.idle_timeout_seconds));
+        }
+        absolute.map_or(end, |cap| end.min(cap))
+    }
+}
+
+/// How a login came about, recorded in `login_session` (migration 0110). `provider` is `email`,
+/// `google`, `operator-link`, `handover`, `service-enrolment` or a configured provider id.
+#[derive(Clone, Debug, Default)]
+pub struct Login<'a> {
+    pub provider: &'a str,
+    pub issuer: Option<&'a str>,
+    pub subject: Option<&'a str>,
+    /// OIDC `sid` or SAML `SessionIndex`, for back-channel logout.
+    pub idp_session: Option<&'a str>,
+    /// The OIDC ID token, kept sealed for RP-initiated logout (`id_token_hint`).
+    pub id_token: Option<&'a str>,
+    pub auth_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// A hard lifetime for this login only (the ten-minute service-account enrolment login).
+    pub lifetime_seconds: Option<i64>,
+}
+
+impl<'a> Login<'a> {
+    /// A login with nothing but its provider.
+    pub fn plain(provider: &'a str) -> Self {
+        Self {
+            provider,
+            ..Default::default()
+        }
+    }
+}
 
 /// Magic links are short-lived: 15 minutes (PRD review flow is interactive).
 pub const MAGIC_LINK_TTL_SECONDS: i64 = 15 * 60;

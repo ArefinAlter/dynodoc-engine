@@ -144,6 +144,10 @@ pub fn merge_with_grouped_insertions(
 /// Signed-v1 convergence merges state, not event plans. Retain its historical
 /// state/conflict behavior (and original insertion positions: grouping changes state
 /// addresses) without weakening checked event-plan callers.
+#[cfg_attr(
+    not(feature = "persistence"),
+    allow(dead_code, reason = "used by repository convergence")
+)]
 pub(crate) fn merge_for_signed_v1(
     base: &DocumentState,
     team: &DocumentState,
@@ -174,11 +178,38 @@ pub fn merge_with_registry(
     policy: &MergePolicy,
     registry: &Registry,
 ) -> (MergePlan, MergeEvidence) {
-    merge_with_registry_mode(base, team, draft, resolutions, policy, registry, true)
+    merge_with_registry_mode(base, team, draft, resolutions, policy, registry, true, None)
+}
+
+/// [`merge_with_registry`] when the roles of the team and draft authors are known
+/// (the shared service knows them), so `prefer-role` parameters can decide.
+pub fn merge_with_roles(
+    base: &DocumentState,
+    team: &DocumentState,
+    draft: &DocumentState,
+    resolutions: &BTreeMap<String, String>,
+    policy: &MergePolicy,
+    registry: &Registry,
+    roles: Option<(merge_policy::policy::Role, merge_policy::policy::Role)>,
+) -> (MergePlan, MergeEvidence) {
+    merge_with_registry_mode(
+        base,
+        team,
+        draft,
+        resolutions,
+        policy,
+        registry,
+        true,
+        roles,
+    )
 }
 
 /// The policy adapter for signed-v1 state convergence preserves that format's
 /// state semantics while continuing to evaluate policy strategies and evidence.
+#[cfg_attr(
+    not(feature = "persistence"),
+    allow(dead_code, reason = "used by repository convergence")
+)]
 pub(crate) fn merge_for_signed_v1_with_registry(
     base: &DocumentState,
     team: &DocumentState,
@@ -186,10 +217,21 @@ pub(crate) fn merge_for_signed_v1_with_registry(
     resolutions: &BTreeMap<String, String>,
     policy: &MergePolicy,
     registry: &Registry,
+    roles: Option<(merge_policy::policy::Role, merge_policy::policy::Role)>,
 ) -> (MergePlan, MergeEvidence) {
-    merge_with_registry_mode(base, team, draft, resolutions, policy, registry, false)
+    merge_with_registry_mode(
+        base,
+        team,
+        draft,
+        resolutions,
+        policy,
+        registry,
+        false,
+        roles,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge_with_registry_mode(
     base: &DocumentState,
     team: &DocumentState,
@@ -198,9 +240,10 @@ fn merge_with_registry_mode(
     policy: &MergePolicy,
     registry: &Registry,
     build_event_plan: bool,
+    roles: Option<(merge_policy::policy::Role, merge_policy::policy::Role)>,
 ) -> (MergePlan, MergeEvidence) {
     let family = merge_policy::Family::of(&[base, team, draft]);
-    let mut engine = merge_policy::engine::Engine::new(policy, registry, family);
+    let mut engine = merge_policy::engine::Engine::new(policy, registry, family).with_roles(roles);
     let mut plan = merge_with(
         base,
         team,
@@ -211,6 +254,11 @@ fn merge_with_registry_mode(
         false,
     );
     let mut evidence = engine.finish();
+    // Values automatic outcomes did not use become suggestions or comments (design 7).
+    let kept = merge_policy::loser::apply(&mut plan.state, &evidence.losers, policy.defaults.loser);
+    if build_event_plan {
+        plan.ops.extend(kept);
+    }
     merge_policy::invariants::apply(
         &mut plan,
         &canonical(team),

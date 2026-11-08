@@ -114,6 +114,7 @@ string_enum!(
         SuggestionAccepted => "SuggestionAccepted",
         SuggestionRejected => "SuggestionRejected",
         Deployed => "Deployed",
+        ChangeAttributed => "ChangeAttributed",
     }
 );
 
