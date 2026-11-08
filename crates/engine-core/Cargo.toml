@@ -10,31 +10,73 @@ publish = false
 description = "dynodoc engine core: event log, hash chain, materialization, merge."
 
 [features]
+# The event log, snapshots, repositories and every other module that touches PostgreSQL,
+# SQLite, files, a runtime or a random source. Without it only the pure modules build, for
+# the WebAssembly engine (`crates/engine-wasm`, decision 036).
+default = ["persistence"]
+persistence = [
+    "engine-shared/db",
+    "dep:sqlx",
+    "dep:ring",
+    "dep:ulid",
+    "dep:anyhow",
+    "dep:tracing",
+    "tokio/full",
+    "dep:futures",
+    "dep:miniz_oxide",
+    "dep:hpke",
+    "dep:rand_core",
+    "dep:zeroize",
+    "dep:subtle",
+    "dep:vsss-rs",
+]
+# Network key providers for at-rest encryption: Vault Transit, AWS KMS, Google Cloud KMS and
+# Azure Key Vault over their REST APIs (decision 041).
+kms = ["persistence", "dep:reqwest"]
 # Deterministic nonces are unsafe outside repeatable test fixtures.
 test-support = []
 
 [dependencies]
-engine-shared = { workspace = true }
-sqlx = { workspace = true, features = ["sqlite"] }
-ring = { workspace = true }
+# A path, not `workspace = true`: a member cannot turn off default features the workspace
+# entry leaves on, and the pure build must not pull in sqlx.
+engine-shared = { path = "../engine-shared", default-features = false }
+# Encrypted projects (decision 035); the E2EE module needs persistence.
+hpke = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
+vsss-rs = { workspace = true, optional = true }
+base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-ulid = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
-tracing = { workspace = true }
-tokio = { workspace = true }
-futures = { workspace = true }
 similar = "=3.2.0"
+# SHA-256 for the pure modules: pure Rust, so it also builds for wasm32 (ring needs a C
+# toolchain there). Already in the build graph through sqlx.
+sha2 = { workspace = true }
+sqlx = { workspace = true, features = ["sqlite"], optional = true }
+ring = { workspace = true, optional = true }
+ulid = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+# Only the I/O traits in the pure build (they build for wasm32); persistence turns on the
+# workspace's `full`. Not `workspace = true`: that would always carry `full`.
+tokio = { version = "1.40", default-features = false, features = ["io-util"] }
+futures = { workspace = true, optional = true }
 # Per-object compression at rest in the local SQLite repository (raw DEFLATE).
 # Pure Rust, MIT OR Zlib OR Apache-2.0, already in the build graph through flate2.
-miniz_oxide = "0.8"
+miniz_oxide = { version = "0.8", optional = true }
+# The same version and TLS stack as engine-api and engine-cli; blocking, for key providers.
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "blocking"], optional = true }
+unicode-segmentation = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 # Integration tests build the library without cfg(test); explicitly opt in there.
-engine-core = { path = ".", features = ["test-support"] }
+engine-core = { path = ".", features = ["test-support", "kms"] }
 proptest = { workspace = true }
+hex = { workspace = true }
 tokio-test = { workspace = true }
 insta = { workspace = true }

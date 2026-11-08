@@ -22,12 +22,16 @@ fn generate_key() -> Ed25519KeyPair {
 
 fn create_genesis_commit(project: DocumentId, key: &Ed25519KeyPair) -> SignedCommit {
     let commit = Commit {
+        sealed: None,
         version: 1,
         project: project.0,
         parents: vec![],
         authored_at_ms: 1700000000000,
         author_key: String::new(),
         files: BTreeMap::new(),
+        project_resolutions: Vec::new(),
+        relocations: Vec::new(),
+        merge_policy: None,
         same_file_resolutions: Vec::new(),
         recovery: None,
         message: "Genesis commit".into(),
@@ -42,12 +46,16 @@ fn create_child_commit(
     seq: i64,
 ) -> SignedCommit {
     let commit = Commit {
+        sealed: None,
         version: 1,
         project: project.0,
         parents: vec![parent],
         authored_at_ms: 1700000000000 + seq * 1000,
         author_key: String::new(),
         files: BTreeMap::new(),
+        project_resolutions: Vec::new(),
+        relocations: Vec::new(),
+        merge_policy: None,
         same_file_resolutions: Vec::new(),
         recovery: None,
         message: format!("Commit {seq}"),

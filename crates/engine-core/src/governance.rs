@@ -114,6 +114,8 @@ pub fn can_perform(role: Role, op: &EventPayload) -> bool {
     match (role, op) {
         // Auditor is read-only: it appends nothing.
         (Role::Auditor, _) => false,
+        // Sealed authorship (decision 038) is written by the merge, never by a role.
+        (_, ChangeAttributed(_)) => false,
         // Reviewer may comment and propose; nothing else touches the log.
         (Role::Reviewer, CommentAdded { .. }) => true,
         (Role::Reviewer, CommentReplied { .. }) => true,

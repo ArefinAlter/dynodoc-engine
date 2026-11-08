@@ -51,7 +51,7 @@ impl LocalRepository {
                 .begin()
                 .await
                 .map_err(crate::repository::Error::from)?;
-            let view = load_view(&mut tx, self.project).await?;
+            let (view, _) = load_view(&mut tx, self.project).await?;
             tx.rollback()
                 .await
                 .map_err(crate::repository::Error::from)?;
@@ -63,7 +63,12 @@ impl LocalRepository {
     }
 }
 
-async fn load_view(tx: &mut SqliteConnection, project: uuid::Uuid) -> Result<HistoryView, Error> {
+/// The view and, by dense object index, the `(document, address)` key of every
+/// object in its graph (the applier needs the keys to archive and release them).
+pub(super) async fn load_view(
+    tx: &mut SqliteConnection,
+    project: uuid::Uuid,
+) -> Result<(HistoryView, Vec<ObjectKey>), Error> {
     let db = |e: sqlx::Error| Error::from(crate::repository::Error::from(e));
     let (schema, bound): (i64, String) =
         sqlx::query_as("select version,project from local_meta where singleton=1")
@@ -127,12 +132,31 @@ async fn load_view(tx: &mut SqliteConnection, project: uuid::Uuid) -> Result<His
         }
     }
 
+    // Earlier horizons (schema 4): their skeletons and the states whose objects
+    // they released, which are neither walked nor released again.
+    let prior = super::horizon_apply::prior(&mut *tx).await?;
+    for entry in prior.skeleton {
+        view.add_prior_skeleton(entry);
+    }
+    for state in &prior.released {
+        view.add_prior_released_state(state.document, &state.state_root);
+    }
+
     // Object graphs of every distinct state, each object read once. Objects are
     // interned by `(document, address)`: the same bytes under another document are
     // another object.
     let mut interner = Interner::default();
     let mut stack: Vec<u32> = Vec::new();
     for (document, root) in view.state_keys() {
+        if prior
+            .released
+            .contains(&crate::repository::horizon::StateKey {
+                document,
+                state_root: root.clone(),
+            })
+        {
+            continue;
+        }
         let object = interner.intern((document.as_u128(), raw(&root)?));
         view.set_state_object(document, &root, object);
         stack.push(object);
@@ -175,10 +199,10 @@ async fn load_view(tx: &mut SqliteConnection, project: uuid::Uuid) -> Result<His
     sizes.resize(count, 0);
     children.resize(count, Vec::new());
     view.objects = ObjectGraph { sizes, children };
-    Ok(view)
+    Ok((view, interner.keys))
 }
 
-type ObjectKey = (u128, [u8; 32]);
+pub(super) type ObjectKey = (u128, [u8; 32]);
 
 /// Dense indices for `(document, address)` object keys, in discovery order.
 #[derive(Default)]

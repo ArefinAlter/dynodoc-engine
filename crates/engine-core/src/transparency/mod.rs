@@ -2,11 +2,12 @@
 //! `docs/DESIGN-WITNESSES-AND-TRANSPARENCY.md`, phases W0, W1 core and W2 verifier
 //! library).
 //!
-//! Pure and storage-agnostic: nothing here is used by an existing code path, and
-//! nothing touches PostgreSQL, the network, a clock or a thread. Callers provide
-//! bytes, keys, a [`tiles::TileStore`] and the current time. Not built: the outbox
-//! and leader worker, HTTP endpoints, the witness protocol and service, journal v2,
-//! CLI verbs and `sync` integration (design W1-server, W2-sync, W3 and later).
+//! Storage-agnostic and clock-free: callers provide bytes, keys, a
+//! [`tiles::TileStore`] and the current time. Only [`witness::WitnessState`] keeps
+//! state (SQLite, for the `dynodoc-witness` service). The PostgreSQL outbox, leader
+//! worker and HTTP endpoints are `engine-api`'s `transparency` module; journal v2 is
+//! `repository::receipt_journal`; the CLI verbs and `sync` integration are
+//! `engine-cli` (decision 032).
 //!
 //! | Module | Contents |
 //! |---|---|
@@ -18,6 +19,9 @@
 //! | [`bundle`] | the inclusion bundle and its canonical JSON |
 //! | [`policy`] | the trust policy and its validating loader |
 //! | [`assurance`] | levels L0 to L3, known checkpoints, rollback and split-view detection |
+//! | [`witness`] | the `tlog-witness` add-checkpoint request, the witness decision and its durable state |
+//! | [`monitor`] | the member monitor: blinded tags, missing and equivocating receipts |
+//! | [`anchor`] | event-chain anchoring: document tags, the heads tree, auditor proofs |
 //!
 //! # Standards and what was checked
 //!
@@ -44,7 +48,8 @@
 //!   hashing and tree shape but not the proof algorithms against a published
 //!   proof vector.
 //!
-//! `tlog-witness` (the `add-checkpoint` protocol) is not implemented here.
+//! `tlog-witness` (the `add-checkpoint` protocol) is in [`witness`], from the
+//! editor's copy and unverified like the rest.
 //!
 //! The vectors in `tests/fixtures/transparency-v1.json` come from an independent
 //! pure-Python implementation (`gen_transparency_vectors.py`) written from the same
@@ -54,15 +59,18 @@
 // Clippy asks for `is_multiple_of`; one source serves both, so the lint is allowed here.
 #![allow(clippy::manual_is_multiple_of)]
 
+pub mod anchor;
 pub mod assurance;
 pub mod bundle;
 pub(crate) mod encoding;
 pub mod leaf;
 pub mod log;
 pub mod merkle;
+pub mod monitor;
 pub mod note;
 pub mod policy;
 pub mod tiles;
+pub mod witness;
 
 pub use assurance::{
     assess, Assessment, ConsistencySource, Cosigner, Decision, KnownCheckpoints, Level, Limit,
@@ -74,7 +82,7 @@ pub use log::Log;
 pub use merkle::{Hash, HashSource, MemoryTree};
 pub use note::{Checkpoint, KeyKind, Note, Origin, Signer, VerifierKey};
 pub use policy::{OnFailure, Policy, PolicyError};
-pub use tiles::{FsTileStore, MemoryTileStore, TileLog, TileStore};
+pub use tiles::{FsTileStore, MemoryTileStore, ProbeStore, TileLog, TileStore};
 
 /// Everything this module can refuse, one variant per rule so callers and tests can
 /// tell the rules apart.

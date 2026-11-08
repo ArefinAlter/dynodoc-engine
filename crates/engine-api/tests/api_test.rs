@@ -3263,20 +3263,17 @@ async fn sse_delivers_a_new_event_within_100ms(pool: PgPool) {
     assert!(ready.starts_with(": connected"));
     assert!(!ready.contains("data:") && !ready.contains("id:"));
 
-    // Append an event from "another connection".
-    let writer = router.clone();
-    let write_token = token.clone();
-    tokio::spawn(async move {
-        send(
-            &writer,
-            auth_post(
-                &format!("/documents/{doc_id}/ops/node-create"),
-                &write_token,
-                &json!({ "node_type": "form", "pos": "a0" }),
-            ),
-        )
-        .await;
-    });
+    // Append an event from "another connection". The 100ms is the delivery after the commit,
+    // not the debug-build request itself (which a loaded test host can stretch past 100ms).
+    send(
+        &router,
+        auth_post(
+            &format!("/documents/{doc_id}/ops/node-create"),
+            &token,
+            &json!({ "node_type": "form", "pos": "a0" }),
+        ),
+    )
+    .await;
 
     // The subscriber receives the event frame within 100ms.
     let frame = tokio::time::timeout(std::time::Duration::from_millis(100), body.next())

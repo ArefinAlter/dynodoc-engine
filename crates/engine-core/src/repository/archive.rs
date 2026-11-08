@@ -122,6 +122,10 @@ pub struct ArchiveSummary {
 
 /// An entry yielded by [`ArchiveReader`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "entries are yielded one at a time; the v4 commit fields made Commit the large variant"
+)]
 pub enum ArchiveEntry {
     Header {
         version: u32,

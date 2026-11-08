@@ -82,6 +82,12 @@ async fn batch(
     let doc = DocumentId(id);
     let actor = IdentityId(auth.identity_id);
     let (mut tx, role, mut current) = apply::begin_write(&state, doc, actor).await?;
+    // A ledger document is created with its root only; its blocks come from editor commits.
+    if !req.ops.iter().all(|op| {
+        matches!(op, EventPayload::NodeCreated { node_type, parent_id: None, .. } if node_type.as_str() == "form")
+    }) {
+        crate::ledger::refuse_direct(&mut tx, id).await?;
+    }
     if role == Role::Author && req.ops.iter().any(crate::access::changes_content) {
         crate::access::ensure_team_edit(&mut tx, id, auth.identity_id).await?;
     }
@@ -523,6 +529,7 @@ async fn create_draft(
     } else {
         seq
     };
+    crate::ledger::refuse_direct(&mut tx, id).await?;
     let stored =
         crate::draft_storage::encode(&mut tx, DocumentId(id), &current, state.shared_draft_bases)
             .await?;
@@ -599,6 +606,8 @@ async fn edit_draft(
     }
     let (mut tx, role) =
         apply::begin_write_locked(&state, DocumentId(id), IdentityId(auth.identity_id)).await?;
+    // Ledger documents change only through editor commits (decision 028).
+    crate::ledger::refuse_direct(&mut tx, id).await?;
     if role == Role::Auditor {
         return Err(ApiError::Forbidden);
     }
@@ -694,6 +703,12 @@ async fn structure(
     ))
 }
 
+/// An object store failure as the API reports it (logged here; no key or path in the answer).
+pub(crate) fn object_error(error: crate::object_store::ObjectError) -> ApiError {
+    tracing::error!(%error, "object store");
+    ApiError::Internal(error.to_string())
+}
+
 #[derive(Deserialize)]
 struct UploadRequest {
     filename: String,
@@ -732,8 +747,28 @@ async fn upload(
     if req.filename.len() > 255 {
         return Err(bad("Filename must be at most 255 bytes"));
     }
-    let upload:Uuid=sqlx::query_scalar("insert into document_upload(document_id,filename,content_type,content,report,created_by) values($1,$2,$3,$4,$5,$6) returning id")
-        .bind(id).bind(req.filename).bind(req.content_type).bind(content).bind(req.report).bind(auth.identity_id).fetch_one(&state.pool).await?;
+    if state.objects.in_database() {
+        let upload:Uuid=sqlx::query_scalar("insert into document_upload(document_id,filename,content_type,content,report,created_by) values($1,$2,$3,$4,$5,$6) returning id")
+            .bind(id).bind(req.filename).bind(req.content_type).bind(content).bind(req.report).bind(auth.identity_id).fetch_one(&state.pool).await?;
+        return Ok(Json(json!({"id":upload})));
+    }
+    // The object first, then the row that names it: a row never points at nothing.
+    let upload = Uuid::new_v4();
+    let key = crate::object_store::original_key(id, upload);
+    let digest = crate::object_store::digest(&content);
+    state
+        .objects
+        .put(&key, &content)
+        .await
+        .map_err(object_error)?;
+    let inserted = sqlx::query("insert into document_upload(id,document_id,filename,content_type,storage_key,size,sha256,report,created_by) values($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+        .bind(upload).bind(id).bind(req.filename).bind(req.content_type).bind(&key).bind(content.len() as i64).bind(&digest).bind(req.report).bind(auth.identity_id).execute(&state.pool).await;
+    if let Err(error) = inserted {
+        if let Err(cleanup) = state.objects.delete(&key).await {
+            tracing::warn!(error = %cleanup, "an upload's object could not be removed after its row failed");
+        }
+        return Err(error.into());
+    }
     Ok(Json(json!({"id":upload})))
 }
 #[utoipa::path(get, path="/documents/{id}/uploads", tag="workspace", params(("id" = Uuid, Path, description = "Resource identifier")), responses((status=200, description="Success; requires document membership", body=Value),(status=401, description="Sign in required"),(status=403, description="Insufficient access"),(status=409, description="Review a concurrent change before retrying")))]
@@ -743,7 +778,7 @@ async fn uploads(
     auth: AuthContext,
 ) -> Result<Json<Value>, ApiError> {
     apply::require_role(&state.pool, DocumentId(id), IdentityId(auth.identity_id)).await?;
-    let items:Vec<Value>=sqlx::query_scalar("select to_jsonb(u)-'content' from document_upload u where document_id=$1 order by created_at desc").bind(id).fetch_all(&state.pool).await?;
+    let items:Vec<Value>=sqlx::query_scalar("select to_jsonb(u)-'content'-'storage_key'-'sha256'-'size' from document_upload u where document_id=$1 order by created_at desc").bind(id).fetch_all(&state.pool).await?;
     Ok(Json(json!({"items":items})))
 }
 #[utoipa::path(get, path="/documents/{id}/uploads/{upload_id}", tag="workspace", params(("id" = Uuid, Path, description = "Resource identifier"), ("upload_id" = Uuid, Path, description = "Resource identifier")), responses((status=200, description="Success; requires document membership", body=Value),(status=401, description="Sign in required"),(status=403, description="Insufficient access"),(status=409, description="Review a concurrent change before retrying")))]
@@ -754,14 +789,26 @@ async fn download_upload(
 ) -> Result<axum::response::Response, ApiError> {
     use axum::response::IntoResponse;
     apply::require_role(&state.pool, DocumentId(id), IdentityId(auth.identity_id)).await?;
-    let row: (String, Vec<u8>) = sqlx::query_as(
-        "select filename,content from document_upload where id=$1 and document_id=$2",
+    #[allow(clippy::type_complexity)]
+    let stored: (String, Option<Vec<u8>>, Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+        "select filename,content,storage_key,sha256 from document_upload where id=$1 and document_id=$2",
     )
     .bind(upload)
     .bind(id)
     .fetch_optional(&state.pool)
     .await?
     .ok_or(ApiError::NotFound)?;
+    let (filename, content, key, sha256) = stored;
+    let bytes = match (content, key, sha256) {
+        (Some(content), _, _) => content,
+        (None, Some(key), Some(sha256)) => state
+            .objects
+            .get(&key, &sha256)
+            .await
+            .map_err(object_error)?,
+        _ => return Err(ApiError::Internal("upload row without bytes".into())),
+    };
+    let row = (filename, bytes);
     let safe: String = row
         .0
         .chars()
@@ -944,6 +991,8 @@ async fn sync_draft(
     let doc = DocumentId(id);
     let actor = IdentityId(auth.identity_id);
     let (mut tx, role, mut team) = apply::begin_write(&state, doc, actor).await?;
+    // Ledger documents change only through editor commits (decision 028).
+    crate::ledger::refuse_direct(&mut tx, id).await?;
     let DraftContext {
         row,
         base,
@@ -1098,6 +1147,8 @@ async fn restore_version(
     let doc = DocumentId(id);
     let actor = IdentityId(auth.identity_id);
     let (mut tx, role, mut current) = apply::begin_write(&state, doc, actor).await?;
+    // Ledger documents change only through editor commits (decision 028).
+    crate::ledger::refuse_direct(&mut tx, id).await?;
     if role != Role::Author {
         return Err(ApiError::Forbidden);
     }

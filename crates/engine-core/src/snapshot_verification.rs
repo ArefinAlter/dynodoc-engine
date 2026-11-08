@@ -392,6 +392,8 @@ pub struct VerificationReport {
     pub through_seq: i64,
     pub snapshots: usize,
     pub replayed_events: usize,
+    /// Sealed agent authorship records (decision 038) checked on the way.
+    pub attributions: usize,
 }
 
 /// Audit the event chain AND every snapshot independently of receipts and
@@ -422,6 +424,7 @@ pub async fn verify_document(
     let mut seq = 0;
     let mut chain = ZERO_HASH.to_vec();
     let mut event_tree = crate::event_merkle::Accumulator::default();
+    let mut seals = log::Seals::default();
     let mut last_snapshot: Option<i64> = None;
     let mut count = 0;
     loop {
@@ -448,6 +451,7 @@ pub async fn verify_document(
             .fetch(&mut *tx);
             while let Some(event) = events.try_next().await? {
                 log::verify_event(&event, document, seq + 1, &chain)?;
+                seals.observe(&event)?;
                 Materializer::fold_into(&mut state, std::slice::from_ref(&event))
                     .map_err(|source| SnapshotError::Replay { document, source })?;
                 seq = event.seq;
@@ -485,6 +489,7 @@ pub async fn verify_document(
         through_seq,
         snapshots: count,
         replayed_events: seq as usize,
+        attributions: seals.count,
     })
 }
 

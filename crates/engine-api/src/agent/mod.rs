@@ -17,7 +17,7 @@
 //! project and file policy ([`policy`]), pulls the kill switch and reads the usage ledger.
 //! A project can be prepared before the gateway is switched on.
 //!
-//! What is not here: OAuth, API keys, the MCP write tools, sealed attribution (layer C), the
+//! What is not here: OAuth, API keys, the MCP write tools, the
 //! review screen's agent badge (the app), the evals, `diff proposal=` and any macro.
 //!
 //! # Decisions and deviations from the specification
@@ -122,17 +122,21 @@
 //!     credential is a bearer token, never a cookie; spec C11 asks for no CORS on the
 //!     agent routes once a remote MCP binding exists (Phase 2).
 
+pub mod attribution;
 pub mod cache;
 pub mod error;
+pub mod held;
 pub mod http;
 pub mod identity;
 pub mod inbox;
 pub mod ledger;
 pub mod manage;
+pub mod memory;
 pub mod policy;
 pub mod proposal;
 pub mod routes;
 pub mod schema;
+pub mod session;
 pub mod state;
 pub mod write;
 

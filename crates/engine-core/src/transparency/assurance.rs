@@ -107,6 +107,12 @@ impl Policy {
         })
     }
 
+    /// Whether a verified checkpoint carries a fresh quorum of cosignatures (L2's
+    /// rule), for checkpoints that arrive without a bundle (air-gapped import).
+    pub fn meets_quorum(&self, verified: &VerifiedCheckpoint, now: u64) -> bool {
+        self.quorum(verified.cosigners(), now) >= self.threshold()
+    }
+
     fn quorum(&self, cosigners: &[Cosigner], now: u64) -> usize {
         let fresh = cosigners
             .iter()

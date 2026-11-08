@@ -1,5 +1,7 @@
-//! `dynodoc-key-v1`: a passphrase- or keystore-encrypted Ed25519 signing key file.
-//! The wire format and the independent test vector are in docs/KEY-FILE-FORMAT.md.
+//! `dynodoc-key-v1`: a passphrase- or keystore-encrypted Ed25519 signing key file, and
+//! `dynodoc-key-v2`, the same container that also carries the device's separate X25519
+//! encryption key (decision 035, OQ-CR-5). The wire format and the independent test vector
+//! are in docs/KEY-FILE-FORMAT.md.
 //!
 //! - KDF: Argon2id (memory-hard; the `argon2` crate) for passphrases, or
 //!   PBKDF2-HMAC-SHA256 (`ring::pbkdf2`, at least 600,000 iterations) for files
@@ -27,6 +29,10 @@ use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 
 pub const FORMAT: &str = "dynodoc-key-v1";
+/// The format that also carries the device encryption key.
+pub const FORMAT_V2: &str = "dynodoc-key-v2";
+/// The X25519 device encryption secret a v2 file carries after the PKCS#8 key.
+pub const ENCRYPTION_KEY_BYTES: usize = 32;
 pub const KDF_NAME: &str = "pbkdf2-hmac-sha256";
 pub const ARGON2ID_NAME: &str = "argon2id";
 pub const AEAD_NAME: &str = "chacha20-poly1305";
@@ -173,6 +179,9 @@ struct Cipher {
 struct Wire {
     format: String,
     public_key: String,
+    /// v2 only: the X25519 public key (lowercase hex), a label until decryption checks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encryption_public_key: Option<String>,
     kdf: Kdf,
     aead: Cipher,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +192,7 @@ struct Wire {
 /// A parsed and bounds-checked container; nothing here is secret.
 pub struct Container {
     public_key: String,
+    encryption_public_key: Option<String>,
     kdf: KdfParams,
     salt: Vec<u8>,
     salt_text: String,
@@ -209,6 +219,23 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn is_hex64(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The X25519 public key (lowercase hex) of a device encryption secret.
+pub fn encryption_public_of(secret: &[u8]) -> anyhow::Result<String> {
+    ensure!(
+        secret.len() == ENCRYPTION_KEY_BYTES,
+        "invalid device encryption key"
+    );
+    let key = engine_core::e2ee::keys::Key::from_slice(secret)
+        .map_err(|_| anyhow!("invalid device encryption key"))?;
+    Ok(engine_core::e2ee::grant::DeviceKey::from_secret(&key)
+        .map_err(|_| anyhow!("invalid device encryption key"))?
+        .public_hex())
+}
+
 fn public_key_hex(pair: &Ed25519KeyPair) -> String {
     hex(pair.public_key().as_ref())
 }
@@ -217,13 +244,18 @@ impl Container {
     pub fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
         ensure!(bytes.len() <= MAX_FILE_BYTES, MALFORMED);
         let wire: Wire = serde_json::from_slice(bytes).map_err(|_| anyhow!(MALFORMED))?;
-        ensure!(wire.format == FORMAT, "{MALFORMED}: unsupported format");
+        let v2 = match wire.format.as_str() {
+            FORMAT => false,
+            FORMAT_V2 => true,
+            _ => return Err(anyhow!("{MALFORMED}: unsupported format")),
+        };
+        ensure!(is_hex64(&wire.public_key), MALFORMED);
+        // v1 has no encryption key; v2 always has one.
         ensure!(
-            wire.public_key.len() == 64
-                && wire
-                    .public_key
-                    .bytes()
-                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            match &wire.encryption_public_key {
+                None => !v2,
+                Some(key) => v2 && is_hex64(key),
+            },
             MALFORMED
         );
         let kdf = KdfParams::from_wire(&wire.kdf)?;
@@ -240,8 +272,10 @@ impl Container {
             .and_then(|n| n.try_into().ok())
             .ok_or_else(|| anyhow!(MALFORMED))?;
         let ciphertext = decode(&wire.ciphertext).ok_or_else(|| anyhow!(MALFORMED))?;
+        let extra = if v2 { ENCRYPTION_KEY_BYTES } else { 0 };
         ensure!(
-            (TAG_BYTES + 1..=MAX_PLAINTEXT_BYTES + TAG_BYTES).contains(&ciphertext.len()),
+            (TAG_BYTES + 1 + extra..=MAX_PLAINTEXT_BYTES + extra + TAG_BYTES)
+                .contains(&ciphertext.len()),
             MALFORMED
         );
         if let Some(store) = &wire.keystore {
@@ -261,6 +295,7 @@ impl Container {
         }
         Ok(Self {
             public_key: wire.public_key,
+            encryption_public_key: wire.encryption_public_key,
             kdf,
             salt,
             salt_text: wire.kdf.salt,
@@ -293,15 +328,22 @@ impl Container {
     fn aad(&self) -> Vec<u8> {
         aad(
             &self.public_key,
+            self.encryption_public_key.as_deref(),
             self.kdf,
             &self.salt_text,
             self.keystore.as_ref(),
         )
     }
 
-    /// Decrypt with the wrapping secret. The error is the same generic message for
-    /// a wrong secret and for any modification of the file.
+    /// Decrypt with the wrapping secret: the PKCS#8 signing key. The error is the same
+    /// generic message for a wrong secret and for any modification of the file.
     pub fn open(&self, secret: &[u8]) -> anyhow::Result<Secret> {
+        self.open_keys(secret).map(|(pkcs8, _)| pkcs8)
+    }
+
+    /// Decrypt with the wrapping secret: the PKCS#8 signing key and, in a v2 file, the
+    /// device encryption secret, each checked against the public key the file declares.
+    pub fn open_keys(&self, secret: &[u8]) -> anyhow::Result<(Secret, Option<Secret>)> {
         let key = derive(secret, &self.salt, self.kdf)?;
         let mut plain = Secret::new(self.ciphertext.clone());
         let opened = key
@@ -313,16 +355,35 @@ impl Container {
             .map(|opened| opened.len())
             .map_err(|_| anyhow!(GENERIC))?;
         plain.as_mut_vec().truncate(opened);
+        let encryption = match &self.encryption_public_key {
+            None => None,
+            Some(expected) => {
+                let at = opened
+                    .checked_sub(ENCRYPTION_KEY_BYTES)
+                    .ok_or_else(|| anyhow!(GENERIC))?;
+                let tail = Secret::new(plain.as_bytes()[at..].to_vec());
+                wipe_slice(&mut plain.as_mut_vec()[at..]);
+                plain.as_mut_vec().truncate(at);
+                ensure!(encryption_public_of(tail.as_bytes())? == *expected, GENERIC);
+                Some(tail)
+            }
+        };
         // The tag already proved the content is what was sealed; this also proves
         // it is a usable key whose public half is the one the file declares.
         let pair = Ed25519KeyPair::from_pkcs8_maybe_unchecked(plain.as_bytes())
             .map_err(|_| anyhow!(GENERIC))?;
         ensure!(public_key_hex(&pair) == self.public_key, GENERIC);
-        Ok(plain)
+        Ok((plain, encryption))
     }
 }
 
-fn aad(public_key: &str, kdf: KdfParams, salt: &str, keystore: Option<&Keystore>) -> Vec<u8> {
+fn aad(
+    public_key: &str,
+    encryption: Option<&str>,
+    kdf: KdfParams,
+    salt: &str,
+    keystore: Option<&Keystore>,
+) -> Vec<u8> {
     let binding = match keystore {
         None => "none".to_owned(),
         Some(Keystore {
@@ -348,8 +409,14 @@ fn aad(public_key: &str, kdf: KdfParams, salt: &str, keystore: Option<&Keystore>
             "kdf={ARGON2ID_NAME}\niterations={time}\nmemory_kib={memory_kib}\nparallelism={lanes}"
         ),
     };
-    format!("{FORMAT}\npublic_key={public_key}\n{kdf}\nsalt={salt}\naead={AEAD_NAME}\nkeystore={binding}")
-        .into_bytes()
+    // v1's text is frozen by its vectors; v2 names itself and adds the encryption key's line.
+    let head = match encryption {
+        None => format!("{FORMAT}\npublic_key={public_key}"),
+        Some(key) => {
+            format!("{FORMAT_V2}\npublic_key={public_key}\nencryption_public_key={key}")
+        }
+    };
+    format!("{head}\n{kdf}\nsalt={salt}\naead={AEAD_NAME}\nkeystore={binding}").into_bytes()
 }
 
 fn derive(secret: &[u8], salt: &[u8], kdf: KdfParams) -> anyhow::Result<LessSafeKey> {
@@ -385,7 +452,20 @@ fn derive(secret: &[u8], salt: &[u8], kdf: KdfParams) -> anyhow::Result<LessSafe
 }
 
 /// Encrypt a PKCS#8 key under `secret` with fresh random salt and nonce.
+// Writes v1, which only the vectors and tests still need (new files are v2).
+#[cfg(test)]
 pub fn seal(pkcs8: &[u8], secret: &[u8], keystore: Option<Keystore>) -> anyhow::Result<Vec<u8>> {
+    seal_keys(pkcs8, None, secret, keystore)
+}
+
+/// Seal a signing key and, when `encryption` is given, the device encryption secret: a v2
+/// file; without it, a v1 file.
+pub fn seal_keys(
+    pkcs8: &[u8],
+    encryption: Option<&[u8]>,
+    secret: &[u8],
+    keystore: Option<Keystore>,
+) -> anyhow::Result<Vec<u8>> {
     let rng = SystemRandom::new();
     let mut salt = [0u8; SALT_BYTES];
     let mut nonce = [0u8; NONCE_BYTES];
@@ -398,12 +478,26 @@ pub fn seal(pkcs8: &[u8], secret: &[u8], keystore: Option<Keystore>) -> anyhow::
     } else {
         KdfParams::DEFAULT_PASSPHRASE
     };
-    seal_with(pkcs8, secret, keystore, kdf, &salt, nonce)
+    seal_keys_with(pkcs8, encryption, secret, keystore, kdf, &salt, nonce)
 }
 
 /// Deterministic form for the published test vector and parameter tests.
+#[cfg(test)]
 pub fn seal_with(
     pkcs8: &[u8],
+    secret: &[u8],
+    keystore: Option<Keystore>,
+    kdf: KdfParams,
+    salt: &[u8],
+    nonce: [u8; NONCE_BYTES],
+) -> anyhow::Result<Vec<u8>> {
+    seal_keys_with(pkcs8, None, secret, keystore, kdf, salt, nonce)
+}
+
+/// `seal_with` for either format: v2 when `encryption` is given.
+pub fn seal_keys_with(
+    pkcs8: &[u8],
+    encryption: Option<&[u8]>,
     secret: &[u8],
     keystore: Option<Keystore>,
     kdf: KdfParams,
@@ -418,11 +512,21 @@ pub fn seal_with(
     let pair = Ed25519KeyPair::from_pkcs8_maybe_unchecked(pkcs8)
         .map_err(|_| anyhow!("invalid Ed25519 PKCS#8 key"))?;
     let public_key = public_key_hex(&pair);
+    let encryption_public_key = encryption.map(encryption_public_of).transpose()?;
     let salt_text = URL_SAFE_NO_PAD.encode(salt);
-    let aad = aad(&public_key, kdf, &salt_text, keystore.as_ref());
+    let aad = aad(
+        &public_key,
+        encryption_public_key.as_deref(),
+        kdf,
+        &salt_text,
+        keystore.as_ref(),
+    );
     let key = derive(secret, salt, kdf)?;
     let mut buffer = Secret::new(Vec::with_capacity(pkcs8.len() + TAG_BYTES));
     buffer.as_mut_vec().extend_from_slice(pkcs8);
+    buffer
+        .as_mut_vec()
+        .extend_from_slice(encryption.unwrap_or_default());
     key.seal_in_place_append_tag(
         Nonce::assume_unique_for_key(nonce),
         Aad::from(aad),
@@ -430,8 +534,14 @@ pub fn seal_with(
     )
     .map_err(|_| anyhow!("encryption failed"))?;
     let wire = Wire {
-        format: FORMAT.into(),
+        format: if encryption.is_some() {
+            FORMAT_V2
+        } else {
+            FORMAT
+        }
+        .into(),
         public_key,
+        encryption_public_key,
         kdf: kdf.wire(salt_text),
         aead: Cipher {
             name: AEAD_NAME.into(),
@@ -443,9 +553,10 @@ pub fn seal_with(
     let mut out = serde_json::to_vec_pretty(&wire)?;
     out.push(b'\n');
     // What was written must be readable with the same secret before it is used.
-    let reread = Container::parse(&out)?.open(secret)?;
+    let (reread, reread_encryption) = Container::parse(&out)?.open_keys(secret)?;
     ensure!(
-        reread.as_bytes() == pkcs8,
+        reread.as_bytes() == pkcs8
+            && reread_encryption.as_ref().map(Secret::as_bytes) == encryption,
         "encrypted key self-check failed"
     );
     Ok(out)

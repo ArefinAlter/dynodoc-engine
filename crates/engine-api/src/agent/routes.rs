@@ -99,6 +99,8 @@ pub fn router() -> Router<AppState> {
         .route("/.well-known/dynodoc-agent", get(discovery))
         // The review-gated write routes (docs/AI-AGENT-PROTOCOL-SPEC.md 12.1, 10 to 13).
         .merge(super::write::routes())
+        .merge(super::session::routes())
+        .merge(super::memory::agent_routes())
 }
 
 // --- request plumbing ---------------------------------------------------------------
@@ -155,6 +157,8 @@ pub(super) struct Ctx<'a> {
     pub(super) tool: Tool,
     pub(super) digest: [u8; 32],
     pub(super) format: Format,
+    /// A person confirmed this held call ([`super::held`]): carry it out instead of holding it.
+    pub(super) confirmed: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -178,6 +182,7 @@ impl<'a> Ctx<'a> {
             tool,
             digest,
             format: http::negotiate(http::accept(headers))?,
+            confirmed: false,
         })
     }
 

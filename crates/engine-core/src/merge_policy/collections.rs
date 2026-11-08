@@ -112,7 +112,7 @@ fn comments(i: &Inputs<'_>) -> Resolved {
     else {
         return Resolved::conflict(Reason::UNSUPPORTED_SHAPE, "comments");
     };
-    let key = |v: &Value| String::from_utf8_lossy(&crate::log::canonical_json(v)).into_owned();
+    let key = |v: &Value| String::from_utf8_lossy(&crate::hashing::canonical_json(v)).into_owned();
     let mut counts: BTreeMap<String, (Counts, &Value)> = BTreeMap::new();
     for (side, items) in [b, t, d].into_iter().enumerate() {
         for item in items {
@@ -168,6 +168,9 @@ mod tests {
             aspect: Some(aspect),
             family: Family::Document,
             params: &params,
+            roles: None,
+            rank: &[],
+            marks: None,
         };
         ElementWise.resolve(
             &Inputs {

@@ -87,10 +87,26 @@ struct ListQuery {
     state: Option<String>,
     offset: Option<i64>,
     limit: Option<i64>,
+    client_kind: Option<String>,
+    principal: Option<Uuid>,
+}
+
+/// A client-kind filter value: one of [`super::identity::CLIENT_KINDS`].
+pub(super) fn kind_filter(value: Option<&str>) -> Result<Option<&'static str>, ApiError> {
+    match value {
+        None => Ok(None),
+        Some(kind) => super::identity::CLIENT_KINDS
+            .iter()
+            .find(|k| **k == kind)
+            .map(|k| Some(*k))
+            .ok_or_else(|| ApiError::BadRequest {
+                reason: "client_kind is one of claude, chatgpt, gemini, copilot, cursor, codex, device, generic".into(),
+            }),
+    }
 }
 
 /// Page numbers from a query, refused when out of range.
-pub(super) fn paging(
+pub(crate) fn paging(
     offset: Option<i64>,
     limit: Option<i64>,
     default_limit: i64,
@@ -131,7 +147,7 @@ async fn budgets(db: &mut PgConnection, project: Uuid, viewer: Uuid) -> Result<V
 
 /// The AI agents' proposals of a project: drafts waiting for the person each acts for, and
 /// the change requests that came from agent identities, with where each stands.
-#[utoipa::path(operation_id="agent_proposals_for_reviewers", get, path="/projects/{id}/agent-proposals", tag="agent policy", params(("id"=Uuid,Path,description="Project"),("state"=Option<String>,Query,description="active (draft, open and changes_requested; the default), all, or one of draft, open, changes_requested, merged, declined, withdrawn"),("offset"=Option<i64>,Query,description="0 to 1000"),("limit"=Option<i64>,Query,description="1 to 50, default 25")), security(("paseto"=[])), responses((status=200, description="items (newest activity first, open ones before closed), more, offset, state and the budgets the viewer's own agents have used (null when the viewer has none). Each item is metadata: id, name (the agent's words: untrusted text), state, revision, base_seq, head_seq, behind, stale_base, created_at, submitted_at, closed_at, document {id,title,kind}, agent {id,client_kind,display_name,principal{id,name},revoked}, mine, edits and ops {proposed,compiled}. Drafts only reach the person the agent acts for", body=Value),(status=400, description="Unknown state, or offset or limit out of range"),(status=401, description="Not an account session"),(status=403, description="Not a member of the project")))]
+#[utoipa::path(operation_id="agent_proposals_for_reviewers", get, path="/projects/{id}/agent-proposals", tag="agent policy", params(("id"=Uuid,Path,description="Project"),("state"=Option<String>,Query,description="active (draft, open and changes_requested; the default), all, or one of draft, open, changes_requested, merged, declined, withdrawn"),("offset"=Option<i64>,Query,description="0 to 1000"),("limit"=Option<i64>,Query,description="1 to 50, default 25"),("client_kind"=Option<String>,Query,description="Only this client kind"),("principal"=Option<Uuid>,Query,description="Only agents acting for this person")), security(("paseto"=[])), responses((status=200, description="items (newest activity first, open ones before closed), more, offset, state and the budgets the viewer's own agents have used (null when the viewer has none). Each item is metadata: id, name (the agent's words: untrusted text), state, revision, base_seq, head_seq, behind, stale_base, created_at, submitted_at, closed_at, document {id,title,kind}, agent {id,client_kind,display_name,principal{id,name},revoked}, mine, edits and ops {proposed,compiled}. Drafts only reach the person the agent acts for", body=Value),(status=400, description="Unknown state, or offset or limit out of range"),(status=401, description="Not an account session"),(status=403, description="Not a member of the project")))]
 async fn list(
     State(state): State<AppState>,
     Path(project): Path<Uuid>,
@@ -139,9 +155,10 @@ async fn list(
     parsed: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Query(q) = parsed.map_err(|_| ApiError::BadRequest {
-        reason: "state, offset and limit are the query parameters".into(),
+        reason: "state, offset, limit, client_kind and principal are the query parameters".into(),
     })?;
     let filter = state_filter(q.state.as_deref())?;
+    let kind = kind_filter(q.client_kind.as_deref())?;
     let (offset, limit) = paging(q.offset, q.limit, DEFAULT_LIMIT)?;
     let viewer = auth.identity_id;
     let mut db = state.pool.begin().await?;
@@ -156,10 +173,10 @@ async fn list(
     let states = reviews::state_sql("d");
     let matches = state_matches("c.state", "$4");
     let sql = format!(
-        "{TREE} select jsonb_build_object('id',p.id,'name',p.name,'state',p.state,'revision',p.revision,'base_seq',p.base_seq,'head_seq',x.head,'behind',greatest(x.head-p.base_seq,0),'stale_base',(p.state in ('draft','open','changes_requested') and x.head>p.base_seq),'created_at',p.created_at,'submitted_at',p.submitted_at,'closed_at',p.closed_at,'document',jsonb_build_object('id',p.document_id,'title',p.title,'kind',p.kind),'agent',jsonb_build_object('id',p.agent_id,'client_kind',p.client_kind,'display_name',p.agent_name,'principal',jsonb_build_object('id',p.principal_id,'name',p.principal_name),'revoked',p.revoked),'mine',p.principal_id=$2,'edits',(select count(*) from draft_edit e where e.draft_id=p.id),'ops',(select jsonb_build_object('proposed',coalesce(sum(r.ops_in),0)::bigint,'compiled',coalesce(sum(r.ops_engine),0)::bigint) from agent_proposal_receipt r where r.draft_id=p.id and r.kind='propose')) \
+        "{TREE} select jsonb_build_object('id',p.id,'name',p.name,'state',p.state,'revision',p.revision,'base_seq',p.base_seq,'head_seq',x.head,'behind',greatest(x.head-p.base_seq,0),'stale_base',(p.state in ('draft','open','changes_requested') and x.head>p.base_seq),'created_at',p.created_at,'submitted_at',p.submitted_at,'closed_at',p.closed_at,'document',jsonb_build_object('id',p.document_id,'title',p.title,'kind',p.kind),'agent',jsonb_build_object('id',p.agent_id,'client_kind',p.client_kind,'display_name',p.agent_name,'principal',jsonb_build_object('id',p.principal_id,'name',p.principal_name),'revoked',p.revoked),'mine',p.principal_id=$2,'edits',coalesce((select lc.edits from ledger_compaction lc where lc.draft_id=p.id),(select count(*) from draft_edit e where e.draft_id=p.id)),'ops',(select jsonb_build_object('proposed',coalesce(sum(r.ops_in),0)::bigint,'compiled',coalesce(sum(r.ops_engine),0)::bigint) from agent_proposal_receipt r where r.draft_id=p.id and r.kind='propose')) \
          from (select c.* from (select d.id,d.name,d.revision,d.base_seq,d.created_at,d.submitted_at,coalesce(d.reviewed_at,d.merged_at) as closed_at,d.document_id,f.title,coalesce(f.settings->>'kind','questionnaire') as kind,ai.identity_id as agent_id,ai.client_kind,ag.display_name as agent_name,ai.principal_id,pr.display_name as principal_name,ai.revoked_at is not null as revoked,{states} as state \
                from workspace_draft d join document f on f.id=d.document_id join tree t on t.id=f.space_id join agent_identity ai on ai.identity_id=d.created_by join identity ag on ag.id=ai.identity_id join identity pr on pr.id=ai.principal_id \
-               where f.deleted_at is null and document_member_role(f.id,$2) is not null and (d.submitted_at is not null or {owned}) \
+               where f.deleted_at is null and document_member_role(f.id,$2) is not null and (d.submitted_at is not null or {owned}) and ($6::text is null or ai.client_kind=$6) and ($7::uuid is null or ai.principal_id=$7) \
                order by coalesce(d.submitted_at,d.created_at) desc,d.id limit {CANDIDATES}) c \
                where {matches} \
                order by (c.state in ('merged','declined','withdrawn')),coalesce(c.submitted_at,c.created_at) desc,c.id limit $5 offset $3) p \
@@ -172,6 +189,8 @@ async fn list(
         .bind(offset)
         .bind(filter)
         .bind(limit + 1)
+        .bind(kind)
+        .bind(q.principal)
         .fetch_all(&mut *db)
         .await?;
     let more = items.len() as i64 > limit;

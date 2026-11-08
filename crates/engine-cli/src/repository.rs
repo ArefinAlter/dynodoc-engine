@@ -8,8 +8,10 @@ use engine_core::{
     repository::{
         convergence::FileExplain,
         horizon::{
+            self as horizon_record, archive as horizon_archive,
             plan::PlanOptions,
             policy::{LoadOptions, Policy, MAX_POLICY_BYTES},
+            Envelope, HorizonRecord, Role, Scope as HorizonScope, Signature, MAX_ENVELOPE_BYTES,
         },
         local::{
             CompactOptions, GcApplyOptions, GcPlanOptions, LocalRepository, ObjectKey,
@@ -17,12 +19,11 @@ use engine_core::{
         },
         log::{CommitLogEntry, FirstParentLogOptions, DEFAULT_LOG_PAGE_LIMIT},
         project_merge::SameFile,
-        recovery, Commit, FileEntry, Head, SignedCommit,
+        recovery, relocation, Commit, FileEntry, Head, SignedCommit,
     },
     shared_checkpoint::Address,
 };
 use engine_shared::DocumentId;
-use ring::signature::Ed25519KeyPair;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -202,6 +203,108 @@ pub enum Action {
         #[arg(long, value_enum, default_value_t = PlanFormat::Json)]
         format: PlanFormat,
     },
+    /// Write the horizon record for a reviewed `horizon-plan` hash, for signers to
+    /// sign offline (design section 6.2). With --archive, also writes the archive
+    /// of exactly the history the horizon releases and records its hash, so the
+    /// release can be undone with `horizon-rehydrate`. Reads the repository only.
+    HorizonDraft {
+        #[arg(long)]
+        policy: PathBuf,
+        /// The `plan_hash` of the plan you reviewed.
+        #[arg(long)]
+        plan_hash: String,
+        /// Same meaning and default as for `horizon-plan`; must equal the plan's.
+        #[arg(long)]
+        as_of_ms: Option<i64>,
+        /// Declared creation time; defaults to now. Signed, never verified.
+        #[arg(long)]
+        created_at_ms: Option<u64>,
+        /// New archive file (`dynodoc.history-archive` v1); never overwrites.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        /// New file for the canonical record JSON; never overwrites.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Sign a horizon record with a local Ed25519 key, offline. Prints the record
+    /// address: compare it with what the other signers saw. Does not open the
+    /// repository.
+    HorizonSign {
+        record: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long, value_enum, default_value_t = HorizonRole::Owner)]
+        role: HorizonRole,
+        /// New file for the signature JSON; never overwrites.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Apply a signed horizon: release the commits and objects the plan selects.
+    ///
+    /// Recomputes the plan inside one write transaction and refuses unless its hash
+    /// equals --plan-hash and the record describes exactly that plan; checks the
+    /// signatures against the policy's `signatures.required` and the archive the
+    /// record names; deletes the released bodies and objects; checks every horizon
+    /// invariant before committing. A crash or any refusal changes nothing. The
+    /// first apply upgrades the repository to local schema 4, which older
+    /// binaries refuse to open. Back up the database file first.
+    HorizonApply {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        plan_hash: String,
+        /// The record from `horizon-draft`.
+        #[arg(long)]
+        record: PathBuf,
+        /// Signature files from `horizon-sign` (repeatable).
+        #[arg(long = "signature")]
+        signatures: Vec<PathBuf>,
+        /// Also sign now with this key (role from --role).
+        #[arg(long)]
+        key: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = HorizonRole::Owner)]
+        role: HorizonRole,
+        #[arg(long)]
+        as_of_ms: Option<i64>,
+        /// The archive the record names.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        /// Release in resumable batches of at most N deletions per transaction instead
+        /// of one transaction (very large releases). Run the same command again after
+        /// an interruption to resume.
+        #[arg(long)]
+        batch: Option<u64>,
+    },
+    /// Every stored horizon with its record, signatures and policy.
+    HorizonShow,
+    /// Check every horizon invariant (H1 to H9) without changing anything; exits
+    /// non-zero on the first violation. Never needs a released body.
+    HorizonVerify,
+    /// Restore what horizon --sequence released from its archive. The horizon stays
+    /// in the chain, marked rehydrated.
+    HorizonRehydrate {
+        #[arg(long)]
+        sequence: u64,
+        #[arg(long)]
+        archive: PathBuf,
+    },
+    /// Check an archive offline against its signed horizon envelope (the
+    /// `horizon-show` record and signatures, or a server's envelope): header, every
+    /// commit signature and address, every object hash, trailer, hash and counts.
+    /// With --required, also checks that many distinct signatures. Does not open
+    /// the repository.
+    HorizonArchiveVerify {
+        #[arg(long)]
+        archive: PathBuf,
+        /// Canonical envelope JSON `{"horizon":..., "signatures":[...]}`.
+        #[arg(long)]
+        envelope: PathBuf,
+        #[arg(long)]
+        required: Option<u32>,
+        /// Local (owner and device keys) or shared (owner and authority keys).
+        #[arg(long)]
+        shared: bool,
+    },
     /// Delete the staged objects of a reviewed gc-plan; nothing else.
     ///
     /// Recomputes the plan inside one write transaction and refuses unless its
@@ -293,10 +396,15 @@ pub enum Action {
         #[arg(long)]
         explain: bool,
         /// A `dynodoc.merge-policy.v1` JSON file to explain with, instead of the
-        /// built-in `dynodoc.default.v1`. A preview only: `merge` always uses the
-        /// default policy, because a signed commit cannot yet record another.
+        /// built-in `dynodoc.default.v1`. `merge --project-merge clean` records the
+        /// policy it used in a v4 commit; `merge` without it uses the default.
         #[arg(long, requires = "explain")]
         merge_policy: Option<PathBuf>,
+        /// Also plan by document identity (`plan_v2`): renames that follow edits,
+        /// documents that need a node merge, project conflicts with their class and
+        /// whether they can ever be automatic, and path portability warnings.
+        #[arg(long)]
+        project_constraints: bool,
     },
     /// Sign/store a two-parent merge of LEFT (first parent) and RIGHT.
     ///
@@ -329,6 +437,84 @@ pub enum Action {
         /// Explain how each automatically merged path was decided.
         #[arg(long)]
         explain: bool,
+        /// Merge by document identity (commit format v4): renames follow edits,
+        /// edits follow moves, splits and joins, project constraints, and every
+        /// automatic decision recorded with the merge policy. Conflicts need a
+        /// choice in --choices (resolution file v2); a rejected merge stores nothing.
+        #[arg(long, value_enum, conflicts_with_all = ["same_file_merge", "resolutions"])]
+        project_merge: Option<SameFileMerge>,
+        /// The `dynodoc.merge-policy.v1` file a project merge decides under
+        /// (default `dynodoc.default.v1`); its canonical form is signed into the commit.
+        #[arg(long, requires = "project_merge")]
+        merge_policy: Option<PathBuf>,
+        /// Resolution file v2: `{"version":2,"choices":[{"conflict":ID,"take":"left|right|delete"}]}`.
+        #[arg(long, requires = "project_merge")]
+        choices: Option<PathBuf>,
+    },
+    /// Move (or with --copy, copy) node subtrees from one document to another, as a
+    /// signed one-parent v4 commit on ONTO with derived node ids. Publish with set-head.
+    Relocate {
+        /// DOCUMENT_UUID:NODE[,NODE...]
+        #[arg(long)]
+        from: String,
+        /// DOCUMENT_UUID:PARENT_NODE:POSITION
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        copy: bool,
+        #[arg(long)]
+        onto: String,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        authored_at_ms: i64,
+    },
+    /// Split node subtrees of DOCUMENT into a new document at NEW_PATH (v4 commit).
+    Split {
+        #[arg(long)]
+        document: String,
+        /// NODE[,NODE...]: subtree roots that move to the new document.
+        #[arg(long)]
+        nodes: String,
+        #[arg(long)]
+        new_path: String,
+        /// The new document's UUID (a random one when omitted).
+        #[arg(long)]
+        new_document: Option<String>,
+        #[arg(long, default_value = "a0")]
+        position: String,
+        #[arg(long)]
+        onto: String,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        authored_at_ms: i64,
+    },
+    /// Join document FROM into INTO under PARENT; FROM leaves the project (v4 commit).
+    Join {
+        #[arg(long)]
+        from: String,
+        /// DOCUMENT_UUID:PARENT_NODE, or DOCUMENT_UUID:PARENT_NODE:POSITION
+        #[arg(long)]
+        into: String,
+        #[arg(long)]
+        onto: String,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        authored_at_ms: i64,
+    },
+    /// The relocation history of NODE in DOCUMENT, following first parents from HEAD.
+    Lineage {
+        head: String,
+        document: String,
+        node: String,
     },
     /// Re-run the recorded strategy of a stored merge commit's same-file records.
     /// With --explain, also print how the default merge policy decides each.
@@ -393,7 +579,7 @@ struct TransferObject {
 }
 
 /// The merge policy to explain with: the file given, or the built-in default.
-fn load_policy(path: Option<&Path>) -> anyhow::Result<MergePolicy> {
+pub(crate) fn load_policy(path: Option<&Path>) -> anyhow::Result<MergePolicy> {
     let Some(path) = path else {
         return Ok(merge_policy::default::policy().clone());
     };
@@ -471,7 +657,7 @@ struct MergeArgs {
 async fn merge_value(
     repo: &LocalRepository,
     args: MergeArgs,
-    key: &Ed25519KeyPair,
+    key: &dyn engine_core::repository::Signer,
 ) -> anyhow::Result<serde_json::Value> {
     let merge = repo
         .prepare_merge(
@@ -518,6 +704,108 @@ async fn merge_value(
         output["explain"] = explain;
     }
     Ok(output)
+}
+
+fn document_id(text: &str) -> anyhow::Result<DocumentId> {
+    Ok(DocumentId(
+        uuid::Uuid::parse_str(text).context("a document is named by its UUID")?,
+    ))
+}
+
+fn node_list(text: &str) -> anyhow::Result<Vec<engine_shared::NodeId>> {
+    let nodes: Vec<_> = text
+        .split(',')
+        .filter(|n| !n.is_empty())
+        .map(|n| engine_shared::NodeId(n.into()))
+        .collect();
+    anyhow::ensure!(!nodes.is_empty(), "name at least one node");
+    Ok(nodes)
+}
+
+/// The single live root node of `document` in commit `onto`.
+async fn root_of(
+    repo: &LocalRepository,
+    onto: &Address,
+    document: DocumentId,
+) -> anyhow::Result<engine_shared::NodeId> {
+    let commit = repo.commit(onto).await?.commit;
+    let entry = commit
+        .files
+        .values()
+        .find(|f| f.document == document)
+        .context("the document is not in ONTO")?;
+    let state = repo.read_state(document, &entry.state).await?;
+    let roots: Vec<_> = state
+        .nodes
+        .values()
+        .filter(|n| !n.deleted && n.parent_id.is_none())
+        .collect();
+    match roots.as_slice() {
+        [root] => Ok(root.id.clone()),
+        _ => anyhow::bail!("the document must have exactly one root node"),
+    }
+}
+
+/// Build, sign and store one relocation commit (v4, one parent).
+async fn relocate_value(
+    repo: &LocalRepository,
+    onto: &Address,
+    spec: relocation::Spec,
+    new_path: Option<String>,
+    (authored_at_ms, message): (i64, String),
+    key: &dyn engine_core::repository::Signer,
+) -> anyhow::Result<serde_json::Value> {
+    let paths = new_path
+        .map(|p| BTreeMap::from([(spec.to.document.0, p)]))
+        .unwrap_or_default();
+    let commit = repo
+        .relocate(onto, &[spec], &paths, authored_at_ms, message)
+        .await?;
+    let signed = SignedCommit::sign(commit, key)?;
+    let address = repo.import_commit(&signed).await?;
+    Ok(serde_json::json!({
+        "commit": address,
+        "version": signed.commit.version,
+        "parents": signed.commit.parents,
+        "relocations": signed.commit.relocations,
+    }))
+}
+
+/// Prepare, sign and store a v4 project merge; nothing is stored on a conflict.
+async fn project_merge_value(
+    repo: &LocalRepository,
+    (left, right): (Address, Address),
+    policy: &MergePolicy,
+    choices: &engine_core::repository::project::ResolutionFile,
+    (authored_at_ms, message): (i64, String),
+    key: &dyn engine_core::repository::Signer,
+) -> anyhow::Result<serde_json::Value> {
+    let merge = repo
+        .prepare_project_merge(&left, &right, policy, choices, authored_at_ms, message)
+        .await?;
+    let Some(commit) = merge.commit else {
+        let list: Vec<String> = merge
+            .report
+            .conflicts
+            .iter()
+            .map(|c| format!("{} ({:?}: {})", c.id, c.auto, c.detail))
+            .collect();
+        anyhow::bail!(
+            "{} project conflict(s) need a choice in --choices: {}",
+            list.len(),
+            list.join("; ")
+        );
+    };
+    let signed = SignedCommit::sign(commit, key)?;
+    let address = repo.import_commit(&signed).await?;
+    Ok(serde_json::json!({
+        "commit": address,
+        "version": signed.commit.version,
+        "parents": signed.commit.parents,
+        "base": merge.base,
+        "project_resolutions": signed.commit.project_resolutions,
+        "report": merge.report,
+    }))
 }
 
 /// A retention policy file, parsed and validated; every problem is listed in the error.
@@ -580,12 +868,104 @@ fn today_start_ms() -> anyhow::Result<i64> {
     Ok(now.as_millis() as i64 / DAY_MS * DAY_MS)
 }
 
+/// Who a local horizon signature stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum HorizonRole {
+    Owner,
+    Device,
+}
+
+impl From<HorizonRole> for Role {
+    fn from(role: HorizonRole) -> Self {
+        match role {
+            HorizonRole::Owner => Role::Owner,
+            HorizonRole::Device => Role::Device,
+        }
+    }
+}
+
+fn read_capped(path: &Path, cap: usize) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .with_context(|| format!("opening {}", path.display()))?
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= cap, "{} is too large", path.display());
+    Ok(bytes)
+}
+
+fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn horizon_as_of(policy: &Policy, given: Option<i64>) -> anyhow::Result<Option<i64>> {
+    Ok(match (policy.window.keep_within_days, given) {
+        (Some(_), None) => Some(today_start_ms()?),
+        (_, given) => given,
+    })
+}
+
 pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::Result<()> {
     let address = |s: String| Address::try_from(s);
     let mut text = None;
     let mut vacuum_failure = None;
 
     let (output, repo) = match action {
+        Action::HorizonSign {
+            record,
+            key,
+            role,
+            out,
+        } => {
+            let record = HorizonRecord::from_bytes(&read_capped(
+                &record,
+                horizon_record::MAX_RECORD_BYTES,
+            )?)?;
+            ensure!(
+                record.project == project,
+                "the record belongs to another project"
+            );
+            let signature =
+                horizon_record::sign(&record, role.into(), &crate::signing::load(&key)?)?;
+            write_new(&out, &serde_json::to_vec(&signature)?)?;
+            (
+                serde_json::json!({"record":record.address()?,"sequence":record.sequence,"role":signature.role,"key":signature.key,"out":out.display().to_string()}),
+                None,
+            )
+        }
+        Action::HorizonArchiveVerify {
+            archive,
+            envelope,
+            required,
+            shared,
+        } => {
+            let envelope = Envelope::from_bytes(&read_capped(&envelope, MAX_ENVELOPE_BYTES)?)?;
+            ensure!(
+                envelope.horizon.project == project,
+                "the envelope belongs to another project"
+            );
+            let found = horizon_archive::verify(&archive, &envelope)?;
+            if let Some(required) = required {
+                let scope = if shared {
+                    HorizonScope::Shared
+                } else {
+                    HorizonScope::Local
+                };
+                envelope.verify(scope, required)?;
+            }
+            (
+                serde_json::json!({"record":envelope.horizon.address()?,"sequence":envelope.horizon.sequence,"archive":found,"signatures_checked":required.is_some()}),
+                None,
+            )
+        }
         Action::ArchiveVerify { file, expect_head } => {
             let expect_head_addr = address(expect_head)?;
             anyhow::ensure!(
@@ -660,6 +1040,9 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                 other_action,
                 Action::GcPlan { .. }
                     | Action::HorizonPlan { .. }
+                    | Action::HorizonDraft { .. }
+                    | Action::HorizonShow
+                    | Action::HorizonVerify
                     | Action::ArchiveExport { .. }
                     | Action::ExportFile { .. }
                     | Action::Log { .. }
@@ -667,7 +1050,12 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                 LocalRepository::open_read_only(&path, project).await?
             } else {
                 // A destructive command never creates the database it would collect.
-                if matches!(other_action, Action::Gc { .. }) {
+                if matches!(
+                    other_action,
+                    Action::Gc { .. }
+                        | Action::HorizonApply { .. }
+                        | Action::HorizonRehydrate { .. }
+                ) {
                     anyhow::ensure!(
                         path.is_file(),
                         "no repository database at {}",
@@ -677,7 +1065,101 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                 LocalRepository::open(&path, project).await?
             };
             let out = match other_action {
-                Action::ArchiveVerify { .. } | Action::ArchiveImport { .. } => unreachable!(),
+                Action::ArchiveVerify { .. }
+                | Action::ArchiveImport { .. }
+                | Action::HorizonSign { .. }
+                | Action::HorizonArchiveVerify { .. } => unreachable!(),
+                Action::HorizonDraft {
+                    policy,
+                    plan_hash,
+                    as_of_ms,
+                    created_at_ms,
+                    archive,
+                    out,
+                } => {
+                    let policy = load_retention_policy(&policy)?;
+                    let as_of_ms = horizon_as_of(&policy, as_of_ms)?;
+                    let created_at_ms = match created_at_ms {
+                        Some(ms) => ms,
+                        None => std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_millis() as u64,
+                    };
+                    let record = repo
+                        .horizon_draft(
+                            &policy,
+                            &PlanOptions { as_of_ms, list: 0 },
+                            &plan_hash,
+                            created_at_ms,
+                            archive.as_deref(),
+                        )
+                        .await?;
+                    write_new(&out, &record.bytes()?)?;
+                    serde_json::json!({"record":record.address()?,"sequence":record.sequence,"counts":record.counts,"archive":record.archive,"out":out.display().to_string(),"instruction":"Each signer runs horizon-sign on this file; then horizon-apply with every signature."})
+                }
+                Action::HorizonApply {
+                    policy,
+                    plan_hash,
+                    record,
+                    signatures,
+                    key,
+                    role,
+                    as_of_ms,
+                    archive,
+                    batch,
+                } => {
+                    let policy = load_retention_policy(&policy)?;
+                    let as_of_ms = horizon_as_of(&policy, as_of_ms)?;
+                    let record = HorizonRecord::from_bytes(&read_capped(
+                        &record,
+                        horizon_record::MAX_RECORD_BYTES,
+                    )?)?;
+                    let mut collected = Vec::new();
+                    for file in &signatures {
+                        let signature: Signature =
+                            serde_json::from_slice(&read_capped(file, 4096)?)
+                                .with_context(|| format!("reading signature {}", file.display()))?;
+                        collected.push(signature);
+                    }
+                    if let Some(key) = key {
+                        collected.push(horizon_record::sign(
+                            &record,
+                            role.into(),
+                            &crate::signing::load(&key)?,
+                        )?);
+                    }
+                    let envelope = Envelope::assemble(record, collected)?;
+                    let options = PlanOptions { as_of_ms, list: 0 };
+                    let report = match batch {
+                        None => {
+                            repo.horizon_apply(
+                                &envelope,
+                                &policy,
+                                &options,
+                                &plan_hash,
+                                archive.as_deref(),
+                            )
+                            .await?
+                        }
+                        Some(batch) => {
+                            repo.horizon_apply_batched(
+                                &envelope,
+                                &policy,
+                                &options,
+                                &plan_hash,
+                                archive.as_deref(),
+                                batch,
+                            )
+                            .await?
+                        }
+                    };
+                    serde_json::to_value(report)?
+                }
+                Action::HorizonShow => serde_json::to_value(repo.horizons().await?)?,
+                Action::HorizonVerify => serde_json::to_value(repo.horizon_verify().await?)?,
+                Action::HorizonRehydrate { sequence, archive } => {
+                    serde_json::to_value(repo.horizon_rehydrate(sequence, &archive).await?)?
+                }
                 Action::Init => {
                     serde_json::json!({"project":project,"local_schema":SCHEMA_VERSION})
                 }
@@ -962,8 +1444,8 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                 Action::Commit { manifest, key } => {
                     let commit: Commit =
                         read_json(&manifest, engine_core::repository::MAX_COMMIT_BYTES)?;
-                    let key = crate::signing::load(&key)?;
-                    let signed = SignedCommit::sign(commit, &key)?;
+                    let key = crate::signing::load_signer(&key)?;
+                    let signed = SignedCommit::sign(commit, &*key)?;
                     serde_json::json!({"commit":repo.import_commit(&signed).await?})
                 }
                 Action::ImportCommit { input } => {
@@ -1031,16 +1513,49 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     right,
                     explain,
                     merge_policy,
+                    project_constraints,
                 } => {
                     let policy = explain
                         .then(|| load_policy(merge_policy.as_deref()))
                         .transpose()?;
-                    compare_explained(
+                    let (b, l, r) = (address(base)?, address(left)?, address(right)?);
+                    let mut output =
+                        compare_explained(&repo, b.clone(), l.clone(), r.clone(), policy.as_ref())
+                            .await?;
+                    if project_constraints {
+                        let plan = engine_core::repository::plan_v2::plan_v2(
+                            &repo.commit(&b).await?.commit,
+                            &repo.commit(&l).await?.commit,
+                            &repo.commit(&r).await?.commit,
+                        )?;
+                        output["project_plan"] = serde_json::to_value(plan)?;
+                    }
+                    output
+                }
+                Action::Merge {
+                    left,
+                    right,
+                    key,
+                    message,
+                    authored_at_ms,
+                    project_merge: Some(SameFileMerge::Clean),
+                    merge_policy,
+                    choices,
+                    ..
+                } => {
+                    let policy = load_policy(merge_policy.as_deref())?;
+                    let choices: engine_core::repository::project::ResolutionFile = match choices {
+                        Some(path) => read_json(&path, engine_core::repository::MAX_COMMIT_BYTES)?,
+                        None => Default::default(),
+                    };
+                    let key = crate::signing::load_signer(&key)?;
+                    project_merge_value(
                         &repo,
-                        address(base)?,
-                        address(left)?,
-                        address(right)?,
-                        policy.as_ref(),
+                        (address(left)?, address(right)?),
+                        &policy,
+                        &choices,
+                        (authored_at_ms, message),
+                        &*key,
                     )
                     .await?
                 }
@@ -1053,13 +1568,15 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     message,
                     authored_at_ms,
                     explain,
+                    project_merge: None,
+                    ..
                 } => {
                     let resolutions = match resolutions {
                         Some(path) => read_json(&path, engine_core::repository::MAX_COMMIT_BYTES)?,
                         None => BTreeMap::new(),
                     };
                     // Load the key before anything is stored.
-                    let key = crate::signing::load(&key)?;
+                    let key = crate::signing::load_signer(&key)?;
                     let args = MergeArgs {
                         left: address(left)?,
                         right: address(right)?,
@@ -1072,12 +1589,163 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                         authored_at_ms,
                         explain,
                     };
-                    merge_value(&repo, args, &key).await?
+                    merge_value(&repo, args, &*key).await?
                 }
+                Action::Relocate {
+                    from,
+                    to,
+                    copy,
+                    onto,
+                    key,
+                    message,
+                    authored_at_ms,
+                } => {
+                    let (document, nodes) = from
+                        .split_once(':')
+                        .context("--from is DOCUMENT_UUID:NODE[,NODE...]")?;
+                    let mut to_parts = to.splitn(3, ':');
+                    let (Some(dest), Some(parent), Some(position)) =
+                        (to_parts.next(), to_parts.next(), to_parts.next())
+                    else {
+                        anyhow::bail!("--to is DOCUMENT_UUID:PARENT_NODE:POSITION");
+                    };
+                    let spec = relocation::Spec {
+                        kind: if copy {
+                            relocation::Kind::Copy
+                        } else {
+                            relocation::Kind::Move
+                        },
+                        from: relocation::Source {
+                            document: document_id(document)?,
+                            roots: node_list(nodes)?,
+                        },
+                        to: relocation::Destination {
+                            document: document_id(dest)?,
+                            parent: engine_shared::NodeId(parent.into()),
+                            position: position.into(),
+                        },
+                    };
+                    let key = crate::signing::load_signer(&key)?;
+                    relocate_value(
+                        &repo,
+                        &address(onto)?,
+                        spec,
+                        None,
+                        (authored_at_ms, message),
+                        &*key,
+                    )
+                    .await?
+                }
+                Action::Split {
+                    document,
+                    nodes,
+                    new_path,
+                    new_document,
+                    position,
+                    onto,
+                    key,
+                    message,
+                    authored_at_ms,
+                } => {
+                    anyhow::ensure!(
+                        engine_core::repository::valid_path(&new_path),
+                        "--new-path is not a valid project path"
+                    );
+                    let onto = address(onto)?;
+                    let source = document_id(&document)?;
+                    let root = root_of(&repo, &onto, source).await?;
+                    let new_document = match new_document {
+                        Some(id) => document_id(&id)?,
+                        None => DocumentId(uuid::Uuid::new_v4()),
+                    };
+                    let spec = relocation::Spec {
+                        kind: relocation::Kind::Split,
+                        from: relocation::Source {
+                            document: source,
+                            roots: node_list(&nodes)?,
+                        },
+                        to: relocation::Destination {
+                            document: new_document,
+                            parent: root,
+                            position,
+                        },
+                    };
+                    let key = crate::signing::load_signer(&key)?;
+                    relocate_value(
+                        &repo,
+                        &onto,
+                        spec,
+                        Some(new_path),
+                        (authored_at_ms, message),
+                        &*key,
+                    )
+                    .await?
+                }
+                Action::Join {
+                    from,
+                    into,
+                    onto,
+                    key,
+                    message,
+                    authored_at_ms,
+                } => {
+                    let onto = address(onto)?;
+                    let source = document_id(&from)?;
+                    let mut parts = into.splitn(3, ':');
+                    let (Some(dest), Some(parent)) = (parts.next(), parts.next()) else {
+                        anyhow::bail!("--into is DOCUMENT_UUID:PARENT_NODE[:POSITION]");
+                    };
+                    let position = parts.next().unwrap_or("a0").to_string();
+                    let root = root_of(&repo, &onto, source).await?;
+                    let commit = repo.commit(&onto).await?.commit;
+                    let entry = commit
+                        .files
+                        .values()
+                        .find(|f| f.document == source)
+                        .context("--from is not a document of ONTO")?;
+                    let state = repo.read_state(source, &entry.state).await?;
+                    let mut children: Vec<_> = state
+                        .nodes
+                        .values()
+                        .filter(|n| !n.deleted && n.parent_id.as_ref() == Some(&root))
+                        .map(|n| (n.pos.clone(), n.id.clone()))
+                        .collect();
+                    children.sort();
+                    anyhow::ensure!(!children.is_empty(), "the document to join has no content");
+                    let spec = relocation::Spec {
+                        kind: relocation::Kind::Join,
+                        from: relocation::Source {
+                            document: source,
+                            roots: children.into_iter().map(|(_, id)| id).collect(),
+                        },
+                        to: relocation::Destination {
+                            document: document_id(dest)?,
+                            parent: engine_shared::NodeId(parent.into()),
+                            position,
+                        },
+                    };
+                    let key = crate::signing::load_signer(&key)?;
+                    relocate_value(&repo, &onto, spec, None, (authored_at_ms, message), &*key)
+                        .await?
+                }
+                Action::Lineage {
+                    head,
+                    document,
+                    node,
+                } => serde_json::json!({
+                    "steps": repo
+                        .lineage(
+                            &address(head)?,
+                            document_id(&document)?,
+                            &engine_shared::NodeId(node),
+                        )
+                        .await?
+                }),
                 Action::VerifyMerge { commit, explain } => {
                     let commit = address(commit)?;
                     let verified = repo.verify_same_file_resolutions(&commit).await?;
-                    let mut output = serde_json::json!({"commit":commit,"verified_same_file_resolutions":verified});
+                    let project_verified = repo.verify_project_resolutions(&commit).await?;
+                    let mut output = serde_json::json!({"commit":commit,"verified_same_file_resolutions":verified,"verified_project_resolutions":project_verified});
                     if explain {
                         let policy = merge_policy::default::policy();
                         let records = repo.commit(&commit).await?.commit.same_file_resolutions;
@@ -1129,7 +1797,7 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                         None => BTreeMap::new(),
                     };
                     let commit = plan.resolve(&resolutions, authored_at_ms, message)?;
-                    let signed = SignedCommit::sign(commit, &crate::signing::load(&key)?)?;
+                    let signed = SignedCommit::sign(commit, &*crate::signing::load_signer(&key)?)?;
                     serde_json::json!({"commit":repo.import_commit(&signed).await?,"recovery":signed.commit.recovery,"parents":signed.commit.parents})
                 }
             };
@@ -1486,6 +2154,7 @@ mod tests {
             message: &str,
         ) -> Address {
             let commit = Commit {
+                sealed: None,
                 version: 1,
                 project: self.project,
                 parents: parents.iter().map(|a| (*a).clone()).collect(),
@@ -1497,6 +2166,9 @@ mod tests {
                 authored_at_ms: 1_700_000_000_000,
                 message: message.into(),
                 recovery: None,
+                project_resolutions: Vec::new(),
+                relocations: Vec::new(),
+                merge_policy: None,
                 same_file_resolutions: Vec::new(),
             };
             let key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
@@ -1800,6 +2472,61 @@ mod tests {
             authored_at_ms: 1_700_000_000_500,
             explain: false,
         }
+    }
+
+    #[tokio::test]
+    async fn a_project_merge_follows_a_rename_with_the_other_side_s_edit_and_verifies() {
+        let f = Fixture::new().await;
+        let report = DocumentId(uuid::Uuid::new_v4());
+        let base = f
+            .commit(
+                &[],
+                vec![("Report.docx", f.file(report, &[]).await)],
+                "base",
+            )
+            .await;
+        let left = f
+            .commit(
+                &[&base],
+                vec![("Archive/Report.docx", f.file(report, &[]).await)],
+                "rename",
+            )
+            .await;
+        let edited = f.file(report, &[(2, "edited")]).await;
+        let right = f
+            .commit(&[&base], vec![("Report.docx", edited.clone())], "edit")
+            .await;
+        let key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let policy = merge_policy::default::policy();
+        let output = project_merge_value(
+            &f.repo,
+            (left.clone(), right.clone()),
+            policy,
+            &Default::default(),
+            (1_700_000_000_900, "merge".into()),
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output["version"], 4);
+        assert_eq!(
+            output["project_resolutions"][0]["strategy"],
+            "dynodoc.project.rename-follow.v1"
+        );
+        let commit = Address::try_from(output["commit"].as_str().unwrap().to_string()).unwrap();
+        let stored = f.repo.commit(&commit).await.unwrap().commit;
+        assert_eq!(stored.files["Archive/Report.docx"], edited);
+        assert_eq!(stored.merge_policy.unwrap().hash, policy.hash_hex());
+        assert_eq!(f.repo.verify_project_resolutions(&commit).await.unwrap(), 1);
+        // The same-file merge of the old planner cannot do this.
+        assert!(merge_value(
+            &f.repo,
+            merge_args(&left, &right, SameFile::Clean, BTreeMap::new()),
+            &key,
+        )
+        .await
+        .is_err());
+        f.finish().await;
     }
 
     #[tokio::test]
@@ -2222,11 +2949,54 @@ mod tests {
             parse(&explained),
             Action::Merge { explain: true, .. }
         ));
-        // The commit-producing merge takes no policy: a v3 commit records only the
-        // default strategy.
+        // The same-file merge takes no policy: a v3 commit records only the
+        // default strategy. A project merge records its policy in a v4 commit.
         let mut with_policy = base.to_vec();
         with_policy.extend(["--merge-policy", "p.json"]);
-        assert!(command.clone().try_get_matches_from(with_policy).is_err());
+        assert!(command
+            .clone()
+            .try_get_matches_from(with_policy.clone())
+            .is_err());
+        with_policy.extend(["--project-merge", "clean", "--choices", "c.json"]);
+        assert!(matches!(
+            parse(&with_policy),
+            Action::Merge {
+                project_merge: Some(SameFileMerge::Clean),
+                merge_policy: Some(_),
+                choices: Some(_),
+                ..
+            }
+        ));
+        // A project merge takes choices, never the v1 path map or the v3 flag.
+        let mut mixed = base.to_vec();
+        mixed.extend(["--project-merge", "clean", "--same-file-merge", "clean"]);
+        assert!(command.clone().try_get_matches_from(mixed).is_err());
+        assert!(matches!(
+            parse(&[
+                "relocate",
+                "--from",
+                "d:n",
+                "--to",
+                "e:p:a0",
+                "--copy",
+                "--onto",
+                "c",
+                "--key",
+                "k",
+                "--message",
+                "m",
+                "--authored-at-ms",
+                "1"
+            ]),
+            Action::Relocate { copy: true, .. }
+        ));
+        assert!(matches!(
+            parse(&["compare", "B", "L", "R", "--project-constraints"]),
+            Action::Compare {
+                project_constraints: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2276,6 +3046,151 @@ mod tests {
             .clone()
             .try_get_matches_from(["horizon-plan", "--policy", "p", "--format", "xml"])
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn horizon_verbs_draft_sign_apply_verify_and_refuse_a_second_key_role() {
+        let f = Fixture::new().await;
+        let document = DocumentId(uuid::Uuid::new_v4());
+        let mut head = f
+            .commit(&[], vec![("a", f.file(document, &[]).await)], "c0")
+            .await;
+        for i in 1..5 {
+            let file = f.file(document, &[(0, &format!("edit {i}"))]).await;
+            head = f
+                .commit(&[&head], vec![("a", file)], &format!("c{i}"))
+                .await;
+        }
+        f.repo.compare_and_swap("main", None, &head).await.unwrap();
+        let (path, project) = (f.path.clone(), f.project);
+        let dir =
+            std::env::temp_dir().join(format!("dynodoc-horizon-verbs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy = dir.join("policy.json");
+        std::fs::write(
+            &policy,
+            r#"{"version":1,"id":"cli","tier":"history","window":{"keep_last_commits":2},"protect":{"branch_heads":true},"signatures":{"required":2},"archive":{"required":true,"destination":"file:///a/{project}/{sequence}.dynarc"}}"#,
+        )
+        .unwrap();
+        let key = |name: &str| {
+            let rng = ring::rand::SystemRandom::new();
+            let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+            let file = dir.join(name);
+            crate::private_file::write_private_test(&file, pkcs8.as_ref()).unwrap();
+            file
+        };
+        let (owner, device) = (key("owner.der"), key("device.der"));
+        let plan = f
+            .repo
+            .horizon_plan(
+                &Policy::load(&std::fs::read(&policy).unwrap(), LoadOptions::default()).unwrap(),
+                &PlanOptions {
+                    as_of_ms: None,
+                    list: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let (record, archive) = (dir.join("record.json"), dir.join("1.dynarc"));
+        run(
+            path.clone(),
+            project,
+            Action::HorizonDraft {
+                policy: policy.clone(),
+                plan_hash: plan.plan_hash.clone(),
+                as_of_ms: None,
+                created_at_ms: Some(1_791_000_000_000),
+                archive: Some(archive.clone()),
+                out: record.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let signature = dir.join("owner.sig");
+        run(
+            path.clone(),
+            project,
+            Action::HorizonSign {
+                record: record.clone(),
+                key: owner.clone(),
+                role: HorizonRole::Owner,
+                out: signature.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let apply = |key: PathBuf, signatures: Vec<PathBuf>| Action::HorizonApply {
+            policy: policy.clone(),
+            plan_hash: plan.plan_hash.clone(),
+            record: record.clone(),
+            signatures,
+            key: Some(key),
+            role: HorizonRole::Device,
+            as_of_ms: None,
+            archive: Some(archive.clone()),
+            batch: None,
+        };
+        // The same key twice is one signer: below the two the policy requires.
+        assert!(run(
+            path.clone(),
+            project,
+            apply(owner.clone(), vec![signature.clone()])
+        )
+        .await
+        .is_err());
+        assert!(f.repo.commit(&plan.sets.released[0]).await.is_ok());
+        run(
+            path.clone(),
+            project,
+            apply(device.clone(), vec![signature.clone()]),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            f.repo.commit(&plan.sets.released[0]).await,
+            Err(engine_core::repository::Error::HistoryPruned { .. })
+        ));
+        run(path.clone(), project, Action::HorizonVerify)
+            .await
+            .unwrap();
+        run(path.clone(), project, Action::HorizonShow)
+            .await
+            .unwrap();
+        let shown = f.repo.horizons().await.unwrap();
+        let envelope = dir.join("envelope.json");
+        std::fs::write(
+            &envelope,
+            Envelope::assemble(shown[0].record.clone(), shown[0].signatures.clone())
+                .unwrap()
+                .bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        run(
+            path.clone(),
+            project,
+            Action::HorizonArchiveVerify {
+                archive: archive.clone(),
+                envelope,
+                required: Some(2),
+                shared: false,
+            },
+        )
+        .await
+        .unwrap();
+        run(
+            path.clone(),
+            project,
+            Action::HorizonRehydrate {
+                sequence: 1,
+                archive,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(f.repo.commit(&plan.sets.released[0]).await.is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+        f.finish().await;
     }
 
     #[tokio::test]
@@ -4457,12 +5372,16 @@ mod tests {
             },
         );
         let commit = engine_core::repository::Commit {
+            sealed: None,
             version: 1,
             project: project_id,
             parents: vec![],
             authored_at_ms: 1700000000000,
             author_key: String::new(),
             files,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
             recovery: None,
             message: "Commit with non-state typed root".into(),
@@ -4569,6 +5488,7 @@ mod tests {
         // Sign a commit claiming to revert c2, but providing false/falsified file content
         let f_fake = f.file(doc1, &[(0, "False content")]).await;
         let commit = engine_core::repository::Commit {
+            sealed: None,
             version: 2,
             project: f.project,
             parents: vec![c2.clone()],
@@ -4579,6 +5499,9 @@ mod tests {
                 map.insert("doc.docx".to_string(), f_fake.clone());
                 map
             },
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
             recovery: Some(engine_core::repository::recovery::Source {
                 kind: engine_core::repository::recovery::Kind::Revert,
@@ -4818,12 +5741,12 @@ mod tests {
             }
         }
 
-        // Schema 4 (unsupported) must fail rather than proceed
+        // Schema 5 (unsupported; 4 is the horizon schema) must fail rather than proceed
         {
             let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
                 .await
                 .unwrap();
-            sqlx::query("update local_meta set version=4")
+            sqlx::query("update local_meta set version=5")
                 .execute(&pool)
                 .await
                 .unwrap();

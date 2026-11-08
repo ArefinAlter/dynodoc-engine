@@ -10,7 +10,6 @@ use engine_core::repository::{
     log::CommitLogEntry,
 };
 use reqwest::{header, Method, StatusCode, Url};
-use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::de::DeserializeOwned;
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
@@ -57,7 +56,8 @@ pub enum Credential {
     },
     /// Sign a one-use challenge with an enrolled device key for a project token.
     Device {
-        key: Ed25519KeyPair,
+        /// A key file or a PKCS#11 token key (`pkcs11:` URI).
+        key: crate::signing::SharedSigner,
         scopes: Vec<String>,
     },
 }
@@ -354,7 +354,7 @@ impl Client {
     /// before anything is signed.
     async fn device_token(
         &self,
-        key: &Ed25519KeyPair,
+        key: &crate::signing::SharedSigner,
         scopes: &[String],
     ) -> anyhow::Result<(String, Option<Duration>)> {
         #[derive(Deserialize)]
@@ -365,7 +365,7 @@ impl Client {
         let issued: Issued = self
             .anonymous(
                 &format!("projects/{}/device-sessions/challenge", self.project),
-                &json!({"public_key":lower_hex(key.public_key().as_ref()),"scopes":scopes}),
+                &json!({"public_key":lower_hex(&engine_core::repository::Signer::public_key_bytes(key)),"scopes":scopes}),
                 8 * 1024,
             )
             .await?;
@@ -552,6 +552,34 @@ impl Client {
         self.request(Method::GET, path, query, None, cap, false)
             .await?
             .ok_or_else(|| anyhow!("missing response"))
+    }
+    /// Bounded raw bytes of a path relative to the API base (transparency tiles,
+    /// which are not JSON and not under the project prefix).
+    pub async fn get_bytes(&self, path: &str, cap: usize) -> anyhow::Result<Vec<u8>> {
+        self.admit()?;
+        let (header, _) = self.current().await?;
+        let mut response = self
+            .send(Method::GET, self.base.join(path)?, None, Some(header))
+            .await?;
+        ensure!(
+            response.status().is_success(),
+            "remote HTTP {} at {path}",
+            response.status().as_u16()
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| anyhow!("remote body failed or timed out"))?
+        {
+            ensure!(
+                chunk.len() <= cap.saturating_sub(bytes.len()),
+                "remote response exceeds byte limit"
+            );
+            self.charge(chunk.len())?;
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
     /// Like [`Client::get`], but a 404 answers `None`.
     pub async fn get_optional<T: DeserializeOwned>(

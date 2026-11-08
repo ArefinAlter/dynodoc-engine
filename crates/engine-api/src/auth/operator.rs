@@ -603,7 +603,14 @@ pub async fn redeem(state: &AppState, token: &str) -> Result<TokenResponse, Auth
         record_refusal(state, &hash).await;
         return Err(AuthError::MagicLinkInvalid);
     };
-    let (tokens, session) = mint_session_with(state, &mut *tx, identity, generation).await?;
+    let (tokens, session) = mint_session_with(
+        state,
+        &mut *tx,
+        identity,
+        generation,
+        &super::Login::plain("operator-link"),
+    )
+    .await?;
     audit(
         &mut tx,
         identity,

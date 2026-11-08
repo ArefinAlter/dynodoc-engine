@@ -167,7 +167,10 @@ pub async fn run(path: PathBuf, scope: Scope, action: Action) -> anyhow::Result<
                 receipt.scope == scope,
                 "manifest does not match the explicit scope"
             );
-            serde_json::to_value(SignedReceipt::sign(receipt, &key(&path)?)?)?
+            serde_json::to_value(SignedReceipt::sign(
+                receipt,
+                &*crate::signing::load_signer(&path)?,
+            )?)?
         }
         Action::Verify {
             receipt,

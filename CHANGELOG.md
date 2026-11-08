@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Application engine at 4f0e7a3 (decisions 024 to 043) - 2026-11-08
+
+Synchronized `engine-shared`, `engine-core`, `engine-agent`, `engine-mcp`, `engine-api`,
+`engine-cli`, migrations 0056 to 0142 and `openapi.yaml` from application `4f0e7a3`, and
+added `engine-wasm` (`dynodoc-engine-wasm`). The incremental history archive export (#122,
+#123) and the engine's own richtext fixture are kept. New in source, none of it deployed:
+
+- Agent sessions, agent blame and project memory with MCP memory tools (026); MCP writes
+  held for a person's confirmation, sealed agent authorship and organisation agent-client
+  policy (029, 038); OAuth 2.1 for remote MCP clients and MCP over HTTP sessions.
+- Ledger mode beside repository mode, storage manifests, relay, block states and partial
+  rebase (025, 028, 040).
+- Directory primitives for enterprise identity: sign-in by `(issuer, subject)`, scoped
+  `/internal/directory/*` routes, source-tagged membership reconciliation and organisation
+  sign-in settings (031); identity protocols themselves are not part of the engine.
+- History horizons, shared object collection and a transparency log with a separate
+  witness binary, `dynodoc-witness` (032).
+- Automatic node resolution and cross-document merge (033); merge policies, history holds
+  and structural merge (042).
+- Resumable uploads, import jobs and shared object budgets for large files (034); object
+  storage on the filesystem or S3 with a deletion queue (037, 043).
+- Encrypted projects (HPKE key grants, Shamir escrow), at-rest data keys with Vault, AWS,
+  Google Cloud and Azure key providers, device key rotation and legacy plaintext erasure
+  (035, 041); PKCS#11 hardware device keys in `engine-cli` (039).
+- Sessions, roles and service accounts, a mail outbox, event fan-out over `NOTIFY`,
+  re-authentication for sensitive actions and metrics (037, 043).
+- A pure build of `engine-core` and `engine-shared` without PostgreSQL, tokio or ring, and
+  its WebAssembly exports with frozen parity vectors (036).
+
 ### Opt-in shared checkpoints - 2026-10-10
 
 Added versioned full-state content objects, stable-key radix maps, document-scoped

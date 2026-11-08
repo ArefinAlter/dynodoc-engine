@@ -262,6 +262,13 @@ impl ObjectStore for PrivateStore<'_> {
         let rows:Vec<(String,Vec<u8>)>=sqlx::query_as("select o.address,o.bytes from project_staged_object a join checkpoint_object o using(document_id,address) where a.identity_id=$1 and a.project_id=$2 and a.document_id=$3 and a.address=any($4)")
             .bind(self.actor).bind(self.project).bind(document.0).bind(keys).fetch_all(&mut *self.db).await?;
         for (address, bytes) in rows {
+            let bytes = engine_core::at_rest::store::open_object(
+                &mut *self.db,
+                document.0,
+                &address,
+                bytes,
+            )
+            .await?;
             self.prefetched
                 .insert((document.0, Address::try_from(address)?), bytes);
         }
@@ -286,9 +293,16 @@ impl ObjectStore for PrivateStore<'_> {
         let bytes = if let Some(bytes) = self.prefetched.get(&(document.0, address.clone())) {
             bytes.clone()
         } else {
-            sqlx::query_scalar::<_,Vec<u8>>("select o.bytes from project_staged_object a join checkpoint_object o using(document_id,address) where a.identity_id=$1 and a.project_id=$2 and a.document_id=$3 and a.address=$4")
+            let stored = sqlx::query_scalar::<_,Vec<u8>>("select o.bytes from project_staged_object a join checkpoint_object o using(document_id,address) where a.identity_id=$1 and a.project_id=$2 and a.document_id=$3 and a.address=$4")
             .bind(self.actor).bind(self.project).bind(document.0).bind(address.as_str()).fetch_optional(&mut *self.db).await?
-            .ok_or_else(||shared_checkpoint::Error::Missing(address.as_str().into()))?
+            .ok_or_else(||shared_checkpoint::Error::Missing(address.as_str().into()))?;
+            engine_core::at_rest::store::open_object(
+                &mut *self.db,
+                document.0,
+                address.as_str(),
+                stored,
+            )
+            .await?
         };
         self.budget.max_objects -= 1;
         self.budget.max_bytes = self
@@ -387,11 +401,24 @@ async fn stage(
     let mut scope: BTreeSet<Uuid> = signed.commit.files.values().map(|f| f.document.0).collect();
     let mut dependencies = BTreeMap::new();
     let mut height = 0;
+    let mut released_parent = false;
     for dependency in signed.commit.dependencies() {
         let stored = match load(&mut tx, auth.identity_id, id, &dependency).await {
             Ok(stored) => stored,
             Err(ApiError::NotFound) => {
-                crate::project_history::load(&mut tx, id, &dependency).await?
+                match crate::project_history::load(&mut tx, id, &dependency).await {
+                    Err(ApiError::NotFound) if signed.commit.parents.contains(&dependency) => {
+                        // A parent a horizon released: its height is in the skeleton.
+                        let (_, _, released) =
+                            crate::project_horizons::skeleton_entry(&mut tx, id, &dependency)
+                                .await?
+                                .ok_or(ApiError::NotFound)?;
+                        height = height.max(released + 1);
+                        released_parent = true;
+                        continue;
+                    }
+                    other => other?,
+                }
             }
             Err(error) => return Err(error),
         };
@@ -408,6 +435,12 @@ async fn stage(
     authorize(&mut tx, &auth, id, &scope, true).await?;
     let _permit = state.workloads.enter(auth.identity_id, Some(id))?;
     let device = devices::current_key(&mut tx, auth.identity_id, &signed.commit.author_key).await?;
+    if signed.commit.recovery.is_some() && released_parent {
+        return Err(bad(
+            "A recovery commit needs its parent's body, which a history horizon released",
+        ));
+    }
+    let sealed = crate::e2ee::check_commit(&mut tx, id, &signed.commit).await?;
     if let Some(source) = &signed.commit.recovery {
         let plan = recovery::plan(
             source.kind,
@@ -434,6 +467,12 @@ async fn stage(
         seen: BTreeSet::new(),
     };
     for file in signed.commit.files.values() {
+        if sealed {
+            engine_core::e2ee::state::traverse(&mut store, file.document, &file.state, 1_000_000)
+                .await
+                .map_err(content_error)?;
+            continue;
+        }
         typed::read_state(
             &mut store,
             file.document,

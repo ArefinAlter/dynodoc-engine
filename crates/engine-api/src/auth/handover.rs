@@ -434,7 +434,14 @@ async fn consume(
         .bind(id)
         .execute(&mut *tx)
         .await?;
-        let (tokens, session) = mint_session_with(state, &mut *tx, identity, generation).await?;
+        let (tokens, session) = mint_session_with(
+            state,
+            &mut *tx,
+            identity,
+            generation,
+            &super::Login::plain("handover"),
+        )
+        .await?;
         audit(
             &mut tx,
             identity,

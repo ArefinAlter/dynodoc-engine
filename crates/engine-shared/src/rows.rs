@@ -8,6 +8,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(feature = "db")]
 use sqlx::FromRow;
 
 use crate::ids::{
@@ -15,7 +16,8 @@ use crate::ids::{
 };
 
 /// A row of `document` — materialized current state of an instrument.
-#[derive(Debug, Clone, PartialEq, Eq, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "db", derive(FromRow))]
 pub struct Document {
     pub id: DocumentId,
     pub title: String,
@@ -30,13 +32,14 @@ pub struct Document {
 }
 
 /// A row of `node` — one stable-identity node in the instrument tree.
-#[derive(Debug, Clone, PartialEq, Eq, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "db", derive(FromRow))]
 pub struct Node {
     pub id: NodeId,
     pub document_id: DocumentId,
     pub parent_id: Option<NodeId>,
     /// One of [`crate::NodeType`].
-    #[sqlx(rename = "type")]
+    #[cfg_attr(feature = "db", sqlx(rename = "type"))]
     #[serde(rename = "type")]
     pub node_type: String,
     /// Dense order key (fractional index) for sibling ordering.
@@ -49,14 +52,15 @@ pub struct Node {
 }
 
 /// A row of `event` — one immutable, hash-chained entry in the log of record.
-#[derive(Debug, Clone, PartialEq, Eq, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "db", derive(FromRow))]
 pub struct Event {
     pub id: EventId,
     pub document_id: DocumentId,
     /// Monotonic per-document sequence (the fold order).
     pub seq: i64,
     /// One of [`crate::EventType`].
-    #[sqlx(rename = "type")]
+    #[cfg_attr(feature = "db", sqlx(rename = "type"))]
     #[serde(rename = "type")]
     pub event_type: String,
     pub actor_id: IdentityId,
@@ -73,7 +77,8 @@ pub struct Event {
 }
 
 /// A row of `snapshot` — a derived fold with a Merkle root over its node set.
-#[derive(Debug, Clone, PartialEq, Eq, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "db", derive(FromRow))]
 pub struct Snapshot {
     pub id: SnapshotId,
     pub document_id: DocumentId,
@@ -90,7 +95,8 @@ pub struct Snapshot {
 }
 
 /// A row of `identity` — an actor (PoC: email + magic-link auth).
-#[derive(Debug, Clone, PartialEq, Eq, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "db", derive(FromRow))]
 pub struct Identity {
     pub id: IdentityId,
     pub email: String,
@@ -99,7 +105,8 @@ pub struct Identity {
 }
 
 /// A row of `magic_link` — a one-time login token (stored hashed).
-#[derive(Debug, Clone, PartialEq, Eq, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "db", derive(FromRow))]
 pub struct MagicLink {
     pub id: MagicLinkId,
     pub identity_id: IdentityId,
@@ -111,7 +118,8 @@ pub struct MagicLink {
 }
 
 /// A row of `document_access` — an identity's role on a document (the access list).
-#[derive(Debug, Clone, PartialEq, Eq, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "db", derive(FromRow))]
 pub struct DocumentAccess {
     pub document_id: DocumentId,
     pub identity_id: IdentityId,
@@ -122,7 +130,8 @@ pub struct DocumentAccess {
 }
 
 /// A row of `refresh_token` — a rotating session-continuation token (stored hashed).
-#[derive(Debug, Clone, PartialEq, Eq, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "db", derive(FromRow))]
 pub struct RefreshToken {
     pub id: RefreshTokenId,
     pub identity_id: IdentityId,

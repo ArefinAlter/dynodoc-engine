@@ -12,9 +12,11 @@
 //! **What exists.** The `DYNOENC` stored form ([`seal`], [`open`], [`Header`]), the key
 //! hierarchy (KEK wraps DEK, DEK derives a key and nonce per value), the
 //! [`KeyProvider`] trait with a local-file provider and a deterministic test provider,
-//! and a [`DekCache`] with a TTL. **What does not.** Nothing in the storage or API code
-//! uses this module yet: no store wrapper, no `data_key` tables, no migration, no
-//! backfill, no Vault or cloud KMS provider.
+//! a [`DekCache`] with a TTL, the network providers ([`kms`], feature `kms`: Vault Transit,
+//! AWS KMS, Google Cloud KMS, Azure Key Vault), and the store wrapper ([`store`]) that
+//! `PgStore` and every reader of `checkpoint_object.bytes` use, with its resumable backfill
+//! (decision 041). **What does not.** Snapshots, uploads, bundles, drafts and JSON columns
+//! are not enveloped; no PKCS#11 provider; no encrypted backups.
 //!
 //! ```text
 //!   KEK (provider) --wrap/unwrap, bound to installation + project + purpose--> DEK
@@ -23,8 +25,11 @@
 //! ```
 mod cache;
 mod envelope;
+#[cfg(feature = "kms")]
+pub mod kms;
 mod provider;
 mod secret;
+pub mod store;
 
 pub use cache::{Clock, DekCache, ManualClock, SystemClock, DEFAULT_MAX_ENTRIES, DEFAULT_TTL};
 pub use envelope::{

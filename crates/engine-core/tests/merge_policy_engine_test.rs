@@ -238,7 +238,7 @@ fn custom(id: &'static str, outcome: fn() -> Outcome) -> (MergePolicy, Registry)
 }
 
 #[test]
-fn a_panicking_strategy_becomes_a_conflict_and_a_preference_is_not_applied() {
+fn a_panicking_strategy_becomes_a_conflict_and_a_preference_keeps_its_loser() {
     let (base, team, draft) = scenario();
     let (p, registry) = custom("test.panics.v1", || panic!("a strategy bug"));
     let (plan, evidence) =
@@ -250,15 +250,28 @@ fn a_panicking_strategy_becomes_a_conflict_and_a_preference_is_not_applied() {
         .iter()
         .all(|d| d.reason == "internal-error"));
 
+    // A preference that reports no loser still keeps the other value: the engine
+    // adds it, and the default `loser: suggestion` writes it into the state.
     let (p, registry) = custom("test.prefers.v1", || Outcome::Prefer(Side::Draft));
     let (plan, evidence) =
         merge_with_registry(&base, &team, &draft, &BTreeMap::new(), &p, &registry);
+    assert!(plan.conflicts.is_empty());
+    assert!(evidence
+        .decisions
+        .iter()
+        .all(|d| d.outcome == DecisionOutcome::Preferred && d.lost.len() == 1));
+    assert_eq!(plan.state.suggestions.len(), 2);
+    assert_eq!(evidence.losers.len(), 2);
+    // With `loser: none` the preference is refused and nothing of the draft applies.
+    let mut none = p.clone();
+    none.defaults.loser = engine_core::merge_policy::policy::Loser::None;
+    let (plan, evidence) =
+        merge_with_registry(&base, &team, &draft, &BTreeMap::new(), &none, &registry);
     assert_eq!(plan.conflicts.len(), 2);
     assert!(evidence
         .decisions
         .iter()
-        .all(|d| d.reason == "prefer-unsupported"));
-    // Nothing of the draft was applied.
+        .all(|d| d.reason == "loser-not-preserved"));
     assert_eq!(plan.state, team);
 
     // A merged value from a strategy that returned one is used.

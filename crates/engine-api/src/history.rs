@@ -299,6 +299,7 @@ async fn recover(
     }
     // Explicit ID makes retry atomic without a second, independently committed
     // receipt. A cross-document UUID collision fails without leaking its draft.
+    crate::ledger::refuse_direct(&mut tx, id).await?;
     let stored =
         crate::draft_storage::encode(&mut tx, DocumentId(id), &team, state.shared_draft_bases)
             .await?;

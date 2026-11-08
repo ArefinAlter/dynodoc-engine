@@ -377,6 +377,11 @@ async fn install_transition(
         .bind(&seal.digest)
         .execute(&mut *tx)
         .await?;
+    // The `authority-rotation` leaf, in this transaction, when the installation runs a
+    // transparency log (the API's rule: DYNODOC_TRANSPARENCY_ORIGIN set; decision 042).
+    if std::env::var_os("DYNODOC_TRANSPARENCY_ORIGIN").is_some() {
+        enqueue_rotation(&mut tx, &address).await?;
+    }
     tx.commit().await?;
     Ok(Installed {
         authority: active.authority,
@@ -384,6 +389,42 @@ async fn install_transition(
         statement_address: address.as_str().to_owned(),
         already_installed: false,
     })
+}
+
+/// Queue the `rot` leaf of an installed authority statement, keyed with the
+/// installation's blinding key (created on first use, 32 random bytes).
+pub async fn enqueue_rotation(
+    db: &mut PgConnection,
+    statement: &crate::shared_checkpoint::Address,
+) -> anyhow::Result<()> {
+    let mut fresh = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut fresh)
+        .map_err(|_| anyhow::anyhow!("random"))?;
+    sqlx::query(
+        "insert into transparency_installation_key(tag_key) values($1) on conflict do nothing",
+    )
+    .bind(fresh.to_vec())
+    .execute(&mut *db)
+    .await?;
+    let key: Vec<u8> =
+        sqlx::query_scalar("select tag_key from transparency_installation_key where singleton")
+            .fetch_one(&mut *db)
+            .await?;
+    let key = crate::transparency::TagKey::new(
+        key.try_into()
+            .map_err(|_| anyhow::anyhow!("installation tag key"))?,
+    );
+    let rotation: [u8; 32] = crate::transparency::encoding::unhex_array(statement.as_str())?;
+    let leaf = crate::transparency::Leaf::AuthorityRotation {
+        tag: key.rotation_tag(),
+        rotation,
+    };
+    sqlx::query("insert into transparency_outbox(leaf_type,leaf,subject) values('rot',$1,$2)")
+        .bind(leaf.data()?)
+        .bind(statement.as_str())
+        .execute(&mut *db)
+        .await?;
+    Ok(())
 }
 
 /// Record that an epoch's key must not be trusted (default: the active epoch,

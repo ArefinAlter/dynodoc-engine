@@ -28,9 +28,20 @@ impl Registry {
                 .register(strategy)
                 .expect("built-in strategy ids are unique");
         }
-        registry
-            .register(Box::new(super::collections::ElementWise))
-            .expect("built-in strategy ids are unique");
+        let later: [Box<dyn Strategy>; 7] = [
+            Box::new(super::collections::ElementWise),
+            Box::new(super::text::Diff3Grapheme),
+            Box::new(super::marks::MarkSet),
+            Box::new(super::block::SameShape),
+            Box::new(super::sheet::SheetCell),
+            Box::new(super::sheet::SheetShift),
+            Box::new(super::slide::SlideShape),
+        ];
+        for strategy in later {
+            registry
+                .register(strategy)
+                .expect("built-in strategy ids are unique");
+        }
         registry
     }
 
@@ -69,10 +80,16 @@ mod tests {
         assert_eq!(
             ids,
             [
+                "dynodoc.block.same-shape.v1",
                 "dynodoc.collection.element-wise.v1",
                 "dynodoc.default.property.v1",
                 "dynodoc.default.richtext.v1",
                 "dynodoc.default.whole-value.v1",
+                "dynodoc.marks.set.v1",
+                "dynodoc.sheet.cell.v1",
+                "dynodoc.sheet.shift.v1",
+                "dynodoc.slide.shape.v1",
+                "dynodoc.text.diff3-grapheme.v1",
             ]
         );
         assert!(ids
@@ -92,6 +109,6 @@ mod tests {
             registry.register(again),
             Err(Duplicate("dynodoc.collection.element-wise.v1"))
         );
-        assert_eq!(registry.ids().len(), 4);
+        assert_eq!(registry.ids().len(), 10);
     }
 }

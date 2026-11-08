@@ -7,7 +7,6 @@ use engine_shared::{
     richtext::{RichTextEdit, RichTextPatch, TextOp},
     EventPayload,
 };
-use ring::digest::{digest, SHA256};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use similar::{capture_diff_slices, Algorithm, DiffOp, DiffTag};
@@ -48,12 +47,9 @@ pub fn redundant_label(state: &DocumentState, op: &EventPayload) -> bool {
 pub struct PatchError(pub &'static str);
 
 pub fn fingerprint(value: &Value) -> String {
-    let bytes = crate::log::canonical_json(value);
-    digest(&SHA256, &bytes)
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    crate::hashing::hex(&crate::hashing::sha256(&[&crate::hashing::canonical_json(
+        value,
+    )]))
 }
 
 /// The editor owns display semantics. Preserve every JSON property, even marks
@@ -66,7 +62,7 @@ struct Styles {
 impl Styles {
     #[allow(clippy::expect_used, reason = "canonical JSON is valid UTF-8")]
     fn intern(&mut self, value: Value) -> usize {
-        let key = String::from_utf8(crate::log::canonical_json(&value))
+        let key = String::from_utf8(crate::hashing::canonical_json(&value))
             .expect("canonical JSON is valid UTF-8");
         if let Some(i) = self.lookup.get(&key) {
             return *i;

@@ -19,7 +19,7 @@ pub use ids::{
     is_valid_pos_key, DocumentId, EventId, IdentityId, MagicLinkId, NodeId, RefreshTokenId,
     SnapshotId,
 };
-pub use payload::EventPayload;
+pub use payload::{AttributedPart, Attribution, EventPayload, SealedSession};
 pub use rows::{
     Document, DocumentAccess, Event, Identity, MagicLink, Node, RefreshToken, Snapshot,
 };

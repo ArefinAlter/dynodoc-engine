@@ -239,6 +239,7 @@ async fn two_file_release_recovery_after_later_main_and_file_edits(pool: PgPool)
     // Commit 1 on main (contains both files)
     let commit1 = SignedCommit::sign(
         Commit {
+            sealed: None,
             version: 1,
             project,
             parents: Vec::new(),
@@ -262,6 +263,9 @@ async fn two_file_release_recovery_after_later_main_and_file_edits(pool: PgPool)
             authored_at_ms: 100,
             message: "Initial release commit".into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         },
         &key,
@@ -344,6 +348,7 @@ async fn two_file_release_recovery_after_later_main_and_file_edits(pool: PgPool)
 
     let commit2 = SignedCommit::sign(
         Commit {
+            sealed: None,
             version: 1,
             project,
             parents: vec![commit1_addr.clone()],
@@ -367,6 +372,9 @@ async fn two_file_release_recovery_after_later_main_and_file_edits(pool: PgPool)
             authored_at_ms: 200,
             message: "Second commit on main".into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         },
         &key,
@@ -518,6 +526,7 @@ async fn duplicate_and_concurrent_naming_rules(pool: PgPool) {
 
     let commit1 = SignedCommit::sign(
         Commit {
+            sealed: None,
             version: 1,
             project,
             parents: Vec::new(),
@@ -532,6 +541,9 @@ async fn duplicate_and_concurrent_naming_rules(pool: PgPool) {
             authored_at_ms: 100,
             message: "Commit 1".into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         },
         &key,
@@ -617,6 +629,7 @@ async fn duplicate_and_concurrent_naming_rules(pool: PgPool) {
     // Advance main to Commit 2
     let commit2 = SignedCommit::sign(
         Commit {
+            sealed: None,
             version: 1,
             project,
             parents: vec![commit1_addr.clone()],
@@ -631,6 +644,9 @@ async fn duplicate_and_concurrent_naming_rules(pool: PgPool) {
             authored_at_ms: 200,
             message: "Commit 2".into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         },
         &key,
@@ -756,6 +772,7 @@ async fn review_bypass_and_merge_authority_enforced(pool: PgPool) {
 
     let main_commit = SignedCommit::sign(
         Commit {
+            sealed: None,
             version: 1,
             project,
             parents: Vec::new(),
@@ -770,6 +787,9 @@ async fn review_bypass_and_merge_authority_enforced(pool: PgPool) {
             authored_at_ms: 100,
             message: "Main commit".into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         },
         &key,
@@ -808,6 +828,7 @@ async fn review_bypass_and_merge_authority_enforced(pool: PgPool) {
     // Feature commit (not on main)
     let feature_commit = SignedCommit::sign(
         Commit {
+            sealed: None,
             version: 1,
             project,
             parents: vec![main_commit_addr.clone()],
@@ -822,6 +843,9 @@ async fn review_bypass_and_merge_authority_enforced(pool: PgPool) {
             authored_at_ms: 150,
             message: "Unreviewed feature candidate".into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         },
         &key,
@@ -945,6 +969,7 @@ async fn quota_rollback_on_budget_exceeded(pool: PgPool) {
 
     let commit = SignedCommit::sign(
         Commit {
+            sealed: None,
             version: 1,
             project,
             parents: Vec::new(),
@@ -959,6 +984,9 @@ async fn quota_rollback_on_budget_exceeded(pool: PgPool) {
             authored_at_ms: 100,
             message: "Commit".into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         },
         &key,

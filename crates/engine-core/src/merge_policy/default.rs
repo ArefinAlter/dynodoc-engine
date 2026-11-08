@@ -199,6 +199,9 @@ mod tests {
             aspect: None,
             family: Family::Document,
             params: &params,
+            roles: None,
+            rank: &[],
+            marks: None,
         };
         strategy
             .resolve(

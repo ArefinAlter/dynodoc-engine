@@ -423,6 +423,9 @@ struct GrantRequest {
     /// `content:submit` (which imply neither each other nor the read scope, but need it: a
     /// preview shows the text it changes). The two sets never mix.
     scopes: Vec<String>,
+    /// The grant lapses after this many days (1 to 366), so an unattended credential such as a
+    /// service account's does not hold access for ever. No expiry when absent.
+    expires_in_days: Option<i64>,
 }
 
 #[utoipa::path(operation_id="device_grant_set", put, path="/devices/{key_id}/projects/{project_id}", tag="devices", params(("key_id"=Uuid,Path,description="Own device key"),("project_id"=Uuid,Path,description="Project the account is a member of")), request_body=GrantRequest, security(("paseto"=[])), responses((status=200, description="The key's active grant for this project (idempotent); changed is false when the scopes were already these", body=Value),(status=400, description="Empty or unknown scopes, a scope that does not match the key's class, or content:propose or content:submit without content:read"),(status=401, description="Account sign-in required; a device token is refused"),(status=403, description="Not a current member of the project"),(status=404, description="No such own key"),(status=409, description="Key revoked or 50 active grants reached")))]
@@ -439,6 +442,12 @@ async fn set_grant(
     let scopes = normalize_scopes(&input.scopes).map_err(|_| {
         bad("Choose one or more of project:read, history:read, history:write, history:review, or content:read, content:propose and content:submit for an agent key")
     })?;
+    if input
+        .expires_in_days
+        .is_some_and(|days| !(1..=366).contains(&days))
+    {
+        return Err(bad("expires_in_days is 1 to 366"));
+    }
     let _permit = state.workloads.enter(auth.identity_id, None)?;
     let mut tx = state.pool.begin().await?;
     account_lock(&mut tx, &auth).await?;
@@ -465,7 +474,7 @@ async fn set_grant(
     let active: Option<(Uuid, Vec<String>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as("select id,scopes,created_at from device_key_project_grant where key_id=$1 and project_id=$2 and revoked_at is null for update")
         .bind(key).bind(project).fetch_optional(&mut *tx).await?;
     if let Some((_, current, created_at)) = &active {
-        if current == &scopes {
+        if current == &scopes && input.expires_in_days.is_none() {
             tx.commit().await?;
             return Ok(Json(
                 json!({"key_id":key,"project_id":project,"scopes":scopes,"created_at":created_at,"changed":false}),
@@ -490,8 +499,8 @@ async fn set_grant(
             .execute(&mut *tx)
             .await?;
     }
-    let created_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("insert into device_key_project_grant(key_id,project_id,scopes,created_at,created_by) values($1,$2,$3,clock_timestamp(),$4) returning created_at")
-        .bind(key).bind(project).bind(&scopes).bind(auth.identity_id).fetch_one(&mut *tx).await?;
+    let created_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("insert into device_key_project_grant(key_id,project_id,scopes,created_at,created_by,expires_at) values($1,$2,$3,clock_timestamp(),$4,clock_timestamp()+make_interval(days=>$5::int)) returning created_at")
+        .bind(key).bind(project).bind(&scopes).bind(auth.identity_id).bind(input.expires_in_days.map(|d| d as i32)).fetch_one(&mut *tx).await?;
     // The first write grant for a product makes the agent identity its proposals are
     // recorded under. The account row lock held since `account_lock` keeps two grants from
     // making two.

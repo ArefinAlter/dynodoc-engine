@@ -206,18 +206,45 @@ impl World {
 
     /// A world with no agent policy: the default, in which agents are disabled.
     pub async fn bare(pool: PgPool, gateway: bool) -> Self {
+        Self::build(pool, gateway, None, None).await
+    }
+
+    /// As [`World::bare`], with the server's receipt signing key installed (seed `signer`).
+    pub async fn with_signer(pool: PgPool, gateway: bool, signer: Option<u8>) -> Self {
+        Self::build(pool, gateway, signer, None).await
+    }
+
+    /// [`World::bare`] with the web tier's service key configured (internal routes).
+    pub async fn bare_with(pool: PgPool, gateway: bool, service_key: Option<String>) -> Self {
+        Self::build(pool, gateway, None, service_key).await
+    }
+
+    async fn build(
+        pool: PgPool,
+        gateway: bool,
+        signer: Option<u8>,
+        service_key: Option<String>,
+    ) -> Self {
         let runtime = crate::common::RuntimeDatabase::new(pool).await;
         let mut state = AppState::new(
             runtime.pool.clone(),
             AuthConfig {
                 paseto_key: KEY,
-                service_key: None,
+                service_key,
                 token_ttl_seconds: 3600,
                 public_base_url: "http://test.local".into(),
             },
         );
         state.admin_emails = "admin@example.test".into();
         state.agent_gateway = gateway;
+        if let Some(seed) = signer {
+            let key = Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap();
+            let public = hex::encode(key.public_key().as_ref());
+            engine_core::repository::server_authority::install(&runtime.owner, &public)
+                .await
+                .unwrap();
+            state.ref_signer = Some(std::sync::Arc::new(key));
+        }
         let cache = state.agent_cache.clone();
         let app = app(state);
         let (owner, owner_login) = person(&runtime.pool, "owner@example.test").await;

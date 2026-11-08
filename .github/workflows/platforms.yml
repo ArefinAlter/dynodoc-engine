@@ -247,7 +247,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     # Tier 2 (decision 016): the aarch64 leg may not block the workflow.
     continue-on-error: ${{ matrix.tier2 }}
-    timeout-minutes: 90
+    # The aarch64 leg runs PostgreSQL under x64 emulation; the suite from application 4f0e7a3
+    # needs about two and a half hours there.
+    timeout-minutes: 180
     defaults:
       run:
         shell: bash

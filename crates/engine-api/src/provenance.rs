@@ -28,6 +28,7 @@ pub fn router() -> Router<AppState> {
                 .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route("/documents/{id}/provenance/bundles/{bundle}", get(bundle))
+        .route("/documents/{id}/nodes/{node}/history", get(node_history))
         .route("/documents/{id}/connectors", get(grants).post(grant))
         .route("/documents/{id}/connectors/{grant}/revoke", post(revoke))
         .route("/connector/connection", get(connection))
@@ -40,6 +41,7 @@ pub fn router() -> Router<AppState> {
             post(connector_push).layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route("/connector/documents/{id}/changes", get(connector_changes))
+        .route("/connector/documents/{id}/events", get(connector_events))
         .route(
             "/connector/documents/{id}/media",
             post(connector_media_put)
@@ -120,6 +122,19 @@ pub(crate) async fn anchor(db: &mut PgConnection, id: Uuid, seq: i64) -> Result<
         .await?
         .ok_or_else(|| bad("The starting revision does not exist"))
 }
+/// Checkpoints and changes name the storage mode; in ledger mode they also carry the
+/// revision's manifest root, so the pane can prove its copy matches (decision 025, 5.6).
+fn with_manifest(
+    mut body: Value,
+    storage: crate::ledger::Storage,
+    state: &engine_core::materializer::DocumentState,
+) -> Value {
+    body["storage"] = storage.json();
+    if storage.ledger {
+        body["manifest_root"] = json!(crate::ledger::root(&crate::ledger::entries(state)));
+    }
+    body
+}
 // JSON object keys are sorted by serde_json's default map representation. Persist
 // the typed request: input whitespace/key order cannot cause duplicate proposals.
 pub(crate) async fn prepare(
@@ -180,7 +195,7 @@ pub(crate) async fn record(
         .bind(id).bind(input.bundle.bundle_id).bind(draft).bind(actor).bind(json!(input)).bind(digest).bind(receipt).execute(&mut **tx).await?;
     Ok(())
 }
-async fn propose(
+pub(crate) async fn propose(
     state: AppState,
     id: Uuid,
     auth: AuthContext,
@@ -246,11 +261,14 @@ async fn read_checkpoint(
     }
     let hash = anchor(&mut tx, id, seq).await?;
     let state = reviews::state_through(&mut tx, id, seq).await?;
+    let storage = crate::ledger::storage(&mut tx, id).await?;
     let proposals: Vec<Value> = sqlx::query_scalar("select jsonb_build_object('id',d.id,'status',case when d.merged_at is not null then 'merged' when d.review_outcome is not null then d.review_outcome when d.submitted_at is null then 'draft' else 'open' end) from workspace_draft d where d.document_id=$1 and d.created_by=$2 and d.source->>'kind'='provenance' order by d.created_at desc limit 100")
         .bind(id).bind(actor).fetch_all(&mut *tx).await?;
-    Ok(Json(
+    Ok(Json(with_manifest(
         json!({"format":"dynodoc.checkpoint","version":1,"document_id":id,"title":title,"kind":kind,"through_seq":seq,"chain_hash":hash,"state":state,"proposals":proposals}),
-    ))
+        storage,
+        &state,
+    )))
 }
 #[utoipa::path(get,path="/documents/{id}/provenance",params(("id"=Uuid,Path),("through_seq"=Option<i64>,Query,description="Historical canonical revision; omitted means current head")),security(("paseto"=[])),responses((status=200,description="Consistent full checkpoint with stable block IDs",body=Value),(status=400,description="Revision outside history")))]
 async fn checkpoint(
@@ -448,11 +466,12 @@ pub(crate) async fn check_grant(
     valid.ok_or(ApiError::Unauthorized)?;
     Ok(())
 }
-struct Connector {
-    auth: AuthContext,
-    document: Uuid,
-    grant: Uuid,
-    host: String,
+/// A request authenticated by a file-scoped connector key.
+pub(crate) struct Connector {
+    pub(crate) auth: AuthContext,
+    pub(crate) document: Uuid,
+    pub(crate) grant: Uuid,
+    pub(crate) host: String,
 }
 impl FromRequestParts<AppState> for Connector {
     type Rejection = ApiError;
@@ -498,18 +517,27 @@ async fn connector_push(
     c: Connector,
     Json(p): Json<Push>,
 ) -> Result<Json<Value>, ApiError> {
+    connector_propose(&s, id, c, p).await
+}
+/// A connector commit, from one request or a completed resumable upload.
+pub(crate) async fn connector_propose(
+    s: &AppState,
+    id: Uuid,
+    c: Connector,
+    p: Push,
+) -> Result<Json<Value>, ApiError> {
     if c.document != id || p.bundle.capture.host != c.host {
         return Err(ApiError::Forbidden);
     }
-    propose(s, id, c.auth, p, Some(c.grant)).await
+    propose(s.clone(), id, c.auth, p, Some(c.grant)).await
 }
 /// Largest single image a block may reference (decision 024). Below the 16 MiB request
 /// limit of the API and of the web tier (BODY_SIZE_LIMIT), so the limit users see is this one.
-const MEDIA_MAX_BYTES: usize = 15 * 1024 * 1024;
+pub(crate) const MEDIA_MAX_BYTES: usize = 15 * 1024 * 1024;
 /// Images stored for one document across all its blocks.
-const MEDIA_QUOTA_BYTES: i64 = 512 * 1024 * 1024;
+pub(crate) const MEDIA_QUOTA_BYTES: i64 = 512 * 1024 * 1024;
 /// The type is accepted only when the bytes start the way that format starts.
-fn media_matches(content_type: &str, b: &[u8]) -> bool {
+pub(crate) fn media_matches(content_type: &str, b: &[u8]) -> bool {
     match content_type {
         "image/png" => b.starts_with(b"\x89PNG\r\n\x1a\n"),
         "image/jpeg" => b.starts_with(&[0xFF, 0xD8, 0xFF]),
@@ -534,7 +562,7 @@ fn media_matches(content_type: &str, b: &[u8]) -> bool {
         _ => false,
     }
 }
-fn sha_hex(v: &str) -> Result<Vec<u8>, ApiError> {
+pub(crate) fn sha_hex(v: &str) -> Result<Vec<u8>, ApiError> {
     if v.len() != 64
         || !v
             .bytes()
@@ -546,7 +574,7 @@ fn sha_hex(v: &str) -> Result<Vec<u8>, ApiError> {
 }
 /// Opens a scoped connector transaction: the credential's document, membership and
 /// live grant, checked as the checkpoint read checks them.
-async fn connector_tx(
+pub(crate) async fn connector_tx(
     s: &AppState,
     c: &Connector,
     id: Uuid,
@@ -564,6 +592,50 @@ async fn connector_tx(
     access::require_member(&mut tx, id, c.auth.identity_id).await?;
     check_grant(&mut tx, c.grant, id, c.auth.identity_id).await?;
     Ok(tx)
+}
+/// Most event rows one events call returns.
+const EVENTS_PAGE: i64 = 1000;
+#[derive(Deserialize)]
+struct EventsQuery {
+    after_seq: i64,
+    through_seq: i64,
+}
+#[utoipa::path(get,path="/connector/documents/{id}/events",params(("id"=Uuid,Path),("after_seq"=i64,Query,description="Revision the client already trusts"),("through_seq"=i64,Query,description="Last revision to return, at most 1,000 after after_seq")),security(("connector_key"=[])),responses((status=200,description="Event rows after_seq < seq <= through_seq in order, as the documents events route returns them, so the client verifies the hash chain and the fold itself (decision 036)",body=Value),(status=400,description="Range outside history or too long")))]
+async fn connector_events(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    c: Connector,
+    Query(q): Query<EventsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let mut tx = connector_tx(&s, &c, id).await?;
+    let _budget = s
+        .workloads
+        .document(&mut tx, c.auth.identity_id, id)
+        .await?;
+    let head: i64 =
+        sqlx::query_scalar("select coalesce(max(seq),0) from event where document_id=$1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if q.after_seq < 0 || q.after_seq > q.through_seq || q.through_seq > head {
+        return Err(bad(
+            "The requested events are outside this document's history",
+        ));
+    }
+    if q.through_seq - q.after_seq > EVENTS_PAGE {
+        return Err(bad("Ask for at most 1,000 events at a time"));
+    }
+    let events: Vec<engine_shared::Event> = sqlx::query_as(
+        "select * from event where document_id=$1 and seq>$2 and seq<=$3 order by seq",
+    )
+    .bind(id)
+    .bind(q.after_seq)
+    .bind(q.through_seq)
+    .fetch_all(&mut *tx)
+    .await?;
+    Ok(Json(
+        json!({"format":"dynodoc.events","version":1,"document_id":id,"events":events}),
+    ))
 }
 #[derive(Deserialize)]
 struct ChangesQuery {
@@ -604,8 +676,9 @@ async fn connector_changes(
         .bind(q.since_seq)
         .fetch_all(&mut *tx)
         .await?;
-    let state = serde_json::to_value(reviews::state_through(&mut tx, id, head).await?)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let head_state = reviews::state_through(&mut tx, id, head).await?;
+    let storage = crate::ledger::storage(&mut tx, id).await?;
+    let state = serde_json::to_value(&head_state).map_err(|e| ApiError::Internal(e.to_string()))?;
     let all = state
         .get("nodes")
         .and_then(Value::as_object)
@@ -618,9 +691,37 @@ async fn connector_changes(
     let hash = anchor(&mut tx, id, head).await?;
     let proposals: Vec<Value> = sqlx::query_scalar("select jsonb_build_object('id',d.id,'status',case when d.merged_at is not null then 'merged' when d.review_outcome is not null then d.review_outcome when d.submitted_at is null then 'draft' else 'open' end) from workspace_draft d where d.document_id=$1 and d.created_by=$2 and d.source->>'kind'='provenance' order by d.created_at desc limit 100")
         .bind(id).bind(c.auth.identity_id).fetch_all(&mut *tx).await?;
-    Ok(Json(
-        json!({"format":"dynodoc.changes","version":1,"document_id":id,"since_seq":q.since_seq,"through_seq":head,"chain_hash":hash,"nodes":nodes,"proposals":proposals}),
-    ))
+    // What is waiting, for the pane's shared view: the merged requests since the base. And
+    // the panes' Team activity: the latest merged requests, pulled or not.
+    let commits = merged_commits(&mut tx, id, Some(q.since_seq), 100).await?;
+    let activity = merged_commits(&mut tx, id, None, 20).await?;
+    Ok(Json(with_manifest(
+        json!({"format":"dynodoc.changes","version":1,"document_id":id,"since_seq":q.since_seq,"through_seq":head,"chain_hash":hash,"nodes":nodes,"proposals":proposals,"commits":commits,"activity":activity}),
+        storage,
+        &head_state,
+    )))
+}
+
+/// Merged change requests of a document with their message, author (the current display name,
+/// empty when there is none, null once the account is erased; never an address), agent flag
+/// with the agent's product and the person it acted for (null when unknown or erased), and the
+/// blocks each changed (count, and up to 200 ids for blame).
+/// With `since`, those ending after that revision, oldest first; otherwise the latest, newest
+/// first.
+async fn merged_commits(
+    db: &mut PgConnection,
+    id: Uuid,
+    since: Option<i64>,
+    limit: i64,
+) -> Result<Vec<Value>, ApiError> {
+    let order = if since.is_some() { "asc" } else { "desc" };
+    let sql = format!("select jsonb_build_object('id',d.id,'name',d.name,'at',a.created_at,'author',case when au.erased_at is null then coalesce(au.display_name,'') end,'agent',ai.identity_id is not null,'agent_product',coalesce((select s.product from agent_proposal_receipt r join agent_session s on s.id=r.session_id where r.draft_id=d.id order by r.at desc limit 1),case ai.client_kind when 'claude' then 'Claude' when 'chatgpt' then 'ChatGPT' when 'gemini' then 'Gemini' when 'copilot' then 'Copilot' when 'cursor' then 'Cursor' when 'codex' then 'Codex' end),'agent_for',case when pr.erased_at is null then nullif(pr.display_name,'') end,'blocks',(select count(distinct e.target_node_id) from event e where e.document_id=$1 and e.seq between (a.detail->>'from_seq')::bigint and (a.detail->>'through_seq')::bigint),'nodes',(select coalesce(jsonb_agg(x.n order by x.n),'[]'::jsonb) from (select distinct e.target_node_id n from event e where e.document_id=$1 and e.seq between (a.detail->>'from_seq')::bigint and (a.detail->>'through_seq')::bigint and e.target_node_id is not null order by 1 limit 200) x)) from operation_audit a join workspace_draft d on d.id::text=a.detail->>'draft_id' and d.document_id=$1 join identity au on au.id=d.created_by left join agent_identity ai on ai.identity_id=au.id left join identity pr on pr.id=ai.principal_id where a.resource_id=$1 and a.action='document.change_request_merged' and a.detail->>'from_seq' ~ '^[0-9]{{1,18}}$' and a.detail->>'through_seq' ~ '^[0-9]{{1,18}}$' and (a.detail->>'through_seq')::bigint>$2 order by a.created_at {order},a.id {order} limit $3");
+    Ok(sqlx::query_scalar(&sql)
+        .bind(id)
+        .bind(since.unwrap_or(-1))
+        .bind(limit)
+        .fetch_all(db)
+        .await?)
 }
 #[utoipa::path(post,path="/connector/documents/{id}/media",params(("id"=Uuid,Path)),request_body(content=Vec<u8>,content_type="application/octet-stream"),security(("connector_key"=[])),responses((status=200,description="Stored once per document by SHA-256",body=Value),(status=400,description="Unsupported type, mismatched bytes, too large, or the document's image quota is used up")))]
 async fn connector_media_put(
@@ -642,39 +743,96 @@ async fn connector_media_put(
     if access::require_member(&mut tx, id, c.auth.identity_id).await? < MemberRole::Contributor {
         return Err(ApiError::Forbidden);
     }
-    let digest = sha256(&body);
+    let stored = store_media(
+        &mut tx,
+        &s.objects,
+        id,
+        c.auth.identity_id,
+        &content_type,
+        &body,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(stored))
+}
+/// Store one image once per document under the per-document quota. Open resumable
+/// media uploads hold a reservation against the same quota (decision 034); `completing`
+/// names the upload whose own reservation this call consumes.
+pub(crate) async fn store_media(
+    tx: &mut Transaction<'_, Postgres>,
+    objects: &crate::object_store::ObjectStore,
+    id: Uuid,
+    actor: Uuid,
+    content_type: &str,
+    body: &[u8],
+    completing: Option<Uuid>,
+) -> Result<Value, ApiError> {
+    if crate::ledger::storage(tx, id).await?.hash_only_media {
+        return Err(bad("This document keeps images by hash only: teammates' editors pass them on, the server does not store them"));
+    }
+    let digest = sha256(body);
     // One upload at a time per document, so concurrent uploads cannot both pass the quota.
     sqlx::query(
         "select pg_advisory_xact_lock(hashtextextended('connector_media:' || $1::text, 0))",
     )
     .bind(id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     let exists: bool = sqlx::query_scalar(
         "select exists(select 1 from connector_media where document_id=$1 and sha256=$2)",
     )
     .bind(id)
     .bind(&digest)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     if !exists {
-        let used: i64 = sqlx::query_scalar(
-            "select coalesce(sum(size),0)::bigint from connector_media where document_id=$1",
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
+        let used = media_used(tx, id, completing).await?;
         if used + body.len() as i64 > MEDIA_QUOTA_BYTES {
             return Err(bad("This document's images already use the 512 MB limit"));
         }
-        sqlx::query("insert into connector_media(document_id,sha256,content_type,bytes,size,created_by) values($1,$2,$3,$4,$5,$6) on conflict do nothing")
-            .bind(id).bind(&digest).bind(&content_type).bind(body.as_ref()).bind(body.len() as i32).bind(c.auth.identity_id)
-            .execute(&mut *tx).await?;
+        if objects.in_database() {
+            sqlx::query("insert into connector_media(document_id,sha256,content_type,bytes,size,created_by) values($1,$2,$3,$4,$5,$6) on conflict do nothing")
+                .bind(id).bind(&digest).bind(content_type).bind(body).bind(body.len() as i32).bind(actor)
+                .execute(&mut **tx).await?;
+        } else {
+            // Content-addressed: writing the same image again writes the same bytes, so an
+            // object left by a transaction that then failed is harmless.
+            let key = crate::object_store::media_key(id, &digest);
+            objects
+                .put(&key, body)
+                .await
+                .map_err(crate::workspace::object_error)?;
+            let inserted = sqlx::query("insert into connector_media(document_id,sha256,content_type,storage_key,size,created_by) values($1,$2,$3,$4,$5,$6) on conflict do nothing")
+                .bind(id).bind(&digest).bind(content_type).bind(&key).bind(body.len() as i32).bind(actor)
+                .execute(&mut **tx).await;
+            // No other row names this key (checked under the lock), so it can go with the row.
+            // shortcut: a failed commit after this point leaves the object behind; an orphan sweep
+            // over the store is later work.
+            if let Err(error) = inserted {
+                let _ = objects.delete(&key).await;
+                return Err(error.into());
+            }
+        }
     }
-    tx.commit().await?;
-    Ok(Json(
-        json!({"sha256":hex::encode(&digest),"size":body.len(),"stored":!exists}),
-    ))
+    Ok(json!({"sha256":hex::encode(&digest),"size":body.len(),"stored":!exists}))
+}
+/// Stored image bytes plus the reservations of open media uploads (other than
+/// `except`). Call under the document's media lock.
+pub(crate) async fn media_used(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    except: Option<Uuid>,
+) -> Result<i64, ApiError> {
+    Ok(sqlx::query_scalar(
+        "select ((select coalesce(sum(size),0) from connector_media where document_id=$1)
+              + (select coalesce(sum(size),0) from upload_session where document_id=$1 and kind='media'
+                 and state='open' and expires_at>now() and id is distinct from $2))::bigint",
+    )
+    .bind(id)
+    .bind(except)
+    .fetch_one(&mut **tx)
+    .await?)
 }
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -697,6 +855,10 @@ async fn connector_media_missing(
         .map(|h| sha_hex(h))
         .collect::<Result<Vec<_>, _>>()?;
     let mut tx = connector_tx(&s, &c, id).await?;
+    // Images by hash only: nothing is uploaded, so nothing is missing.
+    if crate::ledger::storage(&mut tx, id).await?.hash_only_media {
+        return Ok(Json(json!({"missing":[],"media":"hash_only"})));
+    }
     let have: Vec<Vec<u8>> = sqlx::query_scalar(
         "select sha256 from connector_media where document_id=$1 and sha256=any($2)",
     )
@@ -722,14 +884,25 @@ async fn connector_media_get(
     use axum::response::IntoResponse;
     let digest = sha_hex(&sha)?;
     let mut tx = connector_tx(&s, &c, id).await?;
-    let (content_type, bytes): (String, Vec<u8>) = sqlx::query_as(
-        "select content_type,bytes from connector_media where document_id=$1 and sha256=$2",
+    let (content_type, stored, key): (String, Option<Vec<u8>>, Option<String>) = sqlx::query_as(
+        "select content_type,bytes,storage_key from connector_media where document_id=$1 and sha256=$2",
     )
     .bind(id)
     .bind(&digest)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::NotFound)?;
+    // The access check is done; no transaction stays open while the store answers.
+    drop(tx);
+    let bytes = match (stored, key) {
+        (Some(bytes), _) => bytes,
+        (None, Some(key)) => s
+            .objects
+            .get(&key, &digest)
+            .await
+            .map_err(crate::workspace::object_error)?,
+        _ => return Err(ApiError::Internal("image row without bytes".into())),
+    };
     // Never rendered by the browser: SVG and other images stay inert on this origin.
     Ok((
         [
@@ -763,12 +936,49 @@ async fn connector_node_history(
         return Err(bad("Use a block identifier"));
     }
     let mut tx = connector_tx(&s, &c, id).await?;
-    let items: Vec<Value> = sqlx::query_scalar("select jsonb_build_object('seq',e.seq,'type',e.type,'at',e.created_at,'field',e.payload->>'field','actor',jsonb_build_object('id',i.id,'name',case when i.erased_at is null then i.display_name end),'request',(select jsonb_build_object('id',d.id,'name',d.name,'note',d.submission_note,'host',d.source->>'host','author',jsonb_build_object('id',au.id,'name',case when au.erased_at is null then au.display_name end),'agent',exists(select 1 from agent_identity ai where ai.identity_id=au.id)) from operation_audit a join workspace_draft d on d.id::text=a.detail->>'draft_id' and d.document_id=e.document_id join identity au on au.id=d.created_by where a.resource_id=e.document_id and a.action='document.change_request_merged' and a.detail->>'from_seq' ~ '^[0-9]{1,18}$' and a.detail->>'through_seq' ~ '^[0-9]{1,18}$' and (a.detail->>'from_seq')::bigint<=e.seq and (a.detail->>'through_seq')::bigint>=e.seq order by a.created_at limit 1)) from event e join identity i on i.id=e.actor_id where e.document_id=$1 and e.target_node_id=$2 order by e.seq desc limit 200")
+    Ok(Json(
+        history_of(&mut tx, id, &node, c.auth.identity_id).await?,
+    ))
+}
+/// The same block history for a signed-in member (the desktop revision viewer, decision 030).
+#[utoipa::path(get,path="/documents/{id}/nodes/{node}/history",params(("id"=Uuid,Path),("node"=String,Path)),security(("paseto"=[])),responses((status=200,description="Newest first: each event of the block with who appended it and, for merged change requests, the contributor, message and agent session as the capture policy lets this reader see it",body=Value),(status=403,description="Document membership required")))]
+async fn node_history(
+    State(s): State<AppState>,
+    Path((id, node)): Path<(Uuid, String)>,
+    a: AuthContext,
+) -> Result<Json<Value>, ApiError> {
+    if node.len() != 26 || !node.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(bad("Use a block identifier"));
+    }
+    let mut db = s.pool.acquire().await?;
+    access::require_member(&mut db, id, a.identity_id).await?;
+    Ok(Json(history_of(&mut db, id, &node, a.identity_id).await?))
+}
+/// Events of one block, newest first, with contributor attribution and agent blame.
+async fn history_of(
+    db: &mut PgConnection,
+    id: Uuid,
+    node: &str,
+    viewer: Uuid,
+) -> Result<Value, ApiError> {
+    // Agent blame (decision 026): for a block changed by a merged agent request, the
+    // session and turn of the proposal call that touched it. The prompt is shown only to
+    // whom the project's capture policy allows (default: the person the agent acted for).
+    let visible = "($3=s.principal_id or coalesce(pc.prompt_visibility,'author')='members' or (coalesce(pc.prompt_visibility,'author')='reviewers' and document_member_role(e.document_id,$3) in ('reviewer','editor','manager','owner')))";
+    let session = format!("(select jsonb_build_object('id',s.id,'source',s.source,'product',s.product,'model',s.model,'started_at',s.started_at,'turn',r.turn,'turn_at',t.at,'prompt',case when {visible} then t.prompt end,'prompt_source',t.prompt_source,'prompt_hidden',(t.prompt is not null and not {visible}),'redactions',t.redactions,'erased',coalesce(t.erased,false)) from agent_proposal_receipt r join agent_session s on s.id=r.session_id left join agent_turn t on t.session_id=r.session_id and t.seq=r.turn left join project_agent_capture pc on pc.project_id=s.project_id where r.draft_id=d.id and r.session_id is not null and e.target_node_id=any(r.nodes) order by r.at desc limit 1)");
+    // The containment rule (decision 026 section 2, reviews::person_edits): a block a person
+    // rewrote in the agent's draft before the merge is the person's; one they edited lightly
+    // stays the agent's and says it was edited from an agent draft.
+    let person = "jsonb_build_object('id',pi.id,'name',case when pi.erased_at is null then pi.display_name end)";
+    let kept = crate::reviews::AGENT_DRAFT_KEPT;
+    let sql = format!("select jsonb_build_object('seq',e.seq,'type',e.type,'at',e.created_at,'field',e.payload->>'field','sealed_seq',(select s.seq from event s where s.document_id=e.document_id and s.type='ChangeAttributed' and s.seq>e.seq and (s.payload->>'first_seq')::bigint<=e.seq order by s.seq limit 1),'actor',jsonb_build_object('id',i.id,'name',case when i.erased_at is null then i.display_name end),'request',(select jsonb_build_object('id',d.id,'name',d.name,'note',d.submission_note,'host',d.source->>'host','author',case when pe.took then {person} else jsonb_build_object('id',au.id,'name',case when au.erased_at is null then au.display_name end) end,'agent',exists(select 1 from agent_identity ai where ai.identity_id=au.id) and not coalesce(pe.took,false),'edited_from_agent_draft',pe.took is false,'edited_by',case when pe.who is not null then {person} end,'session',case when coalesce(pe.took,false) then null else {session} end) from operation_audit a join workspace_draft d on d.id::text=a.detail->>'draft_id' and d.document_id=e.document_id join identity au on au.id=d.created_by left join lateral (select (x->>'retained')::int<{kept} as took,(x->>'by')::uuid as who from jsonb_array_elements(case when jsonb_typeof(a.detail->'person_edits')='array' then a.detail->'person_edits' else '[]'::jsonb end) x where x->>'node'=e.target_node_id limit 1) pe on true left join identity pi on pi.id=pe.who where a.resource_id=e.document_id and a.action='document.change_request_merged' and a.detail->>'from_seq' ~ '^[0-9]{{1,18}}$' and a.detail->>'through_seq' ~ '^[0-9]{{1,18}}$' and (a.detail->>'from_seq')::bigint<=e.seq and (a.detail->>'through_seq')::bigint>=e.seq order by a.created_at limit 1)) from event e join identity i on i.id=e.actor_id where e.document_id=$1 and e.target_node_id=$2 order by e.seq desc limit 200");
+    let items: Vec<Value> = sqlx::query_scalar(&sql)
         .bind(id)
-        .bind(&node)
-        .fetch_all(&mut *tx)
+        .bind(node)
+        .bind(viewer)
+        .fetch_all(db)
         .await?;
-    Ok(Json(json!({"node_id":node,"events":items})))
+    Ok(json!({"node_id":node,"events":items}))
 }
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -842,10 +1052,12 @@ async fn connector_withdraw(
         connector_checkpoint,
         connector_push,
         connector_changes,
+        connector_events,
         connector_media_put,
         connector_media_missing,
         connector_media_get,
         connector_node_history,
+        node_history,
         connector_merge,
         connector_withdraw
     ),

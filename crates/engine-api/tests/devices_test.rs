@@ -190,6 +190,7 @@ async fn proof(app: &Router, token: &str, seed: u8) -> (Proof, Ed25519KeyPair) {
 fn commit(key: &Ed25519KeyPair) -> Value {
     json!(SignedCommit::sign(
         Commit {
+            sealed: None,
             version: 1,
             project: Uuid::new_v4(),
             parents: vec![],
@@ -198,6 +199,9 @@ fn commit(key: &Ed25519KeyPair) -> Value {
             authored_at_ms: 1,
             message: "Local history".into(),
             recovery: None,
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
             same_file_resolutions: Vec::new(),
         },
         key

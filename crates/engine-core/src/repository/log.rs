@@ -236,6 +236,7 @@ mod tests {
         let version = if recovery.is_some() { 2 } else { 1 };
         let signed = SignedCommit::sign(
             Commit {
+                sealed: None,
                 version,
                 project,
                 parents,
@@ -244,6 +245,9 @@ mod tests {
                 authored_at_ms: 1_700_000_000_000,
                 message: message.into(),
                 recovery,
+                project_resolutions: Vec::new(),
+                relocations: Vec::new(),
+                merge_policy: None,
                 same_file_resolutions: Vec::new(),
             },
             &key(),

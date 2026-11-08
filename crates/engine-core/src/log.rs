@@ -39,15 +39,14 @@
 
 use engine_shared::{DocumentId, Event, EventPayload, IdentityId};
 use futures::TryStreamExt;
-use ring::digest::{Context, SHA256};
-use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::snapshot::{self, SnapshotEngine, SnapshotReason, DEFAULT_MAX_EVENTS_IN_TAIL};
 
-/// The genesis `prev_chain_hash`: 32 zero bytes, so the column stays NOT NULL.
-pub const ZERO_HASH: [u8; 32] = [0u8; 32];
+pub(crate) use crate::hashing::canonical_json;
+pub use crate::hashing::ZERO_HASH;
+use crate::hashing::{self, chain_hash, content_hash};
 
 /// Errors from event-log operations.
 #[derive(Debug, thiserror::Error)]
@@ -254,6 +253,7 @@ pub async fn verify_from(
 
     let mut prev_chain_hash = trusted_chain_hash.to_vec();
     let mut expected_seq = trusted_seq;
+    let mut seals = Seals::default();
     while let Some(ev) = events.try_next().await? {
         expected_seq = expected_seq
             .checked_add(1)
@@ -262,6 +262,7 @@ pub async fn verify_from(
                 detail: "event sequence exceeds the supported range".into(),
             })?;
         verify_event(&ev, document_id, expected_seq, &prev_chain_hash)?;
+        seals.observe(&ev)?;
 
         prev_chain_hash = ev.chain_hash.clone();
     }
@@ -291,37 +292,44 @@ pub(crate) fn verify_event(
             ),
         });
     }
+    hashing::verify_event(event, expected_seq, previous)
+        .map(|_| ())
+        .map_err(|broken| EventError::ChainBroken {
+            seq: broken.seq,
+            detail: broken.detail.into(),
+        })
+}
 
-    let canonical = canonical_json(&event.payload);
-    let recomputed_content = content_hash(
-        &event.event_type,
-        event.target_node_id.as_ref().map(|n| n.0.as_str()),
-        &canonical,
-        &event.actor_id.0,
-    );
-    if recomputed_content[..] != event.content_hash[..] {
-        return Err(EventError::ChainBroken {
+/// The sealed-authorship rules (decision 038) over one ordered pass of a chain: each
+/// `ChangeAttributed` parses, names exactly the events between the previous seal and itself,
+/// and its own bytes are already covered by [`verify_event`]. A pass that starts at a trusted
+/// position does not know earlier seals, so it checks only that a range starts after seq 0.
+#[derive(Debug, Default)]
+pub(crate) struct Seals {
+    last: i64,
+    /// Seals seen in this pass.
+    pub(crate) count: usize,
+}
+
+impl Seals {
+    pub(crate) fn observe(&mut self, event: &Event) -> Result<(), EventError> {
+        if event.event_type != engine_shared::EventType::ChangeAttributed.as_str() {
+            return Ok(());
+        }
+        let broken = |detail: String| EventError::ChainBroken {
             seq: event.seq,
-            detail: "content_hash mismatch (type, target, payload, or actor altered)".into(),
-        });
+            detail: format!("sealed authorship: {detail}"),
+        };
+        let Ok(EventPayload::ChangeAttributed(seal)) =
+            serde_json::from_value::<EventPayload>(event.payload.clone())
+        else {
+            return Err(broken("the payload is malformed".into()));
+        };
+        seal.check(event.seq, self.last).map_err(broken)?;
+        self.last = event.seq;
+        self.count += 1;
+        Ok(())
     }
-
-    if event.prev_chain_hash[..] != previous[..] {
-        return Err(EventError::ChainBroken {
-            seq: event.seq,
-            detail: "prev_chain_hash does not match the prior event's chain_hash".into(),
-        });
-    }
-
-    let recomputed_chain = chain_hash(&recomputed_content, previous);
-    if recomputed_chain[..] != event.chain_hash[..] {
-        return Err(EventError::ChainBroken {
-            seq: event.seq,
-            detail: "chain_hash mismatch".into(),
-        });
-    }
-
-    Ok(())
 }
 
 /// Read events with `from_seq <= seq <= to_seq`, in `seq` order.
@@ -374,96 +382,6 @@ pub async fn read_since_snapshot(
     Ok(events)
 }
 
-// --- hashing -------------------------------------------------------------------
-
-/// SHA-256 over the event's semantic content, length-framed (see module docs).
-fn content_hash(
-    event_type: &str,
-    target_node_id: Option<&str>,
-    canonical_payload: &[u8],
-    actor_id: &Uuid,
-) -> [u8; 32] {
-    let mut ctx = Context::new(&SHA256);
-    feed(&mut ctx, event_type.as_bytes());
-    feed(&mut ctx, target_node_id.unwrap_or("").as_bytes());
-    feed(&mut ctx, canonical_payload);
-    feed(&mut ctx, actor_id.as_bytes());
-    finish(ctx)
-}
-
-/// `chain_hash = SHA-256(content_hash ‖ prev_chain_hash)`. Both inputs are
-/// fixed-width 32-byte digests, so plain concatenation is unambiguous.
-fn chain_hash(content_hash: &[u8], prev_chain_hash: &[u8]) -> [u8; 32] {
-    let mut ctx = Context::new(&SHA256);
-    ctx.update(content_hash);
-    ctx.update(prev_chain_hash);
-    finish(ctx)
-}
-
-/// Feed one length-framed field into the digest: `u64` big-endian length, then bytes.
-fn feed(ctx: &mut Context, bytes: &[u8]) {
-    ctx.update(&(bytes.len() as u64).to_be_bytes());
-    ctx.update(bytes);
-}
-
-fn finish(ctx: Context) -> [u8; 32] {
-    let digest = ctx.finish();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(digest.as_ref());
-    out
-}
-
-/// Canonical JSON: object keys sorted recursively, no insignificant whitespace, so
-/// the same logical value always serializes to the same bytes (and the hash is
-/// reproducible after the value round-trips through Postgres JSONB).
-///
-/// Note: JSONB normalizes numbers, so a payload with non-canonical numeric literals
-/// (e.g. `1.0`) could in principle differ across the round-trip. PoC payloads are
-/// string/object-shaped, so this is not hit; a production-grade decimal
-/// canonicalization is a later hardening step.
-pub(crate) fn canonical_json(value: &Value) -> Vec<u8> {
-    let mut out = Vec::new();
-    write_canonical(value, &mut out);
-    out
-}
-
-#[allow(clippy::expect_used, reason = "scalar JSON is infallible")]
-fn write_canonical(value: &Value, out: &mut Vec<u8>) {
-    match value {
-        Value::Object(map) => {
-            out.push(b'{');
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            for (i, key) in keys.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                write_json_string(key, out);
-                out.push(b':');
-                write_canonical(&map[*key], out);
-            }
-            out.push(b'}');
-        }
-        Value::Array(items) => {
-            out.push(b'[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                write_canonical(item, out);
-            }
-            out.push(b']');
-        }
-        // Scalars (null, bool, number, string) have a single compact serde form.
-        scalar => serde_json::to_writer(out, scalar).expect("scalar JSON is infallible"),
-    }
-}
-
-#[allow(clippy::expect_used, reason = "string JSON is infallible")]
-fn write_json_string(s: &str, out: &mut Vec<u8>) {
-    serde_json::to_writer(out, &Value::String(s.to_string())).expect("string JSON is infallible");
-}
-
 #[cfg(test)]
 mod tests {
     //! In-memory property tests for the verification *math*, no database required.
@@ -473,6 +391,7 @@ mod tests {
 
     use super::*;
     use proptest::prelude::*;
+    use serde_json::Value;
 
     /// A standalone copy of the verify loop over synthetic rows, so the
     /// tamper/reorder properties can be checked without Postgres.

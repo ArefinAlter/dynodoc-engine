@@ -20,9 +20,12 @@ use uuid::Uuid;
 mod auth;
 mod authority;
 mod device;
+mod e2ee;
+mod escrow;
 mod export_token;
 mod keyfile;
 mod keystore;
+mod kms;
 mod mcp;
 mod passphrase;
 mod private_file;
@@ -30,6 +33,8 @@ mod receipt;
 mod repository;
 mod signing;
 mod sync;
+mod token;
+mod transparency;
 
 #[derive(Parser)]
 #[command(name = "engine-cli", version, about = "dynodoc admin tools")]
@@ -64,6 +69,15 @@ enum Command {
         #[command(subcommand)]
         action: device::Action,
     },
+    /// Encrypted projects (pre-release, not independently reviewed): keys, members, epochs,
+    /// recovery, sealed files and agent delegation.
+    E2ee(e2ee::Options),
+    /// The offline escrow ceremony of encrypted projects: split an escrow key into custodian
+    /// shares, or verify shares (pre-release, not independently reviewed).
+    Escrow(escrow::Options),
+    /// Customer-managed at-rest data keys (Phase 0; not end-to-end): create, rewrap after a
+    /// KEK rotation, rotate, crypto-erase. Operator command (MIGRATION_DATABASE_URL).
+    Kms(kms::Options),
     /// Signed ref receipts and a separate durable client trust journal (offline).
     Receipt {
         journal: std::path::PathBuf,
@@ -120,6 +134,40 @@ enum Command {
         effective_at: Option<String>,
         #[arg(long)]
         epoch: Option<u32>,
+    },
+    /// Transparency log: the log worker and anchor export (owner credential), and
+    /// offline bundle, anchor and checkpoint verbs for clients and auditors.
+    Transparency {
+        #[command(subcommand)]
+        action: transparency::Action,
+    },
+    /// Merge benchmark (decision 042): merge a generated, synthetic, deterministic corpus
+    /// under a policy and print the timings as JSON. Numbers depend on the machine.
+    MergeBench {
+        #[arg(long, default_value_t = 1000)]
+        cases: u64,
+        /// Nodes per document.
+        #[arg(long, default_value_t = 200)]
+        nodes: u64,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// A `dynodoc.merge-policy.v1` file; the default policy without one.
+        #[arg(long)]
+        policy: Option<std::path::PathBuf>,
+    },
+    /// Serve Prometheus text metrics of the transparency log and history pruning on a
+    /// loopback address (owner credential; nothing leaves the host).
+    HistoryMetrics {
+        #[arg(long, default_value = "127.0.0.1:9464")]
+        listen: std::net::SocketAddr,
+    },
+    /// Physically delete one document's checkpoint objects that only released history
+    /// reached (owner credential). Without --apply prints the plan and changes nothing;
+    /// --apply PLAN_HASH deletes exactly that reviewed plan. Back up the database first.
+    SharedObjectGc {
+        document: Uuid,
+        #[arg(long)]
+        apply: Option<String>,
     },
     /// Check schema and runtime privileges using DATABASE_URL; makes no changes.
     CheckRuntime,
@@ -251,7 +299,10 @@ async fn run() -> anyhow::Result<()> {
     let logs = tracing_subscriber::fmt().with_env_filter(
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
     );
-    if matches!(cli.command, Command::Mcp(_) | Command::Auth { .. }) {
+    if matches!(
+        cli.command,
+        Command::Mcp(_) | Command::Auth { .. } | Command::E2ee(_)
+    ) {
         // `mcp` speaks its protocol on stdout, and `auth issue-link` prints a sign-in link there
         // (and nothing else, so it can be piped): their logs go to stderr.
         logs.with_writer(std::io::stderr).init();
@@ -265,6 +316,9 @@ async fn run() -> anyhow::Result<()> {
         Command::Sync(options) => sync::run(options).await,
         Command::Mcp(options) => mcp::run(options).await,
         Command::Device { action } => device::run(action),
+        Command::E2ee(options) => e2ee::run(options).await,
+        Command::Escrow(options) => escrow::run(options),
+        Command::Kms(options) => kms::run(options, connect_migration().await?).await,
         Command::Receipt {
             journal,
             authority,
@@ -335,6 +389,33 @@ async fn run() -> anyhow::Result<()> {
                 epoch,
             )
             .await
+        }
+        Command::Transparency { action } => transparency::run(action).await,
+        Command::MergeBench {
+            cases,
+            nodes,
+            seed,
+            policy,
+        } => {
+            let policy = repository::load_policy(policy.as_deref())?;
+            let report = engine_core::merge_bench::run(seed, cases, nodes, &policy);
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::HistoryMetrics { listen } => {
+            engine_api::metrics::serve(connect_migration().await?, listen).await
+        }
+        Command::SharedObjectGc { document, apply } => {
+            let pool = connect_migration().await?;
+            let plan = match apply {
+                None => engine_api::object_collector::plan(&pool, document).await?,
+                Some(hash) => engine_api::object_collector::apply(&pool, document, &hash).await?,
+            };
+            println!(
+                "{}",
+                serde_json::json!({"document":plan.document,"plan_hash":plan.plan_hash,"marked":plan.marked,"candidates":plan.candidates,"sweep_objects":plan.sweep_objects,"sweep_bytes":plan.sweep_bytes,"applied":plan.applied})
+            );
+            Ok(())
         }
         Command::CheckRuntime => {
             engine_core::database::check_runtime(&connect().await?).await?;
@@ -507,6 +588,12 @@ async fn verify(document_id: String, expect_head: Option<String>) -> anyhow::Res
             .await?
             .unwrap_or_else(|| log::ZERO_HASH.to_vec());
     println!("OK: event chain and {} legacy snapshots verified through seq {} for document {document_id}; head {}", report.snapshots, report.through_seq, to_hex(&head));
+    if report.attributions > 0 {
+        println!(
+            "OK: {} sealed AI-agent authorship record(s) name every event of their merge",
+            report.attributions
+        );
+    }
     if let Some(expected) = expect_head {
         let seq: Option<i64> = sqlx::query_scalar(
             "select seq from event where document_id=$1 and encode(chain_hash,'hex')=lower($2) and seq<=$3",

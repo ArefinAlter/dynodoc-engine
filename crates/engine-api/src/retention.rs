@@ -28,6 +28,17 @@
 //! - `web_metric`: recorded more than `RETENTION_METRICS_DAYS` ago.
 //! - `idempotency_key`: older than the replay window ([`crate::idempotency::TTL`]);
 //!   `idempotency::reserve` already treats such a row as absent.
+//! - `login_session` (migration 0110): a login that is over (revoked, or with no unexpired refresh
+//!   row) and was last used more than [`LOGIN_RECORD_DAYS`] (or `RETENTION_AUTH_DAYS`, if longer)
+//!   ago. Kept that long because the local usage report counts active people over up to 366 days
+//!   (docs/SELF-HOSTED-LICENSING-AND-DISTRIBUTION.md 10). Its sealed ID token goes much sooner:
+//!   each pass clears `id_token_hint` of logins over for more than `RETENTION_AUTH_DAYS`.
+//! - `mail_outbox` (migration 0111): sent or failed more than `RETENTION_AUTH_DAYS` ago (the
+//!   content was already cleared when it was sent or given up).
+//! - `mcp_http_session` (migration 0114): idle past the remote MCP session limit.
+//!
+//! Each pass also expires remote agents' held writes past their seven days (decision 043): the
+//! row stays as `expired` without its text, which only the person ever saw.
 use crate::{secrets::Lookup, AppState};
 use serde_json::{json, Map, Value};
 use sqlx::{Connection, PgConnection, PgPool};
@@ -52,9 +63,24 @@ const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(300);
 /// The sign-in and device-enrollment request window (`auth/routes.rs`, `devices.rs`).
 const REQUEST_WINDOW_SECONDS: f64 = 15.0 * 60.0;
 const DAY_SECONDS: f64 = 86_400.0;
+/// Days a finished login's record is kept for the usage report's longest window (366 days).
+pub const LOGIN_RECORD_DAYS: i32 = 400;
 
 /// Number of tables the pass prunes.
-pub const TABLE_COUNT: usize = 8;
+pub const TABLE_COUNT: usize = 11;
+
+/// A login that is over: revoked more than `$2` seconds ago, or not revoked, with no unexpired
+/// refresh row and last used more than `$2` seconds ago.
+macro_rules! login_over {
+    () => {
+        "(s.revoked_at < now() - make_interval(secs => $2)
+       or (s.revoked_at is null
+           and coalesce(s.last_refresh_at, s.started_at) < now() - make_interval(secs => $2)
+           and not exists(select 1 from refresh_token r where r.session_id = s.session_id
+                           and r.revoked_at is null and r.expires_at > now())))"
+    };
+}
+const LOGIN_OVER: &str = login_over!();
 
 /// One table's prune statement. `$1` is the batch size and `$2` the number of seconds
 /// a row must be past its expiry (or older than, for metrics and idempotency keys).
@@ -136,7 +162,51 @@ static SPECS: [Spec; TABLE_COUNT] = [
               delete from operator_sign_in_link using doomed where operator_sign_in_link.ctid = doomed.row_id",
         seconds: |c| f64::from(c.auth_days) * DAY_SECONDS,
     },
+    Spec {
+        table: "login_session",
+        sql: concat!(
+            "with doomed as (select ctid as row_id from login_session s where ",
+            login_over!(),
+            " limit $1 for update skip locked)
+              delete from login_session using doomed where login_session.ctid = doomed.row_id"
+        ),
+        seconds: |c| f64::from(c.auth_days.max(LOGIN_RECORD_DAYS)) * DAY_SECONDS,
+    },
+    Spec {
+        table: "mail_outbox",
+        sql: "with doomed as (select ctid as row_id from mail_outbox
+                where sent_at < now() - make_interval(secs => $2)
+                   or failed_at < now() - make_interval(secs => $2)
+                limit $1 for update skip locked)
+              delete from mail_outbox using doomed where mail_outbox.ctid = doomed.row_id",
+        seconds: |c| f64::from(c.auth_days) * DAY_SECONDS,
+    },
+    Spec {
+        table: "mcp_http_session",
+        sql: "with doomed as (select ctid as row_id from mcp_http_session
+                where seen_at < now() - make_interval(secs => $2)
+                limit $1 for update skip locked)
+              delete from mcp_http_session using doomed where mcp_http_session.ctid = doomed.row_id",
+        seconds: |_| crate::mcp_http::IDLE.as_secs_f64(),
+    },
 ];
+
+/// Clear the sealed ID token of up to `batch` logins over for more than `RETENTION_AUTH_DAYS`
+/// (it is needed only to end the login at the identity provider). Public for tests.
+pub async fn clear_ended_id_tokens(
+    connection: &mut PgConnection,
+    config: &RetentionConfig,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(&format!(
+        "with done as (select ctid as row_id from login_session s where s.id_token_hint is not null and {LOGIN_OVER} limit $1 for update skip locked)
+         update login_session set id_token_hint = null from done where login_session.ctid = done.row_id"
+    ))
+    .bind(config.batch_rows)
+    .bind(f64::from(config.auth_days) * DAY_SECONDS)
+    .execute(connection)
+    .await
+    .map(|done| done.rows_affected())
+}
 
 /// The tables the pass prunes, in reporting order.
 pub fn table_names() -> [&'static str; TABLE_COUNT] {
@@ -334,6 +404,33 @@ async fn locked_pass(
             }
         }
     }
+    // Remote agents' held writes past their seven days expire on this timer, not only on read.
+    loop {
+        match crate::agent::held::expire_due(&mut *connection, config.batch_rows).await {
+            Ok(rows) if rows >= config.batch_rows as u64 && Instant::now() < deadline => {
+                tokio::time::sleep(BATCH_PAUSE).await;
+            }
+            Ok(_) => break,
+            Err(error) => {
+                tracing::warn!(error = %error, "held agent write expiry failed");
+                first_error.get_or_insert(error);
+                break;
+            }
+        }
+    }
+    loop {
+        match clear_ended_id_tokens(&mut *connection, config).await {
+            Ok(rows) if rows >= config.batch_rows as u64 && Instant::now() < deadline => {
+                tokio::time::sleep(BATCH_PAUSE).await;
+            }
+            Ok(_) => break,
+            Err(error) => {
+                tracing::warn!(error = %error, "clearing ended logins' ID tokens failed");
+                first_error.get_or_insert(error);
+                break;
+            }
+        }
+    }
     for (index, spec) in SPECS.iter().enumerate() {
         loop {
             match prune_batch(&mut *connection, spec.table, config).await {
@@ -378,6 +475,9 @@ async fn tick(pool: &PgPool, config: &RetentionConfig, stats: &Stats) -> Duratio
                     web_metric = pruned[5],
                     idempotency_key = pruned[6],
                     operator_sign_in_link = pruned[7],
+                    login_session = pruned[8],
+                    mail_outbox = pruned[9],
+                    mcp_http_session = pruned[10],
                     "retention pass pruned expired rows"
                 );
             } else {
@@ -532,8 +632,25 @@ mod tests {
         let seconds: Vec<f64> = SPECS.iter().map(|s| (s.seconds)(&config)).collect();
         assert_eq!(
             seconds,
-            vec![172_800.0, 172_800.0, 900.0, 172_800.0, 172_800.0, 259_200.0, 86_400.0, 172_800.0]
+            vec![
+                172_800.0,
+                172_800.0,
+                900.0,
+                172_800.0,
+                172_800.0,
+                259_200.0,
+                86_400.0,
+                172_800.0,
+                400.0 * 86_400.0,
+                172_800.0,
+                3_600.0
+            ]
         );
         assert_eq!(table_names()[7], "operator_sign_in_link");
+        assert_eq!(table_names()[10], "mcp_http_session");
+        assert!(
+            SPECS[8].sql.contains(LOGIN_OVER),
+            "the prune and the clearing agree"
+        );
     }
 }

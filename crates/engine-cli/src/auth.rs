@@ -39,6 +39,25 @@ pub enum Action {
         #[arg(long)]
         operator: Option<String>,
     },
+    /// Re-encrypt every stored identity secret (organisation provider client secrets, kept ID
+    /// tokens) under IDENTITY_SECRETS_KEY (or IDENTITY_SECRETS_KEY_FILE). Run it once after
+    /// setting that key for the first time (with --from-paseto-key-file), and when rotating it
+    /// (with --from-identity-key-file naming the previous key). No key is ever printed.
+    ResealIdentitySecrets(Reseal),
+}
+
+#[derive(Args)]
+pub struct Reseal {
+    /// The server key (PASETO_LOCAL_KEY) the secrets were stored under before
+    /// IDENTITY_SECRETS_KEY existed: a file holding its 64 hexadecimal characters.
+    #[arg(long, value_name = "FILE")]
+    from_paseto_key_file: Option<std::path::PathBuf>,
+    /// A previous IDENTITY_SECRETS_KEY, when rotating it: a file holding 64 hexadecimal characters.
+    #[arg(long, value_name = "FILE")]
+    from_identity_key_file: Option<std::path::PathBuf>,
+    /// One JSON object on standard output.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -151,6 +170,7 @@ pub async fn run(action: Action) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Action::ResealIdentitySecrets(args) => reseal(args).await,
         Action::RevokeLink {
             prefix,
             operator: who,
@@ -167,6 +187,66 @@ pub async fn run(action: Action) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// A 32-byte key written as 64 hexadecimal characters (surrounding whitespace ignored). The error
+/// names `what`, never the value.
+fn parse_key(text: &str, what: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = hex::decode(text.trim())
+        .ok()
+        .filter(|b| b.len() == 32)
+        .with_context(|| format!("{what} must be 32 bytes written as 64 hexadecimal characters"))?;
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    if key == [0u8; 32] {
+        bail!("{what} must be a random key");
+    }
+    Ok(key)
+}
+
+/// A key from `path`, read with the API's secret-file rules (size bound, owner-only on Unix).
+fn key_file(path: &std::path::Path, what: &str) -> anyhow::Result<[u8; 32]> {
+    let os = std::ffi::OsString::from(path);
+    let lookup = |name: &str| (name == "RESEAL_KEY_FILE").then(|| os.clone());
+    let secret = engine_api::secrets::read(&lookup, "RESEAL_KEY")
+        .map_err(|e| anyhow::anyhow!("{what}: {e}"))?
+        .with_context(|| format!("{what} is empty"))?;
+    parse_key(secret.expose(), what)
+}
+
+async fn reseal(args: Reseal) -> anyhow::Result<()> {
+    use engine_api::identity_secrets::{identity_key, legacy_key, reseal_all};
+    let target = engine_api::secrets::read(&|n| std::env::var_os(n), "IDENTITY_SECRETS_KEY")
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .context(
+            "set IDENTITY_SECRETS_KEY or IDENTITY_SECRETS_KEY_FILE to the key to store under",
+        )?;
+    let target = parse_key(target.expose(), "IDENTITY_SECRETS_KEY")?;
+    let mut from = Vec::new();
+    if let Some(path) = &args.from_paseto_key_file {
+        from.push(legacy_key(&key_file(path, "--from-paseto-key-file")?));
+    }
+    if let Some(path) = &args.from_identity_key_file {
+        let previous = key_file(path, "--from-identity-key-file")?;
+        if previous == target {
+            bail!("--from-identity-key-file is the same key as IDENTITY_SECRETS_KEY");
+        }
+        from.push(identity_key(&previous));
+    }
+    let pool = connect().await?;
+    let report = reseal_all(&pool, &from, &identity_key(&target)).await?;
+    if args.json {
+        println!("{}", serde_json::to_value(&report)?);
+    } else {
+        println!(
+            "Re-encrypted {} identity secret(s); {} already used the key; {} could not be opened.",
+            report.resealed, report.current, report.unreadable
+        );
+        if report.unreadable > 0 {
+            eprintln!("  The unreadable ones stay as they are: give the key they were stored under, or enter those secrets again.");
+        }
+    }
+    Ok(())
 }
 
 /// The owner connection, after the schema has been checked (a clear message instead of a missing table).
@@ -282,6 +362,37 @@ async fn issue(args: IssueLink) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reseal_keys_are_64_hex_characters_and_never_echoed() {
+        let hex = "0b".repeat(32);
+        assert_eq!(parse_key(&format!("{hex}\n"), "K").unwrap(), [0x0b; 32]);
+        assert_eq!(parse_key(&format!("  {hex}\r\n"), "K").unwrap(), [0x0b; 32]);
+        for bad in [
+            "",
+            "0b0b",
+            &"0b".repeat(33),
+            &"zz".repeat(32),
+            &"00".repeat(32),
+        ] {
+            let error = parse_key(bad, "THE_KEY").unwrap_err().to_string();
+            assert!(error.contains("THE_KEY"), "{error}");
+            assert!(
+                bad.is_empty() || !error.contains(bad),
+                "the value is never echoed"
+            );
+        }
+        let dir = std::env::temp_dir().join(format!("reseal-key-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&dir, format!("{hex}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(key_file(&dir, "F").unwrap(), [0x0b; 32]);
+        std::fs::remove_file(&dir).unwrap();
+        assert!(key_file(&dir, "F").is_err());
+    }
 
     #[test]
     fn lifetimes_are_written_with_a_unit() {

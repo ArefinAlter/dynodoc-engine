@@ -75,8 +75,11 @@ pub(crate) async fn verify_current(
     claimed: &Claimed,
     lock: bool,
 ) -> Result<(), ApiError> {
-    let current: Option<(i64, bool, bool, bool)> = sqlx::query_as(&format!(
-        "select i.session_generation,exists(select 1 from device_key_class c where c.key_id=k.id and c.class='agent'),{},coalesce((select p.sessions_valid_after is null or exists(select 1 from device_session s where s.id=$5 and s.issued_at>p.sessions_valid_after) from project_agent_policy p where p.project_id=$3),true) from identity i join device_signing_key k on k.identity_id=i.id where i.id=$1 and k.id=$2 and i.disabled_at is null and i.erased_at is null and not exists(select 1 from device_key_revocation r where r.key_id=k.id){}",
+    // The fifth column is the organisation policy (migrations 0075 and 0116): no organisation of
+    // the person has turned agents off, pulled its kill switch after this session was issued or
+    // denied the key's client kind.
+    let current: Option<(i64, bool, bool, bool, bool)> = sqlx::query_as(&format!(
+        "select i.session_generation,exists(select 1 from device_key_class c where c.key_id=k.id and c.class='agent'),{},coalesce((select p.sessions_valid_after is null or exists(select 1 from device_session s where s.id=$5 and s.issued_at>p.sessions_valid_after) from project_agent_policy p where p.project_id=$3),true),not exists(select 1 from organisation_member m join organisation o on o.id=m.organisation_id where m.identity_id=i.id and (not o.agents_enabled or (o.agents_valid_after is not null and not exists(select 1 from device_session s where s.id=$5 and s.issued_at>o.agents_valid_after)) or exists(select 1 from device_key_class c where c.key_id=k.id and coalesce(c.client_kind,'device')=any(o.agent_clients_denied)))) from identity i join device_signing_key k on k.identity_id=i.id where i.id=$1 and k.id=$2 and i.disabled_at is null and i.erased_at is null and not exists(select 1 from device_key_revocation r where r.key_id=k.id){}",
         key_reaches("$3", "$4::text[]"),
         if lock { " for share of i" } else { "" }
     ))
@@ -87,13 +90,13 @@ pub(crate) async fn verify_current(
     .bind(claimed.session)
     .fetch_optional(&mut *db)
     .await?;
-    let Some((generation, agent_key, reaches, not_cut_off)) = current else {
+    let Some((generation, agent_key, reaches, not_cut_off, organisation_allows)) = current else {
         return Err(ApiError::Unauthorized);
     };
     if generation != claimed.generation {
         return Err(ApiError::Unauthorized);
     }
-    if !agent_key || !reaches || !not_cut_off {
+    if !agent_key || !reaches || !not_cut_off || !organisation_allows {
         return Err(ApiError::Forbidden);
     }
     Ok(())
@@ -187,4 +190,32 @@ impl<S: AgentScope> FromRequestParts<AppState> for AgentAuth<S> {
             PhantomData,
         ))
     }
+}
+
+/// Does an organisation of `identity` deny the client kind `kind` (migration 0116)? The OAuth
+/// consent and token endpoints and the remote MCP endpoint ask before anything is issued.
+pub(crate) async fn client_kind_denied(
+    db: &mut sqlx::PgConnection,
+    identity: uuid::Uuid,
+    kind: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("select exists(select 1 from organisation_member m join organisation o on o.id=m.organisation_id where m.identity_id=$1 and $2=any(o.agent_clients_denied))")
+        .bind(identity)
+        .bind(kind)
+        .fetch_one(db)
+        .await
+}
+
+/// The client kind recorded on agent key `key` (`device` when enrolment named none).
+pub(crate) async fn key_client_kind(
+    db: &mut sqlx::PgConnection,
+    key: uuid::Uuid,
+) -> Result<String, sqlx::Error> {
+    Ok(sqlx::query_scalar(
+        "select coalesce(client_kind,'device') from device_key_class where key_id=$1",
+    )
+    .bind(key)
+    .fetch_optional(db)
+    .await?
+    .unwrap_or_else(|| "device".into()))
 }

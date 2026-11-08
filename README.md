@@ -23,8 +23,12 @@ push, verified fetch, fast-forward pull and separate pinned remote tracking.
 Project-scoped sign-in, UI/native adoption, server rotation/witnesses and full
 native convergence/large-service acceptance remain open.
 
-Source supports PostgreSQL schema 36. The hosted application remains at schema 29
-and release `858801c`; these new storage and audit capabilities are not deployed.
+Source supports PostgreSQL migrations through 0142 (synchronized from application
+`4f0e7a3` on 8 November 2026). It adds agent sessions and project memory, ledger mode,
+directory primitives for enterprise identity, history horizons with a transparency log,
+encrypted projects and at-rest encryption, large-file uploads and object storage, and a
+WebAssembly build of the pure engine; the [changelog](CHANGELOG.md) lists them by
+decision. None of this is deployed.
 Read [verified source revisions and tests](docs/ENGINE-EVOLUTION-HANDOFF.md) and the
 [complete acceptance ledger](docs/ROADMAP-ACCEPTANCE.md).
 
@@ -52,8 +56,11 @@ release history lives in the [handoff](docs/ENGINE-EVOLUTION-HANDOFF.md).
 | --- | --- |
 | `engine-shared` | IDs, events, row types and rich-text patch schema |
 | `engine-core` | Append/replay/validation, typed shared state, local project history, receipts and client pins |
-| `engine-api` | HTTP/SSE, auth and the existing document/workspace service adapter |
-| `engine-cli` | Verify/migrate/snapshot, local commits/branches, receipt journals and generated OpenAPI |
+| `engine-agent` | Agent protocol: refs, hashes, compact text, outline/read/find/diff and the propose compiler |
+| `engine-mcp` | MCP server for the agent protocol; read-only by default, writes wait for a person |
+| `engine-api` | HTTP/SSE, auth and the existing document/workspace service adapter; `dynodoc-witness` transparency witness |
+| `engine-cli` | Verify/migrate/snapshot, local commits/branches, receipt journals, MCP and generated OpenAPI |
+| `engine-wasm` | Pure engine (hashing, fold, operations, merge) for WebAssembly hosts |
 
 The API adapter still contains product roles, questionnaire validation, access
 hierarchies and administrative operations inherited from Dynodoc. Embedders can

@@ -164,6 +164,9 @@ pub(super) async fn fetch(
                 continue;
             }
             Err(engine_core::repository::Error::Missing(_)) => {}
+            // Released by a verified remote horizon (`sync horizons`): published
+            // history whose body is gone; the walk stops here (design 5.5).
+            Err(engine_core::repository::Error::HistoryPruned { .. }) => continue,
             Err(error) => return Err(error.into()),
         }
         let signed = client

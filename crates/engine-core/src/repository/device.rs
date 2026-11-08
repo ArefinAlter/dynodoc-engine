@@ -1,8 +1,11 @@
 //! Account enrollment proof. This proves possession of a signing key; the server
 //! must also authenticate the account and consume its own unexpired challenge.
-use super::{hex, unhex, Error};
+#[cfg(feature = "persistence")]
+use super::hex;
+use super::{unhex, Error};
 use crate::shared_checkpoint::canonical::CanonicalValue;
-use ring::signature::{self, Ed25519KeyPair, KeyPair};
+#[cfg(feature = "persistence")]
+use ring::signature;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -56,6 +59,7 @@ pub struct Proof {
     pub signature: String,
 }
 
+#[cfg(feature = "persistence")]
 impl Proof {
     /// Callers verify the server/account displayed by the authenticated session.
     /// Requiring both expected IDs prevents blindly signing a substituted scope.
@@ -63,15 +67,15 @@ impl Proof {
         challenge: Challenge,
         authority: Uuid,
         identity: Uuid,
-        key: &Ed25519KeyPair,
+        key: &(impl super::Signer + ?Sized),
     ) -> Result<Self, Error> {
         if challenge.authority != authority
             || challenge.identity != identity
-            || challenge.public_key != hex(key.public_key().as_ref())
+            || challenge.public_key != hex(&key.public_key_bytes())
         {
             return Err(Error::Invalid("device enrollment scope or key"));
         }
-        let signature = hex(key.sign(&challenge.message()?).as_ref());
+        let signature = hex(&key.sign_message(&challenge.message()?)?);
         Ok(Self {
             challenge,
             signature,
@@ -91,6 +95,7 @@ impl Proof {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
 
     #[test]
     fn independent_enrollment_vector_is_stable() {

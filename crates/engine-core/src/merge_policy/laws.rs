@@ -21,8 +21,9 @@
 //! with the strategy's own tests.
 
 use super::{
-    strategy::{selected, Context, Inputs, Laws, Outcome, Reason, Resolved, Strategy},
-    Aspect, Family,
+    policy::Role,
+    strategy::{selected, Context, Inputs, Laws, MarksRule, Outcome, Reason, Resolved, Strategy},
+    Aspect, Family, Gate,
 };
 use serde_json::Value;
 use std::{
@@ -46,6 +47,13 @@ pub struct Setup<'a> {
     pub params: BTreeMap<String, Value>,
     /// The invariant a valid value of the field satisfies, for L6.
     pub valid: Option<&'a dyn Fn(&Value) -> bool>,
+    /// The roles of the team and draft authors; the symmetry check swaps them with
+    /// the sides.
+    pub roles: Option<(Role, Role)>,
+    /// `defaults.roles_rank` for `prefer-role` parameters.
+    pub rank: Vec<Role>,
+    /// Parameters of a marks rule the strategy consults (`match.aspect: marks`).
+    pub marks: Option<BTreeMap<String, Value>>,
 }
 
 impl Setup<'_> {
@@ -58,6 +66,9 @@ impl Setup<'_> {
             family: Family::Document,
             params: BTreeMap::new(),
             valid: None,
+            roles: None,
+            rank: Vec::new(),
+            marks: None,
         }
     }
 }
@@ -98,6 +109,16 @@ fn shape(outcome: &Outcome, inputs: &Inputs<'_>) -> Shape {
 }
 
 fn run(strategy: &dyn Strategy, setup: &Setup<'_>, t: &Triple) -> Result<Resolved, ()> {
+    run_as(strategy, setup, t, false)
+}
+
+/// `swapped` exchanges the roles with the sides, as the symmetry check needs.
+fn run_as(
+    strategy: &dyn Strategy,
+    setup: &Setup<'_>,
+    t: &Triple,
+    swapped: bool,
+) -> Result<Resolved, ()> {
     let ctx = Context {
         node: None,
         node_type: setup.node_type,
@@ -105,6 +126,14 @@ fn run(strategy: &dyn Strategy, setup: &Setup<'_>, t: &Triple) -> Result<Resolve
         aspect: setup.aspect,
         family: setup.family,
         params: &setup.params,
+        roles: setup
+            .roles
+            .map(|(a, b)| if swapped { (b, a) } else { (a, b) }),
+        rank: &setup.rank,
+        marks: setup.marks.as_ref().map(|params| MarksRule {
+            params,
+            gate: Gate::Auto,
+        }),
     };
     let inputs = Inputs {
         base: &t.base,
@@ -204,7 +233,7 @@ pub fn check(
                 team: case.draft.clone(),
                 draft: case.team.clone(),
             };
-            match run(strategy, setup, &swapped) {
+            match run_as(strategy, setup, &swapped, true) {
                 Ok(other) => {
                     let (a, b) = (
                         shape(&resolved.outcome, &inputs),
@@ -285,6 +314,17 @@ pub fn check(
         }
 
         if promises.contains(Laws::NO_SILENT_LOSS) {
+            // A merged value that drops a side's value must name it as lost too;
+            // what "drops" means is the strategy's, so only the shape is checked.
+            if matches!(resolved.outcome, Outcome::Merged(_))
+                && resolved.used.lost.iter().any(|l| l.is_null())
+            {
+                return Err(fail(
+                    "L7 no silent loss",
+                    "a lost value is empty".into(),
+                    &case,
+                ));
+            }
             if let Outcome::Prefer(side) = resolved.outcome {
                 let loser = inputs.side(side.other());
                 if !resolved.used.lost.contains(loser) {

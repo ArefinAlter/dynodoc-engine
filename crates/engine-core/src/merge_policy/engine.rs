@@ -4,9 +4,10 @@
 
 use super::{
     evidence::{Decision, DecisionOutcome, Digest, MergeEvidence, Shortcuts},
-    policy::{MergePolicy, Probe, Unknown},
+    loser::LostValue,
+    policy::{Loser, MergePolicy, Probe, Role, Unknown},
     registry::Registry,
-    strategy::{Context, Inputs, Outcome},
+    strategy::{Context, Inputs, MarksRule, Outcome},
     Aspect, Family, Gate,
 };
 use crate::workspace_merge::{is_new_name, At, Conflict, Selector};
@@ -23,6 +24,8 @@ pub(crate) struct Engine<'a> {
     family: Family,
     decisions: Vec<Decision>,
     shortcuts: Shortcuts,
+    roles: Option<(Role, Role)>,
+    losers: Vec<LostValue>,
 }
 
 struct Decided {
@@ -31,6 +34,10 @@ struct Decided {
 }
 
 /// What a document-level collection does after its rule was consulted.
+#[cfg_attr(
+    not(feature = "persistence"),
+    allow(dead_code, reason = "used by repository convergence")
+)]
 pub(crate) enum Collected {
     /// No rule applied: keep the whole-collection three-way choice.
     Whole,
@@ -47,19 +54,28 @@ impl<'a> Engine<'a> {
             family,
             decisions: Vec::new(),
             shortcuts: Shortcuts::default(),
+            roles: None,
+            losers: Vec::new(),
         }
+    }
+
+    /// The roles of the team and draft authors, for `prefer-role` parameters.
+    pub(crate) fn with_roles(mut self, roles: Option<(Role, Role)>) -> Self {
+        self.roles = roles;
+        self
     }
 
     pub(crate) fn finish(self) -> MergeEvidence {
         let mut evidence = MergeEvidence::new(self.policy, self.family);
         evidence.decisions = self.decisions;
         evidence.shortcuts = self.shortcuts;
+        evidence.losers = self.losers;
         evidence
     }
 
     #[allow(clippy::too_many_arguments)]
     fn decide(
-        &self,
+        &mut self,
         node: Option<&NodeId>,
         node_type: &str,
         field: &str,
@@ -99,6 +115,7 @@ impl<'a> Engine<'a> {
             base: Digest::of(base),
             team: Digest::of(team),
             draft: Digest::of(draft),
+            merged: None,
             lost: Vec::new(),
         };
         let none = |d: Decision| Decided {
@@ -126,6 +143,22 @@ impl<'a> Engine<'a> {
         };
         d.strategy = Some(rule.strategy.clone());
         let inputs = Inputs { base, team, draft };
+        // The marks inside a field are decided by a rule with `aspect: marks`.
+        let marks = if aspect.is_none() {
+            let probe = Probe {
+                aspect: Some(Aspect::Marks),
+                ..probe
+            };
+            self.policy
+                .find_rule(&probe)
+                .filter(|r| self.registry.get(&r.strategy).is_some())
+                .map(|r| MarksRule {
+                    params: &r.params.0,
+                    gate: self.policy.effective_gate(r),
+                })
+        } else {
+            None
+        };
         let ctx = Context {
             node,
             node_type,
@@ -133,6 +166,9 @@ impl<'a> Engine<'a> {
             aspect,
             family: self.family,
             params: &rule.params.0,
+            roles: self.roles,
+            rank: &self.policy.defaults.roles_rank,
+            marks,
         };
         // A strategy is total by law L4; a bug that breaks that becomes a conflict
         // with an internal-error marker instead of taking the merge down.
@@ -144,43 +180,70 @@ impl<'a> Engine<'a> {
         d.basis = Some(resolved.used.basis.into());
         d.notes = resolved.used.notes;
         d.lost = resolved.used.lost.iter().map(Digest::of).collect();
-        match resolved.outcome {
-            Outcome::Merged(_) if gate == Gate::Manual => {
-                d.reason = "manual-gate".into();
-                d.notes.push(
-                    "the strategy proposed a merged value; the gate requires a human decision"
-                        .into(),
-                );
-                none(d)
-            }
-            Outcome::Merged(value) => {
-                d.outcome = DecisionOutcome::Merged;
-                d.reason = "merged".into();
-                d.needs_review = gate == Gate::AutoWithReview;
-                Decided {
-                    value: Some(value),
-                    decision: d,
-                }
-            }
-            // Keeping one side means the other must be preserved (design 7); that
-            // is phase N2, so a preference is not applied.
-            Outcome::Prefer(side) => {
-                d.reason = "prefer-unsupported".into();
-                d.notes.push(format!(
-                    "the strategy preferred the {side:?} side; loser preservation is not built, so nothing is applied"
-                ));
-                none(d)
-            }
+        let preferred = match resolved.outcome {
+            Outcome::Prefer(side) => Some(side),
+            _ => None,
+        };
+        let (value, outcome) = match resolved.outcome {
             Outcome::Conflict(reason) => {
                 d.reason = reason.0.into();
-                none(d)
+                return none(d);
             }
+            _ if gate == Gate::Manual => {
+                d.reason = "manual-gate".into();
+                d.notes.push(
+                    "the strategy proposed an automatic result; the gate requires a human decision"
+                        .into(),
+                );
+                return none(d);
+            }
+            Outcome::Merged(value) => (value, DecisionOutcome::Merged),
+            Outcome::Prefer(side) => (inputs.side(side).clone(), DecisionOutcome::Preferred),
+        };
+        // A preference always loses the other side's value, whatever the strategy
+        // reported (law L7 is not taken on trust).
+        let mut lost = resolved.used.lost;
+        if let Some(side) = preferred {
+            let other = inputs.side(side.other());
+            if !lost.contains(other) {
+                lost.push(other.clone());
+            }
+            d.lost = lost.iter().map(Digest::of).collect();
+        }
+        // Nothing is lost silently (design 7): a lossy outcome needs a loser sink.
+        if !lost.is_empty() && self.policy.defaults.loser == Loser::None {
+            d.reason = "loser-not-preserved".into();
+            d.notes.push(
+                "the automatic result does not use a value and `defaults.loser` is `none`".into(),
+            );
+            return none(d);
+        }
+        for lost in lost {
+            self.losers.push(LostValue::new(
+                node.cloned(),
+                field,
+                &rule.id,
+                &rule.strategy,
+                lost,
+            ));
+        }
+        d.outcome = outcome;
+        d.reason = "merged".into();
+        d.needs_review = gate == Gate::AutoWithReview || resolved.used.review || !d.lost.is_empty();
+        d.merged = Some(Digest::of(&value));
+        Decided {
+            value: Some(value),
+            decision: d,
         }
     }
 
     /// Decide one document-level collection of the converged states. Equal or
     /// one-sided collections are left to the whole-collection choice, which gives
     /// the same value; only a real three-way difference reaches a rule.
+    #[cfg_attr(
+        not(feature = "persistence"),
+        allow(dead_code, reason = "used by repository convergence")
+    )]
     pub(crate) fn collection(
         &mut self,
         aspect: Aspect,

@@ -2,7 +2,7 @@
 //! function from `(base, team, draft)` to a merged value, a preferred side or a
 //! conflict, plus the evidence it used. No clock, randomness, IO or global state.
 
-use super::{Aspect, Family};
+use super::{policy::Role, Aspect, Family, Gate};
 use engine_shared::NodeId;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -64,6 +64,45 @@ pub struct Context<'a> {
     pub family: Family,
     /// The rule's parameters, already checked against [`Strategy::params`].
     pub params: &'a BTreeMap<String, Value>,
+    /// The roles of the authors of the team and draft sides, when the caller knows
+    /// them (the shared service does; a portable repository does not). Only
+    /// `prefer-role` parameters read them.
+    pub roles: Option<(Role, Role)>,
+    /// The policy's `defaults.roles_rank`, highest authority first.
+    pub rank: &'a [Role],
+    /// The rule that decides formatting marks inside this field (`match.aspect:
+    /// marks`), when the policy has one. Text strategies consult it per atom.
+    pub marks: Option<MarksRule<'a>>,
+}
+
+/// A marks rule as a text strategy sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct MarksRule<'a> {
+    pub params: &'a BTreeMap<String, Value>,
+    pub gate: Gate,
+}
+
+impl Context<'_> {
+    /// The text value of a `OneOf` parameter, or `default` when the rule does not
+    /// set it. Parameters were validated at load, so any other type cannot occur.
+    pub fn param<'p>(&'p self, name: &str, default: &'p str) -> &'p str {
+        self.params
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or(default)
+    }
+    /// The side whose author ranks strictly higher in `rank`, when both roles are
+    /// known. Content, never side order, decides: swapping the sides swaps the
+    /// roles, so the preferred value is the same (law L1).
+    pub fn higher_role(&self) -> Option<Side> {
+        let (team, draft) = self.roles?;
+        let at = |role| self.rank.iter().position(|r| *r == role);
+        match (at(team), at(draft)) {
+            (Some(t), Some(d)) if t < d => Some(Side::Team),
+            (Some(t), Some(d)) if d < t => Some(Side::Draft),
+            _ => None,
+        }
+    }
 }
 
 /// A short stable code that says why a strategy declined.
@@ -82,6 +121,16 @@ impl Reason {
     pub const ELEMENT_DIFFERS: Self = Self("element-differs");
     /// The input is not in the shape the strategy understands.
     pub const UNSUPPORTED_SHAPE: Self = Self("unsupported-shape");
+    /// More edit hunks on one side than the strategy's bound.
+    pub const TOO_MANY_HUNKS: Self = Self("too-many-hunks");
+    /// A list or table changed shape and its children carry no identifiers.
+    pub const SHAPE_CHANGED: Self = Self("shape-changed");
+    /// One side made a value a formula (or the reverse) and the other edited it.
+    pub const KIND_CHANGED: Self = Self("kind-changed");
+    /// A structural shift explains a side in more than one way.
+    pub const AMBIGUOUS_SHIFT: Self = Self("ambiguous-shift");
+    /// Two fields that must change together were changed on different sides.
+    pub const COUPLED: Self = Self("coupled-fields");
 }
 
 /// What a strategy decided.
@@ -104,6 +153,9 @@ pub struct Used {
     pub lost: Vec<Value>,
     /// Plain facts that explain the outcome, such as which elements differed.
     pub notes: Vec<String>,
+    /// The case taken asks for review even when the rule's gate is `auto` (for
+    /// example two different insertions at one gap, design 4.2).
+    pub review: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -134,6 +186,31 @@ impl Resolved {
     pub fn with_notes(mut self, notes: Vec<String>) -> Self {
         self.used.notes = notes;
         self
+    }
+    /// One side preferred; the other side's value is carried as lost (law L7).
+    pub fn prefer(side: Side, inputs: &Inputs<'_>, basis: &'static str) -> Self {
+        Self {
+            outcome: Outcome::Prefer(side),
+            used: Used {
+                basis,
+                lost: vec![inputs.side(side.other()).clone()],
+                ..Used::default()
+            },
+        }
+    }
+    /// `Prefer` by role when the parameter `name` asks for `prefer-role` and the
+    /// roles decide; otherwise a conflict for `reason`.
+    pub fn prefer_role_or(
+        ctx: &Context<'_>,
+        name: &str,
+        inputs: &Inputs<'_>,
+        reason: Reason,
+        basis: &'static str,
+    ) -> Self {
+        match (ctx.param(name, "manual"), ctx.higher_role()) {
+            ("prefer-role", Some(side)) => Self::prefer(side, inputs, basis),
+            _ => Self::conflict(reason, basis),
+        }
     }
 }
 

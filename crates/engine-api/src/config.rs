@@ -17,6 +17,43 @@ pub struct StartupConfig {
     /// The runtime login's connection URL (holds its password).
     pub database_url: Secret,
     pub retention: RetentionConfig,
+    /// `IDENTITY_SECRETS_KEY` (or `_FILE`): the key of stored identity secrets, apart from the
+    /// server key ([`crate::identity_secrets`]). Optional; must differ from `PASETO_LOCAL_KEY`.
+    pub identity_key: Option<[u8; 32]>,
+    /// Login lifetimes ([`crate::auth::SessionPolicy`]).
+    pub session: crate::auth::SessionPolicy,
+    /// `SCIM_RATE_PER_MINUTE` (default 600, 10 to 100000).
+    pub scim_rate_per_minute: i32,
+    /// `DYNODOC_EVENT_FANOUT`: `local` (default), `postgres` or `poll` ([`crate::fanout`]).
+    pub fanout: crate::fanout::Mode,
+    /// The request pool (`DB_POOL_MAX`, `DB_ACQUIRE_TIMEOUT_MS`, `DB_STATEMENT_TIMEOUT_MS`).
+    pub pool: PoolConfig,
+    /// `SHUTDOWN_DRAIN_SECONDS` (default 25, 0 to 300): how long in-flight requests and live
+    /// streams may run after SIGTERM before the process exits.
+    pub shutdown_drain_seconds: u64,
+    /// `DYNODOC_OBJECT_STORE` and its settings ([`crate::object_store`]).
+    pub objects: crate::object_store::ObjectStore,
+    /// `REAUTH_MAX_AGE_SECONDS` (default 600, 60 to 86400, or 0 for none): how old a login may
+    /// be for a sensitive action (`crate::auth::sessions::require_recent_login`).
+    pub reauth_seconds: i64,
+}
+
+/// Request pool settings; the defaults are the values used before they were settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolConfig {
+    pub max_connections: u32,
+    pub acquire_timeout_ms: u64,
+    pub statement_timeout_ms: u64,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 8,
+            acquire_timeout_ms: 5_000,
+            statement_timeout_ms: 15_000,
+        }
+    }
 }
 
 impl StartupConfig {
@@ -79,6 +116,105 @@ impl StartupConfig {
             Err(()) => None,
         };
         let retention = RetentionConfig::load(lookup, &mut problems);
+        let identity_key = match secret(lookup, "IDENTITY_SECRETS_KEY", &mut problems) {
+            Ok(Some(value)) => match parse_paseto_key(&value) {
+                Ok(key) if Some(key) == paseto_key => {
+                    problems.push(
+                        "IDENTITY_SECRETS_KEY must differ from PASETO_LOCAL_KEY (it outlives a rotation of that key)"
+                            .into(),
+                    );
+                    None
+                }
+                Ok(key) => Some(key),
+                Err(problem) => {
+                    problems.push(problem.replace("PASETO_LOCAL_KEY", "IDENTITY_SECRETS_KEY"));
+                    None
+                }
+            },
+            _ => None,
+        };
+        let day = 86_400;
+        let session = crate::auth::SessionPolicy {
+            refresh_ttl_seconds: seconds(
+                lookup,
+                "REFRESH_TTL_SECONDS",
+                crate::auth::REFRESH_TTL_SECONDS,
+                300..=90 * day,
+                false,
+                &mut problems,
+            ),
+            idle_timeout_seconds: seconds(
+                lookup,
+                "SESSION_IDLE_TIMEOUT_SECONDS",
+                0,
+                300..=30 * day,
+                true,
+                &mut problems,
+            ),
+            absolute_timeout_seconds: seconds(
+                lookup,
+                "SESSION_ABSOLUTE_TIMEOUT_SECONDS",
+                0,
+                900..=365 * day,
+                true,
+                &mut problems,
+            ),
+        };
+        let scim_rate_per_minute = seconds(
+            lookup,
+            "SCIM_RATE_PER_MINUTE",
+            600,
+            10..=100_000,
+            false,
+            &mut problems,
+        ) as i32;
+        let fanout = match lookup("DYNODOC_EVENT_FANOUT").map(|v| v.into_string()) {
+            None => crate::fanout::Mode::Local,
+            Some(Ok(v)) if crate::fanout::Mode::parse(&v).is_some() => {
+                crate::fanout::Mode::parse(&v).unwrap_or_default()
+            }
+            Some(_) => {
+                problems.push("DYNODOC_EVENT_FANOUT must be local, postgres or poll".into());
+                crate::fanout::Mode::Local
+            }
+        };
+        let pool = PoolConfig {
+            max_connections: seconds(lookup, "DB_POOL_MAX", 8, 1..=200, false, &mut problems)
+                as u32,
+            acquire_timeout_ms: seconds(
+                lookup,
+                "DB_ACQUIRE_TIMEOUT_MS",
+                5_000,
+                100..=120_000,
+                false,
+                &mut problems,
+            ) as u64,
+            statement_timeout_ms: seconds(
+                lookup,
+                "DB_STATEMENT_TIMEOUT_MS",
+                15_000,
+                100..=600_000,
+                false,
+                &mut problems,
+            ) as u64,
+        };
+        let shutdown_drain_seconds = seconds(
+            lookup,
+            "SHUTDOWN_DRAIN_SECONDS",
+            25,
+            1..=300,
+            true,
+            &mut problems,
+        ) as u64;
+        let objects = crate::object_store::ObjectStore::load(lookup, &mut problems);
+        let reauth_seconds = seconds(
+            lookup,
+            "REAUTH_MAX_AGE_SECONDS",
+            600,
+            60..=86_400,
+            true,
+            &mut problems,
+        );
 
         let text = |name: &str| lookup(name).and_then(|v| v.into_string().ok());
         match (paseto_key, service_key, database_url) {
@@ -95,6 +231,14 @@ impl StartupConfig {
                     },
                     database_url,
                     retention,
+                    identity_key,
+                    session,
+                    scim_rate_per_minute,
+                    fanout,
+                    pool,
+                    shutdown_drain_seconds,
+                    objects,
+                    reauth_seconds,
                 })
             }
             _ => anyhow::bail!(
@@ -103,6 +247,34 @@ impl StartupConfig {
                 if problems.len() == 1 { "" } else { "s" },
                 problems.join("\n  - ")
             ),
+        }
+    }
+}
+
+/// A whole number setting within `range` (or `0` when `zero` allows "none"); a problem is recorded
+/// and the default returned.
+fn seconds(
+    lookup: Lookup,
+    name: &str,
+    default: i64,
+    range: std::ops::RangeInclusive<i64>,
+    zero: bool,
+    problems: &mut Vec<String>,
+) -> i64 {
+    let Some(raw) = lookup(name) else {
+        return default;
+    };
+    match raw.to_str().and_then(|v| v.trim().parse::<i64>().ok()) {
+        Some(0) if zero => 0,
+        Some(v) if range.contains(&v) => v,
+        _ => {
+            problems.push(format!(
+                "{name} must be a whole number from {} to {}{}",
+                range.start(),
+                range.end(),
+                if zero { ", or 0 for none" } else { "" }
+            ));
+            default
         }
     }
 }
@@ -186,6 +358,78 @@ mod tests {
         );
         assert_eq!(config.auth.token_ttl_seconds, 3600);
         assert_eq!(config.auth.public_base_url, "https://dynodoc.example.test");
+    }
+
+    #[test]
+    fn identity_key_and_session_lifetimes_are_validated() {
+        let mut pairs = valid();
+        pairs.push(("IDENTITY_SECRETS_KEY", KEY));
+        assert!(error_of(&pairs).contains("IDENTITY_SECRETS_KEY must differ"));
+        let other = "0909090909090909090909090909090909090909090909090909090909090909";
+        let mut pairs = valid();
+        pairs.push(("IDENTITY_SECRETS_KEY", other));
+        pairs.push(("SESSION_IDLE_TIMEOUT_SECONDS", "28800"));
+        pairs.push(("SESSION_ABSOLUTE_TIMEOUT_SECONDS", "0"));
+        let config = StartupConfig::load(&env(&pairs)).unwrap();
+        assert_eq!(config.identity_key, Some([9u8; 32]));
+        assert_eq!(config.session.idle_timeout_seconds, 28_800);
+        assert_eq!(config.session.absolute_timeout_seconds, 0);
+        let mut pairs = valid();
+        pairs.push(("REFRESH_TTL_SECONDS", "0"));
+        pairs.push(("SESSION_IDLE_TIMEOUT_SECONDS", "5"));
+        let message = error_of(&pairs);
+        assert!(message.contains("REFRESH_TTL_SECONDS must be"), "{message}");
+        assert!(
+            message.contains("SESSION_IDLE_TIMEOUT_SECONDS must be"),
+            "{message}"
+        );
+        assert!(!message.contains(other));
+    }
+
+    #[test]
+    fn pool_fanout_and_drain_settings_are_validated() {
+        let config = StartupConfig::load(&env(&valid())).unwrap();
+        assert_eq!(config.pool, PoolConfig::default());
+        assert_eq!(config.fanout, crate::fanout::Mode::Local);
+        assert_eq!(config.shutdown_drain_seconds, 25);
+        assert!(config.objects.in_database());
+        let mut pairs = valid();
+        pairs.extend([
+            ("DB_POOL_MAX", "32"),
+            ("DB_ACQUIRE_TIMEOUT_MS", "2000"),
+            ("DB_STATEMENT_TIMEOUT_MS", "30000"),
+            ("DYNODOC_EVENT_FANOUT", "postgres"),
+            ("SHUTDOWN_DRAIN_SECONDS", "0"),
+        ]);
+        let config = StartupConfig::load(&env(&pairs)).unwrap();
+        assert_eq!(
+            config.pool,
+            PoolConfig {
+                max_connections: 32,
+                acquire_timeout_ms: 2000,
+                statement_timeout_ms: 30000
+            }
+        );
+        assert_eq!(config.fanout, crate::fanout::Mode::Postgres);
+        assert_eq!(config.shutdown_drain_seconds, 0);
+        let mut pairs = valid();
+        pairs.extend([
+            ("DB_POOL_MAX", "0"),
+            ("DB_STATEMENT_TIMEOUT_MS", "soon"),
+            ("DYNODOC_EVENT_FANOUT", "redis"),
+            ("SHUTDOWN_DRAIN_SECONDS", "900"),
+            ("DYNODOC_OBJECT_STORE", "filesystem"),
+        ]);
+        let message = error_of(&pairs);
+        for name in [
+            "DB_POOL_MAX",
+            "DB_STATEMENT_TIMEOUT_MS",
+            "DYNODOC_EVENT_FANOUT",
+            "SHUTDOWN_DRAIN_SECONDS",
+            "DYNODOC_OBJECT_DIR",
+        ] {
+            assert!(message.contains(name), "{name}: {message}");
+        }
     }
 
     #[test]

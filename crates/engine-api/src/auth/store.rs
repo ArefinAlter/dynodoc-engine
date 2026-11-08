@@ -165,6 +165,7 @@ pub async fn rotate_bound_refresh(
          where token_hash = $1
            and rotated_at is null and revoked_at is null and expires_at > now()
            and exists(select 1 from identity i where i.id=refresh_token.identity_id and i.disabled_at is null and i.session_generation=refresh_token.session_generation)
+           and not exists(select 1 from login_session s where s.session_id=refresh_token.session_id and (s.revoked_at is not null or s.absolute_expires_at<=now()))
          returning identity_id,session_generation,session_id",
     )
     .bind(presented_hash)
@@ -176,8 +177,9 @@ pub async fn rotate_bound_refresh(
         return Err(AuthError::RefreshInvalid);
     };
 
+    // A login never outlives its absolute cap (migration 0110); `least` ignores a missing row.
     sqlx::query(
-        "insert into refresh_token (identity_id, token_hash, expires_at,session_generation,session_id) values ($1, $2, $3,$4,$5)",
+        "insert into refresh_token (identity_id, token_hash, expires_at,session_generation,session_id) values ($1, $2, least($3,(select s.absolute_expires_at from login_session s where s.session_id=$5)),$4,$5)",
     )
     .bind(identity_id)
     .bind(new_hash)
@@ -186,6 +188,10 @@ pub async fn rotate_bound_refresh(
     .bind(session_id)
     .execute(&mut *tx)
     .await?;
+    sqlx::query("update login_session set last_refresh_at=now() where session_id=$1")
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
 
     tx.commit().await?;
     Ok((identity_id, generation, session_id))
@@ -194,17 +200,21 @@ pub async fn rotate_bound_refresh(
 /// Revoke a login using any unexpired refresh secret in its rotation lineage.
 /// Legacy tokens lack a login ID, so those logouts revoke the account generation.
 /// Retries and unknown/expired secrets are idempotent and reveal no account state.
-pub async fn revoke_login(pool: &PgPool, presented_hash: &[u8]) -> Result<(), AuthError> {
+pub async fn revoke_login(pool: &PgPool, presented_hash: &[u8]) -> Result<Option<Uuid>, AuthError> {
     let mut tx = pool.begin().await?;
     sqlx::query("select i.id from identity i join refresh_token r on r.identity_id=i.id where r.token_hash=$1 for update of i")
         .bind(presented_hash).fetch_optional(&mut *tx).await?;
     let login: Option<(Uuid, i64, Option<Uuid>)> = sqlx::query_as(
         "select r.identity_id,r.session_generation,r.session_id from refresh_token r join identity i on i.id=r.identity_id where r.token_hash=$1 and r.revoked_at is null and r.expires_at>now() and i.session_generation=r.session_generation")
         .bind(presented_hash).fetch_optional(&mut *tx).await?;
+    let mut ended = None;
     if let Some((identity, generation, session)) = login {
         if let Some(session) = session {
+            ended = Some(session);
             sqlx::query("update refresh_token set revoked_at=now() where identity_id=$1 and session_id=$2 and revoked_at is null")
                 .bind(identity).bind(session).execute(&mut *tx).await?;
+            sqlx::query("update login_session set revoked_at=now(),revoked_reason='logout' where session_id=$1 and revoked_at is null")
+                .bind(session).execute(&mut *tx).await?;
             // The app hand-over codes this login asked for end with it (a code is a way to
             // become this account, so it must not outlive the login that made it).
             sqlx::query("update app_handover_code set consumed_at=now(), outcome='burned' where identity_id=$1 and issued_session=$2 and consumed_at is null")
@@ -217,7 +227,7 @@ pub async fn revoke_login(pool: &PgPool, presented_hash: &[u8]) -> Result<(), Au
         }
     }
     tx.commit().await?;
-    Ok(())
+    Ok(ended)
 }
 
 /// The role an identity holds on a document, if any (the access list). `None` means

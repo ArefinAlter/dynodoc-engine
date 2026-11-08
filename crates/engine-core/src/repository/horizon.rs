@@ -9,9 +9,9 @@
 //! states, and the checks for invariants H1 to H10. [`policy`] is the retention
 //! policy schema and loader; [`plan`] is the read-only planner.
 //!
-//! Not built: the schema-4 tables, the applier, the archive, signing flows, sync
-//! and the shared service (design phases P2 and later). `Scope` and the signature
-//! checks exist so a record can be verified; nothing here produces a signature.
+//! [`archive`] is the cold-copy bundle (phase P3) and [`sign`] / [`Envelope::assemble`]
+//! the signing flow. The schema-4 tables and the applier are in
+//! `repository/local/horizon_apply.rs`; the shared service is in `engine-api`.
 
 use super::{hex, unhex};
 use crate::shared_checkpoint::{canonical::CanonicalValue, Address};
@@ -19,6 +19,7 @@ use ring::{digest, signature};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod archive;
 pub mod plan;
 pub mod policy;
 #[cfg(test)]
@@ -417,6 +418,22 @@ pub fn signing_input(address: &Address) -> Vec<u8> {
     message
 }
 
+/// Sign a validated record in `role` with an Ed25519 key (the same key types every
+/// other local signing command loads). Each co-signer signs the same record offline.
+pub fn sign(
+    record: &HorizonRecord,
+    role: Role,
+    key: &signature::Ed25519KeyPair,
+) -> Result<Signature, Error> {
+    use signature::KeyPair;
+    let address = record.address()?;
+    Ok(Signature {
+        role,
+        key: hex(key.public_key().as_ref()),
+        signature: hex(key.sign(&signing_input(&address)).as_ref()),
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Envelope {
@@ -426,6 +443,25 @@ pub struct Envelope {
 }
 
 impl Envelope {
+    /// Put signatures in envelope order (ascending key). The same signature twice is
+    /// kept once; two different entries for one key are refused.
+    pub fn assemble(horizon: HorizonRecord, mut signatures: Vec<Signature>) -> Result<Self, Error> {
+        signatures.sort_by(|a, b| a.key.cmp(&b.key));
+        signatures.dedup();
+        if signatures.windows(2).any(|pair| pair[0].key == pair[1].key) {
+            return Err(violated(
+                Invariant::H2,
+                "two different signatures by one key",
+            ));
+        }
+        let envelope = Self {
+            horizon,
+            signatures,
+        };
+        envelope.bytes()?;
+        Ok(envelope)
+    }
+
     pub fn bytes(&self) -> Result<Vec<u8>, Error> {
         self.horizon.validate()?;
         let bytes = canonical_bytes(self)?;
@@ -722,6 +758,20 @@ pub fn check_state(
     heads: &[HeadRef],
     present: &BTreeSet<StateKey>,
 ) -> Result<(), Error> {
+    check_state_with(retained, horizons, &[], heads, present)
+}
+
+/// [`check_state`] for a repository that also holds `remote`: skeleton entries of a
+/// remote's verified horizons for commits it never stored (a shallow fetch). They
+/// answer parent and height questions (H3, H4) like any skeleton entry and may not
+/// also be bodies (H7); they belong to no local horizon, so H5 does not count them.
+pub fn check_state_with(
+    retained: &[Retained],
+    horizons: &[HorizonRows<'_>],
+    remote: &[SkeletonEntry],
+    heads: &[HeadRef],
+    present: &BTreeSet<StateKey>,
+) -> Result<(), Error> {
     let mut bodies: BTreeMap<&Address, &Retained> = BTreeMap::new();
     for commit in retained {
         if bodies.insert(&commit.address, commit).is_some() {
@@ -733,8 +783,12 @@ pub fn check_state(
     }
     // H7: a skeleton address appears once across horizons and never as a body.
     let mut skeleton: BTreeMap<&Address, &SkeletonEntry> = BTreeMap::new();
-    for rows in horizons {
-        for entry in rows.skeleton {
+    for rows in horizons
+        .iter()
+        .map(|h| h.skeleton)
+        .chain(std::iter::once(remote))
+    {
+        for entry in rows {
             if bodies.contains_key(&entry.address)
                 || skeleton.insert(&entry.address, entry).is_some()
             {
@@ -821,9 +875,14 @@ pub fn check_state(
     }
     for rows in horizons {
         for edge in rows.frontier {
-            let consistent = bodies
+            // A later horizon may have released the child too; then its skeleton
+            // entry carries the edge.
+            let consistent = (bodies
                 .get(&edge.child)
                 .is_some_and(|c| c.parents.contains(&edge.parent))
+                || skeleton
+                    .get(&edge.child)
+                    .is_some_and(|c| c.parents.contains(&edge.parent)))
                 && skeleton
                     .get(&edge.parent)
                     .is_some_and(|e| e.height == edge.parent_height);

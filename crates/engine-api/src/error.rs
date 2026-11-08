@@ -232,6 +232,17 @@ impl From<sqlx::Error> for ApiError {
             if matches!(db.code().as_deref(), Some("57014" | "55P03")) {
                 return ApiError::Deadline;
             }
+            // Encrypted projects (schema 95): the storage boundary refused a mixed-mode write.
+            if db.code().as_deref() == Some("23514") && db.constraint() == Some("encryption_mode") {
+                return ApiError::Coded {
+                    status: axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "mode_mismatch",
+                    reason:
+                        "A sealed file accepts only sealed content, and a plaintext file refuses it"
+                            .into(),
+                    details: serde_json::json!({}),
+                };
+            }
         }
         ApiError::Internal(err.to_string())
     }

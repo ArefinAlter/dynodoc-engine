@@ -9,7 +9,6 @@ use std::{
 };
 
 use engine_shared::{DocumentId, NodeId};
-use ring::digest::{Context as HashContext, SHA256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncWrite;
@@ -40,7 +39,10 @@ pub struct SemanticLimits {
 impl Default for SemanticLimits {
     fn default() -> Self {
         Self {
-            values: 1_000_000,
+            // shortcut: a fixed budget for about 300,000 paragraphs (decision 043; 1,000,000
+            // stopped v3 states near 100,000 to 150,000, decision 034); the byte budgets stay the
+            // memory bound. Stream materialization before larger documents are supported.
+            values: 3_000_000,
             string_bytes: 256 * 1024 * 1024,
             depth: MAX_DEPTH,
         }
@@ -172,10 +174,7 @@ pub(crate) enum ObjectV3 {
 }
 
 fn address(bytes: &[u8]) -> Address {
-    let mut hash = HashContext::new(&SHA256);
-    hash.update(DOMAIN);
-    hash.update(bytes);
-    Address(super::hex(hash.finish().as_ref()))
+    Address(super::hex(&crate::hashing::sha256(&[DOMAIN, bytes])))
 }
 
 fn encode(object: &Object) -> Result<(Address, Vec<u8>), Error> {
@@ -238,10 +237,7 @@ pub(super) fn references(expected: &Address, bytes: &[u8]) -> Result<Vec<Address
 }
 
 pub fn address_v3(bytes: &[u8]) -> Address {
-    let mut hash = HashContext::new(&SHA256);
-    hash.update(DOMAIN_V3);
-    hash.update(bytes);
-    Address(super::hex(hash.finish().as_ref()))
+    Address(super::hex(&crate::hashing::sha256(&[DOMAIN_V3, bytes])))
 }
 
 pub(crate) fn encode_v3(object: &ObjectV3) -> Result<(Address, Vec<u8>), Error> {
@@ -599,14 +595,16 @@ pub async fn write_state<S: ObjectStore>(
 }
 
 fn is_integrity_error(err: &Error) -> bool {
+    #[cfg(feature = "persistence")]
+    if matches!(err, Error::Db(_) | Error::History(_)) {
+        return true;
+    }
     matches!(
         err,
         Error::HashMismatch
             | Error::Missing(_)
             | Error::Limit(_)
-            | Error::Db(_)
             | Error::Io(_)
-            | Error::History(_)
             | Error::Json(_)
             | Error::Invalid("typed header/version")
             | Error::Invalid("declared content length")
@@ -1318,31 +1316,10 @@ impl<S: ObjectStore> DecoderV3<'_, S> {
             .entries_limited(root, self.semantic.values, MAX_METADATA_BYTES)
             .await
     }
-}
 
-/// Verify the entire v3 typed graph and reconstruct state under semantic and I/O
-/// budgets. Missing/corrupt/wrongly typed content fails closed, including tombstones.
-pub async fn read_state_v3<S: ObjectStore>(
-    store: &mut S,
-    document: DocumentId,
-    root: &Address,
-    limits: Limits,
-    semantic: SemanticLimits,
-) -> Result<DocumentState, Error> {
-    let mut decoder = DecoderV3 {
-        reader: Reader {
-            store,
-            document,
-            budget: limits,
-        },
-        semantic,
-    };
-    let ObjectV3::State(roots) = decoder.object(root).await? else {
-        return Err(Error::Invalid("expected typed state"));
-    };
-    let mut state = DocumentState::default();
-    for (key, root) in decoder.records(&roots.nodes).await? {
-        decoder.semantic.value(0)?;
+    /// One verified node object, with the v3 restore flags applied.
+    async fn node(&mut self, key: String, root: &Address) -> Result<MaterializedNode, Error> {
+        let decoder = self;
         let ObjectV3::Node {
             parent_id,
             node_type,
@@ -1352,7 +1329,7 @@ pub async fn read_state_v3<S: ObjectStore>(
             fields,
             restore_block_id,
             restore_label,
-        } = decoder.object(&root).await?
+        } = decoder.object(root).await?
         else {
             return Err(Error::Invalid("expected typed node"));
         };
@@ -1424,6 +1401,34 @@ pub async fn read_state_v3<S: ObjectStore>(
         }
 
         node.current_fields = fields_val;
+        Ok(node)
+    }
+}
+
+/// Verify the entire v3 typed graph and reconstruct state under semantic and I/O
+/// budgets. Missing/corrupt/wrongly typed content fails closed, including tombstones.
+pub async fn read_state_v3<S: ObjectStore>(
+    store: &mut S,
+    document: DocumentId,
+    root: &Address,
+    limits: Limits,
+    semantic: SemanticLimits,
+) -> Result<DocumentState, Error> {
+    let mut decoder = DecoderV3 {
+        reader: Reader {
+            store,
+            document,
+            budget: limits,
+        },
+        semantic,
+    };
+    let ObjectV3::State(roots) = decoder.object(root).await? else {
+        return Err(Error::Invalid("expected typed state"));
+    };
+    let mut state = DocumentState::default();
+    for (key, root) in decoder.records(&roots.nodes).await? {
+        decoder.semantic.value(0)?;
+        let node = decoder.node(key, &root).await?;
         state.nodes.insert(node.id.clone(), node);
     }
     for (key, root) in decoder.records(&roots.comments).await? {
@@ -1765,6 +1770,219 @@ pub async fn write_state_v3<S: ObjectStore>(
         .await?;
     encoder.writer.flush().await?;
     Ok((root, encoder.writer.stats))
+}
+
+/// The nodes and removed-choice markers that one tail of events changed: each
+/// node's whole new state, and whether each listed choice is now removed.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct NodeChanges {
+    pub nodes: BTreeMap<NodeId, MaterializedNode>,
+    pub removed_choices: BTreeMap<NodeId, bool>,
+}
+
+/// Read only the named nodes (and whether each is a removed choice) from a v3
+/// state, by map lookup. Absent nodes are left out.
+pub async fn read_nodes_v3<S: ObjectStore>(
+    store: &mut S,
+    document: DocumentId,
+    root: &Address,
+    ids: &std::collections::BTreeSet<NodeId>,
+    limits: Limits,
+) -> Result<NodeChanges, Error> {
+    let mut decoder = DecoderV3 {
+        reader: Reader {
+            store,
+            document,
+            budget: limits,
+        },
+        semantic: SemanticLimits::default(),
+    };
+    let ObjectV3::State(roots) = decoder.object(root).await? else {
+        return Err(Error::Invalid("expected typed state"));
+    };
+    let mut found = NodeChanges::default();
+    for id in ids {
+        if let Some(address) = decoder.reader.lookup(&roots.nodes, &id.0).await? {
+            let node = decoder.node(id.0.clone(), &address).await?;
+            found.nodes.insert(id.clone(), node);
+        }
+        let removed = decoder.reader.lookup(&roots.removed_choices, &id.0).await?;
+        if let Some(address) = &removed {
+            match decoder.object(address).await? {
+                ObjectV3::RemovedChoice(choice) if choice == *id => {}
+                _ => return Err(Error::Invalid("removed choice key/id")),
+            }
+        }
+        found.removed_choices.insert(id.clone(), removed.is_some());
+    }
+    Ok(found)
+}
+
+/// Changed-node publication (decision 034): write only `changes` into the
+/// verified v3 state at `base_root`, reusing every other object by address, then
+/// re-read each changed node and compare. Work and bytes follow the number of
+/// changed nodes and the map depth, never the document size. The result is the
+/// root a full [`write_state_v3`] of the new state produces.
+pub async fn apply_changes_v3<S: ObjectStore>(
+    store: &mut S,
+    document: DocumentId,
+    base_root: &Address,
+    changes: &NodeChanges,
+    limits: Limits,
+    semantic: SemanticLimits,
+) -> Result<(Address, WriteStats), Error> {
+    let mut encoder = EncoderV3 {
+        writer: Writer {
+            store,
+            document,
+            budget: limits,
+            stats: WriteStats::default(),
+            pending: Vec::new(),
+            pending_bytes: 0,
+        },
+        semantic,
+    };
+    let ObjectV3::State(mut roots) = encoder.read_object(base_root).await? else {
+        return Err(Error::Invalid("expected typed state"));
+    };
+    let mut edits = Vec::with_capacity(changes.nodes.len());
+    for (id, node) in &changes.nodes {
+        if id != &node.id {
+            return Err(Error::Invalid("node map key differs from logical id"));
+        }
+        encoder.semantic.value(0)?;
+        node_metadata(&mut encoder.semantic, node)?;
+        let (fields, restore_block_id, restore_label) =
+            encoder.encode_node_fields(id, &node.current_fields).await?;
+        let address = encoder
+            .object(ObjectV3::Node {
+                parent_id: node.parent_id.clone(),
+                node_type: node.node_type.clone(),
+                pos: node.pos.clone(),
+                var_name: node.var_name.clone(),
+                deleted: node.deleted,
+                fields,
+                restore_block_id,
+                restore_label,
+            })
+            .await?;
+        edits.push((id.0.clone(), Some(address)));
+    }
+    roots.nodes = encoder.writer.update_map(&roots.nodes, edits).await?;
+    let mut removed = Vec::new();
+    for (id, now) in &changes.removed_choices {
+        encoder.semantic.metadata(&id.0)?;
+        let address = if *now {
+            Some(encoder.object(ObjectV3::RemovedChoice(id.clone())).await?)
+        } else {
+            None
+        };
+        removed.push((id.0.clone(), address));
+    }
+    roots.removed_choices = encoder
+        .writer
+        .update_map(&roots.removed_choices, removed)
+        .await?;
+    let root = encoder.object(ObjectV3::State(roots)).await?;
+    encoder.writer.flush().await?;
+    let stats = encoder.writer.stats;
+    let ids = changes
+        .nodes
+        .keys()
+        .chain(changes.removed_choices.keys())
+        .cloned()
+        .collect();
+    let check = read_nodes_v3(store, document, &root, &ids, limits).await?;
+    let wanted_removed = changes
+        .removed_choices
+        .iter()
+        .all(|(id, now)| check.removed_choices.get(id) == Some(now));
+    if !wanted_removed
+        || changes
+            .nodes
+            .iter()
+            .any(|(id, n)| check.nodes.get(id) != Some(n))
+    {
+        return Err(Error::Invalid("changed node reconstruction differs"));
+    }
+    Ok((root, stats))
+}
+
+/// Streams the nodes of a v3 state without materializing it (decision 034): only
+/// the open path of the node map and one leaf are resident. Nodes come in map
+/// (hash) order, not document order. Every object is verified as it is read.
+pub struct NodeWalker {
+    stack: Vec<Address>,
+    leaf: std::vec::IntoIter<Entry>,
+    budget: Limits,
+}
+
+impl NodeWalker {
+    /// Open the state at `root`.
+    pub async fn new<S: ObjectStore>(
+        store: &mut S,
+        document: DocumentId,
+        root: &Address,
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        let mut decoder = DecoderV3 {
+            reader: Reader {
+                store,
+                document,
+                budget: limits,
+            },
+            semantic: SemanticLimits::default(),
+        };
+        let ObjectV3::State(roots) = decoder.object(root).await? else {
+            return Err(Error::Invalid("expected typed state"));
+        };
+        Ok(Self {
+            stack: vec![roots.nodes],
+            leaf: Vec::new().into_iter(),
+            budget: decoder.reader.budget,
+        })
+    }
+
+    /// The next node, or `None` after the last.
+    pub async fn next<S: ObjectStore>(
+        &mut self,
+        store: &mut S,
+        document: DocumentId,
+    ) -> Result<Option<MaterializedNode>, Error> {
+        loop {
+            if let Some(entry) = self.leaf.next() {
+                let mut decoder = DecoderV3 {
+                    reader: Reader {
+                        store,
+                        document,
+                        budget: self.budget,
+                    },
+                    semantic: SemanticLimits::default(),
+                };
+                let node = decoder.node(entry.key, &entry.address).await?;
+                self.budget = decoder.reader.budget;
+                return Ok(Some(node));
+            }
+            let Some(address) = self.stack.pop() else {
+                return Ok(None);
+            };
+            if self.budget.max_objects == 0 {
+                return Err(Error::Limit("objects"));
+            }
+            let bytes = store.get(document, &address).await?;
+            self.budget.consume(bytes.len())?;
+            match super::decode(&address, &bytes)? {
+                super::Object::MapLeaf(entries) => self.leaf = entries.into_iter(),
+                super::Object::MapBranch(children) => {
+                    if self.stack.len() > 64 * 16 {
+                        return Err(Error::Limit("radix depth"));
+                    }
+                    self.stack.extend(children.into_values().rev());
+                }
+                _ => return Err(Error::Invalid("expected bounded map")),
+            }
+        }
+    }
 }
 
 pub const UNSUPPORTED_V3_DELTA: &str = "unsupported v3 delta";
@@ -4479,5 +4697,119 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, Error::Limit("objects")));
+    }
+
+    #[tokio::test]
+    async fn changed_node_publication_equals_a_full_write_and_touches_little() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+        let base = make_test_state(3000);
+        let limits = Limits::default();
+        let semantic = SemanticLimits::default();
+        let (base_root, _) = write_state_v3(&mut store, document, &base, limits, semantic)
+            .await
+            .unwrap();
+        let mut target = base.clone();
+        let ids: Vec<NodeId> = base.nodes.keys().take(3).cloned().collect();
+        let edited = target.nodes.get_mut(&ids[0]).unwrap();
+        edited.current_fields = json!({"title": "changed", "content": {"type": "doc"}});
+        target.nodes.get_mut(&ids[1]).unwrap().deleted = true;
+        target.nodes.get_mut(&ids[2]).unwrap().pos = "zz".into();
+        let created = NodeId("created_node".into());
+        target.nodes.insert(
+            created.clone(),
+            MaterializedNode {
+                id: created.clone(),
+                parent_id: None,
+                node_type: "item".into(),
+                pos: "9999".into(),
+                current_fields: json!({"title": "new", "blockId": "created_node"}),
+                var_name: None,
+                deleted: false,
+            },
+        );
+        target.removed_choices.insert(ids[1].clone());
+        let mut changes = NodeChanges::default();
+        for id in ids.iter().chain([&created]) {
+            changes.nodes.insert(id.clone(), target.nodes[id].clone());
+        }
+        changes.removed_choices.insert(ids[1].clone(), true);
+        let (root, stats) =
+            apply_changes_v3(&mut store, document, &base_root, &changes, limits, semantic)
+                .await
+                .unwrap();
+        let mut oracle = MemoryStore::default();
+        let (full, full_stats) = write_state_v3(&mut oracle, document, &target, limits, semantic)
+            .await
+            .unwrap();
+        assert_eq!(root, full);
+        assert_eq!(
+            read_state_v3(&mut store, document, &root, limits, semantic)
+                .await
+                .unwrap(),
+            target
+        );
+        assert!(
+            stats.visited_objects * 20 < full_stats.visited_objects,
+            "{stats:?}"
+        );
+        // Read back by lookup: only the named nodes.
+        let wanted = [ids[0].clone(), NodeId("absent".into())]
+            .into_iter()
+            .collect();
+        let found = read_nodes_v3(&mut store, document, &root, &wanted, limits)
+            .await
+            .unwrap();
+        assert_eq!(found.nodes.len(), 1);
+        assert_eq!(found.nodes[&ids[0]], target.nodes[&ids[0]]);
+        // A change whose key is not its id is refused.
+        let mut bad = NodeChanges::default();
+        bad.nodes
+            .insert(NodeId("other".into()), target.nodes[&ids[0]].clone());
+        assert!(
+            apply_changes_v3(&mut store, document, &base_root, &bad, limits, semantic)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn node_walker_streams_every_node_once_and_verifies() {
+        let mut store = MemoryStore::default();
+        let document = doc();
+        let state = make_test_state(2500);
+        let (root, _) = write_state_v3(
+            &mut store,
+            document,
+            &state,
+            Limits::default(),
+            SemanticLimits::default(),
+        )
+        .await
+        .unwrap();
+        let mut walker = NodeWalker::new(&mut store, document, &root, Limits::default())
+            .await
+            .unwrap();
+        let mut seen = BTreeMap::new();
+        while let Some(node) = walker.next(&mut store, document).await.unwrap() {
+            assert!(seen.insert(node.id.clone(), node).is_none());
+        }
+        assert_eq!(seen, state.nodes);
+        // The object budget bounds a walk.
+        let tight = Limits {
+            max_objects: 50,
+            max_bytes: usize::MAX,
+        };
+        let mut walker = NodeWalker::new(&mut store, document, &root, tight)
+            .await
+            .unwrap();
+        let mut outcome = Ok(Some(()));
+        while let Ok(Some(())) = outcome {
+            outcome = walker
+                .next(&mut store, document)
+                .await
+                .map(|n| n.map(|_| ()));
+        }
+        assert!(matches!(outcome, Err(Error::Limit(_))));
     }
 }

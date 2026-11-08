@@ -6,9 +6,10 @@
 //!   a write scope ([`ensure`], inside the grant transaction); found again per request by
 //!   [`resolve`] from the key's own class row, never from anything the client says.
 //! * **Not a person.** The row is born disabled (`identity.disabled_at`, which every
-//!   sign-in, session, magic-link and notification path already tests), its address is in
-//!   the reserved domain [`RESERVED_DOMAIN`] that [`is_reserved_email`] lets no sign-up or
-//!   invitation use, and the database refuses it as a member, a reviewer or a key holder.
+//!   sign-in, session, magic-link and notification path already tests), it is of kind `agent`
+//!   with no address (schema 117; before, an address in the reserved domain
+//!   [`RESERVED_DOMAIN`]), the domain [`is_reserved_email`] lets no sign-up or invitation use,
+//!   and the database refuses it as a member, a reviewer or a key holder.
 //! * **Its authority is its principal's.** Nothing here grants anything: every request
 //!   re-reads the principal's role, the key's grant and the project policy.
 //! * **It ends with the principal.** Disabling or erasing the person revokes it (a trigger,
@@ -46,7 +47,8 @@ pub fn is_reserved_email(email: &str) -> bool {
     domain == RESERVED_DOMAIN || domain.ends_with(&format!(".{RESERVED_DOMAIN}"))
 }
 
-/// The address of agent identity `id`.
+/// The address agent identity `id` had before schema 117 (agents now have none). Kept for
+/// the reserved-domain rule and its tests.
 pub fn agent_email(id: Uuid) -> String {
     format!("agent+{id}@{RESERVED_DOMAIN}")
 }
@@ -124,7 +126,7 @@ pub async fn resolve(
 /// The agent identity for `key`'s product, made if the person has none yet. Called in the
 /// transaction that grants a write scope, which holds the account row lock, so two grants
 /// cannot both make one; the unique index on live identities is the backstop. The new row
-/// is born disabled and with the reserved address (the database checks both at commit).
+/// is born disabled, of kind `agent` and without an address (the database checks it at commit).
 pub async fn ensure(
     tx: &mut Transaction<'_, Postgres>,
     principal: Uuid,
@@ -151,9 +153,9 @@ pub async fn ensure(
             .await?;
     let id = Uuid::new_v4();
     let name = display_name(&kind, display.as_deref(), &email);
-    sqlx::query("insert into identity(id,email,display_name,disabled_at) values($1,$2,$3,now())")
+    // Schema 117: an agent identity has no address, only its kind.
+    sqlx::query("insert into identity(id,email,display_name,disabled_at,kind) values($1,null,$2,now(),'agent')")
         .bind(id)
-        .bind(agent_email(id))
         .bind(&name)
         .execute(&mut **tx)
         .await?;

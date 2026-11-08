@@ -17,8 +17,10 @@ use crate::{
     materializer::{CommentState, DocumentState, SuggestionState},
     merge_policy::{
         engine::{Collected, Engine},
-        evidence::Labels,
-        Aspect, Family, MergeEvidence, MergePolicy, Registry,
+        evidence::{Decision, DecisionOutcome, Digest, Labels},
+        policy::{Probe, Role},
+        sheet::{self, Certificate},
+        Aspect, Family, Gate, MergeEvidence, MergePolicy, Registry,
     },
     shared_checkpoint::{
         self,
@@ -32,30 +34,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-/// Same-document conflicting files examined per comparison; the rest are counted.
-pub const MAX_REPORTED_FILES: usize = 64;
-
-/// Strategy id signed into a v3 commit: the node/field three-way merge of this
-/// module (`converge`), clean in both orientations. A different algorithm needs a
-/// different id; importers accept only ids they know.
-pub const STRATEGY: &str = "dynodoc.same-file.node-field.v1";
-
-/// Signed provenance of one automatically merged path: the three input state
-/// roots under one stable document identity and the stored merged state root.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Resolution {
-    pub path: String,
-    pub document: DocumentId,
-    /// State at the unique best common ancestor.
-    pub base: Address,
-    /// State in the first parent.
-    pub left: Address,
-    /// State in the second parent.
-    pub right: Address,
-    pub merged: Address,
-    pub strategy: String,
-}
+pub use super::records::{Resolution, MAX_REPORTED_FILES, STRATEGY};
 
 /// One node/field (or document-level) disagreement. `node` is the stable node id;
 /// document-level collections (`$comments`, `$suggestions`) have none.
@@ -140,6 +119,18 @@ trait Merger {
         team: &DocumentState,
         draft: &DocumentState,
     ) -> Option<BTreeMap<String, SuggestionState>>;
+    /// Inputs rewritten before the merge (a certified sheet column shift), or
+    /// `None` to merge the inputs as they are.
+    fn prepare(
+        &mut self,
+        _base: &DocumentState,
+        _team: &DocumentState,
+        _draft: &DocumentState,
+    ) -> Option<[DocumentState; 3]> {
+        None
+    }
+    /// Last word on the merged state, after the collections were decided.
+    fn finish_state(&mut self, _state: &mut DocumentState) {}
 }
 
 struct Whole;
@@ -177,6 +168,10 @@ struct Policied<'a> {
     registry: &'a Registry,
     evidence: Option<MergeEvidence>,
     collections: Option<Engine<'a>>,
+    /// The team and draft authors' roles in this orientation, when known.
+    roles: Option<(Role, Role)>,
+    /// Decisions of the structure pre-pass, taken before the field merge.
+    structure: Vec<Decision>,
 }
 
 impl<'a> Policied<'a> {
@@ -186,6 +181,8 @@ impl<'a> Policied<'a> {
             registry,
             evidence: None,
             collections: None,
+            roles: None,
+            structure: Vec::new(),
         }
     }
 
@@ -198,6 +195,9 @@ impl<'a> Policied<'a> {
         if let Some(engine) = self.collections {
             evidence.decisions.extend(engine.finish().decisions);
         }
+        let mut decisions = std::mem::take(&mut self.structure);
+        decisions.append(&mut evidence.decisions);
+        evidence.decisions = decisions;
         evidence
     }
 
@@ -234,6 +234,7 @@ impl Merger for Policied<'_> {
             &BTreeMap::new(),
             self.policy,
             self.registry,
+            self.roles,
         );
         self.collections = Some(Engine::new(self.policy, self.registry, evidence.family));
         self.evidence = Some(evidence);
@@ -267,6 +268,111 @@ impl Merger for Policied<'_> {
             Err(()) => three_way(&base.suggestions, &team.suggestions, &draft.suggestions),
         }
     }
+    /// Design 4.6: when the policy gives sheet structure to `dynodoc.sheet.shift.v1`
+    /// and one side's column change has a unique certificate, the base and the other
+    /// side are rewritten through it, so the field merge compares cells in one
+    /// coordinate system. Every sheet considered leaves a decision.
+    fn prepare(
+        &mut self,
+        base: &DocumentState,
+        team: &DocumentState,
+        draft: &DocumentState,
+    ) -> Option<[DocumentState; 3]> {
+        let family = Family::of(&[base, team, draft]);
+        let probe = Probe {
+            family,
+            node_type: "section",
+            block_type: None,
+            field: "$structure",
+            aspect: Some(Aspect::Structure),
+        };
+        let rule = self
+            .policy
+            .find_rule(&probe)
+            .filter(|r| family == Family::Spreadsheet && r.strategy == sheet::SHIFT_ID)?;
+        let gate = self.policy.effective_gate(rule);
+        let (bg, tg, dg) = (sheet::grids(base), sheet::grids(team), sheet::grids(draft));
+        let mut out: Option<[DocumentState; 3]> = None;
+        for (id, b) in &bg {
+            let (Some(t), Some(d)) = (tg.get(id), dg.get(id)) else {
+                continue;
+            };
+            let (ct, cd) = (sheet::certify(b, t), sheet::certify(b, d));
+            if (ct, cd) == (Certificate::None, Certificate::None) {
+                continue;
+            }
+            let mut decision = Decision {
+                node: Some(id.clone()),
+                field: "$structure".into(),
+                rule: Some(rule.id.clone()),
+                strategy: Some(rule.strategy.clone()),
+                gate: Some(gate),
+                outcome: DecisionOutcome::Conflict,
+                choice: None,
+                reason: String::new(),
+                basis: Some("shift-certificate".into()),
+                notes: Vec::new(),
+                needs_review: false,
+                conflict_key: None,
+                base: Digest::of(&b.to_json()),
+                team: Digest::of(&t.to_json()),
+                draft: Digest::of(&d.to_json()),
+                merged: None,
+                lost: Vec::new(),
+            };
+            // Which inputs move: the base and every side without the shift.
+            let (shift, rewrite) = match (ct, cd) {
+                (Certificate::Unique(s), Certificate::None) => (s, [true, false, true]),
+                (Certificate::None, Certificate::Unique(s)) => (s, [true, true, false]),
+                (Certificate::Unique(x), Certificate::Unique(y)) if x == y => {
+                    (x, [true, false, false])
+                }
+                _ => {
+                    decision.reason = "ambiguous-shift".into();
+                    self.structure.push(decision);
+                    continue;
+                }
+            };
+            decision.notes.push(format!(
+                "column {} {} {}",
+                sheet::col_letters(shift.at),
+                if shift.insert {
+                    "inserted before"
+                } else {
+                    "deleted at"
+                },
+                sheet::col_letters(shift.at)
+            ));
+            if matches!(gate, Gate::Manual | Gate::Blocked) {
+                decision.reason = if gate == Gate::Manual {
+                    "manual-gate"
+                } else {
+                    "blocked"
+                }
+                .into();
+                self.structure.push(decision);
+                continue;
+            }
+            let states = out.get_or_insert_with(|| [base.clone(), team.clone(), draft.clone()]);
+            for (state, moved) in states.iter_mut().zip(rewrite) {
+                if moved {
+                    sheet::apply_shift(state, id, shift);
+                }
+            }
+            decision.outcome = DecisionOutcome::Merged;
+            decision.reason = "normalized".into();
+            decision.needs_review = gate == Gate::AutoWithReview;
+            self.structure.push(decision);
+        }
+        out
+    }
+    fn finish_state(&mut self, state: &mut DocumentState) {
+        // The collections replaced the plan's suggestions and comments; the values
+        // automatic outcomes did not use are written again on top (idempotent).
+        if let Some(evidence) = &self.evidence {
+            crate::merge_policy::loser::apply(state, &evidence.losers, self.policy.defaults.loser);
+        }
+    }
 }
 
 /// Node/field merge with the symmetric handling workspace_merge omits: it only
@@ -282,6 +388,11 @@ fn merge_states_with(
     draft: &DocumentState,
     merger: &mut dyn Merger,
 ) -> Merged {
+    let prepared = merger.prepare(base, team, draft);
+    let (base, team, draft) = match &prepared {
+        Some([b, t, d]) => (b, t, d),
+        None => (base, team, draft),
+    };
     let mut conflicts = Vec::new();
     // The merge indexes into field maps; refuse shapes it cannot handle.
     for id in base
@@ -367,6 +478,7 @@ fn merge_states_with(
             draft: json!(draft.suggestions),
         }),
     }
+    merger.finish_state(&mut state);
     // Union of both sides' removed choices, kept only for nodes that end deleted.
     state.removed_choices = team
         .removed_choices
@@ -431,9 +543,37 @@ pub fn converge_with_registry(
     policy: &MergePolicy,
     registry: &Registry,
 ) -> (Convergence, ConvergenceEvidence) {
+    converge_with_roles(
+        base, left, right, left_root, right_root, policy, registry, None,
+    )
+}
+
+/// [`converge_with_registry`] with the roles of the left and right authors, for
+/// `prefer-role` parameters; each orientation gets them in its side order.
+#[allow(clippy::too_many_arguments)]
+pub fn converge_with_roles(
+    base: &DocumentState,
+    left: &DocumentState,
+    right: &DocumentState,
+    left_root: &Address,
+    right_root: &Address,
+    policy: &MergePolicy,
+    registry: &Registry,
+    roles: Option<(Role, Role)>,
+) -> (Convergence, ConvergenceEvidence) {
     let mut canonical = None;
+    let team_is_left = left_root <= right_root;
+    let mut forward = true;
     let convergence = converge_by(base, left, right, left_root, right_root, &mut |b, t, d| {
         let mut merger = Policied::new(policy, registry);
+        merger.roles = roles.map(|(l, r)| {
+            if team_is_left == forward {
+                (l, r)
+            } else {
+                (r, l)
+            }
+        });
+        forward = false;
         let merged = merge_states_with(b, t, d, &mut merger);
         // The first call is the canonical orientation; the second only checks it.
         if canonical.is_none() {
@@ -442,7 +582,6 @@ pub fn converge_with_registry(
         merged
     });
     let evidence = canonical.unwrap_or_else(|| MergeEvidence::new(policy, Family::Document));
-    let team_is_left = left_root <= right_root;
     (
         convergence,
         ConvergenceEvidence {

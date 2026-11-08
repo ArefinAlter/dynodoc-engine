@@ -26,7 +26,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
@@ -56,10 +56,39 @@ const CHANNEL_CAPACITY: usize = 256;
 /// proxies.
 const KEEPALIVE_SECS: u64 = 30;
 
+/// An idle stream re-checks the login and the role this often, so a revoked login or a removed
+/// member stops receiving within a minute even when nothing is written (identity document 14.3).
+pub const RECHECK_SECS: u64 = 60;
+
 /// The per-document broadcast registry, cloned into [`AppState`].
 #[derive(Clone, Default)]
 pub struct Subscriptions {
-    inner: Arc<Mutex<HashMap<Uuid, broadcast::Sender<Arc<Event>>>>>,
+    inner: Arc<Mutex<HashMap<Uuid, Channel>>>,
+    /// Set when cross-replica fan-out runs ([`crate::fanout`]): ranges to read from storage.
+    catch_up: Arc<OnceLock<tokio::sync::mpsc::UnboundedSender<CatchUp>>>,
+}
+
+/// One document's channel and the last sequence sent through it (`None` until known).
+struct Channel {
+    sender: broadcast::Sender<Arc<Event>>,
+    seen: Option<i64>,
+}
+
+impl Channel {
+    fn new() -> Self {
+        Self {
+            sender: broadcast::channel(CHANNEL_CAPACITY).0,
+            seen: None,
+        }
+    }
+}
+
+/// A range of one document's events to read from storage and send in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatchUp {
+    pub document: Uuid,
+    pub from: i64,
+    pub to: i64,
 }
 
 impl Subscriptions {
@@ -67,37 +96,100 @@ impl Subscriptions {
         Self::default()
     }
 
-    /// Get (or lazily create) the broadcast sender for a document.
-    fn sender(&self, document_id: DocumentId) -> broadcast::Sender<Arc<Event>> {
-        let mut map = self
-            .inner
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Channel>> {
+        self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.entry(document_id.0)
-            .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
-            .clone()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Fan a freshly committed event out to all live subscribers. Non-blocking: if
     /// there are no subscribers (or all have lagged away), this is a no-op. The write
     /// path calls this after `commit()`.
+    ///
+    /// With cross-replica fan-out on, an event is sent only when it follows the last one sent
+    /// (another replica's events may be in between); otherwise the range up to it is read from
+    /// storage, so a stream never sees a gap it would end on.
     pub fn publish(&self, document_id: DocumentId, event: Event) {
-        let sender = self.sender(document_id);
-        // `send` errors only when there are zero receivers — not an error for us.
-        let _ = sender.send(Arc::new(event));
+        let mut map = self.lock();
+        // No channel: nobody subscribed here, so there is nobody to send to.
+        let Some(channel) = map.get_mut(&document_id.0) else {
+            return;
+        };
+        let shared = self.catch_up.get();
+        match (shared, channel.seen) {
+            (Some(_), Some(seen)) if event.seq <= seen => {}
+            (Some(queue), Some(seen)) if event.seq != seen + 1 => {
+                let _ = queue.send(CatchUp {
+                    document: document_id.0,
+                    from: seen + 1,
+                    to: event.seq,
+                });
+            }
+            _ => {
+                channel.seen = Some(channel.seen.map_or(event.seq, |s| s.max(event.seq)));
+                // `send` errors only when there are zero receivers — not an error for us.
+                let _ = channel.sender.send(Arc::new(event));
+            }
+        }
     }
 
     /// Check and subscribe under the same lock so concurrent requests cannot
     /// oversubscribe between a receiver-count check and acquiring the receiver.
     fn subscribe(&self, document_id: DocumentId) -> Option<broadcast::Receiver<Arc<Event>>> {
-        let mut map = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let sender = map
-            .entry(document_id.0)
-            .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0);
-        (sender.receiver_count() < MAX_SUBSCRIBERS_PER_DOCUMENT).then(|| sender.subscribe())
+        let mut map = self.lock();
+        let channel = map.entry(document_id.0).or_insert_with(Channel::new);
+        (channel.sender.receiver_count() < MAX_SUBSCRIBERS_PER_DOCUMENT)
+            .then(|| channel.sender.subscribe())
+    }
+
+    /// A new stream pinned `head` from storage. A channel that knew nothing yet starts there;
+    /// one that did keeps its position, so its other streams still get what lies between.
+    fn note(&self, document_id: DocumentId, head: i64) {
+        if let Some(channel) = self.lock().get_mut(&document_id.0) {
+            channel.seen.get_or_insert(head);
+        }
+    }
+
+    /// Turn on cross-replica fan-out: ranges to catch up go to `queue` ([`crate::fanout`]).
+    pub(crate) fn share(&self, queue: tokio::sync::mpsc::UnboundedSender<CatchUp>) -> bool {
+        self.catch_up.set(queue).is_ok()
+    }
+
+    /// Documents with live subscribers and the last sequence sent to them, if known.
+    pub(crate) fn live(&self) -> Vec<(Uuid, Option<i64>)> {
+        let mut map = self.lock();
+        // A channel nobody listens to any more is dropped, so the registry stays bounded.
+        map.retain(|_, c| c.sender.receiver_count() > 0);
+        map.iter().map(|(id, c)| (*id, c.seen)).collect()
+    }
+
+    /// Whether `document` has a live subscriber here.
+    pub(crate) fn is_live(&self, document: Uuid) -> bool {
+        self.lock()
+            .get(&document)
+            .is_some_and(|c| c.sender.receiver_count() > 0)
+    }
+
+    /// Send `events` (one document's, read from storage, ascending) that follow the last one
+    /// sent; stops at the first gap. Returns the last sequence sent.
+    pub(crate) fn deliver(&self, document: Uuid, events: Vec<Event>) -> Option<i64> {
+        let mut map = self.lock();
+        let channel = map.get_mut(&document)?;
+        for event in events {
+            match channel.seen {
+                Some(seen) if event.seq <= seen => continue,
+                Some(seen) if event.seq != seen + 1 => break,
+                _ => {}
+            }
+            channel.seen = Some(event.seq);
+            let _ = channel.sender.send(Arc::new(event));
+        }
+        channel.seen
+    }
+
+    /// The last sequence sent for `document`, if known.
+    pub(crate) fn seen(&self, document: Uuid) -> Option<i64> {
+        self.lock().get(&document).and_then(|c| c.seen)
     }
 }
 
@@ -163,6 +255,7 @@ async fn document_stream(
             reason: "Resume position is outside document history".into(),
         });
     }
+    state.subscriptions.note(document_id, head);
     // Hold only one page while catching up. DB failures and broadcast lag terminate
     // the stream so the client can resume from its last delivered sequence.
     let events = stream::unfold(
@@ -220,6 +313,19 @@ async fn document_stream(
     let ready = stream::iter([Ok::<_, Infallible>(
         SseEvent::default().comment("connected"),
     )]);
+    // A check tick between events: the `take_while` below runs on it too. The merged stream ends
+    // when the events end (a gap or a failure), never because of the ticks.
+    let events = events.map(Some).chain(stream::once(async { None }));
+    let ticks = stream::unfold((), |()| async {
+        tokio::time::sleep(Duration::from_secs(RECHECK_SECS)).await;
+        Some((
+            Some(Ok::<_, Infallible>(SseEvent::default().comment("check"))),
+            (),
+        ))
+    });
+    let events = stream::select(events, ticks)
+        .take_while(|item| futures::future::ready(item.is_some()))
+        .filter_map(futures::future::ready);
     let stream = ready.chain(events).take_while(move |_| {
         let pool = pool.clone();
         async move {
@@ -291,8 +397,7 @@ mod tests {
         .is_err());
         let id = DocumentId(Uuid::new_v4());
         let receiver = subscriptions.subscribe(id).expect("recovered subscription");
-        let sender = subscriptions.sender(id);
-        assert_eq!(sender.receiver_count(), 1);
+        assert_eq!(subscriptions.live(), vec![(id.0, None)]);
         drop(receiver);
         // Keep every receiver alive to exercise the same limit after recovery.
         let receivers: Vec<_> = (0..MAX_SUBSCRIBERS_PER_DOCUMENT)

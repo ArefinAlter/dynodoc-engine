@@ -298,6 +298,33 @@ async fn structural_commits_merge_from_the_pane_and_pull_as_deltas(pool: PgPool)
         .unwrap()
         .contains("<w:b/>"));
     assert!(delta["through_seq"].as_i64().unwrap() > base["through_seq"].as_i64().unwrap());
+    // The shared view: what is waiting, as commits with message, author and block count.
+    let commits = delta["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 1, "{delta}");
+    assert_eq!(commits[0]["blocks"], 3);
+    assert_eq!(commits[0]["agent"], false);
+    assert!(commits[0]["name"].as_str().is_some_and(|n| !n.is_empty()));
+    // Each commit names the blocks it changed, for blame.
+    let touched: Vec<&str> = commits[0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for id in [&a, &b, &new] {
+        assert!(touched.contains(&id.as_str()), "{delta}");
+    }
+    // Team activity: the latest merged commits, newest first, whatever the base.
+    let activity = delta["activity"].as_array().unwrap();
+    assert_eq!(activity[0]["id"], commits[0]["id"], "{delta}");
+    let head = format!(
+        "/connector/documents/{doc}/changes?since_seq={}&since_chain_hash={}",
+        delta["through_seq"],
+        delta["chain_hash"].as_str().unwrap()
+    );
+    let (_, later) = get(&router, &head, &theirs).await;
+    assert_eq!(later["commits"].as_array().unwrap().len(), 0, "{later}");
+    assert_eq!(later["activity"][0]["id"], commits[0]["id"], "{later}");
     // A base that is not this history is refused, not guessed.
     let forged = format!(
         "/connector/documents/{doc}/changes?since_seq={}&since_chain_hash={}",
@@ -493,4 +520,60 @@ async fn media_is_content_addressed_typed_scoped_and_inert(pool: PgPool) {
         assert!(edit.is_err());
     }
     runtime.close().await;
+}
+
+/// Decision 036: a pane reads the event rows behind a checkpoint and verifies the hash chain
+/// itself. Only a key for this file may read them, and only in bounded pages of history.
+#[sqlx::test(migrations = "../../migrations")]
+async fn events_let_a_pane_verify_the_checkpoint_chain(pool: PgPool) {
+    let runtime = common::RuntimeDatabase::new(pool).await;
+    let pool = runtime.pool.clone();
+    let router = app(test_state(pool.clone()));
+    let owner = identity(&pool, "events-owner@example.test").await;
+    let (doc, ..) = document(&router, &owner).await;
+    let (other, ..) = document(&router, &owner).await;
+    let token = connector(&router, doc, &owner).await;
+    let other_token = connector(&router, other, &owner).await;
+    let (status, checkpoint) = get(
+        &router,
+        &format!("/connector/documents/{doc}/checkpoint"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{checkpoint}");
+    let head = checkpoint["through_seq"].as_i64().unwrap();
+    let uri = format!("/connector/documents/{doc}/events?after_seq=0&through_seq={head}");
+    let (status, body) = get(&router, &uri, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events: Vec<engine_shared::Event> = serde_json::from_value(body["events"].clone()).unwrap();
+    assert_eq!(events.len() as i64, head);
+    let mut chain = engine_core::hashing::ZERO_HASH;
+    for (i, event) in events.iter().enumerate() {
+        chain = engine_core::hashing::verify_event(event, i as i64 + 1, &chain).unwrap();
+    }
+    assert_eq!(
+        engine_core::hashing::hex(&chain),
+        checkpoint["chain_hash"].as_str().unwrap()
+    );
+    // Another file's key, no key and a session token are all refused.
+    assert_eq!(
+        get(&router, &uri, &other_token).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(get(&router, &uri, "").await.0, StatusCode::UNAUTHORIZED);
+    assert_ne!(get(&router, &uri, &owner).await.0, StatusCode::OK);
+    // Ranges stay inside history.
+    for range in [
+        format!("after_seq={}&through_seq={}", head, head + 1),
+        "after_seq=2&through_seq=1".into(),
+        "after_seq=-1&through_seq=1".into(),
+        "after_seq=0&through_seq=1001".into(),
+    ] {
+        let uri = format!("/connector/documents/{doc}/events?{range}");
+        assert_eq!(
+            get(&router, &uri, &token).await.0,
+            StatusCode::BAD_REQUEST,
+            "{range}"
+        );
+    }
 }

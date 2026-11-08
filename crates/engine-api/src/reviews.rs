@@ -390,9 +390,23 @@ pub(crate) async fn create(
         ));
     }
     let base = state_through(&mut tx, id, req.base_seq).await?;
-    let stored =
+    // Ledger mode: only editor commits, whose first commit records hashes and whose changed
+    // blocks carry their manifest hash (decision 028).
+    let kept = crate::ledger::storage(&mut tx, id).await?;
+    let ledger = kept.ledger;
+    if ledger {
+        if req.provenance.is_none() {
+            crate::ledger::refuse_direct(&mut tx, id).await?;
+        }
+        crate::ledger::check_ops(&base, &team, &req.ops, kept.keyed)?;
+    }
+    // A ledger request names its base revision of the log instead of copying the state.
+    let stored = if ledger {
+        crate::draft_storage::at_seq(req.base_seq)
+    } else {
         crate::draft_storage::encode(&mut tx, DocumentId(id), &base, state.shared_draft_bases)
-            .await?;
+            .await?
+    };
     let draft:Uuid=sqlx::query_scalar("insert into workspace_draft(document_id,name,base_seq,base_state,created_by,source,submitted_at,submission_note,revision,content_changed_at) values($1,$2,$3,$4,$5,$6,case when $7 then now() end,$8,1,now()) returning id")
         .bind(id).bind(req.name.trim()).bind(req.base_seq).bind(stored).bind(auth.identity_id).bind(&source).bind(req.submit).bind(req.note.trim()).fetch_one(&mut *tx).await?;
     let mut current = base.clone();
@@ -496,7 +510,7 @@ pub(crate) async fn create(
 /// address is the placeholder of the reserved domain). Every other request is
 /// exactly what it was. The `agent` part is `identity::agent_json("d")`, written out because
 /// this is a constant; a test keeps the two equal.
-pub(crate) const REQUEST_JSON: &str = "(jsonb_build_object('id',d.id,'name',d.name,'note',d.submission_note,'source',d.source,'base_seq',d.base_seq,'created_at',d.created_at,'submitted_at',d.submitted_at,'merged_at',d.merged_at,'review_outcome',d.review_outcome,'reviewed_at',d.reviewed_at,'review_note',d.review_note,'revision',d.revision,'author',jsonb_build_object('id',a.id,'name',a.display_name,'email',case when lower(a.email) like '%@agents.invalid' then null else a.email end),'reviewer',case when r.id is null then null else jsonb_build_object('id',r.id,'name',r.display_name,'email',case when lower(r.email) like '%@agents.invalid' then null else r.email end) end,'edits',(select count(*) from draft_edit e where e.draft_id=d.id),'status',case when d.merged_at is not null then 'merged' when d.review_outcome is not null then d.review_outcome else 'open' end)||coalesce((select jsonb_build_object('agent',jsonb_build_object('id',ai.identity_id,'client_kind',ai.client_kind,'display_name',ag.display_name,'principal',jsonb_build_object('id',pr.id,'name',pr.display_name),'revoked',ai.revoked_at is not null)) from agent_identity ai join identity ag on ag.id=ai.identity_id join identity pr on pr.id=ai.principal_id where ai.identity_id=d.created_by),'{}'::jsonb))";
+pub(crate) const REQUEST_JSON: &str = "(jsonb_build_object('id',d.id,'name',d.name,'note',d.submission_note,'source',d.source,'base_seq',d.base_seq,'created_at',d.created_at,'submitted_at',d.submitted_at,'merged_at',d.merged_at,'review_outcome',d.review_outcome,'reviewed_at',d.reviewed_at,'review_note',d.review_note,'revision',d.revision,'author',jsonb_build_object('id',a.id,'name',a.display_name,'email',case when lower(a.email) like '%@agents.invalid' then null else a.email end),'reviewer',case when r.id is null then null else jsonb_build_object('id',r.id,'name',r.display_name,'email',case when lower(r.email) like '%@agents.invalid' then null else r.email end) end,'edits',coalesce((select c.edits from ledger_compaction c where c.draft_id=d.id),(select count(*) from draft_edit e where e.draft_id=d.id)),'status',case when d.merged_at is not null then 'merged' when d.review_outcome is not null then d.review_outcome else 'open' end)||coalesce((select jsonb_build_object('agent',jsonb_build_object('id',ai.identity_id,'client_kind',ai.client_kind,'display_name',ag.display_name,'principal',jsonb_build_object('id',pr.id,'name',pr.display_name),'revoked',ai.revoked_at is not null)) from agent_identity ai join identity ag on ag.id=ai.identity_id join identity pr on pr.id=ai.principal_id where ai.identity_id=d.created_by),'{}'::jsonb))";
 
 /// Submitted change requests are visible to every member; unsubmitted drafts stay private.
 #[utoipa::path(get, path="/documents/{id}/change-requests", tag="reviews", params(("id" = Uuid, Path, description = "Document identifier")), responses((status=200, description="Open and recently closed change requests", body=Value),(status=403, description="Document membership required")))]
@@ -682,21 +696,68 @@ pub(crate) async fn merge(
     if chosen.is_empty() {
         return Err(bad("Select at least one change to merge"));
     }
-    let events = append_to_team(&mut tx, doc, actor, role, &mut team, &chosen).await?;
+    let mut events = append_to_team(&mut tx, doc, actor, role, &mut team, &chosen).await?;
+    let person_edits = match request["agent"]["id"].as_str().and_then(|a| a.parse().ok()) {
+        Some(agent) => person_edits(&mut tx, id, &ctx.row, agent, &team, &chosen).await?,
+        None => Vec::new(),
+    };
+    // Attribution layer C (decision 038): the agent's authorship, sealed into the chain right
+    // after the events it names. A person's request gets no seal.
+    let sealed = if state.sealed_attribution {
+        crate::agent::attribution::seal(
+            &mut tx,
+            crate::agent::attribution::Merge {
+                document: doc,
+                draft,
+                merger: auth.identity_id,
+                request: &request,
+                events: &events,
+                person_edits: &person_edits,
+                review: &review,
+                overridden,
+            },
+        )
+        .await?
+    } else {
+        None
+    };
+    let content_events = events.len();
+    let sealed_seq = sealed.as_ref().map(|e| e.seq);
+    events.extend(sealed);
     let mut local = ctx.local;
     carry_into_draft(&mut tx, draft, auth.identity_id, &mut local, &plan.state).await?;
     let remaining = engine_core::workspace_merge::diff(&team, &local)?.len();
     let completed = remaining == 0;
     let next_seq = events.last().map_or(seq, |e| e.seq);
-    let stored =
-        crate::draft_storage::encode(&mut tx, doc, &team, state.shared_draft_bases).await?;
+    let ledger = crate::ledger::storage(&mut tx, id).await?.ledger;
+    let stored = if ledger {
+        crate::draft_storage::at_seq(next_seq)
+    } else {
+        crate::draft_storage::encode(&mut tx, doc, &team, state.shared_draft_bases).await?
+    };
     sqlx::query("update workspace_draft set merge_base_state=$2,base_seq=$3,revision=revision+1,merged_at=case when $4 then now() end,review_outcome=case when $4 then 'merged' end,reviewed_by=$5,reviewed_at=now(),review_note=$6 where id=$1")
         .bind(draft).bind(stored).bind(next_seq).bind(completed).bind(auth.identity_id).bind(req.note.trim()).execute(&mut *tx).await?;
-    let mut detail = json!({"draft_id":draft,"contributor":request["author"]["id"],"events":events.len(),"from_seq":events.first().map(|e|e.seq),"through_seq":events.last().map(|e|e.seq),"completed":completed,"rules_overridden":overridden,"approvals":review["approvals"]});
+    // Ledger mode: once merged, the request's edits and uploaded bundle are copies of the
+    // events; drop them (decision 028). The audit row below keeps the record of the merge.
+    if ledger && completed {
+        crate::ledger::compact(&mut tx, id, draft).await?;
+        crate::ledger::release_agent_states(&mut tx, id, draft).await?;
+    } else if ledger {
+        // Partly merged: keep only what is still to merge (decision 040).
+        crate::ledger::rebase_request(&mut tx, id, draft, &team, &local).await?;
+    }
+    let merged = &events[..content_events];
+    let mut detail = json!({"draft_id":draft,"contributor":request["author"]["id"],"events":merged.len(),"from_seq":merged.first().map(|e|e.seq),"through_seq":merged.last().map(|e|e.seq),"completed":completed,"rules_overridden":overridden,"approvals":review["approvals"]});
+    if let Some(seq) = sealed_seq {
+        detail["attribution_seq"] = json!(seq);
+    }
     // Attribution layer B (docs/AI-AGENT-PROTOCOL-SPEC.md 9.5): the contributor of an agent's
     // request is the agent identity (as above); say so, and for whom it acted. The events
     // themselves keep the merger as `actor_id`, unchanged.
     name_agent(&mut detail, &request);
+    if !person_edits.is_empty() {
+        detail["person_edits"] = json!(person_edits);
+    }
     crate::product::audit(
         &mut tx,
         auth.identity_id,
@@ -713,7 +774,7 @@ pub(crate) async fn merge(
             Some(id),
             Some(auth.identity_id),
             Some(draft),
-            json!({"completed":completed,"events":events.len()}),
+            json!({"completed":completed,"events":content_events}),
         )
         .await?;
     }
@@ -776,6 +837,7 @@ pub(crate) async fn close_request(
     }
     sqlx::query("update workspace_draft set review_outcome=$2,reviewed_by=$3,reviewed_at=now(),review_note=$4 where id=$1")
         .bind(draft).bind(outcome).bind(auth.identity_id).bind(note.trim()).execute(&mut *tx).await?;
+    crate::ledger::release_agent_states(&mut tx, id, draft).await?;
     let mut detail = json!({"draft_id":draft,"contributor":request["author"]["id"]});
     name_agent(&mut detail, &request);
     crate::product::audit(
@@ -962,6 +1024,104 @@ pub(crate) async fn mark_submitted(
     )
     .await?;
     Ok(true)
+}
+
+/// The containment rule of decision 026 (section 2): for each block of an agent's request merged
+/// now that a person also edited in the draft, who edited it last and how much of the agent's
+/// text the merged block keeps (`retained`, percent of the agent's word shingles). Block blame
+/// names the person below [`AGENT_DRAFT_KEPT`] and keeps the agent ("edited from an agent
+/// draft") from it on. A block the agent never touched has `retained` 0.
+async fn person_edits(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+    row: &Value,
+    agent: Uuid,
+    merged: &DocumentState,
+    chosen: &[EventPayload],
+) -> Result<Vec<Value>, ApiError> {
+    let draft = row["id"].as_str().and_then(|v| v.parse::<Uuid>().ok());
+    let edits: Vec<(Value, Uuid)> =
+        sqlx::query_as("select payload,actor_id from draft_edit where draft_id=$1 order by id")
+            .bind(draft)
+            .fetch_all(&mut **tx)
+            .await?;
+    if edits.iter().all(|(_, actor)| *actor == agent) {
+        return Ok(Vec::new());
+    }
+    // The agent's own text: the draft's base and the agent's edits only. An agent edit that
+    // needs a person's earlier edit to apply is left out of it.
+    let mut own = crate::draft_storage::decode(tx, DocumentId(id), &row["base_state"]).await?;
+    let mut touched = BTreeSet::new();
+    let mut by: BTreeMap<NodeId, Uuid> = BTreeMap::new();
+    for (payload, actor) in edits {
+        let op: EventPayload =
+            serde_json::from_value(payload).map_err(|e| ApiError::Internal(e.to_string()))?;
+        let Some(node) = op.target_node_id().cloned() else {
+            continue;
+        };
+        if actor == agent {
+            if apply_payload(&mut own, &op).is_ok() {
+                touched.insert(node);
+            }
+        } else {
+            by.insert(node, actor);
+        }
+    }
+    let merged_nodes: BTreeSet<&NodeId> =
+        chosen.iter().filter_map(|op| op.target_node_id()).collect();
+    Ok(by
+        .into_iter()
+        .filter(|(node, _)| merged_nodes.contains(node))
+        .map(|(node, who)| {
+            let retained = if touched.contains(&node) {
+                let text =
+                    |s: &DocumentState| s.nodes.get(&node).map(block_text).unwrap_or_default();
+                containment(&text(&own), &text(merged))
+            } else {
+                0
+            };
+            json!({"node": node.0, "by": who, "retained": retained})
+        })
+        .collect())
+}
+
+/// From this share of the agent's text kept (percent), a person's edit leaves the block the
+/// agent's, shown as "edited from an agent draft" (decision 026: at least half).
+pub(crate) const AGENT_DRAFT_KEPT: u8 = 50;
+
+/// The words of a block: its rich-text `content` (of which `label` is a copy), else its text
+/// fields (sheet cells, shape text) in field order.
+fn block_text(node: &engine_core::materializer::MaterializedNode) -> String {
+    let fields = &node.current_fields;
+    if fields["content"].is_object() {
+        return engine_core::richtext::plain_text(&fields["content"]);
+    }
+    let texts = fields.as_object().into_iter().flat_map(|f| f.values());
+    texts
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How much of `original` survives in `edited`: the percentage of the distinct word
+/// three-shingles of `original` (single words when it has fewer than three) found in `edited`.
+/// Case and punctuation are ignored. An empty `original` keeps nothing.
+fn containment(original: &str, edited: &str) -> u8 {
+    let words = |text: &str| {
+        let mut out = Vec::new();
+        similarity::word_hashes(text, &mut out);
+        out
+    };
+    let (before, after) = (words(original), words(edited));
+    let width = before.len().clamp(1, 3);
+    let shingles =
+        |w: &[u64]| -> BTreeSet<Vec<u64>> { w.windows(width).map(<[u64]>::to_vec).collect() };
+    let (before, after) = (shingles(&before), shingles(&after));
+    if before.is_empty() {
+        return 0;
+    }
+    let kept = before.iter().filter(|s| after.contains(*s)).count();
+    (kept * 100 / before.len()) as u8
 }
 
 /// For a request an AI agent wrote, say so in an audit detail (an object): the contributor is

@@ -17,6 +17,7 @@
 pub mod access;
 pub mod admin;
 mod admin_controls;
+mod admin_identity;
 pub mod agent;
 pub mod audit;
 pub mod auth;
@@ -26,21 +27,37 @@ pub mod copies;
 pub mod counters;
 mod device_sessions;
 mod devices;
+pub mod directory;
 mod discussions;
 pub mod documents;
 mod draft_storage;
+mod e2ee;
+mod egress;
 pub mod error;
 pub mod export_tokens;
+pub mod fanout;
 mod history;
 pub mod idempotency;
+pub mod identity_secrets;
+pub mod ingest;
+mod ledger;
+mod mail_outbox;
+mod mcp_http;
+pub mod merge_policies;
+pub mod metrics;
 pub mod notifications;
+mod oauth;
+pub mod object_collector;
+pub mod object_store;
 pub mod ops;
+pub mod org_sign_in;
 pub mod pagination;
 pub mod people;
 pub mod product;
 mod profiles;
 mod project_activity;
 mod project_history;
+mod project_horizons;
 mod project_issues;
 mod project_staging;
 pub mod projects;
@@ -49,6 +66,9 @@ pub mod retention;
 pub mod reviews;
 pub mod secrets;
 pub mod stream;
+pub mod transparency;
+pub mod uploads;
+pub mod witness_service;
 pub mod workloads;
 pub mod workspace;
 
@@ -87,12 +107,39 @@ pub struct AppState {
     /// `AGENT_GATEWAY=on` mounts the agent data plane ([`agent`]); anything else leaves
     /// its routes absent. Off by default.
     pub agent_gateway: bool,
+    /// `E2EE_ALLOW_CREATE=on` lets owners begin encrypted projects (pre-release, staged
+    /// rollout, protocol 12.1). Existing encrypted projects keep working without it.
+    pub e2ee_create: bool,
+    /// Seal agent authorship into the event chain at merge (decision 038, layer C). On unless
+    /// `DYNODOC_AGENT_ATTRIBUTION=audit`, which keeps layers A and B only, for installations
+    /// whose other readers predate the `ChangeAttributed` event.
+    pub sealed_attribution: bool,
     /// Bounded cache of verified document states for the agent routes.
     pub agent_cache: agent::StateCache,
     /// Opt-in checked write cache; authorization always precedes lookup.
     pub write_cache: Option<engine_core::snapshot::cache::CurrentStateCache>,
+    /// The installation's transparency log, when `DYNODOC_TRANSPARENCY_ORIGIN` is set.
+    pub transparency: Option<transparency::Transparency>,
+    /// Shortest quarantine a shared horizon may have (design CP-Q5: 14 days), from
+    /// `DYNODOC_HORIZON_MIN_QUARANTINE_DAYS`.
+    pub horizon_min_quarantine_days: u32,
     /// The immutable installation ID, read once for device-session challenges.
     device_authority: std::sync::Arc<tokio::sync::OnceCell<uuid::Uuid>>,
+    /// `IDENTITY_SECRETS_KEY`: the data key of stored identity secrets ([`identity_secrets`]).
+    /// `None` keeps the legacy key derived from the server key.
+    pub identity_key: Option<[u8; 32]>,
+    /// Login lifetimes (`REFRESH_TTL_SECONDS`, idle timeout, absolute cap).
+    pub session_policy: auth::SessionPolicy,
+    /// Requests per minute one SCIM token may make (`SCIM_RATE_PER_MINUTE`, default 600).
+    pub scim_rate_per_minute: i32,
+    /// Cross-replica event fan-out (`DYNODOC_EVENT_FANOUT`, [`fanout`]); `local` by default.
+    pub fanout: fanout::Fanout,
+    /// Where originals and media bytes live (`DYNODOC_OBJECT_STORE`, [`object_store`]).
+    pub objects: std::sync::Arc<object_store::ObjectStore>,
+    /// How old a login may be for a sensitive action (`auth::sessions::require_recent_login`).
+    /// `0` (the value of [`AppState::new`]) is off; the binary reads `REAUTH_MAX_AGE_SECONDS`
+    /// (default 600).
+    pub reauth_seconds: i64,
 }
 
 impl AppState {
@@ -118,11 +165,56 @@ impl AppState {
                 engine_core::snapshot::NamedStorage::Legacy
             },
             agent_gateway: std::env::var("AGENT_GATEWAY").as_deref() == Ok("on"),
+            e2ee_create: std::env::var("E2EE_ALLOW_CREATE").as_deref() == Ok("on"),
+            sealed_attribution: std::env::var("DYNODOC_AGENT_ATTRIBUTION").as_deref()
+                != Ok("audit"),
             agent_cache: Default::default(),
             write_cache: (std::env::var("DYNODOC_WRITE_STATE_CACHE").as_deref() == Ok("on"))
                 .then(engine_core::snapshot::cache::CurrentStateCache::default),
+            // An invalid origin is refused at startup (main.rs); tests set the field.
+            transparency: transparency::Transparency::from_env().ok().flatten(),
+            horizon_min_quarantine_days: std::env::var("DYNODOC_HORIZON_MIN_QUARANTINE_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(14),
             device_authority: Default::default(),
+            identity_key: None,
+            session_policy: Default::default(),
+            scim_rate_per_minute: 600,
+            fanout: Default::default(),
+            objects: Default::default(),
+            reauth_seconds: 0,
         }
+    }
+
+    /// The installation ID (immutable; read once per process).
+    pub(crate) async fn installation(&self) -> Result<uuid::Uuid, sqlx::Error> {
+        self.device_authority
+            .get_or_try_init(|| async {
+                sqlx::query_scalar::<_, uuid::Uuid>(
+                    "select id from device_authority where singleton",
+                )
+                .fetch_one(&self.pool)
+                .await
+            })
+            .await
+            .copied()
+    }
+
+    /// The key new identity secrets are sealed with.
+    pub(crate) fn identity_sealing_key(&self) -> engine_core::at_rest::DataKey {
+        identity_secrets::sealing_key(&self.auth.paseto_key, self.identity_key.as_ref())
+    }
+
+    /// Every key a stored identity secret may be sealed with (chosen by the envelope's key id).
+    pub(crate) fn identity_opening_keys(&self) -> Vec<engine_core::at_rest::DataKey> {
+        let mut keys = vec![identity_secrets::legacy_key(&self.auth.paseto_key)];
+        keys.extend(
+            self.identity_key
+                .as_ref()
+                .map(identity_secrets::identity_key),
+        );
+        keys
     }
 }
 
@@ -142,6 +234,7 @@ pub fn app(state: AppState) -> Router {
 
     let routes = Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/openapi.json", get(openapi_json))
         .merge(auth::router())
         .merge(admin::router())
@@ -150,11 +243,18 @@ pub fn app(state: AppState) -> Router {
         .merge(project_activity::router())
         .merge(project_staging::router())
         .merge(project_history::router())
+        .merge(project_horizons::router())
+        .merge(merge_policies::router())
+        .merge(transparency::router())
         .merge(project_issues::router())
         .merge(profiles::router())
         .merge(devices::router())
         .merge(device_sessions::router())
         .merge(provenance::router())
+        .merge(ledger::router())
+        .merge(e2ee::router())
+        .merge(uploads::router())
+        .merge(egress::router())
         .merge(documents::router())
         .merge(ops::router())
         .merge(conflicts::router())
@@ -167,11 +267,18 @@ pub fn app(state: AppState) -> Router {
         .merge(notifications::router())
         .merge(copies::router())
         .merge(people::router())
-        .merge(export_tokens::router());
+        .merge(export_tokens::router())
+        .merge(directory::router())
+        .merge(org_sign_in::router())
+        .merge(mail_outbox::router());
     // Off (the default): the agent routes are not mounted at all, so they answer exactly
     // as a path that never existed.
     let routes = if state.agent_gateway {
-        routes.merge(agent::router())
+        // Remote MCP and the OAuth grants behind it belong to the agent plane too.
+        routes
+            .merge(agent::router())
+            .merge(oauth::router())
+            .merge(mcp_http::router())
     } else {
         routes
     };
@@ -181,6 +288,11 @@ pub fn app(state: AppState) -> Router {
     // So is the reviewers' list of what the agents proposed: proposals outlive the switch.
     let routes = routes.merge(agent::inbox_router());
     routes
+        // Encrypted projects: routes that need plaintext refuse sealed files (decision 035).
+        .layer(axum::middleware::from_fn_with_state(
+            state.pool.clone(),
+            e2ee::guard,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.workloads.clone(),
             workloads::admission,
@@ -255,6 +367,32 @@ mod redact_tests {
 /// Liveness probe. Returns 200 with a small JSON body.
 async fn healthz() -> Json<Value> {
     Json(json!({ "status": "ok", "service": "engine-api" }))
+}
+
+/// Readiness probe: the database answers within 2 s and, with `DYNODOC_EVENT_FANOUT=postgres`,
+/// the event listener is connected. `503` names the failed check, never an error's detail.
+async fn readyz(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    let database = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sqlx::query_scalar::<_, i32>("select 1").fetch_one(&state.pool),
+    )
+    .await
+    .is_ok_and(|r| r.is_ok());
+    let listener = state.fanout.ready();
+    let ok = database && listener;
+    (
+        if ok {
+            axum::http::StatusCode::OK
+        } else {
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(json!({
+            "status": if ok { "ready" } else { "not_ready" },
+            "checks": {"database": database, "event_listener": listener},
+        })),
+    )
 }
 
 /// Serve the generated OpenAPI document as JSON (the committed `openapi.yaml` is the
@@ -345,6 +483,8 @@ impl utoipa::Modify for WorkspaceDocs {
         api.merge(projects::ProjectsApi::openapi());
         api.merge(project_activity::ProjectActivityApi::openapi());
         api.merge(provenance::ProvenanceApi::openapi());
+        api.merge(ledger::LedgerApi::openapi());
+        api.merge(e2ee::E2eeApi::openapi());
         api.merge(export_tokens::ExportTokensApi::openapi());
         api.merge(admin::AdminApi::openapi());
         api.merge(admin_controls::AdminControlsApi::openapi());
@@ -356,6 +496,8 @@ impl utoipa::Modify for WorkspaceDocs {
         api.merge(device_sessions::DeviceSessionsApi::openapi());
         api.merge(project_staging::ProjectStagingApi::openapi());
         api.merge(project_history::ProjectHistoryApi::openapi());
+        api.merge(project_horizons::HorizonsApi::openapi());
+        api.merge(merge_policies::MergePoliciesApi::openapi());
         api.merge(project_issues::ProjectIssuesApi::openapi());
         api.merge(agent::AgentApi::openapi());
         api.merge(agent::AgentManageApi::openapi());

@@ -1,0 +1,72 @@
+# cargo-fuzz targets for the engine's decoders of untrusted bytes (decision 041). Its own
+# workspace, outside the engine's: `cargo +nightly fuzz build` / `cargo +nightly fuzz run
+# <target>` from crates/engine-core (needs cargo-fuzz). Running them is the bulk pass's job.
+[package]
+name = "engine-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+engine-core = { path = ".." }
+serde_json = "1"
+uuid = "1"
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "sealed_object"
+path = "fuzz_targets/sealed_object.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "structural_object"
+path = "fuzz_targets/structural_object.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stored_object"
+path = "fuzz_targets/stored_object.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "at_rest_envelope"
+path = "fuzz_targets/at_rest_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sealed_commit"
+path = "fuzz_targets/sealed_commit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "membership_log"
+path = "fuzz_targets/membership_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "escrow_share"
+path = "fuzz_targets/escrow_share.rs"
+test = false
+doc = false
+bench = false

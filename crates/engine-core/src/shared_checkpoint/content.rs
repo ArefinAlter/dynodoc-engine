@@ -3,8 +3,12 @@
 //! This is an internal storage primitive, not a published checkpoint/commit or an
 //! authorization API. Callers authorize the document and own transaction rollback,
 //! root publication and staged output. See docs/CHUNKED-CONTENT.md.
+//!
+//! Version 1 trees use fixed 64 KiB chunks. Version 2 trees (decision 034) allow
+//! variable-length chunks of at most 256 KiB, cut by a [`Chunker`]: fixed 64 KiB
+//! restarted at forced boundaries (package-aware originals) or FastCDC. Readers
+//! accept both; one tree never mixes versions.
 
-use ring::digest::{Context, SHA256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::{Address, Error, Limits, ObjectStore, WriteStats, Writer};
@@ -15,7 +19,17 @@ pub const FANOUT: usize = 128;
 pub const MAX_HEIGHT: u8 = 4;
 pub(super) const MAGIC: &[u8] = b"DYNOCNT\0";
 const DOMAIN: &[u8] = b"dynodoc.content\0v1\0";
+const DOMAIN_V2: &[u8] = b"dynodoc.content\0v2\0";
 const HEADER: usize = 10;
+/// Largest chunk of a version 2 tree (the FastCDC maximum).
+pub const MAX_CHUNK_BYTES_V2: usize = 256 * 1024;
+/// FastCDC profile `fastcdc-16k-64k-256k`: minimum chunk bytes.
+pub const CDC_MIN_BYTES: usize = 16 * 1024;
+/// FastCDC profile `fastcdc-16k-64k-256k`: average chunk bytes.
+pub const CDC_AVG_BYTES: usize = 64 * 1024;
+// Normalization level 2 around a 2^16 average: stricter mask below it, looser above.
+const CDC_MASK_SMALL: u64 = !0 << (64 - 18);
+const CDC_MASK_LARGE: u64 = !0 << (64 - 14);
 
 #[derive(Debug, Clone)]
 struct Reference {
@@ -39,24 +53,93 @@ fn capacity(height: u8) -> u64 {
     (CHUNK_BYTES as u64) * (FANOUT as u64).pow(height.into())
 }
 
+fn capacity_v2(height: u8) -> u64 {
+    (MAX_CHUNK_BYTES_V2 as u64) * (FANOUT as u64).pow(height.into())
+}
+
 fn height_for(length: u64) -> Result<u8, Error> {
     (0..=MAX_HEIGHT)
         .find(|height| length <= capacity(*height))
         .ok_or(Error::Limit("content tree height"))
 }
 
+#[cfg(test)]
 fn address(bytes: &[u8]) -> Address {
-    let mut hash = Context::new(&SHA256);
-    hash.update(DOMAIN);
-    hash.update(bytes);
-    Address(super::hex(hash.finish().as_ref()))
+    address_v(1, bytes)
 }
 
-fn header(tag: u8) -> Vec<u8> {
+fn address_v(version: u8, bytes: &[u8]) -> Address {
+    let domain = if version == 1 { DOMAIN } else { DOMAIN_V2 };
+    Address(super::hex(&crate::hashing::sha256(&[domain, bytes])))
+}
+
+fn header(version: u8, tag: u8) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(HEADER);
     bytes.extend_from_slice(MAGIC);
-    bytes.extend_from_slice(&[1, tag]);
+    bytes.extend_from_slice(&[version, tag]);
     bytes
+}
+
+/// A FastCDC gear table. Derived from a per-document secret seed so chunk
+/// boundaries cannot be fingerprinted or steered by a chosen input; the seed is
+/// needed only to write a version with maximal reuse, never to read (decision 034).
+pub struct Gear([u64; 256]);
+
+impl Gear {
+    /// Derive the table from a seed (32 random bytes stored with the document).
+    pub fn from_seed(seed: &[u8]) -> Self {
+        let mut table = [0u64; 256];
+        for (i, value) in table.iter_mut().enumerate() {
+            let hash = crate::hashing::sha256(&[b"dynodoc.cdc-gear\0v1\0", seed, &[i as u8]]);
+            let mut word = [0u8; 8];
+            word.copy_from_slice(&hash[..8]);
+            *value = u64::from_be_bytes(word);
+        }
+        Self(table)
+    }
+
+    /// Length of the next chunk of `data`: 1..=len for non-empty input. Callers
+    /// pass a full [`MAX_CHUNK_BYTES_V2`] window unless the stream or a forced
+    /// boundary ends sooner.
+    fn cut(&self, data: &[u8]) -> usize {
+        let n = data.len();
+        if n <= CDC_MIN_BYTES {
+            return n;
+        }
+        let normal = n.min(CDC_AVG_BYTES);
+        let end = n.min(MAX_CHUNK_BYTES_V2);
+        let mut hash = 0u64;
+        for (i, byte) in data.iter().enumerate().take(end).skip(CDC_MIN_BYTES) {
+            hash = (hash << 1).wrapping_add(self.0[*byte as usize]);
+            let mask = if i < normal {
+                CDC_MASK_SMALL
+            } else {
+                CDC_MASK_LARGE
+            };
+            if hash & mask == 0 {
+                return i + 1;
+            }
+        }
+        end
+    }
+}
+
+/// How a version 2 writer cuts a stream into chunks.
+#[derive(Clone, Copy)]
+pub enum Chunker<'a> {
+    /// 64 KiB chunks, restarted at each forced boundary.
+    Fixed,
+    /// FastCDC `fastcdc-16k-64k-256k` with the document's gear table.
+    Cdc(&'a Gear),
+}
+
+impl Chunker<'_> {
+    fn cut(&self, data: &[u8]) -> usize {
+        match self {
+            Self::Fixed => data.len().min(CHUNK_BYTES),
+            Self::Cdc(gear) => gear.cut(data),
+        }
+    }
 }
 
 fn put_address(bytes: &mut Vec<u8>, address: &Address) {
@@ -87,13 +170,16 @@ fn reference(bytes: &[u8]) -> Reference {
     reason = "the matching branch checked the header length; the matching branch checked at least 21 bytes"
 )]
 fn decode<'a>(expected: &Address, bytes: &'a [u8]) -> Result<Object<'a>, Error> {
-    if bytes.len() > HEADER + CHUNK_BYTES {
+    let version = bytes.get(8).copied().unwrap_or(0);
+    if bytes.len() > HEADER + CHUNK_BYTES
+        && (version != 2 || bytes.len() > HEADER + MAX_CHUNK_BYTES_V2)
+    {
         return Err(Error::Limit("content object bytes"));
     }
-    if bytes.len() < HEADER || !bytes.starts_with(MAGIC) || bytes[8] != 1 {
+    if bytes.len() < HEADER || !bytes.starts_with(MAGIC) || !matches!(version, 1 | 2) {
         return Err(Error::Invalid("content header or version"));
     }
-    if &address(bytes) != expected {
+    if &address_v(version, bytes) != expected {
         return Err(Error::HashMismatch);
     }
     match bytes[9] {
@@ -119,16 +205,19 @@ fn decode<'a>(expected: &Address, bytes: &'a [u8]) -> Result<Object<'a>, Error> 
                 return Err(Error::Invalid("content branch bounds"));
             }
             let children: Vec<_> = bytes[21..].chunks_exact(40).map(reference).collect();
-            let maximum = capacity(height - 1);
             let mut total = 0;
             for (index, child) in children.iter().enumerate() {
-                if child.length == 0
-                    || child.length > maximum
-                    || (index + 1 < count && child.length != maximum)
-                {
+                // Version 1 packs every child but the last full; version 2 chunks vary.
+                let unpacked = if version == 1 {
+                    let maximum = capacity(height - 1);
+                    child.length > maximum || (index + 1 < count && child.length != maximum)
+                } else {
+                    child.length > capacity_v2(height - 1)
+                };
+                if child.length == 0 || unpacked {
                     return Err(Error::Invalid("content branch packing"));
                 }
-                total += child.length; // bounded by capacity(MAX_HEIGHT), below u64::MAX
+                total += child.length; // bounded by capacity_v2(MAX_HEIGHT), below u64::MAX
             }
             if total != length {
                 return Err(Error::Invalid("content branch length"));
@@ -142,7 +231,12 @@ fn decode<'a>(expected: &Address, bytes: &'a [u8]) -> Result<Object<'a>, Error> 
                     .try_into()
                     .expect("the matching branch checked the header length"),
             );
-            if height_for(length)? != height {
+            let fits = if version == 1 {
+                height_for(length)? == height
+            } else {
+                height <= MAX_HEIGHT && length <= capacity_v2(height)
+            };
+            if !fits {
                 return Err(Error::Invalid("content root height"));
             }
             Ok(Object::Root {
@@ -175,12 +269,43 @@ pub(super) fn references(expected: &Address, bytes: &[u8]) -> Result<Vec<Address
 struct Builder<'a, 'b, S> {
     writer: &'a mut Writer<'b, S>,
     levels: Vec<Vec<Reference>>,
+    version: u8,
 }
 
 impl<S: ObjectStore> Builder<'_, '_, S> {
+    fn new<'a, 'b>(writer: &'a mut Writer<'b, S>, version: u8) -> Builder<'a, 'b, S> {
+        Builder {
+            writer,
+            levels: (0..=MAX_HEIGHT).map(|_| Vec::new()).collect(),
+            version,
+        }
+    }
+
+    async fn chunk(&mut self, data: &[u8]) -> Result<(), Error> {
+        let mut bytes = header(self.version, 1);
+        bytes.extend_from_slice(data);
+        let address = self
+            .writer
+            .encoded(address_v(self.version, &bytes), bytes)
+            .await?;
+        let length = data.len() as u64;
+        self.push(0, Reference { address, length }).await
+    }
+
+    async fn root(&mut self) -> Result<Address, Error> {
+        let (height, child) = self.finish().await?;
+        let mut bytes = header(self.version, 3);
+        bytes.push(height);
+        bytes.extend_from_slice(&child.length.to_be_bytes());
+        put_address(&mut bytes, &child.address);
+        self.writer
+            .encoded(address_v(self.version, &bytes), bytes)
+            .await
+    }
+
     async fn branch(&mut self, height: u8, children: &[Reference]) -> Result<Reference, Error> {
         let length = children.iter().map(|child| child.length).sum::<u64>();
-        let mut bytes = header(2);
+        let mut bytes = header(self.version, 2);
         bytes.push(height);
         bytes.extend_from_slice(&length.to_be_bytes());
         bytes.extend_from_slice(&(children.len() as u16).to_be_bytes());
@@ -188,7 +313,10 @@ impl<S: ObjectStore> Builder<'_, '_, S> {
             put_address(&mut bytes, &child.address);
             bytes.extend_from_slice(&child.length.to_be_bytes());
         }
-        let address = self.writer.encoded(address(&bytes), bytes).await?;
+        let address = self
+            .writer
+            .encoded(address_v(self.version, &bytes), bytes)
+            .await?;
         Ok(Reference { address, length })
     }
 
@@ -266,10 +394,7 @@ pub(super) async fn write_with_writer<S: ObjectStore, R: AsyncRead + Unpin + Sen
     writer: &mut Writer<'_, S>,
     input: &mut R,
 ) -> Result<Address, Error> {
-    let mut builder = Builder {
-        writer,
-        levels: (0..=MAX_HEIGHT).map(|_| Vec::new()).collect(),
-    };
+    let mut builder = Builder::new(writer, 1);
     let mut buffer = vec![0; CHUNK_BYTES];
     let mut first = true;
     loop {
@@ -285,28 +410,75 @@ pub(super) async fn write_with_writer<S: ObjectStore, R: AsyncRead + Unpin + Sen
             break;
         }
         first = false;
-        let mut bytes = header(1);
-        bytes.extend_from_slice(&buffer[..count]);
-        let address = builder.writer.encoded(address(&bytes), bytes).await?;
-        builder
-            .push(
-                0,
-                Reference {
-                    address,
-                    length: count as u64,
-                },
-            )
-            .await?;
+        builder.chunk(&buffer[..count]).await?;
         if count < CHUNK_BYTES {
             break;
         }
     }
-    let (height, child) = builder.finish().await?;
-    let mut bytes = header(3);
-    bytes.push(height);
-    bytes.extend_from_slice(&child.length.to_be_bytes());
-    put_address(&mut bytes, &child.address);
-    builder.writer.encoded(address(&bytes), bytes).await
+    builder.root().await
+}
+
+/// Store a byte stream as a version 2 tree. `boundaries` are ascending stream
+/// offsets where a chunk must end (for example where each part of an OPC package
+/// starts and ends), so bytes after them deduplicate by their own content wherever
+/// they sit in the stream. Boundaries and the chunker affect reuse only, never what
+/// is read back. Same caller duties as [`write()`].
+pub async fn write_v2<S: ObjectStore, R: AsyncRead + Unpin + Send>(
+    store: &mut S,
+    document: DocumentId,
+    input: &mut R,
+    boundaries: &[u64],
+    chunker: Chunker<'_>,
+    limits: Limits,
+) -> Result<(Address, WriteStats), Error> {
+    let mut writer = Writer {
+        store,
+        document,
+        budget: limits,
+        stats: WriteStats::default(),
+        pending: Vec::new(),
+        pending_bytes: 0,
+    };
+    let root = write_v2_with_writer(&mut writer, input, boundaries, chunker).await?;
+    writer.flush().await?;
+    Ok((root, writer.stats))
+}
+
+pub(super) async fn write_v2_with_writer<S: ObjectStore, R: AsyncRead + Unpin + Send>(
+    writer: &mut Writer<'_, S>,
+    input: &mut R,
+    boundaries: &[u64],
+    chunker: Chunker<'_>,
+) -> Result<Address, Error> {
+    let mut builder = Builder::new(writer, 2);
+    // One maximum chunk is resident: a cut never needs more look-ahead.
+    let mut buffer = vec![0; MAX_CHUNK_BYTES_V2];
+    let (mut filled, mut position, mut eof, mut emitted) = (0, 0u64, false, false);
+    let mut forced = boundaries.iter().copied().peekable();
+    loop {
+        while !eof && filled < buffer.len() {
+            let n = input.read(&mut buffer[filled..]).await?;
+            eof = n == 0;
+            filled += n;
+        }
+        if filled == 0 {
+            break;
+        }
+        while forced.next_if(|b| *b <= position).is_some() {}
+        let limit = forced
+            .peek()
+            .map_or(filled, |b| filled.min((b - position) as usize));
+        let cut = chunker.cut(&buffer[..limit]);
+        builder.chunk(&buffer[..cut]).await?;
+        buffer.copy_within(cut..filled, 0);
+        filled -= cut;
+        position += cut as u64;
+        emitted = true;
+    }
+    if !emitted {
+        builder.chunk(&[]).await?;
+    }
+    builder.root().await
 }
 
 async fn get<S: ObjectStore>(
@@ -348,6 +520,7 @@ pub(super) async fn read_with_budget<S: ObjectStore, W: AsyncWrite + Unpin + Sen
     let Object::Root { height, child } = decode(root, &bytes)? else {
         return Err(Error::Invalid("expected content root"));
     };
+    let version = bytes[8];
     let total = child.length;
     if total > limits.max_bytes as u64 {
         return Err(Error::Limit("bytes"));
@@ -355,7 +528,11 @@ pub(super) async fn read_with_budget<S: ObjectStore, W: AsyncWrite + Unpin + Sen
     let mut stack = vec![(height, child)];
     while let Some((height, child)) = stack.pop() {
         let bytes = get(store, document, &child.address, limits).await?;
-        match decode(&child.address, &bytes)? {
+        let object = decode(&child.address, &bytes)?;
+        if bytes[8] != version {
+            return Err(Error::Invalid("content version mix"));
+        }
+        match object {
             Object::Chunk(data) if height == 0 && data.len() as u64 == child.length => {
                 output.write_all(data).await?;
             }
@@ -714,6 +891,188 @@ mod tests {
         assert!(matches!(
             read_into(&mut store, document, &root, &mut output, Limits::default()).await,
             Err(Error::Io(_))
+        ));
+    }
+
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    async fn write_v2_mem(
+        store: &mut MemoryStore,
+        document: DocumentId,
+        bytes: &[u8],
+        boundaries: &[u64],
+        chunker: Chunker<'_>,
+    ) -> (Address, WriteStats) {
+        let (root, stats) = write_v2(
+            store,
+            document,
+            &mut Fragmented {
+                bytes,
+                maximum: 70_001,
+            },
+            boundaries,
+            chunker,
+            Limits::default(),
+        )
+        .await
+        .unwrap();
+        let mut output = Vec::new();
+        read_into(store, document, &root, &mut output, Limits::default())
+            .await
+            .unwrap();
+        assert_eq!(output, bytes);
+        (root, stats)
+    }
+
+    #[tokio::test]
+    async fn version_2_trees_round_trip_with_both_chunkers() {
+        let gear = Gear::from_seed(&[3; 32]);
+        for chunker in [Chunker::Fixed, Chunker::Cdc(&gear)] {
+            for size in [
+                0,
+                1,
+                CDC_MIN_BYTES,
+                MAX_CHUNK_BYTES_V2,
+                MAX_CHUNK_BYTES_V2 + 1,
+                9 << 20,
+            ] {
+                let mut store = MemoryStore::default();
+                let data = noise(size as u64, size);
+                write_v2_mem(&mut store, doc(), &data, &[], chunker).await;
+                assert!(store
+                    .objects
+                    .values()
+                    .all(|bytes| bytes.len() <= HEADER + MAX_CHUNK_BYTES_V2 && bytes[8] == 2));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn content_defined_chunks_resynchronise_after_an_insertion() {
+        let gear = Gear::from_seed(&[9; 32]);
+        let data = noise(1, 4 << 20);
+        let mut edited = data.clone();
+        edited.splice(1 << 20..1 << 20, noise(2, 100));
+        let document = doc();
+        let mut cdc = MemoryStore::default();
+        write_v2_mem(&mut cdc, document, &data, &[], Chunker::Cdc(&gear)).await;
+        let (_, stats) = write_v2_mem(&mut cdc, document, &edited, &[], Chunker::Cdc(&gear)).await;
+        let mut fixed = MemoryStore::default();
+        write_v2_mem(&mut fixed, document, &data, &[], Chunker::Fixed).await;
+        let (_, fixed_stats) =
+            write_v2_mem(&mut fixed, document, &edited, &[], Chunker::Fixed).await;
+        // About two new chunks plus the branch and root, against every chunk after
+        // the edit for fixed chunks.
+        assert!(stats.new_bytes < 3 * MAX_CHUNK_BYTES_V2, "{stats:?}");
+        assert!(fixed_stats.new_bytes > 3 << 20, "{fixed_stats:?}");
+        let sizes: Vec<usize> = cdc
+            .objects
+            .values()
+            .filter(|b| b[9] == 1)
+            .map(Vec::len)
+            .collect();
+        assert!(sizes.iter().all(|n| *n <= HEADER + MAX_CHUNK_BYTES_V2));
+        assert!(
+            sizes
+                .iter()
+                .filter(|n| **n < HEADER + CDC_MIN_BYTES)
+                .count()
+                <= 2
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_boundaries_reuse_a_part_wherever_it_sits() {
+        let part = noise(5, 1 << 20);
+        let document = doc();
+        let mut store = MemoryStore::default();
+        let mut first = noise(6, 100);
+        first.extend_from_slice(&part);
+        write_v2_mem(&mut store, document, &first, &[100], Chunker::Fixed).await;
+        let mut second = noise(7, 333);
+        second.extend_from_slice(&part);
+        let (_, stats) = write_v2_mem(&mut store, document, &second, &[333], Chunker::Fixed).await;
+        // The new header chunk, the branch and the root; every part chunk is reused.
+        assert_eq!(stats.new_objects, 3, "{stats:?}");
+    }
+
+    #[tokio::test]
+    async fn version_2_objects_are_verified_and_never_mixed_with_version_1() {
+        let gear = Gear::from_seed(&[1; 32]);
+        let mut store = MemoryStore::default();
+        let document = doc();
+        let data = noise(8, 300_000);
+        let (root, _) = write_v2_mem(&mut store, document, &data, &[], Chunker::Cdc(&gear)).await;
+        // A changed chunk byte no longer matches its address.
+        let (chunk_address, chunk) = store
+            .objects
+            .iter()
+            .find(|(_, b)| b[9] == 1)
+            .map(|((_, a), b)| (a.clone(), b.clone()))
+            .unwrap();
+        let mut tampered = chunk.clone();
+        tampered[HEADER] ^= 1;
+        assert!(matches!(
+            validate(&chunk_address, &tampered),
+            Err(Error::HashMismatch)
+        ));
+        assert!(matches!(
+            read_into(
+                &mut store,
+                document,
+                &root,
+                &mut tokio::io::sink(),
+                Limits::default()
+            )
+            .await,
+            Ok(300_000)
+        ));
+        // A version 2 root over a version 1 chunk is refused.
+        let mut v1_store = MemoryStore::default();
+        let mut chunk_v1 = header(1, 1);
+        chunk_v1.extend_from_slice(b"abc");
+        let v1_chunk = store_raw(&mut v1_store, document, chunk_v1);
+        let mut mixed = header(2, 3);
+        mixed.push(0);
+        mixed.extend_from_slice(&3u64.to_be_bytes());
+        put_address(&mut mixed, &v1_chunk);
+        let mixed_root = address_v(2, &mixed);
+        v1_store
+            .objects
+            .insert((document.0, mixed_root.clone()), mixed);
+        assert!(matches!(
+            read_into(
+                &mut v1_store,
+                document,
+                &mixed_root,
+                &mut tokio::io::sink(),
+                Limits::default()
+            )
+            .await,
+            Err(Error::Invalid("content version mix"))
+        ));
+        // Oversized version 2 chunks and version 1 chunks over 64 KiB are limits.
+        let mut big = header(2, 1);
+        big.extend(vec![0; MAX_CHUNK_BYTES_V2 + 1]);
+        assert!(matches!(
+            validate(&address_v(2, &big), &big),
+            Err(Error::Limit(_))
+        ));
+        let mut v1_big = header(1, 1);
+        v1_big.extend(vec![0; CHUNK_BYTES + 1]);
+        assert!(matches!(
+            validate(&address(&v1_big), &v1_big),
+            Err(Error::Limit(_))
         ));
     }
 }

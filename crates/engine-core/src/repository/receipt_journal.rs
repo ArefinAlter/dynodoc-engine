@@ -11,6 +11,9 @@ use sqlx::{
 };
 use std::{path::Path, time::Duration};
 
+mod horizons;
+pub use horizons::{AcceptedHorizons, MAX_REMOTE_HORIZONS};
+
 const SCHEMA: &str = "
 create table if not exists receipt_journal_meta(singleton integer primary key check(singleton=1),version integer not null);
 insert into receipt_journal_meta values(1,1) on conflict(singleton) do nothing;
@@ -129,11 +132,14 @@ impl ReceiptJournal {
                 sqlx::query_scalar("select version from receipt_journal_meta where singleton=1")
                     .fetch_one(&mut *tx)
                     .await?;
-            if version != 1 {
+            // Version 2 (horizons, checkpoints, inclusions) only adds tables; a
+            // version-1 binary refuses a version-2 journal by this same check.
+            if !(1..=2).contains(&version) {
                 return Err(Error::Invalid("receipt journal version"));
             }
         }
         sqlx::raw_sql(SCHEMA).execute(&mut *tx).await?;
+        sqlx::raw_sql(horizons::SCHEMA_V2).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(Self { pool })
     }

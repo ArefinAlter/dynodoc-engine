@@ -9,8 +9,14 @@ authors.workspace = true
 publish = false
 description = "Types shared across the dynodoc engine (events, nodes, identity newtypes)."
 
+[features]
+# sqlx `Type` and `FromRow` derives for the database crates. Off for the WebAssembly engine
+# (decision 036), which needs the types and never a database.
+default = ["db"]
+db = ["dep:sqlx"]
+
 [dependencies]
-sqlx = { workspace = true }
+sqlx = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ulid = { workspace = true }

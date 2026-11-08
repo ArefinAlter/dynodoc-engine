@@ -265,6 +265,19 @@ pub struct Floors {
     pub gate_at_least: StrictMap<Gate>,
 }
 
+impl Floors {
+    /// Whether these floors are at least as strict as `other` for every strategy
+    /// `other` names: a stored policy may only be replaced by one that keeps or
+    /// strengthens its floors (design 8, `PUT /merge-policy`).
+    pub fn at_least(&self, other: &Floors) -> bool {
+        other
+            .gate_at_least
+            .0
+            .iter()
+            .all(|(s, g)| self.gate_at_least.0.get(s).is_some_and(|mine| mine >= g))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MergePolicy {
@@ -617,6 +630,36 @@ impl MergePolicy {
         Ok(())
     }
 
+    /// Check against a project or organization floor (design 6.2): every rule is
+    /// at least as strict as the floor for its strategy, and the policy's own
+    /// floors keep the floor's. A policy can only tighten a floor.
+    pub fn check_floor(&self, floor: &Floors) -> Result<(), PolicyError> {
+        for (i, rule) in self.rules.iter().enumerate() {
+            if let Some(min) = floor.gate_at_least.0.get(&rule.strategy) {
+                if self.effective_gate(rule) < *min {
+                    return Err(err(
+                        ErrorKind::WeakensFloor,
+                        format!("rules[{i}].gate"),
+                        format!(
+                            "gate `{}` is weaker than the project floor `{}` for `{}`",
+                            self.effective_gate(rule).name(),
+                            min.name(),
+                            rule.strategy
+                        ),
+                    ));
+                }
+            }
+        }
+        if !self.floors.at_least(floor) {
+            return Err(err(
+                ErrorKind::WeakensFloor,
+                "floors",
+                "the policy's floors are weaker than the project floor",
+            ));
+        }
+        Ok(())
+    }
+
     /// The first rule that matches, or `None` for the implicit `unknown` rule.
     pub fn find_rule(&self, probe: &Probe<'_>) -> Option<&Rule> {
         self.rules.iter().find(|r| r.matcher.matches(probe))
@@ -642,17 +685,12 @@ impl MergePolicy {
 
     /// The bytes that are hashed and embedded in a commit.
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        crate::log::canonical_json(&self.canonical_value())
+        crate::hashing::canonical_json(&self.canonical_value())
     }
 
     /// `SHA-256(HASH_DOMAIN || canonical bytes)`.
     pub fn hash(&self) -> [u8; 32] {
-        let mut context = ring::digest::Context::new(&ring::digest::SHA256);
-        context.update(HASH_DOMAIN);
-        context.update(&self.canonical_bytes());
-        let mut out = [0u8; 32];
-        out.copy_from_slice(context.finish().as_ref());
-        out
+        crate::hashing::sha256(&[HASH_DOMAIN, &self.canonical_bytes()])
     }
 
     pub fn hash_hex(&self) -> String {
@@ -668,6 +706,33 @@ mod tests {
         Registry,
     };
     use serde_json::json;
+
+    #[test]
+    fn a_project_floor_can_only_be_tightened() {
+        let registry = Registry::builtin();
+        let text = |gate: &str, floor: &str| {
+            format!(
+                r#"{{"version":1,"id":"p","rules":[{{"id":"t","match":{{"field":"content"}},"strategy":"dynodoc.text.diff3-grapheme.v1","gate":"{gate}"}}],"floors":{{"gate_at_least":{{{floor}}}}}}}"#
+            )
+        };
+        let floor: Floors = serde_json::from_value(
+            json!({"gate_at_least":{"dynodoc.text.diff3-grapheme.v1":"auto-with-review"}}),
+        )
+        .unwrap();
+        let strict = MergePolicy::from_json(
+            text("manual", r#""dynodoc.text.diff3-grapheme.v1":"manual""#).as_bytes(),
+            &registry,
+        )
+        .unwrap();
+        assert!(strict.check_floor(&floor).is_ok());
+        let loose = MergePolicy::from_json(text("auto", "").as_bytes(), &registry).unwrap();
+        assert_eq!(
+            loose.check_floor(&floor).unwrap_err().kind,
+            ErrorKind::WeakensFloor
+        );
+        assert!(strict.floors.at_least(&floor) && !loose.floors.at_least(&floor));
+        assert!(loose.floors.at_least(&Floors::default()));
+    }
 
     /// Declares one parameter of each type, so the loader's parameter rules can be
     /// exercised without inventing parameters on a real strategy.
@@ -973,10 +1038,10 @@ mod tests {
             (e.kind, e.path.as_str()),
             (ErrorKind::UnknownStrategy, "rules[0].strategy")
         );
-        // The grapheme text strategy is designed (N2) but not built.
+        // A designed strategy version that is not built is unknown.
         let e = rejected(&policy(&rule("").replace(
             "dynodoc.default.whole-value.v1",
-            "dynodoc.text.diff3-grapheme.v1",
+            "dynodoc.text.diff3-grapheme.v2",
         )));
         assert_eq!(e.kind, ErrorKind::UnknownStrategy);
         // A field strategy cannot decide a collection and the reverse.

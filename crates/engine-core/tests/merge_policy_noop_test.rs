@@ -244,6 +244,7 @@ fn tally(evidence: &MergeEvidence, plan: &MergePlan, seen: &mut Seen) {
             DecisionOutcome::Conflict => *seen.conflicts_by.entry(strategy).or_default() += 1,
             DecisionOutcome::Explicit => seen.explicit += 1,
             DecisionOutcome::Legacy => unreachable!("the default policy has no collection rule"),
+            DecisionOutcome::Preferred => unreachable!("the default policy never prefers a side"),
         }
     }
     // The evidence never alters the plan: under the default policy it adds no conflict.

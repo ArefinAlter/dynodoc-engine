@@ -106,6 +106,7 @@ async fn change(
         }
     };
     governance::authorize(role, &op, &current)?;
+    crate::ledger::refuse_direct(&mut tx, doc.0).await?;
     apply::materialize_node_change(&mut tx, doc, &op).await?;
     let event = log::append_in_tx(&mut tx, doc, &op, actor).await?;
     tx.commit().await?;

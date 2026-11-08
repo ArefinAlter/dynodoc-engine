@@ -7,7 +7,11 @@ members = [
     "crates/engine-mcp",
     "crates/engine-api",
     "crates/engine-cli",
+    "crates/engine-wasm",
 ]
+# The fuzz targets are their own workspace (cargo-fuzz, nightly); keep them out of the
+# engine's cargo fmt/clippy/test --workspace and its CI.
+exclude = ["crates/engine-core/fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -42,7 +46,12 @@ sqlx = { version = "0.8", features = [
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip`: parse every number to the nearest double, as JavaScript does. Without
+# it serde_json can land one unit in the last place off, so a canonical hash the SDK or a
+# browser computes for a number disagrees with the engine's (decision 036). Stored history
+# still verifies: its numbers are serde_json's own shortest spellings, which parse back
+# exactly either way.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # Opaque cursor encoding for cursor pagination (stage 18).
 base64 = "0.22"
 
@@ -59,17 +68,32 @@ chrono = { version = "0.4", features = ["serde"] }
 # signatures later). ring's build-script binary is blocked by Smart App Control on
 # the laptop, so the engine is built/run on a SAC-free machine (home PC / WSL2 / CI).
 ring = "0.17"
+# PKCS#11 hardware-token device keys in engine-cli (decision 039). Parsec project,
+# Apache-2.0; loads the token's module at run time, no C toolchain at build time.
+cryptoki = "0.12"
+# Pure-Rust SHA-256 for the engine's pure modules, which also build for wasm32 (decision 036).
+sha2 = "0.10"
 # Constant-time comparison and wiping of secrets: both are already in the lockfile through the crypto crates.
 subtle = "2.6"
 zeroize = "1"
 # Memory-hard key derivation for encrypted key files (RFC 9106 Argon2id). RustCrypto;
 # MIT OR Apache-2.0.
 argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+# Encrypted projects (decision 035): RFC 9180 HPKE base mode with DHKEM(X25519, HKDF-SHA256)
+# and AES-256-GCM for key grants and sealed relay answers; ring has no static X25519 keys.
+# Pure Rust (RustCrypto x25519-dalek, aes-gcm, hkdf). rand_core supplies the OS generator.
+hpke = { version = "0.12", default-features = false, features = ["alloc", "x25519"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Shamir secret sharing over GF(2^8) for the escrow ceremony (decision 041): maintained,
+# constant time, Apache-2.0 OR MIT. Same rand_core 0.6 as hpke.
+vsss-rs = { version = "5.4", default-features = false, features = ["std"] }
 
 # Auth: Paseto v4 local tokens (symmetric AEAD) instead of JWT — no alg-confusion or
 # `none`-algorithm footguns (docs/17, NFR-8). `hex` decodes the 32-byte signing key.
 pasetors = "0.8"
 hex = "0.4"
+# WHATWG URL parsing (OAuth redirect URIs read as a browser reads them)
+url = "2"
 
 # Errors + logging
 thiserror = "1"
@@ -77,8 +101,13 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Text segmentation (UAX #29 grapheme clusters, MIT OR Apache-2.0) for merge alignment,
+# and NFC normalization for path portability checks (already in the build graph).
+unicode-segmentation = "=1.13.3"
+unicode-normalization = "0.1.25"
+
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Internal crates
 engine-shared = { path = "crates/engine-shared" }
@@ -106,3 +135,12 @@ opt-level = 1
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The WebAssembly engine (decision 036): smallest code, whole-program optimisation.
+[profile.wasm]
+inherits = "release"
+# "z", not "s": with the e2ee parts (decision 041) "s" left the module over the SDK's 400 KiB
+# gzip budget after wasm-opt (421,011 bytes); "z" gives 382,465.
+opt-level = "z"
+lto = true
+panic = "abort"

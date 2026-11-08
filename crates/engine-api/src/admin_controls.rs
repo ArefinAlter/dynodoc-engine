@@ -29,9 +29,9 @@ fn bad(message: &str) -> ApiError {
 }
 
 #[derive(Deserialize)]
-struct Target {
-    kind: String,
-    id: Uuid,
+pub(crate) struct Target {
+    pub(crate) kind: String,
+    pub(crate) id: Uuid,
 }
 
 async fn plan(
@@ -54,7 +54,7 @@ async fn plan(
             // A document outside Trash is moved there within the same transaction, so
             // its public links stop before its history is removed.
             in_trash = Some(row.get::<bool, _>("removed"));
-            let counts: Value = sqlx::query_scalar("select jsonb_build_object('events',(select count(*) from event where document_id=$1),'last_event',(select coalesce(max(seq),0) from event where document_id=$1),'blocks',(select count(*) from node where document_id=$1),'versions',(select count(*) from document_version where document_id=$1),'snapshots',(select count(*) from snapshot where document_id=$1),'shared_checkpoints',(select count(*) from shared_checkpoint where document_id=$1),'checkpoint_objects',(select count(*) from checkpoint_object where document_id=$1),'checkpoint_bytes',(select coalesce(sum(octet_length(bytes)),0) from checkpoint_object where document_id=$1),'drafts',(select count(*) from workspace_draft where document_id=$1),'draft_edits',(select count(*) from draft_edit e join workspace_draft d on d.id=e.draft_id where d.document_id=$1),'files',(select count(*) from document_upload where document_id=$1),'file_bytes',(select coalesce(sum(octet_length(content)),0) from document_upload where document_id=$1),'public_links',(select count(*) from public_document_view where document_id=$1))")
+            let counts: Value = sqlx::query_scalar("select jsonb_build_object('events',(select count(*) from event where document_id=$1),'last_event',(select coalesce(max(seq),0) from event where document_id=$1),'blocks',(select count(*) from node where document_id=$1),'versions',(select count(*) from document_version where document_id=$1),'snapshots',(select count(*) from snapshot where document_id=$1),'shared_checkpoints',(select count(*) from shared_checkpoint where document_id=$1),'checkpoint_objects',(select count(*) from checkpoint_object where document_id=$1),'checkpoint_bytes',(select coalesce(sum(octet_length(bytes)),0) from checkpoint_object where document_id=$1),'drafts',(select count(*) from workspace_draft where document_id=$1),'draft_edits',(select count(*) from draft_edit e join workspace_draft d on d.id=e.draft_id where d.document_id=$1),'files',(select count(*) from document_upload where document_id=$1),'file_bytes',(select coalesce(sum(coalesce(size,octet_length(content))),0) from document_upload where document_id=$1),'public_links',(select count(*) from public_document_view where document_id=$1))")
                 .bind(target.id).fetch_one(&mut *db).await?;
             (row.get::<String, _>("title"), counts)
         }
@@ -97,7 +97,7 @@ async fn impact(
     auth: AuthContext,
     Query(target): Query<Target>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &auth).await?;
+    crate::admin::require_reader(&state, &auth).await?;
     let mut db = state.pool.acquire().await?;
     Ok(Json(
         plan(&mut db, &target, &state.admin_emails, auth.identity_id).await?,
@@ -120,6 +120,7 @@ async fn erase(
     Json(input): Json<Erase>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &auth).await?;
+    crate::auth::sessions::require_recent_login(&state, &auth).await?;
     if !input.acknowledge_backups
         || !["owner_request", "duplicate", "policy", "other"].contains(&input.reason.as_str())
     {
@@ -152,6 +153,23 @@ async fn erase_one(
     expected: Option<(&str, &str)>,
 ) -> Result<(), ApiError> {
     let mut tx = state.pool.begin().await?;
+    let objects = erase_in(&mut tx, state, actor, target, reason, expected).await?;
+    tx.commit().await?;
+    purge(state, target, &objects).await;
+    Ok(())
+}
+
+/// The erasure inside the caller's transaction, so another record (the legacy-plaintext
+/// erasure of encrypted projects, decision 035) commits with it. Returns the object-store
+/// keys the erased rows named; pass them to [`purge`] after commit.
+pub(crate) async fn erase_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    state: &AppState,
+    actor: Uuid,
+    target: &Target,
+    reason: &str,
+    expected: Option<(&str, &str)>,
+) -> Result<Vec<String>, ApiError> {
     let lock = match target.kind.as_str() {
         "documents" => "select id from document where id=$1 for update",
         "users" => "select id from identity where id=$1 for update",
@@ -159,16 +177,16 @@ async fn erase_one(
     };
     sqlx::query(lock)
         .bind(target.id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .ok_or(ApiError::NotFound)?;
     if target.kind == "documents" {
         sqlx::query("select id from workspace_draft where document_id=$1 order by id for update")
             .bind(target.id)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut **tx)
             .await?;
     }
-    let current = plan(&mut tx, target, &state.admin_emails, actor).await?;
+    let current = plan(tx, target, &state.admin_emails, actor).await?;
     if !current["blockers"].as_array().is_some_and(Vec::is_empty) {
         return Err(bad(
             "Resolve the listed dependencies before permanently deleting this resource.",
@@ -184,14 +202,14 @@ async fn erase_one(
     if current["in_trash"] == false {
         sqlx::query("update document set deleted_at=now(),updated_at=now() where id=$1")
             .bind(target.id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         sqlx::query("update public_document_view set revoked_at=now() where document_id=$1 and revoked_at is null")
             .bind(target.id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         crate::product::audit(
-            &mut tx,
+            tx,
             actor,
             "document.trashed_by_admin",
             target.id,
@@ -200,16 +218,22 @@ async fn erase_one(
         .await?;
     }
     sqlx::query("insert into erasure_receipt(resource_id,kind,actor_id,reason,counts) values($1,$2,$3,$4,$5)")
-        .bind(target.id).bind(&target.kind).bind(actor).bind(reason).bind(&current["counts"]).execute(&mut *tx).await?;
+        .bind(target.id).bind(&target.kind).bind(actor).bind(reason).bind(&current["counts"]).execute(&mut **tx).await?;
+    // The objects the document's rows name (an object store), removed once the rows are gone.
+    let mut objects: Vec<String> = Vec::new();
     if target.kind == "documents" {
+        objects = sqlx::query_scalar("select storage_key from document_upload where document_id=$1 and storage_key is not null union all select storage_key from connector_media where document_id=$1 and storage_key is not null")
+            .bind(target.id)
+            .fetch_all(&mut **tx)
+            .await?;
         sqlx::query("delete from document where id=$1")
             .bind(target.id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
     } else {
         sqlx::query("delete from public_document_view where created_by=$1")
             .bind(target.id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         for table in [
             "refresh_token",
@@ -222,38 +246,70 @@ async fn erase_one(
         ] {
             sqlx::query(&format!("delete from {table} where identity_id=$1"))
                 .bind(target.id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
         }
         // Issues and comments they wrote stay under the anonymised account.
         sqlx::query("update project_issue set assignee_id=null where assignee_id=$1")
             .bind(target.id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         sqlx::query("delete from notification where recipient_id=$1")
             .bind(target.id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         sqlx::query("update identity set email=$2,display_name='Deleted account',bio='',profile_revision=profile_revision+1,erased_at=now(),disabled_at=now(),session_generation=session_generation+1 where id=$1")
-            .bind(target.id).bind(format!("deleted-{}@removed.invalid",target.id)).execute(&mut *tx).await?;
+            .bind(target.id).bind(format!("deleted-{}@removed.invalid",target.id)).execute(&mut **tx).await?;
     }
     crate::product::audit(
-        &mut tx,
+        tx,
         actor,
         &format!("{}.erased", target.kind),
         target.id,
         json!({"reason":reason,"counts":current["counts"]}),
     )
     .await?;
-    tx.commit().await?;
+    // Queued with the erasure, so a delete that fails or never runs is retried by the sweep.
+    sqlx::query(
+        "insert into object_deletion(storage_key) select unnest($1::text[]) on conflict do nothing",
+    )
+    .bind(&objects)
+    .execute(&mut **tx)
+    .await?;
+    Ok(objects)
+}
+
+/// Derived content of an erased document must not outlive it in memory, nor its
+/// objects in the object store once the rows naming them are gone.
+pub(crate) async fn purge(state: &AppState, target: &Target, objects: &[String]) {
     if target.kind == "documents" {
-        // Derived content of the erased document must not outlive it in memory.
         state.agent_cache.purge_document(target.id);
         if let Some(cache) = &state.write_cache {
             cache.purge_document(engine_shared::DocumentId(target.id));
         }
+        let mut failed = 0;
+        for key in objects {
+            match state.objects.delete(key).await {
+                Ok(()) => {
+                    let _ = sqlx::query("delete from object_deletion where storage_key=$1")
+                        .bind(key)
+                        .execute(&state.pool)
+                        .await;
+                }
+                Err(error) => {
+                    failed += 1;
+                    tracing::error!(%error, "an erased document's object could not be deleted; the sweep retries it");
+                }
+            }
+        }
+        if !objects.is_empty() {
+            tracing::info!(
+                objects = objects.len(),
+                failed,
+                "erased document objects deleted"
+            );
+        }
     }
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -273,6 +329,7 @@ async fn erase_batch(
     Json(input): Json<EraseBatch>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &auth).await?;
+    crate::auth::sessions::require_recent_login(&state, &auth).await?;
     let mut ids = input.ids.clone();
     ids.sort();
     ids.dedup();

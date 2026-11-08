@@ -116,13 +116,31 @@ pub async fn load(
     db: &mut PgConnection,
     point: &Point,
 ) -> Result<Arc<DocumentState>, AgentFail> {
+    // Encrypted projects: the gateway holds no keys; only a local agent can read (row 29).
+    crate::e2ee::refuse_sealed(db, point.document, "agent_reads").await?;
     let key = (point.document, point.rev, point.chain);
     if let Some(hit) = cache.get(&key) {
-        return Ok(hit);
+        return with_held(db, point.document, hit).await;
     }
     let read = snapshot::read_state_at(db, DocumentId(point.document), point.rev as i64).await?;
     let state = Arc::new(read.state);
     cache.insert(key, state.clone(), estimate_bytes(&state));
+    with_held(db, point.document, state).await
+}
+
+/// Ledger mode: the blocks members' panes sent for agents, filled into the state read
+/// (decision 040). Outside the cache, which holds the server's own state.
+async fn with_held(
+    db: &mut PgConnection,
+    document: Uuid,
+    mut state: Arc<DocumentState>,
+) -> Result<Arc<DocumentState>, AgentFail> {
+    if crate::ledger::storage(db, document).await?.ledger {
+        let held = crate::ledger::held(db, document, &state).await?;
+        if !held.is_empty() {
+            crate::ledger::fill(Arc::make_mut(&mut state), held);
+        }
+    }
     Ok(state)
 }
 
