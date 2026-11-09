@@ -127,7 +127,11 @@ pub fn restrict_windows(path: &Path) -> Result<(), String> {
         )
     };
     let applied = Command::new(&icacls)
-        .args(icacls_apply_args(path, &principal))
+        .args(icacls_apply_args_with_logon_sid(
+            path,
+            &principal,
+            logon_sid(&root),
+        ))
         .output()
         .map_err(|e| fail("icacls did not start", e.to_string()))?;
     if !applied.status.success() {
@@ -168,15 +172,63 @@ pub fn restrict_windows(path: &Path) -> Result<(), String> {
 /// removed by well-known SID (S-1-5-18, S-1-5-32-544: no language dependence)
 /// before the grant, so the grant stays even when the user is SYSTEM itself.
 pub fn icacls_apply_args(path: &Path, principal: &str) -> Vec<std::ffi::OsString> {
-    vec![
+    icacls_apply_args_with_logon_sid(path, principal, None)
+}
+
+/// [`icacls_apply_args`], also removing the entry for this process's logon session SID.
+///
+/// An object created where nothing is inherited (inside a directory this module already
+/// restricted) gets the creating token's default access list. That list can hold an
+/// explicit `NT AUTHORITY\LogonSessionId_X_Y` (S-1-5-5-X-Y) read/execute entry, which
+/// `/inheritance:r` does not drop, so it is removed by SID like SYSTEM and Administrators.
+pub fn icacls_apply_args_with_logon_sid(
+    path: &Path,
+    principal: &str,
+    logon_sid: Option<&str>,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
         path.as_os_str().to_owned(),
         "/inheritance:r".into(),
         "/remove:g".into(),
         "*S-1-5-18".into(),
         "*S-1-5-32-544".into(),
-        "/grant:r".into(),
-        format!("{principal}:F").into(),
-    ]
+    ];
+    if let Some(sid) = logon_sid {
+        args.push(format!("*{sid}").into());
+    }
+    args.push("/grant:r".into());
+    args.push(format!("{principal}:F").into());
+    args
+}
+
+/// The logon session SID in `whoami /logonid` output, only when it is exactly
+/// `S-1-5-5-<digits>-<digits>`; anything else (so never an icacls switch) is `None`.
+pub fn parse_logon_sid(output: &str) -> Option<String> {
+    let sid = output.trim();
+    let rest = sid.strip_prefix("S-1-5-5-")?;
+    let (high, low) = rest.split_once('-')?;
+    let digits = |part: &str| {
+        !part.is_empty() && part.len() <= 10 && part.bytes().all(|b| b.is_ascii_digit())
+    };
+    (digits(high) && digits(low)).then(|| sid.to_owned())
+}
+
+/// This process's logon session SID from the system `whoami` (fixed path, never found
+/// through `PATH`), asked once per process. `None` when it cannot be determined; the
+/// access list verification still refuses any entry that is left.
+#[cfg(windows)]
+fn logon_sid(system_root: &Path) -> Option<&'static str> {
+    static SID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SID.get_or_init(|| {
+        let whoami = system_root.join("System32").join("whoami.exe");
+        let output = std::process::Command::new(whoami)
+            .arg("/logonid")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        parse_logon_sid(&String::from_utf8_lossy(&output.stdout))
+    })
+    .as_deref()
 }
 
 /// The principals named in `icacls <path>` output.
@@ -266,6 +318,54 @@ mod tests {
         assert_eq!(rendered[4], "*S-1-5-32-544");
         assert_eq!(rendered[5], "/grant:r");
         assert_eq!(rendered[6], "alice:F");
+    }
+
+    #[test]
+    fn icacls_apply_args_also_removes_the_logon_session_sid_when_known() {
+        let path = Path::new(r"C:\test\artifact.json");
+        let rendered: Vec<String> =
+            icacls_apply_args_with_logon_sid(path, "alice", Some("S-1-5-5-0-249135"))
+                .into_iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+        assert_eq!(
+            rendered,
+            [
+                r"C:\test\artifact.json",
+                "/inheritance:r",
+                "/remove:g",
+                "*S-1-5-18",
+                "*S-1-5-32-544",
+                "*S-1-5-5-0-249135",
+                "/grant:r",
+                "alice:F",
+            ]
+        );
+        assert_eq!(
+            icacls_apply_args_with_logon_sid(path, "alice", None),
+            icacls_apply_args(path, "alice")
+        );
+    }
+
+    #[test]
+    fn only_a_well_formed_logon_session_sid_is_accepted() {
+        assert_eq!(
+            parse_logon_sid("S-1-5-5-0-249135\r\n").as_deref(),
+            Some("S-1-5-5-0-249135")
+        );
+        for bad in [
+            "",
+            "S-1-5-18",
+            "S-1-5-5-0",
+            "S-1-5-5--1",
+            "S-1-5-5-0-1-2",
+            "S-1-5-5-0-12a",
+            "S-1-5-5-0-1 /T",
+            "/grant Everyone:F",
+            "S-1-5-5-0-12345678901",
+        ] {
+            assert_eq!(parse_logon_sid(bad), None, "{bad:?} must be refused");
+        }
     }
 
     #[test]
