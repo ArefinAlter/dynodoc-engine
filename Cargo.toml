@@ -72,7 +72,7 @@ ring = "0.17"
 # Apache-2.0; loads the token's module at run time, no C toolchain at build time.
 cryptoki = "0.12"
 # Pure-Rust SHA-256 for the engine's pure modules, which also build for wasm32 (decision 036).
-sha2 = "0.10"
+sha2 = "0.11"
 # Constant-time comparison and wiping of secrets: both are already in the lockfile through the crypto crates.
 subtle = "2.6"
 zeroize = "1"
