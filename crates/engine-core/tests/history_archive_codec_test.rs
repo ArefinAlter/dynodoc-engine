@@ -5,8 +5,8 @@ use std::io::{self, Cursor, Read};
 
 use engine_core::materializer::DocumentState;
 use engine_core::repository::archive::{
-    verify_archive_stream, ArchiveEntry, ArchiveError, ArchiveLimits, ArchiveReader, ArchiveWriter,
-    MAGIC,
+    validate_and_stage_archive, verify_archive_stream, ArchiveEntry, ArchiveError, ArchiveLimits,
+    ArchiveReader, ArchiveWriter, MAGIC,
 };
 use engine_core::repository::{Commit, SignedCommit};
 use engine_core::shared_checkpoint::{write_state, Address, Limits, MemoryStore, ObjectStore};
@@ -752,4 +752,39 @@ async fn incremental_archive_disjoint_dependency_rejected() {
     // child depends on genesis_addr, which is neither in seen_commits nor is it `since`
     let err = writer.write_commit(&child).unwrap_err();
     assert!(matches!(err, ArchiveError::MissingDependency(_, _)));
+}
+
+#[tokio::test]
+async fn validate_and_stage_archive_missing_base_refusal() {
+    let project = DocumentId(uuid::Uuid::new_v4());
+    let key = generate_key();
+
+    let genesis = create_genesis_commit(project, &key);
+    let genesis_addr = genesis.verify().unwrap();
+
+    let child = create_child_commit(project, genesis_addr.clone(), &key, 2);
+    let child_addr = child.verify().unwrap();
+
+    let mut buf = Vec::new();
+    let mut writer = ArchiveWriter::new(&mut buf).unwrap();
+    writer
+        .write_header_with_since(1, project, child_addr.clone(), Some(genesis_addr.clone()))
+        .unwrap();
+    writer.write_commit(&child).unwrap();
+    writer.finish().unwrap();
+
+    // Calling validate_and_stage_archive without a target repo must fail requiring target repository
+    let err = validate_and_stage_archive(
+        Cursor::new(&buf),
+        ArchiveLimits::default(),
+        Some(&child_addr),
+        Some(project),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ArchiveError::InvalidFrame(msg) if msg.contains("requires target repository")
+    ));
 }
