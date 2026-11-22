@@ -1902,6 +1902,102 @@ async fn retention_report_honours_pins_orphans_limits_and_inventory_pages(
     Ok(())
 }
 
+/// A staged commit may name a state the server already held (no staged-object row of
+/// its own); the shared object collector marks it, so the report must keep it too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retention_report_pins_the_file_states_of_staged_commits(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    use engine_core::repository::{Commit, FileEntry, SignedCommit};
+    let (actor, document, node) = seed(&pool).await?;
+    let edit = EventPayload::FieldEdited {
+        node_id: node.clone(),
+        field: "label".into(),
+        value: json!("rev 2 edit"),
+    };
+    append(&pool, document, &edit, actor).await?;
+    let limits = Limits::default();
+    for seq in [1, 2] {
+        postgres::take_with_codec(&pool, document, seq, limits, postgres::Codec::V2).await?;
+    }
+    let root1 = checkpoint_root(&pool, document, 1).await;
+    let report = postgres::retention_report(&pool, document, &[2], limits).await?;
+    assert!(report.outside_keep.contains(&root1));
+
+    let project: uuid::Uuid = sqlx::query_scalar(
+        "insert into access_space(name,kind,created_by) values('Staged','project',$1) returning id",
+    )
+    .bind(actor.0)
+    .fetch_one(&pool)
+    .await?;
+    sqlx::query("insert into project_settings(space_id) values($1)")
+        .bind(project)
+        .execute(&pool)
+        .await?;
+    let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[3; 32]).unwrap();
+    let stage = |files: Vec<(&str, DocumentId)>, scope: Vec<uuid::Uuid>| {
+        let commit = Commit {
+            sealed: None,
+            version: 1,
+            project,
+            parents: Vec::new(),
+            files: files
+                .into_iter()
+                .map(|(path, document)| {
+                    let file = FileEntry {
+                        document,
+                        state: root1.clone(),
+                    };
+                    (path.to_string(), file)
+                })
+                .collect(),
+            author_key: String::new(),
+            authored_at_ms: 1_700_000_000_000,
+            message: "staged".into(),
+            recovery: None,
+            same_file_resolutions: Vec::new(),
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
+        };
+        let signed = SignedCommit::sign(commit, &key).unwrap();
+        let pool = pool.clone();
+        async move {
+            // Only the row matters to this read-only report; skip the staging triggers.
+            let mut tx = pool.begin().await?;
+            sqlx::query("set local session_replication_role=replica")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "insert into project_staged_commit(identity_id,project_id,address,body,scope,height,device_id)
+                 values($1,$2,$3,$4,$5,0,$6)",
+            )
+            .bind(actor.0)
+            .bind(project)
+            .bind(signed.commit.address()?.as_str())
+            .bind(serde_json::to_vec(&signed)?)
+            .bind(scope)
+            .bind(uuid::Uuid::new_v4())
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            anyhow::Ok(())
+        }
+    };
+
+    // Another document's staged commit pins nothing here.
+    let other = DocumentId(uuid::Uuid::new_v4());
+    stage(vec![("other.docx", other)], vec![other.0]).await?;
+    let report = postgres::retention_report(&pool, document, &[2], limits).await?;
+    assert!(report.outside_keep.contains(&root1));
+
+    stage(vec![("doc.docx", document)], vec![document.0]).await?;
+    let report = postgres::retention_report(&pool, document, &[2], limits).await?;
+    assert!(!report.outside_keep.contains(&root1));
+    assert!(report.unreferenced.is_empty());
+    Ok(())
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn retention_report_is_one_snapshot_and_refuses_a_weaker_isolation(
     pool: PgPool,

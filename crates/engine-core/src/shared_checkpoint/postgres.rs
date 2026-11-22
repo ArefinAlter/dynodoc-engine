@@ -947,7 +947,8 @@ pub struct RetentionReport {
 const INVENTORY_PAGE: i64 = 1000;
 
 /// Kept roots are the `keep` checkpoints plus whatever else holds an object: typed
-/// named snapshots, draft bases and staged or published project objects. A checkpoint
+/// named snapshots, draft bases, staged or published project objects and the file
+/// states of staged commits (the roots the shared object collector marks). A checkpoint
 /// keeps everything it reaches, so a kept incremental checkpoint never needs its base
 /// row. `limits` bounds the objects and bytes read. Nothing is deleted: objects are
 /// append-only.
@@ -990,7 +991,7 @@ pub async fn retention_report_in(
     if kept.len() != keep.iter().collect::<BTreeSet<_>>().len() {
         return Err(Error::Invalid("checkpoint not found"));
     }
-    let pinned: Vec<String> = sqlx::query_scalar(
+    let mut pinned: Vec<String> = sqlx::query_scalar(
         "select r from (
             select state_root r from snapshot where document_id=$1 and state_root is not null
             union select base_state_root from workspace_draft where document_id=$1 and base_state_root is not null
@@ -1002,6 +1003,36 @@ pub async fn retention_report_in(
     .bind(cap)
     .fetch_all(&mut *connection)
     .await?;
+    // A staged commit can name a state the server already held, so that state has no
+    // staged-object row of its own. As in the shared object collector, the commit's file
+    // states for this document are pins. Bodies stream, charged to the byte budget.
+    let mut bytes_read = 0;
+    {
+        use futures::TryStreamExt;
+        let mut bodies = sqlx::query_scalar::<_, Vec<u8>>(
+            "select body from project_staged_commit where scope @> array[$1]::uuid[]",
+        )
+        .bind(document.0)
+        .fetch(&mut *connection);
+        while let Some(body) = bodies.try_next().await? {
+            bytes_read += body.len();
+            if bytes_read > limits.max_bytes {
+                return Err(Error::Limit("bytes"));
+            }
+            let signed: crate::repository::SignedCommit = serde_json::from_slice(&body)?;
+            pinned.extend(
+                signed
+                    .commit
+                    .files
+                    .values()
+                    .filter(|file| file.document == document)
+                    .map(|file| file.state.as_str().to_owned()),
+            );
+            if pinned.len() > limits.max_objects {
+                return Err(Error::Limit("objects"));
+            }
+        }
+    }
     let others: Vec<String> = sqlx::query_scalar(
         "select state_root from shared_checkpoint where document_id=$1 and not through_seq=any($2) limit $3",
     )
@@ -1014,7 +1045,7 @@ pub async fn retention_report_in(
         return Err(Error::Limit("objects"));
     }
 
-    let (mut reached, mut bytes_read) = (BTreeSet::new(), 0);
+    let mut reached = BTreeSet::new();
     let mut store = PgStore::new(&mut *connection);
     let roots = kept.into_iter().chain(pinned).collect();
     reach(
