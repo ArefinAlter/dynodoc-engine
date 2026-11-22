@@ -130,6 +130,15 @@ commits were already imported; those rows stay, like any committed transfer batc
 are charged to capacity. A retry is idempotent. Moving a branch to the imported head is a
 separate, explicit step.
 
+## Offline recovery and cherry-pick feasibility preflight
+
+`engine-cli repository DATABASE PROJECT archive-recovery-preflight FILE --source COMMIT [--onto COMMIT] [--branch BRANCH] [--kind cherry-pick|revert] [--mainline COMMIT]`
+performs read-only preflight feasibility analysis for applying commit-addressed recovery (cherry-pick or revert) directly against an offline history archive.
+- Operates read-only: it never mutates the repository, its branch references or any project file. If the database does not exist, `--onto` (a commit in the archive) allows evaluating feasibility across the archive's own commits.
+- Analyzes 3-way merge feasibility against the active branch head (or specified `--onto` commit), classifying any conflicts (`content_conflict`, `modify_delete`, `namespace_collision`) and reporting modified paths.
+- Resolves the source, `--onto` and mainline commits only from verified evidence: each must hash and verify to the address it was looked up by and belong to this project, or the preflight refuses. A commit absent from both the archive and the repository is refused (`absent parent refusal`); a merge source needs an explicit `--mainline` that is one of its parents.
+- Returns a structured JSON report: `feasible` is true only when there is no conflict and no required commit is missing from the repository, `conflict_free` reports conflicts alone, and `evidence` says what was checked. The analysis rests on commit frames (addresses, signatures, project); typed file states and recovery rules are not replayed, so it is not a promise that the recovery will commit.
+
 ## Normalized state export
 
 `engine-cli repository DATABASE PROJECT export-file --commit ADDRESS --path PATH --out FILE`

@@ -141,6 +141,26 @@ pub enum Action {
         #[arg(long)]
         expect_head: String,
     },
+    /// Read-only preflight analysis for commit recovery directly against an archive.
+    ArchiveRecoveryPreflight {
+        /// Archive file to inspect.
+        file: PathBuf,
+        /// Recovery kind: cherry-pick or revert.
+        #[arg(long, value_enum, default_value = "cherry-pick")]
+        kind: RecoveryKind,
+        /// Commit address to recover.
+        #[arg(long)]
+        source: String,
+        /// Base commit address to recover onto (defaults to branch head).
+        #[arg(long)]
+        onto: Option<String>,
+        /// Target branch to recover onto (defaults to "main").
+        #[arg(long, default_value = "main")]
+        branch: String,
+        /// Parent commit address to treat as mainline for merge recovery.
+        #[arg(long)]
+        mainline: Option<String>,
+    },
     /// Export a local historical file as a normalized-state JSON envelope.
     ExportFile {
         /// Commit address containing the file.
@@ -1043,6 +1063,68 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
             });
             (out, Some(repo))
         }
+        Action::ArchiveRecoveryPreflight {
+            file,
+            kind,
+            source,
+            onto,
+            branch,
+            mainline,
+        } => {
+            let source_addr = address(source)?;
+            let onto_addr = onto.map(address).transpose()?;
+            let mainline_addr = mainline.map(address).transpose()?;
+
+            anyhow::ensure!(
+                file.is_file(),
+                "archive file not found at {}",
+                file.display()
+            );
+
+            let file_handle = std::fs::File::open(&file)
+                .with_context(|| format!("failed to open archive at {}", file.display()))?;
+
+            let limits = engine_core::repository::archive::ArchiveLimits::default();
+            let recovery_kind: engine_core::repository::recovery::Kind = kind.into();
+
+            let report = if path.exists() {
+                let repo = LocalRepository::open_read_only(&path, project).await?;
+                let report = repo
+                    .plan_archive_recovery_preflight(
+                        file_handle,
+                        limits,
+                        recovery_kind,
+                        &source_addr,
+                        onto_addr.as_ref(),
+                        Some(&branch),
+                        mainline_addr.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("archive recovery preflight failed: {e}"))?;
+                repo.close().await;
+                report
+            } else {
+                let onto_addr = onto_addr.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "target repository does not exist and no explicit --onto commit provided"
+                    )
+                })?;
+                engine_core::repository::recovery::preflight_archive_recovery(
+                    file_handle,
+                    limits,
+                    recovery_kind,
+                    &source_addr,
+                    &onto_addr,
+                    mainline_addr.as_ref(),
+                    |_| None,
+                    |_| false,
+                )
+                .map_err(|e| anyhow::anyhow!("archive recovery preflight failed: {e}"))?
+            };
+
+            let out = serde_json::to_value(&report)?;
+            (out, None)
+        }
         other_action => {
             // The retention, horizon plans, archive export, export-file and log must not create, upgrade or write the database.
             let repo = if matches!(
@@ -1077,7 +1159,8 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                 Action::ArchiveVerify { .. }
                 | Action::ArchiveImport { .. }
                 | Action::HorizonSign { .. }
-                | Action::HorizonArchiveVerify { .. } => unreachable!(),
+                | Action::HorizonArchiveVerify { .. }
+                | Action::ArchiveRecoveryPreflight { .. } => unreachable!(),
                 Action::HorizonDraft {
                     policy,
                     plan_hash,
@@ -4072,7 +4155,9 @@ mod tests {
         let f = Fixture::new().await;
         let doc1 = DocumentId(uuid::Uuid::new_v4());
         let f1 = f.file(doc1, &[(0, "Genesis")]).await;
-        let c1 = f.commit(&[], vec![("doc.docx", f1)], "Genesis").await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
 
         let archive_path = std::env::temp_dir().join(format!(
             "test-verify-subst-{}.dynoarc",
@@ -5223,7 +5308,9 @@ mod tests {
         let f = Fixture::new().await;
         let doc1 = DocumentId(uuid::Uuid::new_v4());
         let f1 = f.file(doc1, &[(0, "Genesis")]).await;
-        let c1 = f.commit(&[], vec![("doc.docx", f1)], "Genesis").await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
 
         let empty_out = std::env::temp_dir().join(format!(
             "test-archive-empty-{}.dynoarc",
@@ -6350,6 +6437,293 @@ mod tests {
             "log action must not mutate the database or WAL"
         );
 
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_recovery_preflight_clean_cherry_pick() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        let doc2 = DocumentId(uuid::Uuid::new_v4());
+        let f2 = f.file(doc2, &[(0, "Feature")]).await;
+        let c2 = f
+            .commit(
+                &[&c1],
+                vec![("doc.docx", f1), ("feature.docx", f2)],
+                "Feature",
+            )
+            .await;
+
+        f.repo.compare_and_swap("main", None, &c1).await.unwrap();
+
+        let archive_path = f.path.with_extension("archive-preflight-clean.dynoarc");
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                since: None,
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1. Direct plan check
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let report = f
+            .repo
+            .plan_archive_recovery_preflight(
+                file,
+                engine_core::repository::archive::ArchiveLimits::default(),
+                engine_core::repository::recovery::Kind::CherryPick,
+                &c2,
+                None,
+                Some("main"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(report.feasible);
+        assert!(report.conflicts.is_empty());
+        assert_eq!(report.modified_paths.len(), 1);
+        assert_eq!(report.modified_paths[0].path, "feature.docx");
+
+        // 2. Action CLI execution
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveRecoveryPreflight {
+                file: archive_path.clone(),
+                kind: RecoveryKind::CherryPick,
+                source: c2.as_str().to_string(),
+                onto: None,
+                branch: "main".to_string(),
+                mainline: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_recovery_preflight_conflicting_change_detection() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        let f2 = f.file(doc1, &[(0, "Genesis"), (1, "Branch A")]).await;
+        let c2 = f.commit(&[&c1], vec![("doc.docx", f2)], "Branch A").await;
+
+        let f3 = f.file(doc1, &[(0, "Genesis"), (1, "Branch B")]).await;
+        let c3 = f.commit(&[&c1], vec![("doc.docx", f3)], "Branch B").await;
+
+        f.repo.compare_and_swap("main", None, &c3).await.unwrap();
+
+        let archive_path = f.path.with_extension("archive-preflight-conflict.dynoarc");
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                since: None,
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1. Direct plan check
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let report = f
+            .repo
+            .plan_archive_recovery_preflight(
+                file,
+                engine_core::repository::archive::ArchiveLimits::default(),
+                engine_core::repository::recovery::Kind::CherryPick,
+                &c2,
+                None,
+                Some("main"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!report.feasible);
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(report.conflicts[0].path, "doc.docx");
+        assert_eq!(
+            report.conflicts[0].classification,
+            engine_core::repository::recovery::ConflictClass::ContentConflict
+        );
+
+        // 2. Action CLI execution
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveRecoveryPreflight {
+                file: archive_path.clone(),
+                kind: RecoveryKind::CherryPick,
+                source: c2.as_str().to_string(),
+                onto: None,
+                branch: "main".to_string(),
+                mainline: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_recovery_preflight_absent_parent_refusal() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+        f.repo.compare_and_swap("main", None, &c1).await.unwrap();
+
+        // Create an external parent and child in memory without adding to f.repo
+        let absent_parent = Address::try_from("11".repeat(32)).unwrap();
+        let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+            .unwrap();
+        let key_pair = ring::signature::Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+        let commit = Commit {
+            version: 1,
+            project: f.project,
+            parents: vec![absent_parent.clone()],
+            files: BTreeMap::new(),
+            author_key: String::new(),
+            authored_at_ms: 1_700_000_000_000,
+            message: "Orphan recovery commit".into(),
+            recovery: None,
+            same_file_resolutions: Vec::new(),
+        };
+        let signed = SignedCommit::sign(commit, &key_pair).unwrap();
+        let source_addr = signed.commit.address().unwrap();
+
+        let archive_path = f.path.with_extension("archive-preflight-absent.dynoarc");
+        let mut file = std::fs::File::create(&archive_path).unwrap();
+        let mut writer = engine_core::repository::archive::ArchiveWriter::new(&mut file).unwrap();
+        writer
+            .write_header_with_since(
+                1,
+                DocumentId(f.project),
+                source_addr.clone(),
+                Some(absent_parent.clone()),
+            )
+            .unwrap();
+        writer.write_commit(&signed).unwrap();
+        writer.finish().unwrap();
+
+        let err = run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveRecoveryPreflight {
+                file: archive_path.clone(),
+                kind: RecoveryKind::CherryPick,
+                source: source_addr.as_str().to_string(),
+                onto: None,
+                branch: "main".to_string(),
+                mainline: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("absent")
+                || err.to_string().contains("not found")
+                || err.to_string().contains("failed")
+                || err.to_string().contains(absent_parent.as_str()),
+            "unexpected error message: {err}"
+        );
+
+        let _ = std::fs::remove_file(&archive_path);
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn archive_recovery_preflight_revert_and_database_immutability() {
+        let f = Fixture::new().await;
+        let doc1 = DocumentId(uuid::Uuid::new_v4());
+        let f1 = f.file(doc1, &[(0, "Genesis")]).await;
+        let c1 = f
+            .commit(&[], vec![("doc.docx", f1.clone())], "Genesis")
+            .await;
+
+        let doc2 = DocumentId(uuid::Uuid::new_v4());
+        let f2 = f.file(doc2, &[(0, "Feature")]).await;
+        let c2 = f
+            .commit(
+                &[&c1],
+                vec![("doc.docx", f1), ("feature.docx", f2)],
+                "Feature",
+            )
+            .await;
+
+        f.repo.compare_and_swap("main", None, &c2).await.unwrap();
+
+        let archive_path = f.path.with_extension("archive-preflight-revert.dynoarc");
+        run(
+            f.path.clone(),
+            f.project,
+            Action::ArchiveExport {
+                head: c2.as_str().to_string(),
+                since: None,
+                out: archive_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Database immutability: record snapshot, run action, verify unchanged
+        let (path, project) = (f.path.clone(), f.project);
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let snapshot = || {
+            (
+                std::fs::read(&path).unwrap(),
+                std::fs::read(&wal).unwrap_or_default(),
+            )
+        };
+        let before = snapshot();
+
+        run(
+            path.clone(),
+            project,
+            Action::ArchiveRecoveryPreflight {
+                file: archive_path.clone(),
+                kind: RecoveryKind::Revert,
+                source: c2.as_str().to_string(),
+                onto: None,
+                branch: "main".to_string(),
+                mainline: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            snapshot(),
+            before,
+            "archive-recovery-preflight must not mutate the database or WAL"
+        );
+
+        let _ = std::fs::remove_file(&archive_path);
         f.finish().await;
     }
 }
