@@ -8405,8 +8405,8 @@ components:
             description: 'Outline hash: pass it back as `if_none_match`.'
           profile:
             oneOf:
-            - type: 'null'
             - $ref: '#/components/schemas/AgentProfile'
+            - type: 'null'
           sheets:
             type:
             - array
@@ -8922,12 +8922,12 @@ components:
             minimum: 0
           profile:
             oneOf:
-            - type: 'null'
             - $ref: '#/components/schemas/AgentProfile'
+            - type: 'null'
           range:
             oneOf:
-            - type: 'null'
             - $ref: '#/components/schemas/AgentRangeRead'
+            - type: 'null'
           slides:
             type:
             - array
@@ -9695,8 +9695,8 @@ components:
       properties:
         assignee:
           oneOf:
-          - type: 'null'
           - $ref: '#/components/schemas/IssueAssignee'
+          - type: 'null'
         author:
           $ref: '#/components/schemas/IssuePerson'
         body:
@@ -9708,16 +9708,16 @@ components:
           format: date-time
         closed_by:
           oneOf:
-          - type: 'null'
           - $ref: '#/components/schemas/IssuePerson'
+          - type: 'null'
         comment_count:
           type: integer
           format: int32
         comments:
           oneOf:
-          - type: 'null'
           - $ref: '#/components/schemas/IssueCommentPage'
             description: Present on `GET` of one issue only.
+          - type: 'null'
         created_at:
           type: string
           format: date-time
@@ -9953,8 +9953,8 @@ components:
       properties:
         assignee:
           oneOf:
-          - type: 'null'
           - $ref: '#/components/schemas/IssueAssignee'
+          - type: 'null'
         author:
           $ref: '#/components/schemas/IssuePerson'
         closed_at:
