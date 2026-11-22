@@ -542,13 +542,10 @@ pub struct StateExportPayload {
     /// Authority epoch under which this attestation was issued.
     pub authority_epoch: u32,
     /// Hex-encoded 32-byte Ed25519 public key of the signer.
-    #[serde(alias = "signer_public_key")]
     pub signer_key: String,
     /// Verified commit address containing the state.
-    #[serde(alias = "commit_address")]
     pub commit: Address,
     /// Hex-encoded 32-byte SHA-256 digest of the exported state bytes.
-    #[serde(alias = "state_hash", alias = "digest")]
     pub state_digest: String,
     /// Declared issuance time in milliseconds since Unix epoch.
     pub issued_at_ms: i64,
@@ -588,13 +585,10 @@ pub struct StateExportAttestation {
     /// Authority epoch under which this attestation was issued.
     pub authority_epoch: u32,
     /// Hex-encoded 32-byte Ed25519 public key of the signer.
-    #[serde(alias = "signer_public_key")]
     pub signer_key: String,
     /// Verified commit address containing the state.
-    #[serde(alias = "commit_address")]
     pub commit: Address,
     /// Hex-encoded 32-byte SHA-256 digest of the exported state bytes.
-    #[serde(alias = "state_hash", alias = "digest")]
     pub state_digest: String,
     /// Declared issuance time in milliseconds since Unix epoch.
     pub issued_at_ms: i64,
@@ -801,8 +795,9 @@ impl AttestationVerificationPolicy {
         from_epoch: u32,
         until_epoch: Option<u32>,
     ) -> Self {
+        // `sign` writes the key in lowercase hex; any other spelling would never match.
         self.trusted_keys.insert(
-            key.into(),
+            key.into().to_ascii_lowercase(),
             KeyEpochs {
                 from_epoch,
                 until_epoch,
@@ -871,7 +866,12 @@ impl AttestationVerificationPolicy {
         } else if self.trusted_keys.is_empty() {
             return Err(AttestationError::NoTrustAnchor);
         }
-        for window in self.trusted_keys.values() {
+        for (key, window) in &self.trusted_keys {
+            if key.len() != 64 || !key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return Err(AttestationError::InconsistentPolicy(
+                    "a trusted key is not a 32-byte public key in lowercase hex",
+                ));
+            }
             if window
                 .until_epoch
                 .is_some_and(|until| until < window.from_epoch)
@@ -2227,6 +2227,77 @@ mod tests {
             Err(AttestationError::UntrustedKey { .. })
         ));
         let _ = &s.key;
+    }
+
+    #[test]
+    fn trust_anchors_are_validated_and_each_field_has_exactly_one_name() {
+        let s = signed_at_epoch(7, 2);
+        let policy = |key: &str| {
+            AttestationVerificationPolicy::new()
+                .with_project(s.project)
+                .with_commit(s.commit.clone())
+                .with_trusted_key(key)
+        };
+        // The same key typed in capitals is the same trust anchor.
+        assert_eq!(
+            verify_state_attestation(
+                &s.attestation,
+                s.bytes,
+                &policy(&s.pub_key.to_ascii_uppercase())
+            ),
+            Ok(AttestationTrust::Authority)
+        );
+        // A malformed anchor is a policy error, not a silently unmatched key.
+        for bad in ["not-hex", &s.pub_key[..62], &format!("{}00", s.pub_key)] {
+            assert!(
+                matches!(
+                    verify_state_attestation(&s.attestation, s.bytes, &policy(bad)),
+                    Err(AttestationError::InconsistentPolicy(_))
+                ),
+                "{bad}"
+            );
+        }
+        let mut direct = policy(&s.pub_key);
+        direct.trusted_keys = BTreeMap::from([(
+            s.pub_key.to_ascii_uppercase(),
+            KeyEpochs {
+                from_epoch: 0,
+                until_epoch: None,
+            },
+        )]);
+        assert!(matches!(
+            verify_state_attestation(&s.attestation, s.bytes, &direct),
+            Err(AttestationError::InconsistentPolicy(_))
+        ));
+        // v1 has one spelling per field; another name is an unknown field.
+        let json = serde_json::to_value(&s.attestation).unwrap();
+        assert_eq!(
+            serde_json::from_value::<StateExportAttestation>(json.clone()).unwrap(),
+            s.attestation
+        );
+        for (field, other) in [
+            ("signer_key", "signer_public_key"),
+            ("commit", "commit_address"),
+            ("state_digest", "state_hash"),
+            ("state_digest", "digest"),
+        ] {
+            let mut renamed = json.clone();
+            let object = renamed.as_object_mut().unwrap();
+            let value = object.remove(field).unwrap();
+            object.insert(other.into(), value);
+            assert!(
+                serde_json::from_value::<StateExportAttestation>(renamed.clone()).is_err(),
+                "{other}"
+            );
+            let mut payload = serde_json::to_value(s.attestation.payload()).unwrap();
+            let object = payload.as_object_mut().unwrap();
+            let value = object.remove(field).unwrap();
+            object.insert(other.into(), value);
+            assert!(
+                serde_json::from_value::<StateExportPayload>(payload).is_err(),
+                "{other}"
+            );
+        }
     }
 
     #[test]

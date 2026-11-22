@@ -36,7 +36,7 @@ canonical JSON object:
 
 | Field | Type | Description |
 |---|---|---|
-| `version` | `u32` | Format version (currently `1`). |
+| `version` | `u8` | Format version (currently `1`). |
 | `project` | `Uuid` | Document project identifier. |
 | `authority_epoch` | `u32` | Authority epoch at signing time (`>= 1`). |
 | `commit` | `Address` | 64-character hex SHA-256 commit address containing this state. |
@@ -44,6 +44,8 @@ canonical JSON object:
 | `state_digest` | `String` | SHA-256 hash of the exact UTF-8 / binary bytes of the state export file. |
 | `signature` | `String` | 128-character hex Ed25519 signature over canonical signing payload. |
 | `issued_at_ms` | `i64` | UTC timestamp in milliseconds when attestation was issued. |
+
+Each field has exactly this name. Any other field, including another spelling of one of these, is refused.
 
 ---
 
@@ -78,7 +80,7 @@ labelled `signature_only` so it is never read as trusted.
 
 When verifying with `AttestationVerificationPolicy`:
 
-1. **Policy:** contradictory settings fail with `InconsistentPolicy` (minimum epoch above the maximum, signature-only with trusted keys, a key window that ends before it starts).
+1. **Policy:** contradictory settings fail with `InconsistentPolicy` (minimum epoch above the maximum, signature-only with trusted keys, a key window that ends before it starts, a trusted key that is not 64 hex characters). Trusted keys are compared in lowercase, the spelling `signer_key` is written in.
 2. **State Digest:** The SHA-256 hash of the state export file on disk is compared to `state_digest`. Any bit alteration, whitespace variation, or truncation causes `DigestMismatch`.
 3. **Project and Commit Binding:** If the policy expects a project UUID or a commit address, it must match, else `ProjectMismatch` or `CommitMismatch`. The CLI always sets both from the export it verified.
 4. **Epoch Limits:** `min_epoch` and `max_epoch` are plain limits (`ExpiredEpoch`, `FutureEpoch`). They are not rotation or revocation and do not show the signer was authorized at a real time.
