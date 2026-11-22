@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Open pull requests #126 to #141 integrated - 2026-11-22
+
+- Incremental history archive import, offline recovery preflight, historical file diff
+  and signed state-export attestations (#126 to #129); the diff's line search stops
+  after 2 s and attestation trust anchors are validated (review patches).
+- Multi-codec historical reader with bounded fallback past corrupt periodic checkpoints,
+  a read-only retention report that also pins staged commits, compact v3 named and
+  deployed snapshots (migration **0143**, renumbered from the contributor's 0056) and a
+  read-only `shared-reencode-check` (#130 to #134).
+- The PR-73 compact node id measurement: no change; the prototype stays with its
+  benchmark, not in `engine-shared` (#135).
+- serde_json 1.0.154, unicode-normalization 0.1.26, zeroize 1.9.1, sha2 0.11.1 and
+  utoipa 6.0 (`openapi.yaml` regenerated, order of nullable `oneOf` entries only).
+
 ### Application engine at 4f0e7a3 (decisions 024 to 043) - 2026-11-08
 
 Synchronized `engine-shared`, `engine-core`, `engine-agent`, `engine-mcp`, `engine-api`,
