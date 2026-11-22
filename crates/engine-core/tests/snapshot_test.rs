@@ -879,20 +879,20 @@ async fn snapshot_rows(pool: &PgPool) -> anyhow::Result<serde_json::Value> {
 }
 
 #[sqlx::test(migrations = false)]
-async fn migration_0056_keeps_populated_snapshots_receipts_and_references(
+async fn migration_0143_keeps_populated_snapshots_receipts_and_references(
     pool: PgPool,
 ) -> anyhow::Result<()> {
-    let mut at_55 = sqlx::migrate!("../../migrations");
-    at_55.migrations = at_55
+    let mut at_142 = sqlx::migrate!("../../migrations");
+    at_142.migrations = at_142
         .migrations
         .iter()
-        .filter(|m| m.version < 56)
+        .filter(|m| m.version < 143)
         .cloned()
         .collect::<Vec<_>>()
         .into();
-    at_55.run(&pool).await?;
+    at_142.run(&pool).await?;
 
-    // Legacy and v2 snapshots, with their receipts, written at schema 55.
+    // Legacy and v2 snapshots, with their receipts, written at schema 142.
     let (actor, doc, node) = seed(&pool).await?;
     let engine = SnapshotEngine::new(pool.clone());
     let first = engine.take(doc, SnapshotReason::Periodic).await?;

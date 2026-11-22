@@ -6,8 +6,8 @@ the API writer; its default is legacy. Core callers explicitly select
 `NamedStorage::SharedV2`. Periodic checkpoints and draft bases keep their separate
 writer settings. This capability is not enabled on the VPS.
 
-`shared-v3` (migration 0056) stores the compact v3 graph instead, with state
-`{"$dynodoc_state":3,"root":"<64 hex>"}`. Readers from before 0056 refuse that
+`shared-v3` (migration 0143) stores the compact v3 graph instead, with state
+`{"$dynodoc_state":3,"root":"<64 hex>"}`. Readers from before 0143 refuse that
 envelope, so deploy v3-capable readers first; their refusal is a compatibility
 limit, not rollback support. The migration rebuilds the generated `state_root`
 column (100,000 rows took under a second), so restart API processes after it:
