@@ -6984,6 +6984,10 @@ mod tests {
             message: "Orphan recovery commit".into(),
             recovery: None,
             same_file_resolutions: Vec::new(),
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
+            sealed: None,
         };
         let signed = SignedCommit::sign(commit, &key_pair).unwrap();
         let source_addr = signed.commit.address().unwrap();
