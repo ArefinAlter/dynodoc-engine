@@ -6,6 +6,7 @@ use engine_shared::DocumentId;
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 /// Most node changes one report lists, and the most diff bytes it carries; whatever is
 /// left out is counted in `omitted`. The event list is all or nothing, because a partial
@@ -16,6 +17,11 @@ const MAX_EVENT_BYTES: usize = 256 * 1024;
 const MAX_DIFF_BYTES: usize = 256 * 1024;
 /// Largest value or diff line shown whole; longer text is replaced by its length and SHA-256.
 const MAX_VALUE_BYTES: usize = 4 * 1024;
+/// Longest the minimal line-diff search runs. Its cost grows with the number of changed
+/// lines, so two heavily rewritten large states could otherwise take minutes. After the
+/// limit the search settles for coarser hunks that still turn `a` into `b`, and `omitted`
+/// says so; `node_changes` are always computed exactly from the states.
+const LINE_SEARCH_LIMIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -143,6 +149,31 @@ pub fn diff_states(
     file_b: &FileEntry,
     state_b: &DocumentState,
 ) -> Result<HistoricalDiffReport, Error> {
+    diff_states_within(
+        commit_a_addr,
+        path_a,
+        file_a,
+        state_a,
+        commit_b_addr,
+        path_b,
+        file_b,
+        state_b,
+        LINE_SEARCH_LIMIT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_states_within(
+    commit_a_addr: &Address,
+    path_a: &str,
+    file_a: &FileEntry,
+    state_a: &DocumentState,
+    commit_b_addr: &Address,
+    path_b: &str,
+    file_b: &FileEntry,
+    state_b: &DocumentState,
+    line_search: Duration,
+) -> Result<HistoricalDiffReport, Error> {
     let same_document = file_a.document == file_b.document;
     let mut also_differs = Vec::new();
     if !same_document {
@@ -198,12 +229,22 @@ pub fn diff_states(
         })
     };
     let (a_text, b_text) = (lines(state_a)?, lines(state_b)?);
-    let text_diff = TextDiff::from_lines(&a_text, &b_text);
+    let started = Instant::now();
+    let text_diff = TextDiff::configure()
+        .timeout(line_search)
+        .diff_lines(&a_text, &b_text);
+    let searched = started.elapsed();
     if text_diff
         .ops()
         .iter()
         .any(|op| op.tag() != similar::DiffTag::Equal)
     {
+        if searched >= line_search {
+            report.omitted.push(format!(
+                "unified_diff: the line search stopped after {} ms, so hunks may be coarser than a minimal diff",
+                line_search.as_millis()
+            ));
+        }
         let mut unified = text_diff
             .unified_diff()
             .header(
@@ -560,5 +601,81 @@ mod tests {
             report.events_unavailable.as_deref(),
             Some("more than 1000 events")
         );
+    }
+
+    #[test]
+    fn a_line_search_that_runs_out_of_time_still_covers_every_change_and_says_so() {
+        let commit_a = Address::try_from("aa".repeat(32)).unwrap();
+        let commit_b = Address::try_from("bb".repeat(32)).unwrap();
+        let (file_a, file_b) = (make_entry(1, "1"), make_entry(1, "2"));
+        let (mut state_a, mut state_b) = (DocumentState::default(), DocumentState::default());
+        for i in 0..200 {
+            let (id, pos) = (format!("{i:03}"), format!("p{i:03}"));
+            let after = if i % 3 == 0 {
+                format!("new {i}")
+            } else {
+                format!("old {i}")
+            };
+            state_a.nodes.insert(
+                NodeId(id.clone()),
+                make_node(&id, &pos, &format!("old {i}")),
+            );
+            state_b
+                .nodes
+                .insert(NodeId(id.clone()), make_node(&id, &pos, &after));
+        }
+        let args = (&commit_a, "doc.docx", &file_a, &state_a);
+        let exact = diff_states(
+            args.0, args.1, args.2, args.3, &commit_b, "doc.docx", &file_b, &state_b,
+        )
+        .unwrap();
+        let coarse = diff_states_within(
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            &commit_b,
+            "doc.docx",
+            &file_b,
+            &state_b,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        assert!(exact.omitted.is_empty(), "{:?}", exact.omitted);
+        assert!(
+            coarse
+                .omitted
+                .iter()
+                .any(|note| note.contains("line search stopped")),
+            "{:?}",
+            coarse.omitted
+        );
+        assert_eq!(coarse.node_changes, exact.node_changes);
+        assert_eq!(coarse.node_changes.len(), 67);
+        // Whatever the hunks look like, every removed and added line is in them.
+        let marked = |diff: &str, sign: char| -> BTreeSet<String> {
+            diff.lines()
+                .filter(|l| l.starts_with(sign) && !l.starts_with("---") && !l.starts_with("+++"))
+                .map(|l| l[1..].to_string())
+                .collect()
+        };
+        let (a_lines, b_lines): (BTreeSet<_>, BTreeSet<_>) = (
+            canonical_node_lines(&state_a)
+                .unwrap()
+                .into_iter()
+                .collect(),
+            canonical_node_lines(&state_b)
+                .unwrap()
+                .into_iter()
+                .collect(),
+        );
+        let removed: BTreeSet<_> = a_lines.difference(&b_lines).cloned().collect();
+        let added: BTreeSet<_> = b_lines.difference(&a_lines).cloned().collect();
+        assert_eq!(removed.len(), 67);
+        assert!(marked(&coarse.unified_diff, '-').is_superset(&removed));
+        assert!(marked(&coarse.unified_diff, '+').is_superset(&added));
+        assert_eq!(marked(&exact.unified_diff, '-'), removed);
+        assert_eq!(marked(&exact.unified_diff, '+'), added);
     }
 }
