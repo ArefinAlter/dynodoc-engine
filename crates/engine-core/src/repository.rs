@@ -25,6 +25,8 @@ pub mod device;
 #[cfg(feature = "persistence")]
 pub mod device_session;
 #[cfg(feature = "persistence")]
+pub mod historical_diff;
+#[cfg(feature = "persistence")]
 pub mod horizon;
 #[cfg(feature = "persistence")]
 pub mod local;
