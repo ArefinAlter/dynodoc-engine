@@ -117,9 +117,14 @@ removed if the export fails and synced to disk before success is reported.
 
 `engine-cli repository DATABASE PROJECT archive-import FILE --expect-head ADDRESS` runs the
 complete offline verification first, including a semantic import into a disposable private
-repository, before it creates, opens or upgrades the target database. It then copies the
+repository, before it creates, opens or upgrades the target database. When importing an
+incremental archive (with a declared `since` base commitment), semantic preflight verifies that
+the target repository exists and contains the declared `since` commit before copying any staged
+objects. If the destination lacks the required base commit or is absent, the import is refused
+fail-closed without mutating or creating the target database. It then copies the
 objects in transfer batches (at most 64 objects / 1 MiB each) and the commits in dependency
-order. It never creates or moves a branch and never raises storage limits. If the target
+order. Redundant imports are zero-copy, and destination branch references and pins remain
+invariant. It never creates or moves a branch and never raises storage limits. If the target
 fails part way, for example at its capacity limit, the error reports how many objects and
 commits were already imported; those rows stay, like any committed transfer batch, and
 are charged to capacity. A retry is idempotent. Moving a branch to the imported head is a
