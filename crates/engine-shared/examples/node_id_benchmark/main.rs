@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::hint::black_box;
 use std::time::Instant;
 
-use engine_shared::ids::{encode_ulid_u128, CompactNodeId};
+mod compact;
+
+use compact::{encode_ulid_u128, CompactNodeId};
 use engine_shared::NodeId;
 
 #[derive(Debug, Clone, serde::Serialize)]
