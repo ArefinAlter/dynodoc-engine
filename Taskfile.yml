@@ -94,5 +94,5 @@ tasks:
     desc: Install engine-cli into Cargo's bin directory for direct local use
     cmds: ["cargo install --locked --path crates/engine-cli"]
   cli:
-    desc: Run engine-cli directly (usage: task cli -- <args>)
+    desc: "Run engine-cli directly (usage: task cli -- <args>)"
     cmds: ["cargo run --locked -p engine-cli -- {{.CLI_ARGS}}"]
