@@ -94,6 +94,17 @@ enum Command {
         #[command(subcommand)]
         action: repository::Action,
     },
+    /// Shorthand for `repository` using flags or `DYNODOC_REPO` / `DYNODOC_PROJECT`.
+    Repo {
+        /// Local SQLite repository path (or the variable DYNODOC_REPO).
+        #[arg(long, env = "DYNODOC_REPO")]
+        repo: std::path::PathBuf,
+        /// Project UUID (or the variable DYNODOC_PROJECT).
+        #[arg(long, env = "DYNODOC_PROJECT")]
+        project: Uuid,
+        #[command(subcommand)]
+        action: repository::Action,
+    },
     /// Operator-issued sign-in links, for an installation with no mail or with email sign-in off
     /// (owner credential: MIGRATION_DATABASE_URL). The link is a credential; see the subcommands.
     Auth {
@@ -254,11 +265,15 @@ enum Command {
     },
     /// Compare two historical file revisions across commits or offline archives without extracting files to disk.
     HistoricalDiff {
-        /// Repository database path (optional if --archive is provided).
-        #[arg(long)]
+        /// Repository database path (optional if --archive is provided, or DYNODOC_REPO).
+        #[arg(long, env = "DYNODOC_REPO")]
         repository: Option<std::path::PathBuf>,
-        /// Project UUID (defaults to nil UUID if omitting repository).
-        #[arg(long, default_value = "00000000-0000-0000-0000-000000000000")]
+        /// Project UUID (defaults to nil UUID if omitting repository, or DYNODOC_PROJECT).
+        #[arg(
+            long,
+            env = "DYNODOC_PROJECT",
+            default_value = "00000000-0000-0000-0000-000000000000"
+        )]
         project: Uuid,
         /// First commit address.
         #[arg(long = "commit-a")]
@@ -415,6 +430,11 @@ async fn run() -> anyhow::Result<()> {
             project,
             action,
         } => repository::run(path, project, action).await,
+        Command::Repo {
+            repo,
+            project,
+            action,
+        } => repository::run(repo, project, action).await,
         Command::Auth { action } => auth::run(action).await,
         Command::Migrate => {
             let pool = connect_migration().await?;
@@ -797,8 +817,9 @@ async fn state_export_attest(
 
 /// Connect to Postgres from `DATABASE_URL`.
 async fn connect() -> anyhow::Result<PgPool> {
-    let database_url =
-        std::env::var("DATABASE_URL").context("DATABASE_URL is not set (see .env / SETUP.md)")?;
+    let database_url = std::env::var("DATABASE_URL").context(
+        "DATABASE_URL is not set; binaries do not read .env files — run via Task (e.g. 'task db:check') or export DATABASE_URL (see docs/LOCAL-DEVELOPMENT.md)",
+    )?;
     PgPoolOptions::new()
         .max_connections(4)
         .connect(&database_url)
@@ -808,7 +829,7 @@ async fn connect() -> anyhow::Result<PgPool> {
 
 async fn connect_migration() -> anyhow::Result<PgPool> {
     let url = std::env::var("MIGRATION_DATABASE_URL").context(
-        "MIGRATION_DATABASE_URL is required for this operator command; never pass it to the API",
+        "MIGRATION_DATABASE_URL is required for this operator command (never pass it to engine-api); binaries do not read .env.migrate — run via Task (e.g. 'task migrate') or export MIGRATION_DATABASE_URL",
     )?;
     PgPoolOptions::new()
         .max_connections(1)
@@ -1210,5 +1231,103 @@ fn print_ordering_report(report: &engine_core::database::ordering::OrderingAudit
             report.incompatible_columns.len(),
             report.ordering_mismatches
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn repo_shorthand_and_positional_repository_parse_identically() {
+        let project = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let shorthand = Cli::try_parse_from([
+            "engine-cli",
+            "repo",
+            "--repo",
+            "local.sqlite",
+            "--project",
+            "11111111-1111-4111-8111-111111111111",
+            "storage",
+        ])
+        .unwrap();
+        match shorthand.command {
+            Command::Repo {
+                repo,
+                project: parsed_project,
+                action: repository::Action::Storage,
+            } => {
+                assert_eq!(repo, std::path::PathBuf::from("local.sqlite"));
+                assert_eq!(parsed_project, project);
+            }
+            _ => panic!("expected Command::Repo with Storage action"),
+        }
+
+        let positional = Cli::try_parse_from([
+            "engine-cli",
+            "repository",
+            "local.sqlite",
+            "11111111-1111-4111-8111-111111111111",
+            "storage",
+        ])
+        .unwrap();
+        match positional.command {
+            Command::Repository {
+                path,
+                project: parsed_project,
+                action: repository::Action::Storage,
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("local.sqlite"));
+                assert_eq!(parsed_project, project);
+            }
+            _ => panic!("expected Command::Repository with Storage action"),
+        }
+    }
+
+    #[test]
+    fn cli_subcommands_register_dynodoc_env_vars() {
+        let cmd = Cli::command();
+
+        let repo_cmd = cmd.find_subcommand("repo").expect("repo subcommand");
+        let repo_arg = repo_cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "repo")
+            .unwrap();
+        assert_eq!(repo_arg.get_env(), Some(OsStr::new("DYNODOC_REPO")));
+        let project_arg = repo_cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "project")
+            .unwrap();
+        assert_eq!(project_arg.get_env(), Some(OsStr::new("DYNODOC_PROJECT")));
+
+        let diff_cmd = cmd
+            .find_subcommand("historical-diff")
+            .expect("historical-diff subcommand");
+        let diff_repo = diff_cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "repository")
+            .unwrap();
+        assert_eq!(diff_repo.get_env(), Some(OsStr::new("DYNODOC_REPO")));
+        let diff_proj = diff_cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "project")
+            .unwrap();
+        assert_eq!(diff_proj.get_env(), Some(OsStr::new("DYNODOC_PROJECT")));
+
+        let sync_cmd = cmd.find_subcommand("sync").expect("sync subcommand");
+        for (arg_id, expected_env) in [
+            ("remote", "DYNODOC_REMOTE"),
+            ("device_key", "DYNODOC_KEY"),
+            ("journal", "DYNODOC_JOURNAL"),
+            ("branch", "DYNODOC_BRANCH"),
+        ] {
+            let arg = sync_cmd
+                .get_arguments()
+                .find(|a| a.get_id() == arg_id)
+                .unwrap_or_else(|| panic!("missing sync arg {arg_id}"));
+            assert_eq!(arg.get_env(), Some(OsStr::new(expected_env)), "{arg_id}");
+        }
     }
 }

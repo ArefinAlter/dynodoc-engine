@@ -43,8 +43,8 @@ pub struct Options {
     /// Local SQLite repository; fetch adds verified history but never changes its branches.
     repository: PathBuf,
     project: Uuid,
-    /// Independently prepared JSON with version, url, authority and public_key.
-    #[arg(long)]
+    /// Independently prepared JSON with version, url, authority and public_key. Or the variable DYNODOC_REMOTE.
+    #[arg(long, env = "DYNODOC_REMOTE")]
     remote: PathBuf,
     /// Account access token in a private file; never pass the token as an argument.
     #[arg(long, conflicts_with = "device_key")]
@@ -59,13 +59,14 @@ pub struct Options {
     /// Obtains and renews short-lived tokens for this project in memory; no token or
     /// refresh secret is stored. The key must be granted this project in your
     /// profile (signing keys), unless it is an older all-projects key. On Unix a key
-    /// readable by group or others is refused.
-    #[arg(long)]
+    /// readable by group or others is refused. Or the variable DYNODOC_KEY.
+    #[arg(long, env = "DYNODOC_KEY")]
     device_key: Option<PathBuf>,
-    /// Separate durable client receipt journal (must not be the repository database).
-    #[arg(long)]
+    /// Separate durable client receipt journal (must not be the repository database). Or the variable DYNODOC_JOURNAL.
+    #[arg(long, env = "DYNODOC_JOURNAL")]
     journal: PathBuf,
-    #[arg(long)]
+    /// Remote branch name. Or the variable DYNODOC_BRANCH.
+    #[arg(long, env = "DYNODOC_BRANCH")]
     branch: String,
     /// Synthetic local tests only. HTTPS is required for other addresses.
     #[arg(long)]

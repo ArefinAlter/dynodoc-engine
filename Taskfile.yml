@@ -1,9 +1,33 @@
 version: "3"
 dotenv: [".env"]
 tasks:
+  setup:
+    desc: Create local .env and .env.migrate with generated dev keys (preserves existing files)
+    cmds: ["bash scripts/dev-setup.sh"]
   up:
     desc: Start local PostgreSQL on loopback port 5548
     cmds: ["docker compose up -d --wait"]
+  down:
+    desc: Stop local PostgreSQL container (preserves data volume)
+    cmds: ["docker compose down"]
+  db:bootstrap-runtime:
+    desc: Create or sync the restricted dynodoc_runtime login in local Compose PostgreSQL
+    cmds: ["bash scripts/dev-bootstrap-runtime.sh"]
+  dev:init:
+    desc: First-time local setup (env files, Postgres, runtime role, migrations, grants, check)
+    cmds:
+      - task: setup
+      - task: up
+      - task: db:bootstrap-runtime
+      - task: migrate
+      - task: db:grant-runtime
+      - task: db:check
+  db:upgrade:
+    desc: Apply new migrations, refresh runtime grants, and verify privileges (run after git pull)
+    cmds:
+      - task: migrate
+      - task: db:grant-runtime
+      - task: db:check
   run:
     desc: Run the provisioned API; never applies migrations
     cmds: ["cargo run --locked -p engine-api"]
@@ -18,9 +42,29 @@ tasks:
   db:check:
     desc: Read-only schema/runtime privilege check
     cmds: ["cargo run --locked -p engine-cli -- check-runtime"]
+  doctor:
+    desc: Check local prerequisites, env files, and runtime database privileges
+    cmds:
+      - |
+        echo "Rust:   $(rustc --version 2>/dev/null || echo 'MISSING')"
+        echo "Docker: $(docker --version 2>/dev/null || echo 'MISSING')"
+        test -f .env && echo ".env:         present" || echo ".env:         MISSING (run: task setup)"
+        test -f .env.migrate && echo ".env.migrate: present" || echo ".env.migrate: MISSING (run: task setup)"
+      - task: db:check
   test:
-    desc: Run pure and isolated PostgreSQL integration tests
+    desc: Run pure and isolated PostgreSQL integration tests (requires owner DATABASE_URL in env)
     cmds: ["cargo test --locked --workspace -- --test-threads=1"]
+  test:local:
+    desc: Run full workspace tests against the local Compose PostgreSQL owner on 127.0.0.1:5548
+    env:
+      DATABASE_URL: postgres://dynodoc:local-development-only@127.0.0.1:5548/dynodoc_engine
+    cmds: ["cargo test --locked --workspace -- --test-threads=1"]
+  test:unit:
+    desc: Run pure-Rust and non-DB CLI tests without needing PostgreSQL or Docker
+    cmds:
+      - cargo test --locked -p engine-shared -p engine-agent -p engine-mcp -p dynodoc-engine-wasm
+      - cargo test --locked -p engine-cli --test key_files --test mcp_plugin --test mcp_stdio --test mcp_write_stdio --test platform_behaviour
+      - cargo test --locked -p engine-cli --bin engine-cli -- --skip export_token::tests --skip a_granted_key_signs_in --skip device_sessions_push_fetch --skip real_http_selected_push_fetch --skip refresh_rotation_retries_once --skip release_cli_options --skip release_create_ --skip release_list_ --skip release_permission_ --skip release_show_ --skip revocation_refuses_clients --skip sync_clients_follow_a_planned_rotation
   lint:
     cmds:
       - cargo fmt --all -- --check
@@ -35,3 +79,9 @@ tasks:
       - cargo run --release --locked -p engine-core --example similarity_bench
   openapi:
     cmds: ["cargo run --locked -p engine-cli -- openapi --out openapi.yaml"]
+  install-cli:
+    desc: Install engine-cli into Cargo's bin directory for direct local use
+    cmds: ["cargo install --locked --path crates/engine-cli"]
+  cli:
+    desc: Run engine-cli directly (usage: task cli -- <args>)
+    cmds: ["cargo run --locked -p engine-cli -- {{.CLI_ARGS}}"]
