@@ -1,5 +1,55 @@
 # Dynodoc: intent, current implementation and remaining work
 
+## Source: the 15 open pull requests of the public engine repository integrated (22 November 2026)
+
+All 15 open pull requests in `ArefinAlter/dynodoc-engine` were reviewed against current `main` (the 4f0e7a3 port, #136) and
+integrated on `int/open-prs-2026-11-22` with `--no-ff` merge commits, contributor commits intact and review patches as separate
+commits: Dependabot #137 to #141, the history-archive stack #126 to #129 (NEXT-42 to NEXT-45), the compact-storage stack #130 to
+#134 (NEXT-46 to NEXT-50) and #135 (PR-73). Their own CI had run before #136 landed, so every conflict and test below is against
+the port. **The private application repository has not received any of this**, and it owns migration numbering: port
+`0143_named_snapshot_codec_v3.sql` there (or reserve 0143) before the application adds a migration of its own.
+
+**Dependabot.** serde_json 1.0.154, unicode-normalization 0.1.26, zeroize 1.9.1 (lock only). sha2 0.11.1 is used only for plain
+SHA-256 digests in engine-core (no HMAC/HKDF trait mixing; sqlx and hpke keep 0.10, so both versions are in the tree); output is
+unchanged and the fixed hash vectors still pass. utoipa 6.0 (review patch `7f1f99f`): `openapi.yaml` regenerated; the only change
+is `type: 'null'` moving after the `$ref` in 14 nullable `oneOf` lists, and the document with every list sorted is identical to the
+utoipa 5 output.
+
+**History archives (#126 to #129).** Verified incremental archive import against a destination's base commit (#126), offline
+recovery/cherry-pick preflight labelled as frame-level evidence (#127), historical file diff without extraction (#128), signed
+state-export attestations that need a trust anchor (#129). Merge fixes: main moved `recovery::{Kind, Source}` to `records`
+(re-exported); `historical_diff` gated behind `persistence` like its neighbours (it uses `ring`, absent from the WebAssembly
+build); a #127 test `Commit` literal completed with the four fields main added (`176c365`). Review patches: `4a9ce53` (#128) the
+line-diff search had no limit (similar 3.2 runs "as long as it takes", growing with changed lines, on inputs that can come from any
+archive); it now stops after 2 s, the hunks are then coarser but still cover every change, `omitted` says so, node changes stay
+exact. `c5c499a` (#129) the new v1 attestation format accepted four alias field names no writer produced (not forgeable, but
+needless leniency in a verification format), now removed; trusted keys are lowercased and a key that is not 64 hex characters is
+`InconsistentPolicy` instead of a silent `UntrustedKey`.
+
+**Compact storage (#130 to #134).** Multi-codec historical reader that skips at most three corrupt periodic checkpoints and never
+an attested snapshot (#130), read-only retention report (#131), compact v3 named/deployed snapshots (#132), read-only re-encode
+preview CLI (#133), acceptance suite (#134). Merge resolution (#130): main already had `PeriodicStorage::SharedV3` and changed-node
+v3 publication in `ensure_recent` (decision 034); that path stays first, #130's incremental write from the latest same-codec
+checkpoint runs only when it declines, then the full write; no `unreachable!()` added. Review patches: `9b05db8` (#131) main's
+shared object collector (0081) marks the file states of staged commits as roots, the report did not, so it could call objects
+freeable that a pending staged commit needs; they are now pins, streamed and charged to the byte budget. `38d1713` (#132) its
+migration was numbered 0056, which the port's `0056_agent_sessions.sql` already holds; renumbered to **0143**, content unchanged.
+Checked on current main: nothing in 0056 to 0142 depends on `snapshot.state_root`, runtime privileges on `snapshot` are
+table-level, the collector reads named-snapshot roots through that generated column (so v3 roots are protected once it covers
+version 3), and `$dynodoc_state` is still interpreted only in `snapshot_verification.rs`. Restart API processes after 0143 (column
+order of `select * from snapshot`); readers older than this refuse a v3 envelope, so deploy readers before selecting `shared-v3`.
+
+**#135.** The measurement concluded no change (parse 3x to 8x slower, about 2.4 MB saved at 100,000 nodes), yet added
+`CompactNodeId` and three helpers as public `engine_shared::ids` items. Review patch `7e5e5a2`: the prototype moves unchanged
+beside its benchmark (`examples/node_id_benchmark/`), its parity properties run as `tests/compact_node_id_prototype.rs`, and
+`ids.rs` is byte-identical to main. The proposal is retired.
+
+**Evidence.** Local, rustc 1.100 (CI pins 1.96): `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` (only `chunks_exact_to_as_chunks` allowed, a lint new in clippy 1.100 that fires on code already on main), rustdoc `-D warnings` and the OpenAPI drift check all clean at `7e5e5a2`. Pure tests (`--lib --bins` and the 47 integration targets that use no database): 1,430 passed, 4 ignored, 0 failed; the other 23 are `#[sqlx::test]` cases that need `DATABASE_URL`. No PostgreSQL could run on this machine, so every database test, including the new retention, staged-commit pin, migration 0143 and acceptance tests, rests on CI of integration PR #142: all green at `7e5e5a2`: `build-test` (pinned Rust 1.96, PostgreSQL 16; lint, build, `task test`, rustdoc, OpenAPI consistency) 2,013 passed, 0 failed, 6 ignored across 119 test binaries, including `sse_delivers_a_new_event_within_100ms`; `mcp-boundary`, `disposable-verification` and the six platform jobs (Linux, macOS and Windows on x86-64 and aarch64) passed. New review tests were checked by mutation (an alias restored and the key lowercasing removed each fail `trust_anchors_are_validated_and_each_field_has_exactly_one_name`).
+
+**Not verified:** migration 0143 on a production-sized copy (the author measured 0.8 s for 100,000 rows on a throwaway database);
+any of this in the application repository or its frontend; the two-second diff limit on a real large archive; the new CLI
+commands by a real client. Nothing is deployed; production is unchanged.
+
 ## Source: 51 contributor pull requests of the public engine repository integrated (3 November 2026)
 
 Every open pull request by `happinessisreal` in `ArefinAlter/dynodoc-engine` (#39, #56, #59, #60, #62, #66, #74 to #82, #84 to #119)

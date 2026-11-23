@@ -9,8 +9,8 @@ use engine_core::{
         READ_BATCH_OBJECTS, WRITE_BATCH_BYTES, WRITE_BATCH_OBJECTS,
     },
     snapshot::{
-        read_state_at, CheckpointFormat, PeriodicStorage, SnapshotEngine, SnapshotError,
-        SnapshotReason,
+        read_state_at, CheckpointFormat, NamedStorage, PeriodicStorage, SnapshotEngine,
+        SnapshotError, SnapshotReason,
     },
 };
 use engine_shared::{DocumentId, Event, EventPayload, IdentityId, NodeId, NodeType};
@@ -1672,6 +1672,503 @@ async fn incremental_v3_mixed_codec_history_and_base_isolation(pool: PgPool) -> 
     Ok(())
 }
 
+async fn checkpoint_root(pool: &PgPool, document: DocumentId, seq: i64) -> Address {
+    let root: String = sqlx::query_scalar(
+        "select state_root from shared_checkpoint where document_id=$1 and through_seq=$2",
+    )
+    .bind(document.0)
+    .bind(seq)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    Address::try_from(root).unwrap()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn retention_report_keeps_what_a_kept_incremental_checkpoint_reaches(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    let snapshot = SnapshotEngine::new(pool.clone())
+        .with_named_storage(NamedStorage::SharedV2)
+        .take(document, SnapshotReason::Deployed)
+        .await?;
+    let edit = EventPayload::FieldEdited {
+        node_id: node,
+        field: "label".into(),
+        value: json!("rev 2 edit"),
+    };
+    append(&pool, document, &edit, actor).await?;
+    postgres::take_incremental_v3(&pool, document, 1, Limits::default()).await?;
+    let increment = postgres::take_incremental_v3(&pool, document, 2, Limits::default()).await?;
+    assert_eq!(increment.base_seq, Some(1));
+
+    let limits = Limits::default();
+    sqlx::query(
+        "insert into workspace_draft(document_id,name,base_seq,base_state,created_by)
+         select $1::uuid,'draft',1,jsonb_build_object('$dynodoc_state',2,'root',state_root),$2::uuid
+         from shared_checkpoint where document_id=$1 and through_seq=1",
+    )
+    .bind(document.0)
+    .bind(actor.0)
+    .execute(&pool)
+    .await?;
+    let pinned = postgres::retention_report(&pool, document, &[2], limits).await?;
+    assert!(
+        pinned.outside_keep.is_empty(),
+        "a draft base keeps the objects it reaches"
+    );
+    sqlx::query("delete from workspace_draft where document_id=$1")
+        .bind(document.0)
+        .execute(&pool)
+        .await?;
+
+    let both = postgres::retention_report(&pool, document, &[1, 2], limits).await?;
+    assert!(both.outside_keep.is_empty() && both.unreferenced.is_empty());
+    let report = postgres::retention_report(&pool, document, &[2], limits).await?;
+    assert!(
+        !report.outside_keep.is_empty(),
+        "objects only the base used are outside the keep set"
+    );
+    assert!(
+        report.unreferenced.is_empty(),
+        "the base checkpoint row still reaches them"
+    );
+    let snapshot_root: String = sqlx::query_scalar("select state_root from snapshot where id=$1")
+        .bind(snapshot.id.0)
+        .fetch_one(&pool)
+        .await?;
+    assert!(!report
+        .outside_keep
+        .contains(&Address::try_from(snapshot_root)?));
+    assert!(matches!(
+        postgres::retention_report(&pool, document, &[9], limits).await,
+        Err(Error::Invalid("checkpoint not found"))
+    ));
+
+    // Prune exactly what is outside the keep set, as a database owner outside the
+    // runtime role would, then read the increment without its base.
+    let mut tx = pool.begin().await?;
+    sqlx::query("set local session_replication_role=replica")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from shared_checkpoint where document_id=$1 and through_seq=1")
+        .bind(document.0)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from checkpoint_object where document_id=$1 and address=any($2)")
+        .bind(document.0)
+        .bind(
+            report
+                .outside_keep
+                .iter()
+                .map(Address::as_str)
+                .collect::<Vec<_>>(),
+        )
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    let events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id=$1 and seq <= 2 order by seq")
+            .bind(document.0)
+            .fetch_all(&pool)
+            .await?;
+    let loaded = postgres::load(&pool, document, 2, limits).await?;
+    assert_eq!(loaded, Materializer::fold(&events)?);
+    let after = postgres::retention_report(&pool, document, &[2], limits).await?;
+    assert!(after.outside_keep.is_empty() && after.unreferenced.is_empty());
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn retention_report_honours_pins_orphans_limits_and_inventory_pages(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    for n in 2..=3 {
+        let edit = EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!(format!("rev {n} edit")),
+        };
+        append(&pool, document, &edit, actor).await?;
+    }
+    let limits = Limits::default();
+    for (seq, codec) in [
+        (1, postgres::Codec::V1),
+        (2, postgres::Codec::V2),
+        (3, postgres::Codec::V3),
+    ] {
+        postgres::take_with_codec(&pool, document, seq, limits, codec).await?;
+    }
+    let (root1, root2) = (
+        checkpoint_root(&pool, document, 1).await,
+        checkpoint_root(&pool, document, 2).await,
+    );
+
+    // Older v1 and v2 roots are outside a keep set of the v3 head, yet still stored roots.
+    let report = postgres::retention_report(&pool, document, &[3], limits).await?;
+    assert!(report.outside_keep.contains(&root1) && report.outside_keep.contains(&root2));
+    assert!(report.unreferenced.is_empty());
+
+    // Staged and published project objects pin an object and everything it reaches.
+    let project: uuid::Uuid = sqlx::query_scalar(
+        "insert into access_space(name,kind,created_by) values('Pins','project',$1) returning id",
+    )
+    .bind(actor.0)
+    .fetch_one(&pool)
+    .await?;
+    sqlx::query("insert into project_settings(space_id) values($1)")
+        .bind(project)
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "insert into project_published_object(project_id,state_root,document_id,address)
+         values($1,$2,$3,$2)",
+    )
+    .bind(project)
+    .bind(root1.as_str())
+    .bind(document.0)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "insert into project_staged_object(identity_id,project_id,document_id,address,charged_bytes)
+         values($1,$2,$3,$4,1)",
+    )
+    .bind(actor.0)
+    .bind(project)
+    .bind(document.0)
+    .bind(root2.as_str())
+    .execute(&pool)
+    .await?;
+    let report = postgres::retention_report(&pool, document, &[3], limits).await?;
+    assert!(!report.outside_keep.contains(&root1) && !report.outside_keep.contains(&root2));
+
+    // Orphans from nowhere are unreferenced; 2,500 of them span three inventory pages.
+    sqlx::query(
+        "insert into checkpoint_object(document_id,address,bytes)
+         select $1, md5(i::text)||md5((i+1000000)::text), '\\x00'::bytea from generate_series(1,2500) i",
+    )
+    .bind(document.0)
+    .execute(&pool)
+    .await?;
+    let report = postgres::retention_report(&pool, document, &[3], limits).await?;
+    assert_eq!(report.unreferenced.len(), 2500);
+    assert!(report.outside_keep.is_superset(&report.unreferenced));
+
+    for tight in [
+        Limits {
+            max_objects: 1,
+            ..limits
+        },
+        Limits {
+            max_bytes: 1,
+            ..limits
+        },
+    ] {
+        let err = postgres::retention_report(&pool, document, &[3], tight).await;
+        assert!(matches!(err, Err(Error::Limit(_))), "{err:?}");
+    }
+
+    // A reachable object that is altered or gone fails the report instead of shrinking it.
+    let root3 = checkpoint_root(&pool, document, 3).await;
+    let mut tx = pool.begin().await?;
+    sqlx::query("set local session_replication_role=replica")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "update checkpoint_object set bytes=decode('00','hex') where document_id=$1 and address=$2",
+    )
+    .bind(document.0)
+    .bind(root3.as_str())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    assert!(postgres::retention_report(&pool, document, &[3], limits)
+        .await
+        .is_err());
+    let mut tx = pool.begin().await?;
+    sqlx::query("set local session_replication_role=replica")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from checkpoint_object where document_id=$1 and address=$2")
+        .bind(document.0)
+        .bind(root3.as_str())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    let err = postgres::retention_report(&pool, document, &[3], limits).await;
+    assert!(matches!(err, Err(Error::Missing(_))), "{err:?}");
+    Ok(())
+}
+
+/// A staged commit may name a state the server already held (no staged-object row of
+/// its own); the shared object collector marks it, so the report must keep it too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retention_report_pins_the_file_states_of_staged_commits(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    use engine_core::repository::{Commit, FileEntry, SignedCommit};
+    let (actor, document, node) = seed(&pool).await?;
+    let edit = EventPayload::FieldEdited {
+        node_id: node.clone(),
+        field: "label".into(),
+        value: json!("rev 2 edit"),
+    };
+    append(&pool, document, &edit, actor).await?;
+    let limits = Limits::default();
+    for seq in [1, 2] {
+        postgres::take_with_codec(&pool, document, seq, limits, postgres::Codec::V2).await?;
+    }
+    let root1 = checkpoint_root(&pool, document, 1).await;
+    let report = postgres::retention_report(&pool, document, &[2], limits).await?;
+    assert!(report.outside_keep.contains(&root1));
+
+    let project: uuid::Uuid = sqlx::query_scalar(
+        "insert into access_space(name,kind,created_by) values('Staged','project',$1) returning id",
+    )
+    .bind(actor.0)
+    .fetch_one(&pool)
+    .await?;
+    sqlx::query("insert into project_settings(space_id) values($1)")
+        .bind(project)
+        .execute(&pool)
+        .await?;
+    let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[3; 32]).unwrap();
+    let stage = |files: Vec<(&str, DocumentId)>, scope: Vec<uuid::Uuid>| {
+        let commit = Commit {
+            sealed: None,
+            version: 1,
+            project,
+            parents: Vec::new(),
+            files: files
+                .into_iter()
+                .map(|(path, document)| {
+                    let file = FileEntry {
+                        document,
+                        state: root1.clone(),
+                    };
+                    (path.to_string(), file)
+                })
+                .collect(),
+            author_key: String::new(),
+            authored_at_ms: 1_700_000_000_000,
+            message: "staged".into(),
+            recovery: None,
+            same_file_resolutions: Vec::new(),
+            project_resolutions: Vec::new(),
+            relocations: Vec::new(),
+            merge_policy: None,
+        };
+        let signed = SignedCommit::sign(commit, &key).unwrap();
+        let pool = pool.clone();
+        async move {
+            // Only the row matters to this read-only report; skip the staging triggers.
+            let mut tx = pool.begin().await?;
+            sqlx::query("set local session_replication_role=replica")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "insert into project_staged_commit(identity_id,project_id,address,body,scope,height,device_id)
+                 values($1,$2,$3,$4,$5,0,$6)",
+            )
+            .bind(actor.0)
+            .bind(project)
+            .bind(signed.commit.address()?.as_str())
+            .bind(serde_json::to_vec(&signed)?)
+            .bind(scope)
+            .bind(uuid::Uuid::new_v4())
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            anyhow::Ok(())
+        }
+    };
+
+    // Another document's staged commit pins nothing here.
+    let other = DocumentId(uuid::Uuid::new_v4());
+    stage(vec![("other.docx", other)], vec![other.0]).await?;
+    let report = postgres::retention_report(&pool, document, &[2], limits).await?;
+    assert!(report.outside_keep.contains(&root1));
+
+    stage(vec![("doc.docx", document)], vec![document.0]).await?;
+    let report = postgres::retention_report(&pool, document, &[2], limits).await?;
+    assert!(!report.outside_keep.contains(&root1));
+    assert!(report.unreferenced.is_empty());
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn retention_report_is_one_snapshot_and_refuses_a_weaker_isolation(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    let edit = EventPayload::FieldEdited {
+        node_id: node,
+        field: "label".into(),
+        value: json!("rev 2 edit"),
+    };
+    append(&pool, document, &edit, actor).await?;
+    let limits = Limits::default();
+    postgres::take_incremental_v3(&pool, document, 1, limits).await?;
+
+    let mut weak = pool.acquire().await?;
+    let refused = postgres::retention_report_in(&mut weak, document, &[1], limits).await;
+    assert!(matches!(refused, Err(Error::Invalid(_))), "{refused:?}");
+    drop(weak);
+
+    // A publication that commits after the snapshot is not seen, so its objects are
+    // not mistaken for orphans of roots the report never read.
+    let mut tx = pool.begin().await?;
+    sqlx::query("set transaction isolation level repeatable read")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("select 1").fetch_one(&mut *tx).await?;
+    postgres::take_incremental_v3(&pool, document, 2, limits).await?;
+    let report = postgres::retention_report_in(&mut tx, document, &[1], limits).await?;
+    assert!(report.unreferenced.is_empty() && report.outside_keep.is_empty());
+    tx.rollback().await?;
+    let later = postgres::retention_report(&pool, document, &[1], limits).await?;
+    assert!(!later.outside_keep.is_empty() && later.unreferenced.is_empty());
+    Ok(())
+}
+
+async fn table_digests(pool: &PgPool) -> serde_json::Value {
+    sqlx::query_scalar(
+        "select jsonb_build_object(
+            'objects',(select md5(string_agg(t::text,'|' order by t::text)) from checkpoint_object t),
+            'checkpoints',(select md5(string_agg(t::text,'|' order by t::text)) from shared_checkpoint t),
+            'snapshots',(select md5(string_agg(t::text,'|' order by t::text)) from snapshot t),
+            'receipts',(select md5(string_agg(t::text,'|' order by t::text)) from snapshot_verification t),
+            'events',(select md5(string_agg(t::text,'|' order by t::text)) from event t),
+            'documents',(select md5(string_agg(t::text,'|' order by t::text)) from document t))",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reencode_check_previews_every_codec_and_changes_nothing(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    // An old-style identity and an annotation, so the state is not only canonical ids.
+    sqlx::query(
+        "insert into node(id,document_id,type,pos,current_fields) values('legacy-form-1',$1,'form','b0','{}')",
+    )
+    .bind(document.0)
+    .execute(&pool)
+    .await?;
+    let payloads = [
+        EventPayload::NodeCreated {
+            node_id: NodeId("legacy-form-1".into()),
+            node_type: NodeType::Form,
+            parent_id: None,
+            pos: "b0".into(),
+            fields: json!({"label": "Old"}),
+            var_name: None,
+        },
+        EventPayload::CommentAdded {
+            node_id: Some(node.clone()),
+            body: "Retained review".into(),
+        },
+        EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!("Edited"),
+        },
+    ];
+    for payload in &payloads {
+        append(&pool, document, payload, actor).await?;
+    }
+    let limits = Limits::default();
+    for (seq, codec) in [
+        (1, postgres::Codec::V1),
+        (2, postgres::Codec::V2),
+        (3, postgres::Codec::V3),
+    ] {
+        postgres::take_with_codec(&pool, document, seq, limits, codec).await?;
+    }
+    postgres::take_incremental_v3(&pool, document, 4, limits).await?;
+
+    let before = table_digests(&pool).await;
+    for (seq, codec_version) in [(1, 1), (2, 2), (3, 3), (4, 3)] {
+        let check = postgres::reencode_check(&pool, document, seq, limits).await?;
+        assert_eq!(check.codec_version, codec_version, "revision {seq}");
+        assert_eq!(
+            check.source_root,
+            checkpoint_root(&pool, document, seq).await
+        );
+        assert!(check.v3.visited_objects > 0 && check.v3.encoded_bytes > 0);
+        // Roots differ across codecs by design; a v3 source previews as itself.
+        assert_eq!(
+            check.v3_root == check.source_root,
+            codec_version == 3,
+            "revision {seq}"
+        );
+    }
+    assert_eq!(
+        table_digests(&pool).await,
+        before,
+        "the preview wrote nothing"
+    );
+
+    // No checkpoint at a revision means nothing to preview; a tight budget is refused.
+    let missing = postgres::reencode_check(&pool, document, 5, limits).await;
+    assert!(
+        matches!(missing, Err(Error::Invalid("checkpoint not found"))),
+        "{missing:?}"
+    );
+    let tight = Limits {
+        max_objects: 1,
+        ..limits
+    };
+    assert!(postgres::reencode_check(&pool, document, 4, tight)
+        .await
+        .is_err());
+
+    // A checkpoint holding another revision's state passes its own chain check, so `load`
+    // accepts it, but it is not event replay and the preview says so.
+    append(&pool, document, &payloads[2], actor).await?;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         select document_id,5,codec_version,state_root,
+                (select chain_hash from event where document_id=$1 and seq=5)
+         from shared_checkpoint where document_id=$1 and through_seq=3",
+    )
+    .bind(document.0)
+    .execute(&pool)
+    .await?;
+    postgres::load(&pool, document, 5, limits).await?;
+    let stale = postgres::reencode_check(&pool, document, 5, limits).await;
+    assert!(
+        matches!(
+            stale,
+            Err(Error::Invalid("checkpoint differs from the event history"))
+        ),
+        "{stale:?}"
+    );
+
+    // A corrupted source object fails the preview instead of being re-encoded.
+    let mut tx = pool.begin().await?;
+    sqlx::query("set local session_replication_role=replica")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "update checkpoint_object set bytes=decode('00','hex') where document_id=$1 and address=$2",
+    )
+    .bind(document.0)
+    .bind(checkpoint_root(&pool, document, 4).await.as_str())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    assert!(postgres::reencode_check(&pool, document, 4, limits)
+        .await
+        .is_err());
+    Ok(())
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn incremental_v3_occupied_target_revision_rejects_conversion(
     pool: PgPool,
@@ -2043,5 +2540,392 @@ async fn periodic_publication_over_the_object_budget_keeps_a_legacy_checkpoint(
             .fetch_one(&pool)
             .await?;
     assert_eq!(legacy, 1);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_v3_multi_codec_selection_and_replay_equivalence(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+
+    for i in 2..=35 {
+        append(
+            &pool,
+            document,
+            &EventPayload::FieldEdited {
+                node_id: node.clone(),
+                field: "label".into(),
+                value: json!(format!("Rev {i} edit")),
+            },
+            actor,
+        )
+        .await?;
+    }
+
+    // Rev 10: publish Codec::V1
+    let p1 = postgres::take_with_codec(&pool, document, 10, Limits::default(), postgres::Codec::V1)
+        .await?;
+    assert_eq!(p1.through_seq, 10);
+
+    // Rev 20: publish Codec::V2 (incremental)
+    let p2 = postgres::take_incremental(&pool, document, 20, Limits::default()).await?;
+    assert_eq!(p2.through_seq, 20);
+
+    // Rev 30: publish Codec::V3 (incremental)
+    let p3 = postgres::take_incremental_v3(&pool, document, 30, Limits::default()).await?;
+    assert_eq!(p3.through_seq, 30);
+
+    let all_events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id=$1 order by seq")
+            .bind(document.0)
+            .fetch_all(&pool)
+            .await?;
+
+    let mut connection = pool.acquire().await?;
+
+    // Verify historical reads at exact checkpoint boundaries
+    let h10 = read_state_at(&mut connection, document, 10).await?;
+    assert_eq!(h10.checkpoint_format, CheckpointFormat::SharedV1);
+    assert_eq!(h10.snapshot_seq, 10);
+    assert_eq!(h10.replayed_events, 0);
+    assert_eq!(h10.state, Materializer::fold(&all_events[..10])?);
+
+    let h20 = read_state_at(&mut connection, document, 20).await?;
+    assert_eq!(h20.checkpoint_format, CheckpointFormat::SharedV2);
+    assert_eq!(h20.snapshot_seq, 20);
+    assert_eq!(h20.replayed_events, 0);
+    assert_eq!(h20.state, Materializer::fold(&all_events[..20])?);
+
+    let h30 = read_state_at(&mut connection, document, 30).await?;
+    assert_eq!(h30.checkpoint_format, CheckpointFormat::SharedV3);
+    assert_eq!(h30.snapshot_seq, 30);
+    assert_eq!(h30.replayed_events, 0);
+    assert_eq!(h30.state, Materializer::fold(&all_events[..30])?);
+
+    // Verify historical reads at intermediate revisions (tail folding on top of closest checkpoint)
+    let h15 = read_state_at(&mut connection, document, 15).await?;
+    assert_eq!(h15.checkpoint_format, CheckpointFormat::SharedV1);
+    assert_eq!(h15.snapshot_seq, 10);
+    assert_eq!(h15.replayed_events, 5);
+    assert_eq!(h15.state, Materializer::fold(&all_events[..15])?);
+
+    let h25 = read_state_at(&mut connection, document, 25).await?;
+    assert_eq!(h25.checkpoint_format, CheckpointFormat::SharedV2);
+    assert_eq!(h25.snapshot_seq, 20);
+    assert_eq!(h25.replayed_events, 5);
+    assert_eq!(h25.state, Materializer::fold(&all_events[..25])?);
+
+    let h35 = read_state_at(&mut connection, document, 35).await?;
+    assert_eq!(h35.checkpoint_format, CheckpointFormat::SharedV3);
+    assert_eq!(h35.snapshot_seq, 30);
+    assert_eq!(h35.replayed_events, 5);
+    assert_eq!(h35.state, Materializer::fold(&all_events[..35])?);
+
+    // Verify background periodic snapshot selection with SharedV3
+    let engine = SnapshotEngine::new(pool.clone()).with_periodic_storage(PeriodicStorage::SharedV3);
+    engine.ensure_recent(document, 0).await?;
+    let latest_v3: (i16, i64) = sqlx::query_as(
+        "select codec_version, through_seq from shared_checkpoint where document_id=$1 and through_seq=35",
+    )
+    .bind(document.0)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(latest_v3.0, 3);
+    assert_eq!(latest_v3.1, 35);
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn corrupted_checkpoint_transparent_fallback_to_prior_valid_codec(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+
+    for i in 2..=35 {
+        append(
+            &pool,
+            document,
+            &EventPayload::FieldEdited {
+                node_id: node.clone(),
+                field: "label".into(),
+                value: json!(format!("Rev {i} edit")),
+            },
+            actor,
+        )
+        .await?;
+    }
+
+    // Rev 10: publish Codec::V1
+    postgres::take_with_codec(&pool, document, 10, Limits::default(), postgres::Codec::V1).await?;
+
+    // Rev 20: publish Codec::V2 (incremental)
+    postgres::take_incremental(&pool, document, 20, Limits::default()).await?;
+
+    // Rev 30: publish Codec::V3 (incremental)
+    postgres::take_incremental_v3(&pool, document, 30, Limits::default()).await?;
+
+    let all_events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id=$1 order by seq")
+            .bind(document.0)
+            .fetch_all(&pool)
+            .await?;
+
+    let mut connection = pool.acquire().await?;
+
+    // Inject a corrupted checkpoint candidate at rev 32 with Codec::V3
+    let corrupt_root_32 = "e".repeat(64);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(document.0)
+        .bind(&corrupt_root_32)
+        .bind(b"corrupt_v3_data".as_slice())
+        .execute(&pool)
+        .await?;
+    let chain_32 = postgres::chain_at(&mut connection, document, 32).await?;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,32,3,$2,$3)",
+    )
+    .bind(document.0)
+    .bind(&corrupt_root_32)
+    .bind(&chain_32)
+    .execute(&pool)
+    .await?;
+
+    // Reading at rev 35: candidate 32 is corrupt, so it falls back to valid candidate 30 (V3)
+    let h35 = read_state_at(&mut connection, document, 35).await?;
+    assert_eq!(h35.checkpoint_format, CheckpointFormat::SharedV3);
+    assert_eq!(h35.snapshot_seq, 30);
+    assert_eq!(h35.replayed_events, 5);
+    assert_eq!(h35.state, Materializer::fold(&all_events[..35])?);
+
+    // Now inject another corrupted candidate at rev 31 with Codec::V2
+    let corrupt_root_31 = "f".repeat(64);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(document.0)
+        .bind(&corrupt_root_31)
+        .bind(b"corrupt_v2_data".as_slice())
+        .execute(&pool)
+        .await?;
+    let chain_31 = postgres::chain_at(&mut connection, document, 31).await?;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,31,2,$2,$3)",
+    )
+    .bind(document.0)
+    .bind(&corrupt_root_31)
+    .bind(&chain_31)
+    .execute(&pool)
+    .await?;
+
+    // Reading at rev 31: candidate 31 (corrupt V2) fails, falls back to candidate 30 (valid V3)
+    let h31 = read_state_at(&mut connection, document, 31).await?;
+    assert_eq!(h31.checkpoint_format, CheckpointFormat::SharedV3);
+    assert_eq!(h31.snapshot_seq, 30);
+    assert_eq!(h31.replayed_events, 1);
+    assert_eq!(h31.state, Materializer::fold(&all_events[..31])?);
+
+    // Reading at rev 25: candidate 25 (if corrupt) falls back to candidate 20 (valid V2)
+    let corrupt_root_25 = "a".repeat(64);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(document.0)
+        .bind(&corrupt_root_25)
+        .bind(b"corrupt_v2_at_25".as_slice())
+        .execute(&pool)
+        .await?;
+    let chain_25 = postgres::chain_at(&mut connection, document, 25).await?;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,25,2,$2,$3)",
+    )
+    .bind(document.0)
+    .bind(&corrupt_root_25)
+    .bind(&chain_25)
+    .execute(&pool)
+    .await?;
+
+    let h25 = read_state_at(&mut connection, document, 25).await?;
+    assert_eq!(h25.checkpoint_format, CheckpointFormat::SharedV2);
+    assert_eq!(h25.snapshot_seq, 20);
+    assert_eq!(h25.replayed_events, 5);
+    assert_eq!(h25.state, Materializer::fold(&all_events[..25])?);
+
+    // If candidate at 15 is corrupt: falls back to 10 (V1)
+    let corrupt_root_15 = "b".repeat(64);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(document.0)
+        .bind(&corrupt_root_15)
+        .bind(b"corrupt_v1_at_15".as_slice())
+        .execute(&pool)
+        .await?;
+    let chain_15 = postgres::chain_at(&mut connection, document, 15).await?;
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,15,1,$2,$3)",
+    )
+    .bind(document.0)
+    .bind(&corrupt_root_15)
+    .bind(&chain_15)
+    .execute(&pool)
+    .await?;
+
+    let h15 = read_state_at(&mut connection, document, 15).await?;
+    assert_eq!(h15.checkpoint_format, CheckpointFormat::SharedV1);
+    assert_eq!(h15.snapshot_seq, 10);
+    assert_eq!(h15.replayed_events, 5);
+    assert_eq!(h15.state, Materializer::fold(&all_events[..15])?);
+
+    Ok(())
+}
+
+/// A periodic checkpoint at `seq` that fails to read: its root object is not a graph.
+async fn inject_corrupt_checkpoint(pool: &PgPool, document: DocumentId, seq: i64, bad_chain: bool) {
+    let root = format!("{seq:02x}").repeat(32);
+    sqlx::query("insert into checkpoint_object(document_id,address,bytes) values($1,$2,$3)")
+        .bind(document.0)
+        .bind(&root)
+        .bind(b"corrupt_v3_data".as_slice())
+        .execute(pool)
+        .await
+        .unwrap();
+    // A wrong chain hash is corrupt metadata over otherwise readable data.
+    let chain: Vec<u8> = if bad_chain {
+        vec![0; 32]
+    } else {
+        sqlx::query_scalar("select chain_hash from event where document_id=$1 and seq=$2")
+            .bind(document.0)
+            .bind(seq)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    };
+    sqlx::query(
+        "insert into shared_checkpoint(document_id,through_seq,codec_version,state_root,event_chain_hash)
+         values($1,$2,3,$3,$4)",
+    )
+    .bind(document.0)
+    .bind(seq)
+    .bind(&root)
+    .bind(&chain)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_historical_read_skips_only_a_bounded_number_of_corrupt_periodic_checkpoints(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    for n in 2..=7 {
+        let edit = EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!(format!("rev {n}")),
+        };
+        append(&pool, document, &edit, actor).await?;
+    }
+    for seq in [2, 3] {
+        postgres::take_with_codec(&pool, document, seq, Limits::default(), postgres::Codec::V3)
+            .await?;
+    }
+    // Corrupt bytes, a wrong chain position, and corrupt bytes again, newest valid below.
+    inject_corrupt_checkpoint(&pool, document, 4, false).await;
+    inject_corrupt_checkpoint(&pool, document, 5, true).await;
+    inject_corrupt_checkpoint(&pool, document, 6, false).await;
+    let events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id=$1 order by seq")
+            .bind(document.0)
+            .fetch_all(&pool)
+            .await?;
+
+    let mut connection = pool.acquire().await?;
+    let read = read_state_at(&mut connection, document, 7).await?;
+    assert_eq!(
+        (read.snapshot_seq, read.checkpoint_format),
+        (3, CheckpointFormat::SharedV3)
+    );
+    assert_eq!(read.state, Materializer::fold(&events[..7])?);
+
+    // One more corrupt checkpoint exceeds the bound: an error, not an unbounded search
+    // down to genesis.
+    inject_corrupt_checkpoint(&pool, document, 7, false).await;
+    let err = read_state_at(&mut connection, document, 7)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("too many corrupt periodic checkpoints"),
+        "{err}"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_named_snapshot_serves_its_sequence_but_is_never_skipped_for_an_older_checkpoint(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let (actor, document, node) = seed(&pool).await?;
+    for n in 2..=4 {
+        let edit = EventPayload::FieldEdited {
+            node_id: node.clone(),
+            field: "label".into(),
+            value: json!(format!("rev {n}")),
+        };
+        append(&pool, document, &edit, actor).await?;
+    }
+    // A valid older periodic checkpoint, and a named v2 snapshot at the head.
+    postgres::take_with_codec(&pool, document, 2, Limits::default(), postgres::Codec::V3).await?;
+    let snapshot = SnapshotEngine::new(pool.clone())
+        .with_named_storage(engine_core::snapshot::NamedStorage::SharedV2)
+        .take(document, SnapshotReason::Deployed)
+        .await?;
+    let events: Vec<Event> =
+        sqlx::query_as("select * from event where document_id=$1 order by seq")
+            .bind(document.0)
+            .fetch_all(&pool)
+            .await?;
+    let mut connection = pool.acquire().await?;
+
+    let read = read_state_at(&mut connection, document, 4).await?;
+    assert_eq!(
+        (read.snapshot_seq, read.checkpoint_format),
+        (4, CheckpointFormat::SharedV2)
+    );
+
+    // A corrupt periodic checkpoint at the same sequence sorts first and is skipped; the
+    // named snapshot at that sequence serves the read with nothing replayed.
+    inject_corrupt_checkpoint(&pool, document, 4, false).await;
+    let read = read_state_at(&mut connection, document, 4).await?;
+    assert_eq!(
+        (
+            read.snapshot_seq,
+            read.checkpoint_format,
+            read.replayed_events
+        ),
+        (4, CheckpointFormat::SharedV2, 0)
+    );
+    assert_eq!(read.state, Materializer::fold(&events)?);
+
+    // Corrupt the named snapshot's graph: that is an error, not a reason to read the older
+    // valid periodic checkpoint at revision 2 and replay.
+    let root: String = sqlx::query_scalar("select state_root from snapshot where id=$1")
+        .bind(snapshot.id.0)
+        .fetch_one(&pool)
+        .await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("set local session_replication_role=replica")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "update checkpoint_object set bytes=decode('00','hex') where document_id=$1 and address=$2",
+    )
+    .bind(document.0)
+    .bind(&root)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    assert!(read_state_at(&mut connection, document, 4).await.is_err());
     Ok(())
 }

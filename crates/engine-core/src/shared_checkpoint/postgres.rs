@@ -5,8 +5,9 @@ use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    read_state, validate_stored, write_state, Address, Error, Limits, ObjectStore, WriteStats,
-    READ_BATCH_OBJECTS, WRITE_BATCH_BYTES, WRITE_BATCH_OBJECTS,
+    read_state, references, typed, validate_stored, write_state, Address, Error, Limits,
+    MemoryStore, ObjectStore, WriteStats, READ_BATCH_OBJECTS, WRITE_BATCH_BYTES,
+    WRITE_BATCH_OBJECTS,
 };
 use crate::{
     at_rest::store::{open_object, seal_object},
@@ -931,6 +932,281 @@ pub(crate) async fn publish_changed_in_connection(
         base_seq: Some(base_seq),
         fallback_ran: false,
     }))
+}
+
+/// Read-only retention report for one document, taken from a single snapshot.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RetentionReport {
+    /// Stored objects that no kept checkpoint and no pin reaches: what dropping every
+    /// other checkpoint would free. Not a deletion list on its own.
+    pub outside_keep: BTreeSet<Address>,
+    /// Stored objects that no stored root or pin reaches at all, such as those left by
+    /// an aborted publication.
+    pub unreferenced: BTreeSet<Address>,
+}
+
+const INVENTORY_PAGE: i64 = 1000;
+
+/// Kept roots are the `keep` checkpoints plus whatever else holds an object: typed
+/// named snapshots, draft bases, staged or published project objects and the file
+/// states of staged commits (the roots the shared object collector marks). A checkpoint
+/// keeps everything it reaches, so a kept incremental checkpoint never needs its base
+/// row. `limits` bounds the objects and bytes read. Nothing is deleted: objects are
+/// append-only.
+pub async fn retention_report(
+    pool: &PgPool,
+    document: DocumentId,
+    keep: &[i64],
+    limits: Limits,
+) -> Result<RetentionReport, Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("set transaction isolation level repeatable read")
+        .execute(&mut *tx)
+        .await?;
+    protect_document(&mut tx, document).await?;
+    retention_report_in(&mut tx, document, keep, limits).await
+}
+
+/// The same report in the caller's repeatable-read transaction, so a publication that
+/// commits meanwhile cannot make it authoritative about objects it never saw.
+pub async fn retention_report_in(
+    connection: &mut PgConnection,
+    document: DocumentId,
+    keep: &[i64],
+    limits: Limits,
+) -> Result<RetentionReport, Error> {
+    let isolation: String = sqlx::query_scalar("select current_setting('transaction_isolation')")
+        .fetch_one(&mut *connection)
+        .await?;
+    if isolation != "repeatable read" {
+        return Err(Error::Invalid("retention report needs a repeatable read"));
+    }
+    let cap = limits.max_objects as i64 + 1;
+    let kept: Vec<String> = sqlx::query_scalar(
+        "select state_root from shared_checkpoint where document_id=$1 and through_seq=any($2)",
+    )
+    .bind(document.0)
+    .bind(keep)
+    .fetch_all(&mut *connection)
+    .await?;
+    if kept.len() != keep.iter().collect::<BTreeSet<_>>().len() {
+        return Err(Error::Invalid("checkpoint not found"));
+    }
+    let mut pinned: Vec<String> = sqlx::query_scalar(
+        "select r from (
+            select state_root r from snapshot where document_id=$1 and state_root is not null
+            union select base_state_root from workspace_draft where document_id=$1 and base_state_root is not null
+            union select merge_base_root from workspace_draft where document_id=$1 and merge_base_root is not null
+            union select address from project_staged_object where document_id=$1
+            union select address from project_published_object where document_id=$1) pins limit $2",
+    )
+    .bind(document.0)
+    .bind(cap)
+    .fetch_all(&mut *connection)
+    .await?;
+    // A staged commit can name a state the server already held, so that state has no
+    // staged-object row of its own. As in the shared object collector, the commit's file
+    // states for this document are pins. Bodies stream, charged to the byte budget.
+    let mut bytes_read = 0;
+    {
+        use futures::TryStreamExt;
+        let mut bodies = sqlx::query_scalar::<_, Vec<u8>>(
+            "select body from project_staged_commit where scope @> array[$1]::uuid[]",
+        )
+        .bind(document.0)
+        .fetch(&mut *connection);
+        while let Some(body) = bodies.try_next().await? {
+            bytes_read += body.len();
+            if bytes_read > limits.max_bytes {
+                return Err(Error::Limit("bytes"));
+            }
+            let signed: crate::repository::SignedCommit = serde_json::from_slice(&body)?;
+            pinned.extend(
+                signed
+                    .commit
+                    .files
+                    .values()
+                    .filter(|file| file.document == document)
+                    .map(|file| file.state.as_str().to_owned()),
+            );
+            if pinned.len() > limits.max_objects {
+                return Err(Error::Limit("objects"));
+            }
+        }
+    }
+    let others: Vec<String> = sqlx::query_scalar(
+        "select state_root from shared_checkpoint where document_id=$1 and not through_seq=any($2) limit $3",
+    )
+    .bind(document.0)
+    .bind(keep)
+    .bind(cap)
+    .fetch_all(&mut *connection)
+    .await?;
+    if pinned.len() > limits.max_objects || others.len() > limits.max_objects {
+        return Err(Error::Limit("objects"));
+    }
+
+    let mut reached = BTreeSet::new();
+    let mut store = PgStore::new(&mut *connection);
+    let roots = kept.into_iter().chain(pinned).collect();
+    reach(
+        &mut store,
+        document,
+        roots,
+        &mut reached,
+        &mut bytes_read,
+        limits,
+    )
+    .await?;
+    let in_keep = reached.clone();
+    reach(
+        &mut store,
+        document,
+        others,
+        &mut reached,
+        &mut bytes_read,
+        limits,
+    )
+    .await?;
+
+    let mut report = RetentionReport {
+        outside_keep: BTreeSet::new(),
+        unreferenced: BTreeSet::new(),
+    };
+    let mut after = String::new();
+    loop {
+        let page: Vec<String> = sqlx::query_scalar(
+            "select address from checkpoint_object where document_id=$1 and address>$2 order by address limit $3",
+        )
+        .bind(document.0)
+        .bind(&after)
+        .bind(INVENTORY_PAGE)
+        .fetch_all(&mut *connection)
+        .await?;
+        let Some(last) = page.last().cloned() else {
+            return Ok(report);
+        };
+        for address in page {
+            let address = Address::try_from(address)?;
+            if !in_keep.contains(&address) {
+                if !reached.contains(&address) {
+                    report.unreferenced.insert(address.clone());
+                }
+                report.outside_keep.insert(address);
+            }
+        }
+        if report.outside_keep.len() > limits.max_objects {
+            return Err(Error::Limit("objects"));
+        }
+        after = last;
+    }
+}
+
+/// Walk the verified references from `roots` into `reached`, charging every distinct
+/// object and its bytes against `limits`. The queue only ever holds unseen addresses.
+async fn reach(
+    store: &mut PgStore<'_>,
+    document: DocumentId,
+    roots: Vec<String>,
+    reached: &mut BTreeSet<Address>,
+    bytes_read: &mut usize,
+    limits: Limits,
+) -> Result<(), Error> {
+    let mut found = roots
+        .into_iter()
+        .map(Address::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut queue = Vec::new();
+    loop {
+        for address in found.drain(..) {
+            if reached.insert(address.clone()) {
+                if reached.len() > limits.max_objects {
+                    return Err(Error::Limit("objects"));
+                }
+                queue.push(address);
+            }
+        }
+        let batch = queue.split_off(queue.len().saturating_sub(READ_BATCH_OBJECTS));
+        if batch.is_empty() {
+            return Ok(());
+        }
+        store.prefetch(document, &batch).await?;
+        for address in &batch {
+            let bytes = store.get(document, address).await?;
+            *bytes_read += bytes.len();
+            if *bytes_read > limits.max_bytes {
+                return Err(Error::Limit("bytes"));
+            }
+            found.extend(references(address, &bytes)?);
+        }
+    }
+}
+
+/// What a published checkpoint would cost as compact v3, compared with typed v2.
+/// The roots differ between codecs by design; only the decoded state is compared.
+#[derive(Debug)]
+pub struct ReencodeCheck {
+    pub codec_version: i16,
+    pub source_root: Address,
+    pub v3_root: Address,
+    pub v3: WriteStats,
+    pub v2: WriteStats,
+}
+
+/// Read-only preview: check that a published checkpoint equals event replay at its
+/// revision and that its state re-encodes as compact v3 and reads back identical.
+/// Checkpoints are immutable and an occupied revision refuses another codec, so nothing
+/// is written (the transaction is read-only); the new graphs exist only in memory.
+pub async fn reencode_check(
+    pool: &PgPool,
+    document: DocumentId,
+    through_seq: i64,
+    limits: Limits,
+) -> Result<ReencodeCheck, Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("set transaction isolation level repeatable read, read only")
+        .execute(&mut *tx)
+        .await?;
+    let (codec_version, source_root): (i16, String) = sqlx::query_as(
+        "select c.codec_version, c.state_root from shared_checkpoint c
+         join document d on d.id=c.document_id and d.deleted_at is null
+         where c.document_id=$1 and c.through_seq=$2",
+    )
+    .bind(document.0)
+    .bind(through_seq)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(Error::Invalid("checkpoint not found"))?;
+    let state = load_in_connection(&mut tx, document, through_seq, limits).await?;
+    if read_legacy_state_at(&mut tx, document, through_seq)
+        .await?
+        .state
+        != state
+    {
+        return Err(Error::Invalid("checkpoint differs from the event history"));
+    }
+    let mut store = MemoryStore::default();
+    let (v3_root, v3) =
+        typed::write_state_v3(&mut store, document, &state, limits, Default::default()).await?;
+    let read = typed::read_state_v3(&mut store, document, &v3_root, limits, Default::default());
+    if read.await? != state {
+        return Err(Error::Invalid("compact v3 differs from the checkpoint"));
+    }
+    let (_, v2) = typed::write_state(
+        &mut MemoryStore::default(),
+        document,
+        &state,
+        limits,
+        Default::default(),
+    )
+    .await?;
+    Ok(ReencodeCheck {
+        codec_version,
+        source_root: Address::try_from(source_root)?,
+        v3_root,
+        v3,
+        v2,
+    })
 }
 
 /// Load an exact published checkpoint, checking chain-position metadata and every

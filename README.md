@@ -23,8 +23,9 @@ push, verified fetch, fast-forward pull and separate pinned remote tracking.
 Project-scoped sign-in, UI/native adoption, server rotation/witnesses and full
 native convergence/large-service acceptance remain open.
 
-Source supports PostgreSQL migrations through 0142 (synchronized from application
-`4f0e7a3` on 8 November 2026). It adds agent sessions and project memory, ledger mode,
+Source supports PostgreSQL migrations through 0143 (0056 to 0142 synchronized from application
+`4f0e7a3` on 8 November 2026; 0143, compact v3 named snapshots, from #132 on 22 November and
+not yet in the application). It adds agent sessions and project memory, ledger mode,
 directory primitives for enterprise identity, history horizons with a transparency log,
 encrypted projects and at-rest encryption, large-file uploads and object storage, and a
 WebAssembly build of the pure engine; the [changelog](CHANGELOG.md) lists them by
