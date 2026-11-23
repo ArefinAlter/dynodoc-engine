@@ -3,7 +3,11 @@ dotenv: [".env"]
 tasks:
   setup:
     desc: Create local .env and .env.migrate with generated dev keys (preserves existing files)
-    cmds: ["bash scripts/dev-setup.sh"]
+    cmds:
+      - cmd: bash scripts/dev-setup.sh
+        platforms: [linux, darwin]
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-setup.ps1
+        platforms: [windows]
   up:
     desc: Start local PostgreSQL on loopback port 5548
     cmds: ["docker compose up -d --wait"]
@@ -12,7 +16,11 @@ tasks:
     cmds: ["docker compose down"]
   db:bootstrap-runtime:
     desc: Create or sync the restricted dynodoc_runtime login in local Compose PostgreSQL
-    cmds: ["bash scripts/dev-bootstrap-runtime.sh"]
+    cmds:
+      - cmd: bash scripts/dev-bootstrap-runtime.sh
+        platforms: [linux, darwin]
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-bootstrap-runtime.ps1
+        platforms: [windows]
   dev:init:
     desc: First-time local setup (env files, Postgres, runtime role, migrations, grants, check)
     cmds:
@@ -45,11 +53,14 @@ tasks:
   doctor:
     desc: Check local prerequisites, env files, and runtime database privileges
     cmds:
-      - |
-        echo "Rust:   $(rustc --version 2>/dev/null || echo 'MISSING')"
-        echo "Docker: $(docker --version 2>/dev/null || echo 'MISSING')"
-        test -f .env && echo ".env:         present" || echo ".env:         MISSING (run: task setup)"
-        test -f .env.migrate && echo ".env.migrate: present" || echo ".env.migrate: MISSING (run: task setup)"
+      - cmd: |
+          echo "Rust:   $(rustc --version 2>/dev/null || echo 'MISSING')"
+          echo "Docker: $(docker --version 2>/dev/null || echo 'MISSING')"
+          test -f .env && echo ".env:         present" || echo ".env:         MISSING (run: task setup)"
+          test -f .env.migrate && echo ".env.migrate: present" || echo ".env.migrate: MISSING (run: task setup)"
+        platforms: [linux, darwin]
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-doctor.ps1
+        platforms: [windows]
       - task: db:check
   test:
     desc: Run pure and isolated PostgreSQL integration tests (requires owner DATABASE_URL in env)

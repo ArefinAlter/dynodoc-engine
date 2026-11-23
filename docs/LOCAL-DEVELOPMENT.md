@@ -24,10 +24,10 @@ task dev:init
 task run
 ```
 
-`task dev:init` runs the full setup idempotently:
-1. `task setup` ([`scripts/dev-setup.sh`](../scripts/dev-setup.sh)) — creates `.env` (with generated `PASETO_LOCAL_KEY`, `WEB_SERVICE_KEY`, and a local `dynodoc_runtime` password) and `.env.migrate`, never overwriting existing files.
+`task dev:init` works natively on Linux, macOS, and Windows (PowerShell) and runs the full setup idempotently:
+1. `task setup` ([`scripts/dev-setup.sh`](../scripts/dev-setup.sh) on Linux/macOS, [`scripts/dev-setup.ps1`](../scripts/dev-setup.ps1) on Windows) — creates `.env` (with generated `PASETO_LOCAL_KEY`, `WEB_SERVICE_KEY`, and a local `dynodoc_runtime` password) and `.env.migrate`, never overwriting existing files.
 2. `task up` — starts PostgreSQL 16 on `127.0.0.1:5548`.
-3. `task db:bootstrap-runtime` ([`scripts/dev-bootstrap-runtime.sh`](../scripts/dev-bootstrap-runtime.sh)) — creates/updates the restricted `dynodoc_runtime` login inside the local Compose container using stdin (no password in argv).
+3. `task db:bootstrap-runtime` ([`scripts/dev-bootstrap-runtime.sh`](../scripts/dev-bootstrap-runtime.sh) on Linux/macOS, [`scripts/dev-bootstrap-runtime.ps1`](../scripts/dev-bootstrap-runtime.ps1) on Windows) — creates/updates the restricted `dynodoc_runtime` login inside the local Compose container using stdin (no password in argv).
 4. `task migrate` — applies PostgreSQL migrations using `.env.migrate`.
 5. `task db:grant-runtime` — grants the explicit runtime allowlist to `dynodoc_runtime`.
 6. `task db:check` — verifies schema checksums and runtime role privileges.
@@ -46,9 +46,9 @@ task docs         # cargo doc with -D warnings
 task openapi      # Regenerate openapi.yaml
 ```
 
-### Manual / Windows setup (without bash scripts)
+### Manual setup (without bootstrap scripts)
 
-If you prefer not to use `scripts/dev-setup.sh` or `scripts/dev-bootstrap-runtime.sh`:
+If you prefer not to use the `dev-setup` or `dev-bootstrap-runtime` scripts:
 
 1. Copy `.env.example` to `.env` and `migration.env.example` to `.env.migrate`.
 2. Fill `PASETO_LOCAL_KEY` (`openssl rand -hex 32`), a distinct `WEB_SERVICE_KEY` (at least 32 characters), and a password in `DATABASE_URL` inside `.env`.

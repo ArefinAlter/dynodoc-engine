@@ -193,7 +193,8 @@ because a schema-level REVOKE alone cannot subtract PostgreSQL's global default.
 See [local development and CLI usage](LOCAL-DEVELOPMENT.md) for the complete quickstart.
 In this standalone engine repository, run `task dev:init` (which invokes `task setup`,
 `task up`, `task db:bootstrap-runtime`, `task migrate`, `task db:grant-runtime`, and
-`task db:check`), then `task run`. To perform those steps manually or on Windows without bash:
+`task db:check` on Linux, macOS, and Windows), then `task run`. To perform those steps
+manually without the bootstrap scripts:
 
 1. `task setup` (or copy `.env.example` → `.env` and `migration.env.example` → `.env.migrate`)
    preserves existing files and creates missing ones. `.env.migrate` is ignored by Git and is
