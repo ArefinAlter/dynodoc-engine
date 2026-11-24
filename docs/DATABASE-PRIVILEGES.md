@@ -190,36 +190,39 @@ because a schema-level REVOKE alone cannot subtract PostgreSQL's global default.
 
 ## Local setup
 
-The numbered task names below are for the application repository. In the standalone
-engine, copy `.env.example` and `migration.env.example` to `.env` and `.env.migrate`
-only if absent; use `task run` instead of `task dev`. Both repositories provide the
-same migrate, grant and check tasks.
+See [local development and CLI usage](LOCAL-DEVELOPMENT.md) for the complete quickstart.
+In this standalone engine repository, run `task dev:init` (which invokes `task setup`,
+`task up`, `task db:bootstrap-runtime`, `task migrate`, `task db:grant-runtime`, and
+`task db:check` on Linux, macOS, and Windows), then `task run`. To perform those steps
+manually without the bootstrap scripts:
 
-1. `task setup` preserves existing files and creates `.env` and `.env.migrate` if
-   missing. The latter is ignored by Git and is loaded only by operator tasks.
-   Keep runtime credentials and auth keys in `.env`; never put the migration URL
-   there. Existing development databases/credentials are not changed automatically.
-2. `task up`, then connect to the intended local database as its owner. Create a
-   separate login, using `psql` interactively so its password is not a CLI argument:
+1. `task setup` (or copy `.env.example` → `.env` and `migration.env.example` → `.env.migrate`)
+   preserves existing files and creates missing ones. `.env.migrate` is ignored by Git and is
+   loaded only by operator tasks. Keep runtime credentials and auth keys in `.env`; never put
+   the migration URL there. Existing development databases/credentials are not changed
+   automatically.
+2. `task up`, then run `task db:bootstrap-runtime` or connect to the local database on port
+   `5548` as its owner (`dynodoc`) and create the restricted login interactively so its
+   password is not a CLI argument:
 
    ```sql
    CREATE ROLE dynodoc_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
    \password dynodoc_runtime
    ```
 
-3. Set the owner's URL in `.env.migrate` as `MIGRATION_DATABASE_URL`; set the new
-   login's URL in `.env` as `DATABASE_URL`. URL-encode password characters as needed.
-4. `task migrate`, then `task db:grant-runtime`. On an existing database complete
-   `engine-cli verify-snapshots --all` and independent audits before serving data.
-5. `task db:check`, then `task dev`. The API performs the same startup gate. `task dev`
-   does not migrate or inherit `.env.migrate` from a dependency.
+3. Ensure `MIGRATION_DATABASE_URL` is set in `.env.migrate` and the restricted login's
+   `DATABASE_URL` is set in `.env` (URL-encode password characters as needed).
+4. `task migrate`, then `task db:grant-runtime` (or `task db:upgrade` after pulling new
+   migrations). On an existing database complete `engine-cli verify-snapshots --all` and
+   independent audits before serving data.
+5. `task db:check`, then `task run`. The API performs the same startup gate. `task run` does
+   not migrate or inherit `.env.migrate`.
 
-The standalone engine uses the same CLI contracts; its development port is
-5548 instead of the application's default 5432. For a custom role name use the CLI
-directly. CLI binaries read environment variables, not dotenv files themselves.
-SQLx tests still require isolated test-owner credentials with CREATE DATABASE and
-CREATE ROLE; never give those credentials to a running API. Test fixtures create
-actual restricted logins and dispose of their grants/roles after passing tests.
+The standalone engine uses PostgreSQL port `5548` instead of `5432`. For a custom role name
+use the CLI directly. CLI binaries read environment variables, not dotenv files themselves.
+Use `task test:local` (or export isolated test-owner credentials with `CREATE DATABASE` and
+`CREATE ROLE` for `task test`); never give test-owner credentials to a running API. Test
+fixtures create actual restricted logins and dispose of their grants/roles after passing tests.
 
 ## Hosted upgrade and rollback
 

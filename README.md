@@ -69,44 +69,48 @@ use core/shared without adopting its entire HTTP product surface. These domain
 boundaries are documented honestly; this extraction does not rename product code
 as a fully generic distributed version-control service.
 
-## Local development
+## Local development and CLI usage
 
-Install Docker, Rust (the pinned `rust-toolchain.toml`) and
-[Task](https://taskfile.dev/). PostgreSQL 16 is required for integration tests.
+Install Rust (pinned via `rust-toolchain.toml`), [Task](https://taskfile.dev/), and
+Docker (only needed for PostgreSQL-backed API runs and integration tests).
+
+**Local API + PostgreSQL (`127.0.0.1:5548` → API on `127.0.0.1:8080`):**
 
 ```sh
-cp .env.example .env
-cp migration.env.example .env.migrate
-# Fill PASETO_LOCAL_KEY with `openssl rand -hex 32` and WEB_SERVICE_KEY with
-# a separate random value. Task loads .env; the binaries do not read it themselves.
-task up
-# Create the restricted login and set its password as described in DATABASE-PRIVILEGES.
-task migrate
-task db:grant-runtime
-task db:check
-task run
+task dev:init      # Generates .env/.env.migrate, starts Postgres, bootstraps dynodoc_runtime, migrates, grants, checks
+task run           # Starts engine-api (GET /healthz); never runs migrations
+task test:local    # Runs full workspace tests against the local Compose owner
+task db:upgrade    # After git pull: migrate + grant-runtime + check
 ```
 
-The development database listens only at `127.0.0.1:5548`. `task run` checks the
-schema/runtime role and listens on loopback port 8080; it never migrates. The operator
-URL belongs only in `.env.migrate`, loaded by the migrate/grant tasks. `GET /healthz`
-is the health check. Export separate isolated test-owner credentials as `DATABASE_URL`
-for `task test`; SQLx tests need CREATE DATABASE and CREATE ROLE. Never run tests
-against hosted data or start an API with the test-owner URL. See
-[the full setup contract](docs/DATABASE-PRIVILEGES.md); the application-specific
-`task setup`/`task dev` commands there are replaced by the copy/`task run` steps above.
+**Local-only CLI & pure tests (no Docker/PostgreSQL):**
+
+```sh
+task install-cli   # Installs engine-cli into Cargo's bin directory (or use `task cli -- <args>`)
+task test:unit     # Runs pure-Rust and CLI unit tests
+engine-cli repo --help
+```
+
+`engine-cli` commands (`repo`, `sync`, `historical-diff`, `mcp`) read `DYNODOC_REPO`,
+`DYNODOC_PROJECT`, `DYNODOC_REMOTE`, `DYNODOC_JOURNAL`, `DYNODOC_BRANCH`, and `DYNODOC_KEY`
+when flags are omitted. `engine-api` enforces strict credential separation: `.env` holds
+only the restricted `dynodoc_runtime` login, `.env.migrate` holds `MIGRATION_DATABASE_URL`,
+and `task test:local` uses an isolated test-owner URL. Never run tests against hosted data
+or pass `MIGRATION_DATABASE_URL` to `engine-api`.
 
 ```sh
 task lint
 task docs
-cargo run --locked -p engine-cli -- openapi
-# With DATABASE_URL exported (or using your .env loader):
-cargo run --locked -p engine-cli -- verify DOCUMENT_UUID
-cargo run --locked -p engine-cli -- replay DOCUMENT_UUID
-cargo run --locked -p engine-cli -- snapshot DOCUMENT_UUID
+task openapi
+# With DATABASE_URL exported (or via `task cli -- ...`):
+engine-cli verify DOCUMENT_UUID
+engine-cli replay DOCUMENT_UUID
+engine-cli snapshot DOCUMENT_UUID
 ```
 
-See [current capabilities](docs/CAPABILITIES.md), [architecture](docs/ARCHITECTURE.md),
+See [local development and CLI usage](docs/LOCAL-DEVELOPMENT.md),
+[database privileges](docs/DATABASE-PRIVILEGES.md),
+[current capabilities](docs/CAPABILITIES.md), [architecture](docs/ARCHITECTURE.md),
 [API and authentication](docs/API.md),
 [contributing](CONTRIBUTING.md), [security](SECURITY.md),
 [code of conduct](CODE_OF_CONDUCT.md) and [roadmap](ROADMAP.md).
