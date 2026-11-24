@@ -217,6 +217,9 @@ impl StartupConfig {
         );
 
         let text = |name: &str| lookup(name).and_then(|v| v.into_string().ok());
+        let api_port = text("API_PORT")
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(8080);
         match (paseto_key, service_key, database_url) {
             (Some(paseto_key), Some(service_key), Some(database_url)) if problems.is_empty() => {
                 Ok(Self {
@@ -227,7 +230,7 @@ impl StartupConfig {
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(86_400),
                         public_base_url: text("PUBLIC_API_BASE_URL")
-                            .unwrap_or_else(|| "http://127.0.0.1:8080".to_string()),
+                            .unwrap_or_else(|| format!("http://127.0.0.1:{api_port}")),
                     },
                     database_url,
                     retention,
@@ -358,6 +361,14 @@ mod tests {
         );
         assert_eq!(config.auth.token_ttl_seconds, 3600);
         assert_eq!(config.auth.public_base_url, "https://dynodoc.example.test");
+    }
+
+    #[test]
+    fn public_base_url_follows_api_port_when_unset() {
+        let mut pairs = valid();
+        pairs.push(("API_PORT", "8081"));
+        let config = StartupConfig::load(&env(&pairs)).unwrap();
+        assert_eq!(config.auth.public_base_url, "http://127.0.0.1:8081");
     }
 
     #[test]

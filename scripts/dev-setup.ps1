@@ -4,6 +4,8 @@ Set-StrictMode -Version Latest
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location $RepoRoot
 
+. (Join-Path $PSScriptRoot 'dev-port.ps1')
+
 function New-Hex32 {
     $bytes = New-Object byte[] 32
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
@@ -30,6 +32,7 @@ if (Test-Path -LiteralPath $EnvPath) {
     $pasetoKey = New-Hex32
     $webKey = New-Hex32
     $runtimePw = New-Hex32
+    $apiPort = Get-FreeLocalPort -HostAddress '127.0.0.1' -StartPort 8080
 
     $lines = [System.IO.File]::ReadAllLines($ExamplePath, $Utf8NoBom)
     $out = New-Object System.Collections.Generic.List[string]
@@ -37,6 +40,8 @@ if (Test-Path -LiteralPath $EnvPath) {
         $line = $rawLine.TrimEnd("`r")
         if ($line -match '^DATABASE_URL=.*REPLACE_WITH_RUNTIME_PASSWORD') {
             $out.Add($line.Replace('REPLACE_WITH_RUNTIME_PASSWORD', $runtimePw))
+        } elseif ($line -eq 'API_PORT=8080') {
+            $out.Add("API_PORT=$apiPort")
         } elseif ($line -eq 'PASETO_LOCAL_KEY=') {
             $out.Add("PASETO_LOCAL_KEY=$pasetoKey")
         } elseif ($line -eq 'WEB_SERVICE_KEY=') {
@@ -56,6 +61,9 @@ if (Test-Path -LiteralPath $EnvPath) {
         }
     }
     Write-Output '[setup] created .env with generated local development keys'
+    if ($apiPort -ne 8080) {
+        Write-Output "[setup] port 8080 is in use; configured API_PORT=$apiPort in .env"
+    }
 }
 
 $MigrateEnvPath = Join-Path $RepoRoot '.env.migrate'

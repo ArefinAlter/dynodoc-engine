@@ -32,7 +32,7 @@ task run
 5. `task db:grant-runtime` — grants the explicit runtime allowlist to `dynodoc_runtime`.
 6. `task db:check` — verifies schema checksums and runtime role privileges.
 
-`task run` starts `engine-api` on `127.0.0.1:8080` (`GET /healthz`).
+`task run` starts `engine-api` on `127.0.0.1:8080` (`GET /healthz`). If `8080` is already in use, `task dev:init` and `task run` automatically pick the next free local port (`8081+`); set `API_PORT` in `.env` to pin a specific port.
 
 ### Day-to-day commands
 
@@ -128,3 +128,4 @@ See [the database runtime boundary](DATABASE-PRIVILEGES.md) for the full Postgre
 - **`task test` fails with permission denied for `CREATE DATABASE`:** `.env` holds the restricted `dynodoc_runtime` login, which cannot create test databases. Run `task test:local` for local Compose tests, or export an isolated test-owner `DATABASE_URL`.
 - **`check-runtime` fails after `git pull`:** A new migration was added. Run `task db:upgrade` to apply migrations and re-grant the runtime allowlist.
 - **Port `5548` connection refused:** Run `task up` (or `task doctor`) to verify the local PostgreSQL container is running and healthy.
+- **Port `8080` already in use:** `task dev:init` and `task run` automatically select the next free port (`8081+`) when `API_PORT` is at its default `8080`. To pin a specific port, change `API_PORT` in `.env` (or pass `API_PORT=<port>` when running `engine-api` directly).

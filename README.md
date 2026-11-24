@@ -74,7 +74,7 @@ as a fully generic distributed version-control service.
 Install Rust (pinned via `rust-toolchain.toml`), [Task](https://taskfile.dev/), and
 Docker (only needed for PostgreSQL-backed API runs and integration tests).
 
-**Local API + PostgreSQL (`127.0.0.1:5548` → API on `127.0.0.1:8080`):**
+**Local API + PostgreSQL (`127.0.0.1:5548` → API on `127.0.0.1:8080`, or next free port if `8080` is busy):**
 
 Start the Docker engine/daemon before running `task dev:init` or any PostgreSQL-backed
 task (open Docker Desktop on macOS/Windows, or run `sudo systemctl start docker` on

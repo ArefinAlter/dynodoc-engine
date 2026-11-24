@@ -148,8 +148,16 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(8080);
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
 
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::AddrInUse {
+            anyhow::anyhow!(
+                "address {addr} is already in use; set API_PORT to a free port in .env or the environment"
+            )
+        } else {
+            anyhow::Error::new(err).context(format!("failed to bind {addr}"))
+        }
+    })?;
     tracing::info!(%addr, "engine-api listening");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     // On SIGTERM or Ctrl-C: stop accepting, let in-flight requests finish, and exit after
     // SHUTDOWN_DRAIN_SECONDS at most (live event streams never end by themselves).
     let (stopping, mut stopped) = tokio::sync::watch::channel(false);
