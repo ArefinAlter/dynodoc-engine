@@ -11,7 +11,7 @@ Dynodoc Engine supports two local workflows:
 
 - **Rust `1.96.0`** (pinned in [`rust-toolchain.toml`](../rust-toolchain.toml), with `rustfmt` and `clippy`)
 - **[Task](https://taskfile.dev/)** (`task`) — loads `.env` / `.env.migrate` for local tasks; the Rust binaries themselves do not read dotenv files
-- **Docker** (only needed for PostgreSQL-backed API runs and `task test:local` / `task test`)
+- **Docker** (only needed for PostgreSQL-backed API runs and `task test:local` / `task test`) — start the Docker engine/daemon before running `task dev:init` or `task up` (Docker Desktop on macOS/Windows, or `sudo systemctl start docker` on Linux; reboot first if Docker fails to start after a Linux kernel upgrade)
 
 ---
 
