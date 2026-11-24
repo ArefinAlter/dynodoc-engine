@@ -49,6 +49,7 @@ tasks:
     cmds: ["cargo run --locked -p engine-cli -- grant-runtime dynodoc_runtime"]
   db:check:
     desc: Read-only schema/runtime privilege check
+    dotenv: [".env"]
     cmds: ["cargo run --locked -p engine-cli -- check-runtime"]
   doctor:
     desc: Check local prerequisites, env files, and runtime database privileges

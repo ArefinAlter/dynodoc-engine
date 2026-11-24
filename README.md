@@ -76,6 +76,10 @@ Docker (only needed for PostgreSQL-backed API runs and integration tests).
 
 **Local API + PostgreSQL (`127.0.0.1:5548` → API on `127.0.0.1:8080`):**
 
+Start the Docker engine/daemon before running `task dev:init` or any PostgreSQL-backed
+task (open Docker Desktop on macOS/Windows, or run `sudo systemctl start docker` on
+Linux; if Docker fails to start after a Linux kernel upgrade, reboot first).
+
 ```sh
 task dev:init      # Generates .env/.env.migrate, starts Postgres, bootstraps dynodoc_runtime, migrates, grants, checks
 task run           # Starts engine-api (GET /healthz); never runs migrations
