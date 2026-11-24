@@ -447,13 +447,9 @@ impl LocalRepository {
         })
     }
 
-    /// Open an existing repository without any chance of writing: nothing is
-    /// created, no schema is upgraded and every connection is `query_only`.
-    /// Read methods work; mutating methods fail with a database error.
-    pub async fn open_read_only(path: &Path, project: uuid::Uuid) -> Result<Self, Error> {
-        if project.is_nil() {
-            return Err(Error::Invalid("nil project"));
-        }
+    /// Open an existing repository strictly read-only and read `(pool, schema, project)`
+    /// from `local_meta` without creating or upgrading anything.
+    async fn open_meta_read_only(path: &Path) -> Result<(SqlitePool, i64, uuid::Uuid), Error> {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(false)
@@ -462,15 +458,47 @@ impl LocalRepository {
             .pragma("query_only", "ON");
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
-            .connect_with(options.clone())
+            .connect_with(options)
             .await?;
         let (version, actual): (i64, String) =
             sqlx::query_as("select version,project from local_meta where singleton=1")
                 .fetch_one(&pool)
                 .await?;
-        if !storage::supported(version) || actual != project.to_string() {
+        let project =
+            uuid::Uuid::parse_str(&actual).map_err(|_| Error::Invalid("local schema/project"))?;
+        if !storage::supported(version) || project.is_nil() {
+            pool.close().await;
             return Err(Error::Invalid("local schema/project"));
         }
+        Ok((pool, version, project))
+    }
+
+    /// Inspect the bound project UUID of an existing local repository without creating
+    /// or upgrading it.
+    pub async fn inspect_project(path: &Path) -> Result<uuid::Uuid, Error> {
+        let (pool, _version, project) = Self::open_meta_read_only(path).await?;
+        pool.close().await;
+        Ok(project)
+    }
+
+    /// Open an existing repository without any chance of writing: nothing is
+    /// created, no schema is upgraded and every connection is `query_only`.
+    /// Read methods work; mutating methods fail with a database error.
+    pub async fn open_read_only(path: &Path, project: uuid::Uuid) -> Result<Self, Error> {
+        if project.is_nil() {
+            return Err(Error::Invalid("nil project"));
+        }
+        let (pool, version, actual) = Self::open_meta_read_only(path).await?;
+        if actual != project {
+            pool.close().await;
+            return Err(Error::Invalid("local schema/project"));
+        }
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(false)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5))
+            .pragma("query_only", "ON");
         Ok(Self {
             pool,
             project,
@@ -1001,6 +1029,28 @@ impl LocalRepository {
                 }
             },
         )
+    }
+
+    /// List all local branch heads ordered by branch name.
+    pub async fn branches(&self) -> Result<Vec<(String, Head)>, Error> {
+        let rows: Vec<(String, String, i64)> =
+            sqlx::query_as("select name,head,generation from refs order by name")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter()
+            .map(|(name, commit, generation)| {
+                if !super::valid_branch(&name) || generation <= 0 {
+                    return Err(Error::Invalid("stored branch ref"));
+                }
+                Ok((
+                    name,
+                    Head {
+                        commit: Address::try_from(commit)?,
+                        generation,
+                    },
+                ))
+            })
+            .collect()
     }
 
     pub async fn head(&self, branch: &str) -> Result<Option<Head>, Error> {
@@ -1813,5 +1863,47 @@ mod tests {
         assert!(!page2.more);
 
         cleanup(repo, &file).await;
+    }
+
+    #[tokio::test]
+    async fn inspect_project_and_branches_read_existing_repo() {
+        let file = path();
+        let missing = path();
+        assert!(LocalRepository::inspect_project(&missing).await.is_err());
+        assert!(!missing.exists());
+
+        let project = uuid::Uuid::new_v4();
+        let repo = LocalRepository::open(&file, project).await.unwrap();
+        assert!(repo.branches().await.unwrap().is_empty());
+
+        let c0 = repo
+            .import_commit(&signed(project, vec![], BTreeMap::new(), "c0"))
+            .await
+            .unwrap();
+        let c1 = repo
+            .import_commit(&signed(project, vec![c0.clone()], BTreeMap::new(), "c1"))
+            .await
+            .unwrap();
+        let main_head = repo.compare_and_swap("main", None, &c1).await.unwrap();
+        let alpha_head = repo.compare_and_swap("alpha", None, &c0).await.unwrap();
+        repo.close().await;
+
+        assert_eq!(
+            LocalRepository::inspect_project(&file).await.unwrap(),
+            project
+        );
+
+        let ro = LocalRepository::open_read_only(&file, project)
+            .await
+            .unwrap();
+        let listed = ro.branches().await.unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                ("alpha".to_string(), alpha_head),
+                ("main".to_string(), main_head),
+            ]
+        );
+        cleanup(ro, &file).await;
     }
 }

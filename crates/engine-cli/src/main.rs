@@ -94,14 +94,14 @@ enum Command {
         #[command(subcommand)]
         action: repository::Action,
     },
-    /// Shorthand for `repository` using flags or `DYNODOC_REPO` / `DYNODOC_PROJECT`.
+    /// Shorthand for `repository` using flags, `.dynodoc/repo.sqlite` discovery, or `DYNODOC_REPO` / `DYNODOC_PROJECT`.
     Repo {
-        /// Local SQLite repository path (or the variable DYNODOC_REPO).
+        /// Local SQLite repository path (defaults to discovering .dynodoc/repo.sqlite, or DYNODOC_REPO).
         #[arg(long, env = "DYNODOC_REPO")]
-        repo: std::path::PathBuf,
-        /// Project UUID (or the variable DYNODOC_PROJECT).
+        repo: Option<std::path::PathBuf>,
+        /// Project UUID (auto-detected from the repository or generated on `init`; or DYNODOC_PROJECT).
         #[arg(long, env = "DYNODOC_PROJECT")]
-        project: Uuid,
+        project: Option<Uuid>,
         #[command(subcommand)]
         action: repository::Action,
     },
@@ -384,19 +384,12 @@ fn main() -> anyhow::Result<()> {
 #[tokio::main]
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let logs = tracing_subscriber::fmt().with_env_filter(
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-    );
-    if matches!(
-        cli.command,
-        Command::Mcp(_) | Command::Auth { .. } | Command::E2ee(_)
-    ) {
-        // `mcp` speaks its protocol on stdout, and `auth issue-link` prints a sign-in link there
-        // (and nothing else, so it can be piped): their logs go to stderr.
-        logs.with_writer(std::io::stderr).init();
-    } else {
-        logs.init();
-    }
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     private_file::allow_insecure(cli.allow_insecure_key_file);
     passphrase::set_file(cli.passphrase_file);
     match cli.command {
@@ -434,7 +427,7 @@ async fn run() -> anyhow::Result<()> {
             repo,
             project,
             action,
-        } => repository::run(repo, project, action).await,
+        } => repository::run_repo(repo, project, action).await,
         Command::Auth { action } => auth::run(action).await,
         Command::Migrate => {
             let pool = connect_migration().await?;
@@ -1259,11 +1252,21 @@ mod tests {
                 project: parsed_project,
                 action: repository::Action::Storage,
             } => {
-                assert_eq!(repo, std::path::PathBuf::from("local.sqlite"));
-                assert_eq!(parsed_project, project);
+                assert_eq!(repo, Some(std::path::PathBuf::from("local.sqlite")));
+                assert_eq!(parsed_project, Some(project));
             }
             _ => panic!("expected Command::Repo with Storage action"),
         }
+
+        let init_no_flags = Cli::try_parse_from(["engine-cli", "repo", "init"]).unwrap();
+        assert!(matches!(
+            init_no_flags.command,
+            Command::Repo {
+                repo: None,
+                project: None,
+                action: repository::Action::Init,
+            }
+        ));
 
         let positional = Cli::try_parse_from([
             "engine-cli",

@@ -190,8 +190,8 @@ pub enum Action {
         /// Authority epoch for the attestation key (>= 1).
         #[arg(long, default_value_t = 1)]
         epoch: u32,
-        /// Ed25519 PKCS#8 key file to sign with.
-        #[arg(long)]
+        /// Ed25519 PKCS#8 key file to sign with (or the variable DYNODOC_KEY).
+        #[arg(long, env = "DYNODOC_KEY")]
         key: PathBuf,
         /// Optional companion output path (defaults to `<state>.dynoattest`).
         #[arg(long)]
@@ -327,7 +327,7 @@ pub enum Action {
     /// repository.
     HorizonSign {
         record: PathBuf,
-        #[arg(long)]
+        #[arg(long, env = "DYNODOC_KEY")]
         key: PathBuf,
         #[arg(long, value_enum, default_value_t = HorizonRole::Owner)]
         role: HorizonRole,
@@ -440,15 +440,22 @@ pub enum Action {
     /// Reconstruct an old or current state root as JSON.
     ReadState { document: uuid::Uuid, root: String },
     /// Sign and store a Commit JSON manifest with an existing Ed25519 PKCS#8 key.
-    Commit { manifest: PathBuf, key: PathBuf },
+    Commit {
+        manifest: PathBuf,
+        /// Ed25519 PKCS#8 key file (optional when --key or DYNODOC_KEY is set).
+        key: Option<PathBuf>,
+        /// Ed25519 PKCS#8 key file (or the variable DYNODOC_KEY).
+        #[arg(long = "key", env = "DYNODOC_KEY")]
+        key_flag: Option<PathBuf>,
+    },
     /// Verify/import a signed commit after its parents and objects are available.
     ImportCommit { input: PathBuf },
     /// Print a verified signed commit for review or transfer.
     Show { commit: String },
     /// Retrieve a bounded page or full chain of first-parent commit history from the local repository.
     Log {
-        /// Starting commit address.
-        commit: String,
+        /// Starting commit address or branch name (defaults to DYNODOC_BRANCH or "main").
+        commit: Option<String>,
         /// Page limit (1..=50, default 20).
         #[arg(long)]
         limit: Option<usize>,
@@ -462,8 +469,10 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
-    /// Read one project branch. Missing branches print null.
-    Head { branch: String },
+    /// List local branches and their head commit addresses.
+    Branches,
+    /// Read one project branch (defaults to DYNODOC_BRANCH or "main"). Missing branches print null.
+    Head { branch: Option<String> },
     /// Publish a project commit using an exact expected address AND generation.
     SetHead {
         branch: String,
@@ -524,12 +533,13 @@ pub enum Action {
         /// JSON object mapping each remaining conflict path to FileEntry or null.
         #[arg(long)]
         resolutions: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, env = "DYNODOC_KEY")]
         key: PathBuf,
         #[arg(long)]
         message: String,
+        /// Authored timestamp in UTC milliseconds (defaults to now).
         #[arg(long)]
-        authored_at_ms: i64,
+        authored_at_ms: Option<i64>,
         /// Explain how each automatically merged path was decided.
         #[arg(long)]
         explain: bool,
@@ -560,12 +570,13 @@ pub enum Action {
         copy: bool,
         #[arg(long)]
         onto: String,
-        #[arg(long)]
+        #[arg(long, env = "DYNODOC_KEY")]
         key: PathBuf,
         #[arg(long)]
         message: String,
+        /// Authored timestamp in UTC milliseconds (defaults to now).
         #[arg(long)]
-        authored_at_ms: i64,
+        authored_at_ms: Option<i64>,
     },
     /// Split node subtrees of DOCUMENT into a new document at NEW_PATH (v4 commit).
     Split {
@@ -583,12 +594,13 @@ pub enum Action {
         position: String,
         #[arg(long)]
         onto: String,
-        #[arg(long)]
+        #[arg(long, env = "DYNODOC_KEY")]
         key: PathBuf,
         #[arg(long)]
         message: String,
+        /// Authored timestamp in UTC milliseconds (defaults to now).
         #[arg(long)]
-        authored_at_ms: i64,
+        authored_at_ms: Option<i64>,
     },
     /// Join document FROM into INTO under PARENT; FROM leaves the project (v4 commit).
     Join {
@@ -599,12 +611,13 @@ pub enum Action {
         into: String,
         #[arg(long)]
         onto: String,
-        #[arg(long)]
+        #[arg(long, env = "DYNODOC_KEY")]
         key: PathBuf,
         #[arg(long)]
         message: String,
+        /// Authored timestamp in UTC milliseconds (defaults to now).
         #[arg(long)]
-        authored_at_ms: i64,
+        authored_at_ms: Option<i64>,
     },
     /// The relocation history of NODE in DOCUMENT, following first parents from HEAD.
     Lineage {
@@ -640,12 +653,13 @@ pub enum Action {
         /// JSON object mapping EVERY conflict path to FileEntry or null (delete).
         #[arg(long)]
         resolutions: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, env = "DYNODOC_KEY")]
         key: PathBuf,
         #[arg(long)]
         message: String,
+        /// Authored timestamp in UTC milliseconds (defaults to now).
         #[arg(long)]
-        authored_at_ms: i64,
+        authored_at_ms: Option<i64>,
     },
 }
 
@@ -1009,6 +1023,156 @@ fn horizon_as_of(policy: &Policy, given: Option<i64>) -> anyhow::Result<Option<i
     })
 }
 
+const DEFAULT_REPO_REL_PATH: &str = ".dynodoc/repo.sqlite";
+
+/// Walk up from the current working directory looking for `.dynodoc/repo.sqlite`.
+fn discover_repo() -> anyhow::Result<Option<PathBuf>> {
+    let cwd = std::env::current_dir().context("reading current working directory")?;
+    for dir in cwd.ancestors() {
+        let candidate = dir.join(DEFAULT_REPO_REL_PATH);
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_branch_default(branch: Option<String>) -> String {
+    branch
+        .or_else(|| {
+            std::env::var("DYNODOC_BRANCH")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_else(|| "main".to_string())
+}
+
+fn resolve_authored_at_ms(authored_at_ms: Option<i64>) -> i64 {
+    authored_at_ms.unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+}
+
+/// Resolve either a 64-hex commit address or a local branch name to a commit address.
+async fn resolve_commit_ref(repo: &LocalRepository, spec: &str) -> anyhow::Result<Address> {
+    if let Ok(addr) = Address::try_from(spec.to_string()) {
+        return Ok(addr);
+    }
+    match repo.head(spec).await {
+        Ok(Some(head)) => Ok(head.commit),
+        Ok(None) => anyhow::bail!("unknown branch or commit reference: {spec}"),
+        Err(_) => anyhow::bail!("unknown branch or invalid commit address: {spec}"),
+    }
+}
+
+fn allows_omitted_repo_file(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::ArchiveVerify { .. }
+            | Action::HorizonSign { .. }
+            | Action::HorizonArchiveVerify { .. }
+            | Action::ArchiveRecoveryPreflight { onto: Some(_), .. }
+            | Action::HistoricalDiff {
+                archive: Some(_),
+                ..
+            }
+    )
+}
+
+fn is_read_only_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Storage
+            | Action::Objects { .. }
+            | Action::ExportObject { .. }
+            | Action::ReadState { .. }
+            | Action::Show { .. }
+            | Action::Log { .. }
+            | Action::Head { .. }
+            | Action::Branches
+            | Action::MergeBases { .. }
+            | Action::Compare { .. }
+            | Action::Lineage { .. }
+            | Action::VerifyMerge { .. }
+            | Action::RecoveryPlan { .. }
+            | Action::GcPlan { .. }
+            | Action::HorizonPlan { .. }
+            | Action::HorizonDraft { .. }
+            | Action::HorizonShow
+            | Action::HorizonVerify
+            | Action::ArchiveExport { .. }
+            | Action::ExportFile { .. }
+            | Action::AttestState { .. }
+            | Action::VerifyStateAttestation { .. }
+    )
+}
+
+fn requires_existing_repo_file(action: &Action) -> bool {
+    is_read_only_action(action)
+        || matches!(
+            action,
+            Action::Gc { .. }
+                | Action::HorizonApply { .. }
+                | Action::HorizonRehydrate { .. }
+                | Action::Compact { .. }
+                | Action::StorageLimits { .. }
+                | Action::Merge { .. }
+                | Action::Relocate { .. }
+                | Action::Split { .. }
+                | Action::Join { .. }
+                | Action::Recover { .. }
+        )
+}
+
+/// Resolve repo path and project UUID for `engine-cli repo`, supporting `.dynodoc/repo.sqlite`
+/// discovery, auto-reading `project` from `local_meta`, and auto-UUID generation on `init`.
+pub async fn run_repo(
+    repo: Option<PathBuf>,
+    project: Option<uuid::Uuid>,
+    action: Action,
+) -> anyhow::Result<()> {
+    if matches!(action, Action::Init) {
+        let path = repo.unwrap_or_else(|| PathBuf::from(DEFAULT_REPO_REL_PATH));
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating repository directory {}", parent.display()))?;
+        }
+        let project = match project {
+            Some(project) => project,
+            None if path.is_file() => LocalRepository::inspect_project(&path).await?,
+            None => uuid::Uuid::new_v4(),
+        };
+        return run(path, project, action).await;
+    }
+
+    let discovered = match repo {
+        Some(path) => Some(path),
+        None => discover_repo()?,
+    };
+    let path = match discovered {
+        Some(path) => path,
+        None if allows_omitted_repo_file(&action) => {
+            let project = project.ok_or_else(|| {
+                anyhow::anyhow!("--project (or DYNODOC_PROJECT) is required when no repository is present")
+            })?;
+            return run(PathBuf::from(":memory:"), project, action).await;
+        }
+        None => anyhow::bail!(
+            "no repository found in current or parent directories (run 'engine-cli repo init' or pass --repo)"
+        ),
+    };
+    let project = match project {
+        Some(project) => project,
+        None if path.is_file() => LocalRepository::inspect_project(&path).await?,
+        None if requires_existing_repo_file(&action) => {
+            anyhow::bail!("no repository database at {}", path.display());
+        }
+        None => anyhow::bail!(
+            "--project (or DYNODOC_PROJECT) is required when creating a new repository at {}",
+            path.display()
+        ),
+    };
+    run(path, project, action).await
+}
+
 pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::Result<()> {
     let address = |s: String| Address::try_from(s);
     let mut text = None;
@@ -1217,10 +1381,9 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                 .or_else(|| common_path.clone())
                 .unwrap_or_else(|| resolved_path_a.clone());
 
-            let commit_a_addr = address(commit_a)?;
-            let commit_b_addr = address(commit_b)?;
-
-            let report = if let Some(archive_path) = archive {
+            let (commit_a_addr, commit_b_addr, report) = if let Some(archive_path) = archive {
+                let commit_a_addr = address(commit_a)?;
+                let commit_b_addr = address(commit_b)?;
                 anyhow::ensure!(
                     archive_path.is_file(),
                     "archive file not found at {}",
@@ -1328,7 +1491,7 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     )
                 })?;
 
-                engine_core::repository::historical_diff::diff_states(
+                let report = engine_core::repository::historical_diff::diff_states(
                     &commit_a_addr,
                     &resolved_path_a,
                     &file_a,
@@ -1338,7 +1501,8 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     &file_b,
                     &state_b,
                 )
-                .map_err(|e| anyhow::anyhow!("historical diff failed: {e}"))?
+                .map_err(|e| anyhow::anyhow!("historical diff failed: {e}"))?;
+                (commit_a_addr, commit_b_addr, report)
             } else {
                 anyhow::ensure!(
                     path.is_file(),
@@ -1346,6 +1510,8 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     path.display()
                 );
                 let repo = LocalRepository::open_read_only(&path, project).await?;
+                let commit_a_addr = resolve_commit_ref(&repo, &commit_a).await?;
+                let commit_b_addr = resolve_commit_ref(&repo, &commit_b).await?;
                 let report = repo
                     .historical_diff(
                         &commit_a_addr,
@@ -1356,7 +1522,7 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     .await
                     .map_err(|e| anyhow::anyhow!("historical diff failed: {e}"))?;
                 repo.close().await;
-                report
+                (commit_a_addr, commit_b_addr, report)
             };
 
             let out = serde_json::to_value(&report)?;
@@ -1376,35 +1542,17 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
             (out, None)
         }
         other_action => {
-            // The retention, horizon plans, archive export, export-file and log must not create, upgrade or write the database.
-            let repo = if matches!(
-                other_action,
-                Action::GcPlan { .. }
-                    | Action::HorizonPlan { .. }
-                    | Action::HorizonDraft { .. }
-                    | Action::HorizonShow
-                    | Action::HorizonVerify
-                    | Action::ArchiveExport { .. }
-                    | Action::ExportFile { .. }
-                    | Action::AttestState { .. }
-                    | Action::VerifyStateAttestation { .. }
-                    | Action::Log { .. }
-            ) {
+            if requires_existing_repo_file(&other_action) {
+                anyhow::ensure!(
+                    path.is_file(),
+                    "no repository database at {}",
+                    path.display()
+                );
+            }
+            // Read-only commands must never create, upgrade or write the database.
+            let repo = if is_read_only_action(&other_action) {
                 LocalRepository::open_read_only(&path, project).await?
             } else {
-                // A destructive command never creates the database it would collect.
-                if matches!(
-                    other_action,
-                    Action::Gc { .. }
-                        | Action::HorizonApply { .. }
-                        | Action::HorizonRehydrate { .. }
-                ) {
-                    anyhow::ensure!(
-                        path.is_file(),
-                        "no repository database at {}",
-                        path.display()
-                    );
-                }
                 LocalRepository::open(&path, project).await?
             };
             let out = match other_action {
@@ -1573,8 +1721,11 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     serde_json::json!({"address":packet.key.address,"bytes":STANDARD.encode(packet.bytes)})
                 }
                 Action::ArchiveExport { head, since, out } => {
-                    let head_addr = address(head)?;
-                    let since_addr = since.map(address).transpose()?;
+                    let head_addr = resolve_commit_ref(&repo, &head).await?;
+                    let since_addr = match since {
+                        Some(s) => Some(resolve_commit_ref(&repo, &s).await?),
+                        None => None,
+                    };
                     anyhow::ensure!(
                         !out.exists(),
                         "output file {} already exists; refusing overwrite",
@@ -1626,7 +1777,7 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     attest_key,
                     attest_epoch,
                 } => {
-                    let commit_addr = address(commit)?;
+                    let commit_addr = resolve_commit_ref(&repo, &commit).await?;
                     anyhow::ensure!(
                         !out.exists(),
                         "output file {} already exists; refusing overwrite",
@@ -1888,10 +2039,19 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     repo.read_state(DocumentId(document), &address(root)?)
                         .await?,
                 )?,
-                Action::Commit { manifest, key } => {
+                Action::Commit {
+                    manifest,
+                    key,
+                    key_flag,
+                } => {
+                    let key_path = key.or(key_flag).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "signing key is required (pass positional KEY, --key, or DYNODOC_KEY)"
+                        )
+                    })?;
                     let commit: Commit =
                         read_json(&manifest, engine_core::repository::MAX_COMMIT_BYTES)?;
-                    let key = crate::signing::load_signer(&key)?;
+                    let key = crate::signing::load_signer(&key_path)?;
                     let signed = SignedCommit::sign(commit, &*key)?;
                     serde_json::json!({"commit":repo.import_commit(&signed).await?})
                 }
@@ -1899,7 +2059,8 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     serde_json::json!({"commit":repo.import_commit(&read_json(&input, engine_core::repository::MAX_COMMIT_BYTES + 1024)?).await?})
                 }
                 Action::Show { commit } => {
-                    serde_json::to_value(repo.commit(&address(commit)?).await?)?
+                    let commit_addr = resolve_commit_ref(&repo, &commit).await?;
+                    serde_json::to_value(repo.commit(&commit_addr).await?)?
                 }
                 Action::Log {
                     commit,
@@ -1908,7 +2069,8 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     all,
                     json,
                 } => {
-                    let commit_addr = address(commit)?;
+                    let commit_spec = resolve_branch_default(commit);
+                    let commit_addr = resolve_commit_ref(&repo, &commit_spec).await?;
                     let cursor_addr = match cursor {
                         Some(c) => Some(address(c)?),
                         None => None,
@@ -1929,7 +2091,25 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                         serde_json::Value::Null
                     }
                 }
-                Action::Head { branch } => serde_json::to_value(repo.head(&branch).await?)?,
+                Action::Branches => {
+                    let branches: Vec<_> = repo
+                        .branches()
+                        .await?
+                        .into_iter()
+                        .map(|(name, head)| {
+                            serde_json::json!({
+                                "branch": name,
+                                "commit": head.commit,
+                                "generation": head.generation,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({"branches": branches})
+                }
+                Action::Head { branch } => {
+                    let branch = resolve_branch_default(branch);
+                    serde_json::to_value(repo.head(&branch).await?)?
+                }
                 Action::SetHead {
                     branch,
                     commit,
@@ -1946,14 +2126,17 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                             "expected address and generation must be supplied together"
                         ),
                     };
+                    let commit_addr = resolve_commit_ref(&repo, &commit).await?;
                     serde_json::to_value(
-                        repo.compare_and_swap(&branch, expected.as_ref(), &address(commit)?)
+                        repo.compare_and_swap(&branch, expected.as_ref(), &commit_addr)
                             .await?,
                     )?
                 }
-                Action::MergeBases { left, right } => serde_json::to_value(
-                    repo.merge_bases(&address(left)?, &address(right)?).await?,
-                )?,
+                Action::MergeBases { left, right } => {
+                    let left_addr = resolve_commit_ref(&repo, &left).await?;
+                    let right_addr = resolve_commit_ref(&repo, &right).await?;
+                    serde_json::to_value(repo.merge_bases(&left_addr, &right_addr).await?)?
+                }
                 Action::Compare {
                     base,
                     left,
@@ -1965,7 +2148,11 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     let policy = explain
                         .then(|| load_policy(merge_policy.as_deref()))
                         .transpose()?;
-                    let (b, l, r) = (address(base)?, address(left)?, address(right)?);
+                    let (b, l, r) = (
+                        resolve_commit_ref(&repo, &base).await?,
+                        resolve_commit_ref(&repo, &left).await?,
+                        resolve_commit_ref(&repo, &right).await?,
+                    );
                     let mut output =
                         compare_explained(&repo, b.clone(), l.clone(), r.clone(), policy.as_ref())
                             .await?;
@@ -1990,15 +2177,18 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     choices,
                     ..
                 } => {
+                    let authored_at_ms = resolve_authored_at_ms(authored_at_ms);
                     let policy = load_policy(merge_policy.as_deref())?;
                     let choices: engine_core::repository::project::ResolutionFile = match choices {
                         Some(path) => read_json(&path, engine_core::repository::MAX_COMMIT_BYTES)?,
                         None => Default::default(),
                     };
+                    let left_addr = resolve_commit_ref(&repo, &left).await?;
+                    let right_addr = resolve_commit_ref(&repo, &right).await?;
                     let key = crate::signing::load_signer(&key)?;
                     project_merge_value(
                         &repo,
-                        (address(left)?, address(right)?),
+                        (left_addr, right_addr),
                         &policy,
                         &choices,
                         (authored_at_ms, message),
@@ -2018,15 +2208,18 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     project_merge: None,
                     ..
                 } => {
+                    let authored_at_ms = resolve_authored_at_ms(authored_at_ms);
                     let resolutions = match resolutions {
                         Some(path) => read_json(&path, engine_core::repository::MAX_COMMIT_BYTES)?,
                         None => BTreeMap::new(),
                     };
+                    let left_addr = resolve_commit_ref(&repo, &left).await?;
+                    let right_addr = resolve_commit_ref(&repo, &right).await?;
                     // Load the key before anything is stored.
                     let key = crate::signing::load_signer(&key)?;
                     let args = MergeArgs {
-                        left: address(left)?,
-                        right: address(right)?,
+                        left: left_addr,
+                        right: right_addr,
                         same_file: match same_file_merge {
                             Some(SameFileMerge::Clean) => SameFile::Clean,
                             None => SameFile::Off,
@@ -2047,6 +2240,7 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     message,
                     authored_at_ms,
                 } => {
+                    let authored_at_ms = resolve_authored_at_ms(authored_at_ms);
                     let (document, nodes) = from
                         .split_once(':')
                         .context("--from is DOCUMENT_UUID:NODE[,NODE...]")?;
@@ -2072,10 +2266,11 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                             position: position.into(),
                         },
                     };
+                    let onto_addr = resolve_commit_ref(&repo, &onto).await?;
                     let key = crate::signing::load_signer(&key)?;
                     relocate_value(
                         &repo,
-                        &address(onto)?,
+                        &onto_addr,
                         spec,
                         None,
                         (authored_at_ms, message),
@@ -2098,7 +2293,8 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                         engine_core::repository::valid_path(&new_path),
                         "--new-path is not a valid project path"
                     );
-                    let onto = address(onto)?;
+                    let authored_at_ms = resolve_authored_at_ms(authored_at_ms);
+                    let onto = resolve_commit_ref(&repo, &onto).await?;
                     let source = document_id(&document)?;
                     let root = root_of(&repo, &onto, source).await?;
                     let new_document = match new_document {
@@ -2136,7 +2332,8 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     message,
                     authored_at_ms,
                 } => {
-                    let onto = address(onto)?;
+                    let authored_at_ms = resolve_authored_at_ms(authored_at_ms);
+                    let onto = resolve_commit_ref(&repo, &onto).await?;
                     let source = document_id(&from)?;
                     let mut parts = into.splitn(3, ':');
                     let (Some(dest), Some(parent)) = (parts.next(), parts.next()) else {
@@ -2179,17 +2376,20 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     head,
                     document,
                     node,
-                } => serde_json::json!({
-                    "steps": repo
-                        .lineage(
-                            &address(head)?,
-                            document_id(&document)?,
-                            &engine_shared::NodeId(node),
-                        )
-                        .await?
-                }),
+                } => {
+                    let head_addr = resolve_commit_ref(&repo, &head).await?;
+                    serde_json::json!({
+                        "steps": repo
+                            .lineage(
+                                &head_addr,
+                                document_id(&document)?,
+                                &engine_shared::NodeId(node),
+                            )
+                            .await?
+                    })
+                }
                 Action::VerifyMerge { commit, explain } => {
-                    let commit = address(commit)?;
+                    let commit = resolve_commit_ref(&repo, &commit).await?;
                     let verified = repo.verify_same_file_resolutions(&commit).await?;
                     let project_verified = repo.verify_project_resolutions(&commit).await?;
                     let mut output = serde_json::json!({"commit":commit,"verified_same_file_resolutions":verified,"verified_project_resolutions":project_verified});
@@ -2209,12 +2409,17 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     kind,
                     mainline,
                 } => {
-                    let mainline = mainline.map(address).transpose()?;
+                    let mainline = match mainline {
+                        Some(m) => Some(resolve_commit_ref(&repo, &m).await?),
+                        None => None,
+                    };
+                    let source_addr = resolve_commit_ref(&repo, &source).await?;
+                    let onto_addr = resolve_commit_ref(&repo, &onto).await?;
                     serde_json::to_value(
                         repo.plan_recovery(
                             kind.into(),
-                            &address(source)?,
-                            &address(onto)?,
+                            &source_addr,
+                            &onto_addr,
                             mainline.as_ref(),
                         )
                         .await?,
@@ -2230,14 +2435,15 @@ pub async fn run(path: PathBuf, project: uuid::Uuid, action: Action) -> anyhow::
                     message,
                     authored_at_ms,
                 } => {
-                    let mainline = mainline.map(address).transpose()?;
+                    let authored_at_ms = resolve_authored_at_ms(authored_at_ms);
+                    let mainline = match mainline {
+                        Some(m) => Some(resolve_commit_ref(&repo, &m).await?),
+                        None => None,
+                    };
+                    let source_addr = resolve_commit_ref(&repo, &source).await?;
+                    let onto_addr = resolve_commit_ref(&repo, &onto).await?;
                     let plan = repo
-                        .plan_recovery(
-                            kind.into(),
-                            &address(source)?,
-                            &address(onto)?,
-                            mainline.as_ref(),
-                        )
+                        .plan_recovery(kind.into(), &source_addr, &onto_addr, mainline.as_ref())
                         .await?;
                     let resolutions = match resolutions {
                         Some(path) => read_json(&path, engine_core::repository::MAX_COMMIT_BYTES)?,
@@ -6489,11 +6695,20 @@ mod tests {
             let matches = command.clone().try_get_matches_from(args).unwrap();
             Action::from_arg_matches(&matches).unwrap()
         };
-        assert!(command.clone().try_get_matches_from(["log"]).is_err());
+        assert!(matches!(
+            parse(&["log"]),
+            Action::Log {
+                commit: None,
+                limit: None,
+                cursor: None,
+                all: false,
+                json: false
+            }
+        ));
         assert!(matches!(
             parse(&["log", "abc"]),
             Action::Log {
-                commit,
+                commit: Some(commit),
                 limit: None,
                 cursor: None,
                 all: false,
@@ -6512,7 +6727,7 @@ mod tests {
                 "--json"
             ]),
             Action::Log {
-                commit,
+                commit: Some(commit),
                 limit: Some(25),
                 cursor: Some(cur),
                 all: true,
@@ -6546,7 +6761,7 @@ mod tests {
             path.clone(),
             project,
             Action::Log {
-                commit: c1.as_str().to_string(),
+                commit: Some(c1.as_str().to_string()),
                 limit: None,
                 cursor: None,
                 all: false,
@@ -6575,7 +6790,7 @@ mod tests {
             missing.clone(),
             project,
             Action::Log {
-                commit: "1".repeat(64),
+                commit: Some("1".repeat(64)),
                 limit: None,
                 cursor: None,
                 all: false,
@@ -6616,7 +6831,7 @@ mod tests {
                 path.clone(),
                 project,
                 Action::Log {
-                    commit: c0.as_str().to_string(),
+                    commit: Some(c0.as_str().to_string()),
                     limit: None,
                     cursor: None,
                     all: false,
@@ -6656,7 +6871,7 @@ mod tests {
             path.clone(),
             project,
             Action::Log {
-                commit: c0.as_str().to_string(),
+                commit: Some(c0.as_str().to_string()),
                 limit: None,
                 cursor: None,
                 all: false,
@@ -6795,7 +7010,7 @@ mod tests {
             path.clone(),
             project,
             Action::Log {
-                commit: c3.as_str().to_string(),
+                commit: Some(c3.as_str().to_string()),
                 limit: Some(2),
                 cursor: None,
                 all: false,
