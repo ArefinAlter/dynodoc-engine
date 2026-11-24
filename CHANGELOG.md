@@ -16,6 +16,26 @@
 - serde_json 1.0.154, unicode-normalization 0.1.26, zeroize 1.9.1, sha2 0.11.1 and
   utoipa 6.0 (`openapi.yaml` regenerated, order of nullable `oneOf` entries only).
 
+### Dependency security advisories - 2026-11-09
+
+Lockfile-only updates, found by `cargo audit`: `orion` 0.18.0 to 0.18.1 (RUSTSEC-2026-0426,
+RUSTSEC-2026-0428; used through `pasetors`) and `webpki-roots` 1.0.7 to 1.0.11
+(RUSTSEC-2026-0381, distrusted emSign intermediates; used through `reqwest`). No source,
+migration, event format or API change. Still reported and not fixed here: `crypto-bigint`
+0.5.5 through `vsss-rs`/`elliptic-curve` (RUSTSEC-2026-0387; the fix needs a major upgrade
+upstream), and `crypto-bigint` 0.6.1 and `rsa` 0.9.10 (RUSTSEC-2023-0071), which are in
+`Cargo.lock` only and are not built by any workspace crate.
+
+### Windows private files inside private directories - 2026-11-09
+
+Private files and directories created inside a directory that is already private no longer
+fail with "cannot restrict ... to the current user" when the process's default access list
+holds a logon session entry (`NT AUTHORITY\LogonSessionId_X_Y`, read/execute). That entry
+is now removed by SID with SYSTEM and Administrators; the SID comes from the system
+`whoami /logonid`, is accepted only as `S-1-5-5-<digits>-<digits>` and is asked once per
+process. Verification is unchanged and still refuses any other entry. This affected
+archive import and verification and state export on such hosts. No format or API change.
+
 ### Application engine at 4f0e7a3 (decisions 024 to 043) - 2026-11-08
 
 Synchronized `engine-shared`, `engine-core`, `engine-agent`, `engine-mcp`, `engine-api`,
