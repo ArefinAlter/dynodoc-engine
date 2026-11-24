@@ -38,7 +38,11 @@ tasks:
       - task: db:check
   run:
     desc: Run the provisioned API; never applies migrations
-    cmds: ["cargo run --locked -p engine-api"]
+    cmds:
+      - cmd: bash scripts/dev-run.sh
+        platforms: [linux, darwin]
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-run.ps1
+        platforms: [windows]
   migrate:
     desc: Apply migrations in a separate operator process
     dotenv: [".env.migrate"]
