@@ -22,6 +22,7 @@
 //! and handed to the stage-16 governance gate.
 
 pub mod agent;
+pub mod cli_login;
 pub mod device;
 pub mod handover;
 pub mod operator;

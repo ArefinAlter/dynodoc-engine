@@ -119,6 +119,8 @@ const MUTABLE: &[&str] = &[
     "import_job",
     // Object-store keys an erasure left to delete (migration 0140): queued, retried, removed.
     "object_deletion",
+    // Browser-assisted CLI device login (migration 0144): created, approved/denied, consumed, pruned.
+    "cli_login_request",
 ];
 /// Rows are created and pruned but never edited: a replay ledger, not a record.
 const INSERT_DELETE: &[&str] = &[

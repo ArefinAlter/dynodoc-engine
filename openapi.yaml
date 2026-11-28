@@ -415,6 +415,97 @@ paths:
           description: Not the trusted web server
         '429':
           description: Too many failed attempts from this address or for this code prefix
+  /auth/cli-login/approve:
+    post:
+      tags:
+      - auth
+      operationId: cli_login_approve
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApproveRequest'
+        required: true
+      responses:
+        '200':
+          description: CLI login decision recorded
+          content:
+            application/json:
+              schema: {}
+        '400':
+          description: Invalid code or decision
+        '403':
+          description: Browser session required
+        '404':
+          description: Code not found or expired
+      security:
+      - paseto: []
+  /auth/cli-login/lookup:
+    get:
+      tags:
+      - auth
+      operationId: cli_login_lookup
+      responses:
+        '200':
+          description: Pending CLI login details for confirmation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LookupResponse'
+        '400':
+          description: Malformed code
+        '403':
+          description: Browser session required
+        '404':
+          description: Code not found or expired
+      security:
+      - paseto: []
+  /auth/cli-login/poll:
+    post:
+      tags:
+      - auth
+      operationId: cli_login_poll
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PollRequest'
+        required: true
+      responses:
+        '200':
+          description: Pending or approved with enrolled key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollResponse'
+        '401':
+          description: Invalid proof-of-possession or expired
+        '403':
+          description: Denied by user
+        '409':
+          description: Device limit reached or key already enrolled
+  /auth/cli-login/start:
+    post:
+      tags:
+      - auth
+      operationId: cli_login_start
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartRequest'
+        required: true
+      responses:
+        '200':
+          description: Pending CLI login request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StartResponse'
+        '400':
+          description: Invalid public key or label
+        '429':
+          description: Rate limit exceeded
   /auth/logout:
     post:
       tags:
@@ -9220,6 +9311,20 @@ components:
           type: string
         trust:
           type: string
+    ApproveRequest:
+      type: object
+      required:
+      - user_code
+      - decision
+      properties:
+        all_projects:
+          type: boolean
+        decision:
+          type: string
+          description: '`"approve"` or `"deny"`.'
+        user_code:
+          type: string
+      additionalProperties: false
     AskInput:
       type: object
       required:
@@ -10089,6 +10194,26 @@ components:
         open_issue_count:
           type: integer
           format: int64
+    LookupResponse:
+      type: object
+      required:
+      - user_code
+      - label
+      - public_key
+      - fingerprint
+      - expires_at
+      properties:
+        expires_at:
+          type: string
+          format: date-time
+        fingerprint:
+          type: string
+        label:
+          type: string
+        public_key:
+          type: string
+        user_code:
+          type: string
     MergeFloorBody:
       type: object
       required:
@@ -10373,6 +10498,43 @@ components:
             What agents may write: `none` (the default: they only read), `draft` (they stage
             drafts that a person submits) or `change_request` (they may submit, unless
             `submit_requires_person`). The kill switch sets it back to `none`.
+    PollRequest:
+      type: object
+      required:
+      - device_code
+      - signature
+      properties:
+        device_code:
+          type: string
+        signature:
+          type: string
+          description: Lowercase 128-hex Ed25519 signature over `canonical_message(challenge, public_key)`.
+      additionalProperties: false
+    PollResponse:
+      type: object
+      required:
+      - status
+      properties:
+        email:
+          type:
+          - string
+          - 'null'
+        identity_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        key_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        project_access:
+          type:
+          - string
+          - 'null'
+        status:
+          type: string
     ProjectHistoryLogView:
       type: object
       required:
@@ -10651,6 +10813,53 @@ components:
           format: int64
         starred:
           type: boolean
+    StartRequest:
+      type: object
+      required:
+      - public_key
+      properties:
+        label:
+          type:
+          - string
+          - 'null'
+          description: Optional human-readable device label (1..=80 chars, no control characters).
+        public_key:
+          type: string
+          description: Lowercase 64-hex Ed25519 public key to enroll.
+      additionalProperties: false
+    StartResponse:
+      type: object
+      required:
+      - device_code
+      - user_code
+      - verification_path
+      - expires_in
+      - interval
+      - challenge
+      - authority
+      properties:
+        authority:
+          type: string
+          format: uuid
+        authority_public_key:
+          type:
+          - string
+          - 'null'
+        challenge:
+          type: string
+        device_code:
+          type: string
+        expires_in:
+          type: integer
+          format: int64
+        interval:
+          type: integer
+          format: int64
+          minimum: 0
+        user_code:
+          type: string
+        verification_path:
+          type: string
     StorageInput:
       type: object
       required:

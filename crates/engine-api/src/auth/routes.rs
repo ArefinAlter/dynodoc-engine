@@ -78,6 +78,7 @@ pub fn router() -> Router<AppState> {
         .route("/auth/me", get(me))
         .route("/auth/exchange", post(exchange))
         .merge(super::handover::router())
+        .merge(super::cli_login::router())
         .merge(super::sessions::router())
 }
 
