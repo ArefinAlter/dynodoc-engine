@@ -116,9 +116,10 @@ pub fn verify_bound_session(
 // reads a claim. The footer and claim names are belt and braces: a footer alone
 // would not separate the types (the library only compares a footer when asked).
 
-const DEVICE_TYPE: &str = "dynodoc.project-device-session.v1";
+const DEVICE_TYPE: &str = engine_shared::auth_wire::PROJECT_DEVICE_TOKEN_TYPE;
 /// The footer is the JSON object `{"typ":"dynodoc.project-device-session.v1"}`.
-const DEVICE_FOOTER_JSON: &[u8] = br#"{"typ":"dynodoc.project-device-session.v1"}"#;
+#[cfg(test)]
+const DEVICE_FOOTER_JSON: &[u8] = engine_shared::auth_wire::PROJECT_DEVICE_FOOTER_JSON;
 #[allow(clippy::expect_used, reason = "static footer claim")]
 fn device_footer() -> Footer {
     let mut footer = Footer::new();
@@ -177,9 +178,7 @@ pub fn mint_project_device(
 /// True when the token carries the device footer. Used only to choose which
 /// verifier runs; the verifier itself is what authenticates.
 pub fn is_project_device_token(token: &str) -> bool {
-    UntrustedToken::<Local, V4>::try_from(token)
-        .map(|t| t.untrusted_footer() == DEVICE_FOOTER_JSON)
-        .unwrap_or(false)
+    engine_shared::auth_wire::is_project_device_token(token)
 }
 
 /// Verify a project device token. Account tokens, connector keys and tokens from

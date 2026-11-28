@@ -1,8 +1,8 @@
-# Container image of engine-api and engine-cli for linux/amd64 and linux/arm64.
+# Container image of engine-api and engine-admin for linux/amd64 and linux/arm64.
 #
 # Each architecture is built NATIVELY on a runner of its own (no emulation): ubuntu-latest
 # for amd64, ubuntu-24.04-arm for arm64. Every run builds the image and proves it starts
-# on that processor (engine-cli --version, and engine-api refusing to start without
+# on that processor (engine-admin --version, and engine-api refusing to start without
 # configuration). Nothing is published from a push, a pull request or a manual run.
 #
 # Publishing happens only for a pushed `image-v*` tag: each architecture is pushed to
@@ -67,7 +67,7 @@ jobs:
           IMAGE=dynodoc-engine:${{ matrix.arch }}
           docker image inspect "$IMAGE" --format 'architecture={{.Architecture}} os={{.Os}} size={{.Size}}'
           test "$(docker image inspect "$IMAGE" --format '{{.Architecture}}')" = "${{ matrix.arch }}"
-          docker run --rm --entrypoint engine-cli "$IMAGE" --version
+          docker run --rm --entrypoint engine-admin "$IMAGE" --version
           # engine-api has no --version: with no configuration it must refuse to start
           # and say why, which proves the binary runs on this processor.
           set +e

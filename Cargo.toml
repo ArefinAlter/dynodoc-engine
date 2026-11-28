@@ -6,7 +6,7 @@ members = [
     "crates/engine-agent",
     "crates/engine-mcp",
     "crates/engine-api",
-    "crates/engine-cli",
+    "crates/engine-admin",
     "crates/engine-wasm",
 ]
 # The fuzz targets are their own workspace (cargo-fuzz, nightly); keep them out of the
@@ -18,7 +18,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
-repository = "https://github.com/ArefinAlter/dynodoc-engine"
+repository = "https://github.com/Vernesystems/dynodoc-engine"
 authors = ["Verne Ltd."]
 
 # Shared dependency versions — crates reference these with `{ workspace = true }`
@@ -68,17 +68,11 @@ chrono = { version = "0.4", features = ["serde"] }
 # signatures later). ring's build-script binary is blocked by Smart App Control on
 # the laptop, so the engine is built/run on a SAC-free machine (home PC / WSL2 / CI).
 ring = "0.17"
-# PKCS#11 hardware-token device keys in engine-cli (decision 039). Parsec project,
-# Apache-2.0; loads the token's module at run time, no C toolchain at build time.
-cryptoki = "0.12"
 # Pure-Rust SHA-256 for the engine's pure modules, which also build for wasm32 (decision 036).
 sha2 = "0.11"
 # Constant-time comparison and wiping of secrets: both are already in the lockfile through the crypto crates.
 subtle = "2.6"
 zeroize = "1"
-# Memory-hard key derivation for encrypted key files (RFC 9106 Argon2id). RustCrypto;
-# MIT OR Apache-2.0.
-argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 # Encrypted projects (decision 035): RFC 9180 HPKE base mode with DHKEM(X25519, HKDF-SHA256)
 # and AES-256-GCM for key grants and sealed relay answers; ring has no static X25519 keys.
 # Pure Rust (RustCrypto x25519-dalek, aes-gcm, hkdf). rand_core supplies the OS generator.
@@ -120,17 +114,6 @@ engine-mcp = { path = "crates/engine-mcp" }
 proptest = "1"
 tokio-test = "0.4"
 insta = { version = "1", features = ["json"] }
-
-# Key derivation (Argon2id, 64 MiB) is unusably slow unoptimised, and tests derive keys.
-[profile.dev.package.argon2]
-opt-level = 3
-[profile.dev.package.blake2]
-opt-level = 3
-# engine-cli's generated argument parser needs about 1 MiB of stack at opt-level 0, the
-# whole main-thread stack of a Windows debug build, so adding one option to a
-# subcommand made `engine-cli --help` overflow it. Level 1 needs under a quarter.
-[profile.dev.package.engine-cli]
-opt-level = 1
 
 [profile.release]
 lto = "thin"

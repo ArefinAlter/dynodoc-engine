@@ -26,7 +26,7 @@ path = "src/bin/dynodoc-witness.rs"
 engine-core = { workspace = true, features = ["kms"] }
 engine-agent = { workspace = true }
 engine-mcp = { workspace = true }
-engine-shared = { workspace = true }
+engine-shared = { path = "../engine-shared", features = ["db", "openapi"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }

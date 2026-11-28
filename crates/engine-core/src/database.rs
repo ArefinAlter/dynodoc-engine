@@ -235,7 +235,7 @@ pub async fn check_schema(pool: &PgPool) -> anyhow::Result<()> {
     )
     .fetch_all(pool)
     .await
-    .context("schema unavailable; run engine-cli migrate with separate migration credentials")?;
+    .context("schema unavailable; run engine-admin migrate with separate migration credentials")?;
     if rows.len() != MIGRATOR.iter().count()
         || rows
             .iter()

@@ -1,0 +1,33 @@
+[package]
+name = "engine-admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Dynodoc server and database operator CLI (migrate, grant-runtime, auth, kms, verify, openapi)."
+
+[[bin]]
+name = "engine-admin"
+path = "src/main.rs"
+
+[dependencies]
+engine-api = { workspace = true }
+engine-core = { workspace = true, features = ["kms"] }
+engine-shared = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ring = { workspace = true }
+utoipa = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "blocking"] }

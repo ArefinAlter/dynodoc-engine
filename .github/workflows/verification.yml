@@ -8,7 +8,7 @@ on:
     paths:
       - '.github/workflows/verification.yml'
       - 'scripts/verify-scheduled.sh'
-      - 'crates/engine-cli/tests/verify_cli_test.rs'
+      - 'crates/engine-admin/tests/verify_cli_test.rs'
       - 'crates/engine-core/src/projection.rs'
       - 'crates/engine-core/src/snapshot_verification.rs'
 
@@ -50,7 +50,7 @@ jobs:
       - name: Seed disposable databases and verify, including failure notifications
         # These tests invoke the actual CLI --all commands as a restricted login.
         # Corruption and the alert sink exist only in isolated synthetic fixtures.
-        run: cargo test --locked -p engine-cli --test verify_cli_test -- --test-threads=1
+        run: cargo test --locked -p engine-admin --test verify_cli_test -- --test-threads=1
       - name: Mark an actionable failure
         if: failure()
         run: echo '::error::Scheduled verification failed. Investigate this run; see "The GitHub Actions run" in docs/SCHEDULED-VERIFICATION.md.'
