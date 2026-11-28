@@ -80,7 +80,7 @@ hpke = { version = "0.12", default-features = false, features = ["alloc", "x2551
 rand_core = { version = "0.6", features = ["getrandom"] }
 # Shamir secret sharing over GF(2^8) for the escrow ceremony (decision 041): maintained,
 # constant time, Apache-2.0 OR MIT. Same rand_core 0.6 as hpke.
-vsss-rs = { version = "5.4", default-features = false, features = ["std"] }
+vsss-rs = { version = "6.0", default-features = false, features = ["std"] }
 
 # Auth: Paseto v4 local tokens (symmetric AEAD) instead of JWT — no alg-confusion or
 # `none`-algorithm footguns (docs/17, NFR-8). `hex` decodes the 32-byte signing key.
