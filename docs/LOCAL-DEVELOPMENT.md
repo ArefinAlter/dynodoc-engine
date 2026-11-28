@@ -62,51 +62,22 @@ If you prefer not to use the `dev-setup` or `dev-bootstrap-runtime` scripts:
 
 ---
 
-## Track 2: Local-only CLI & pure tests (no Docker / Postgres)
+## Track 2: Pure unit tests & user CLI (`dynodoc-cli`)
 
-Install `engine-cli` into Cargo's bin directory, or run via `task cli -- <args>`:
+Pure Rust tests and operator CLI inspection run without Docker or PostgreSQL:
 
 ```sh
-task install-cli
 task test:unit
+task admin -- --help
 ```
 
-### Environment defaults (`DYNODOC_*`)
-
-To avoid repeating paths, project UUIDs, remotes, and keys across commands, export the variables once in your shell:
+The end-user CLI (`dynodoc repo`, `dynodoc sync`, `dynodoc mcp`, `dynodoc historical-diff`) lives in the separate [Vernesystems/dynodoc-cli](https://github.com/Vernesystems/dynodoc-cli) repository. Install it from source with:
 
 ```sh
-export DYNODOC_REPO=./local-project.sqlite
-export DYNODOC_PROJECT=11111111-1111-4111-8111-111111111111
-export DYNODOC_REMOTE=./remote.json
-export DYNODOC_JOURNAL=./pins.sqlite
-export DYNODOC_BRANCH=main
-export DYNODOC_KEY=./device-key.der
+cargo install --git https://github.com/Vernesystems/dynodoc-cli --locked
 ```
 
-| Variable | Used by |
-| --- | --- |
-| `DYNODOC_REPO` | `engine-cli repo --repo ...`, `engine-cli historical-diff --repository ...` |
-| `DYNODOC_PROJECT` | `engine-cli repo --project ...`, `engine-cli historical-diff --project ...`, `engine-cli mcp --project ...` |
-| `DYNODOC_REMOTE` | `engine-cli sync --remote ...`, `engine-cli mcp --remote ...` |
-| `DYNODOC_JOURNAL` | `engine-cli sync --journal ...` |
-| `DYNODOC_BRANCH` | `engine-cli sync --branch ...` |
-| `DYNODOC_KEY` | `engine-cli sync --device-key ...`, `engine-cli mcp --device-key ...` |
-
-Explicit CLI flags always override environment variables.
-
-### Shorthand `repo` vs positional `repository`
-
-Both forms invoke the same local SQLite repository engine:
-
-```sh
-# Flag / env-backed shorthand (uses DYNODOC_REPO and DYNODOC_PROJECT when exported):
-engine-cli repo init
-engine-cli repo storage
-
-# Explicit positional form (still fully supported):
-engine-cli repository ./local-project.sqlite 11111111-1111-4111-8111-111111111111 init
-```
+See the `dynodoc-cli` README for `DYNODOC_*` environment defaults, `.dynodoc/config.toml`, and `dynodoc mcp setup`.
 
 ---
 

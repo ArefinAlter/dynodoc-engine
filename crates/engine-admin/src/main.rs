@@ -81,6 +81,12 @@ enum Command {
         effective_at: Option<String>,
         #[arg(long)]
         epoch: Option<u32>,
+        /// Required confirmation: repeat the epoch number being revoked.
+        #[arg(long)]
+        confirm_revoke_epoch: Option<u32>,
+        /// Preview which epoch would be revoked without modifying the database.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Transparency log: log worker, log-key rotation and anchor export (owner credential).
     Transparency {
@@ -247,12 +253,16 @@ async fn main() -> anyhow::Result<()> {
             reason,
             effective_at,
             epoch,
+            confirm_revoke_epoch,
+            dry_run,
         } => {
             authority::revoke(
                 &connect_migration().await?,
                 &reason,
                 effective_at.as_deref(),
                 epoch,
+                confirm_revoke_epoch,
+                dry_run,
             )
             .await
         }

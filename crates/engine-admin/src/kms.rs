@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Args)]
-pub struct Options {
+pub struct ProviderArgs {
     /// `file` (a directory of `kek-<n>.key` files), `vault-transit`, `aws-kms`, `gcp-kms` or
     /// `azure-keyvault`. Cloud credentials come from the environment (`AWS_ACCESS_KEY_ID`,
     /// `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`; `GOOGLE_OAUTH_ACCESS_TOKEN`;
@@ -37,6 +37,10 @@ pub struct Options {
     vault_token_file: Option<PathBuf>,
     #[arg(long)]
     allow_loopback_http: bool,
+}
+
+#[derive(Args)]
+pub struct Options {
     #[command(subcommand)]
     action: Action,
 }
@@ -45,32 +49,46 @@ pub struct Options {
 pub enum Action {
     /// Register the provider key (once) and create the active data key of a project.
     CreateDataKey {
+        #[command(flatten)]
+        kms: ProviderArgs,
+        /// Project UUID (omit to create the default installation-wide data key).
         #[arg(long)]
         project: Option<Uuid>,
     },
     /// After a KEK rotation in the provider: rewrap every data key of this key. Row data is
     /// not touched.
-    Rewrap,
+    Rewrap {
+        #[command(flatten)]
+        kms: ProviderArgs,
+    },
     /// A new data key for a project; the old one stays decrypt-only for existing values.
     Rotate {
+        #[command(flatten)]
+        kms: ProviderArgs,
         #[arg(long)]
         project: Uuid,
     },
     /// Seal a project's existing plaintext rows with its active data key, in batches; safe
     /// to stop and run again (it resumes with the rows still plaintext).
     Backfill {
+        #[command(flatten)]
+        kms: ProviderArgs,
         #[arg(long)]
         project: Uuid,
         #[arg(long, default_value_t = 500)]
         batch: i64,
     },
-    /// Crypto-erase: delete every data key of a project. Values sealed under them, in the
-    /// database and in backups, become unreadable. Irreversible; needs --confirm PROJECT.
+    /// Crypto-erase: delete every data key of a project (database-only; does not contact
+    /// cloud KMS). Values sealed under them, in the database and in backups, become unreadable.
+    /// Irreversible; requires --confirm PROJECT (or use --dry-run to preview).
     Erase {
         #[arg(long)]
         project: Uuid,
         #[arg(long)]
-        confirm: Uuid,
+        confirm: Option<Uuid>,
+        /// Show how many data keys would be deleted without changing the database.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -81,6 +99,19 @@ struct Config {
     vault_mount: String,
     vault_token_file: Option<PathBuf>,
     allow_loopback_http: bool,
+}
+
+impl From<ProviderArgs> for Config {
+    fn from(args: ProviderArgs) -> Self {
+        Self {
+            provider: args.provider,
+            key_ref: args.key_ref,
+            vault_key: args.vault_key,
+            vault_mount: args.vault_mount,
+            vault_token_file: args.vault_token_file,
+            allow_loopback_http: args.allow_loopback_http,
+        }
+    }
 }
 
 fn provider(o: &Config) -> anyhow::Result<Box<dyn KeyProvider>> {
@@ -110,35 +141,67 @@ fn provider(o: &Config) -> anyhow::Result<Box<dyn KeyProvider>> {
 }
 
 pub async fn run(options: Options, pool: sqlx::PgPool) -> anyhow::Result<()> {
+    if let Action::Erase {
+        project,
+        confirm,
+        dry_run,
+    } = options.action
+    {
+        let count: i64 = sqlx::query_scalar("select count(*) from data_key where project_id=$1")
+            .bind(project)
+            .fetch_one(&pool)
+            .await
+            .context("querying data_key count for project")?;
+        if dry_run {
+            println!("Dry run: would crypto-erase {count} data key(s) for project {project}.");
+            return Ok(());
+        }
+        if confirm != Some(project) {
+            bail!("refusing to crypto-erase project {project} without --confirm {project}");
+        }
+        let n = sqlx::query("delete from data_key where project_id=$1")
+            .bind(project)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+        if n == 0 {
+            bail!("no data keys found for project {project}; nothing was erased");
+        }
+        println!("Crypto-erased: {n} data key(s) of {project} deleted. Values sealed under them cannot be read again.");
+        return Ok(());
+    }
+
     let installation: Uuid = sqlx::query_scalar("select id from device_authority where singleton")
         .fetch_one(&pool)
-        .await?;
-    let Options {
-        provider: kind,
-        key_ref,
-        vault_key,
-        vault_mount,
-        vault_token_file,
-        allow_loopback_http,
-        action,
-    } = options;
-    let config = Config {
-        provider: kind,
-        key_ref,
-        vault_key,
-        vault_mount,
-        vault_token_file,
-        allow_loopback_http,
+        .await
+        .context("failed to read installation id from device_authority; run `engine-admin migrate` first")?;
+
+    let (provider_args, action) = match options.action {
+        Action::CreateDataKey { kms, project } => (kms, KmsOp::CreateDataKey { project }),
+        Action::Rewrap { kms } => (kms, KmsOp::Rewrap),
+        Action::Rotate { kms, project } => (kms, KmsOp::Rotate { project }),
+        Action::Backfill {
+            kms,
+            project,
+            batch,
+        } => (kms, KmsOp::Backfill { project, batch }),
+        Action::Erase { .. } => unreachable!("handled above"),
     };
+
+    let config = Config::from(provider_args);
     // Providers block (network or files): run them off the async runtime.
     let p: std::sync::Arc<dyn KeyProvider> = tokio::task::spawn_blocking(move || provider(&config))
         .await??
         .into();
     let info = p.describe();
-    let kms: Uuid = match sqlx::query_scalar("select id from kms_key where provider=$1 and key_ref=$2 and purpose='data' and status='active'").bind(info.provider).bind(&info.key_ref).fetch_optional(&pool).await? {
-        Some(id) => id,
-        None => sqlx::query_scalar("insert into kms_key(provider,key_ref,purpose) values($1,$2,'data') returning id").bind(info.provider).bind(&info.key_ref).fetch_one(&pool).await?,
-    };
+    let existing_kms: Option<Uuid> = sqlx::query_scalar(
+        "select id from kms_key where provider=$1 and key_ref=$2 and purpose='data' and status='active'",
+    )
+    .bind(info.provider)
+    .bind(&info.key_ref)
+    .fetch_optional(&pool)
+    .await?;
+
     let wrap = |project: Option<Uuid>| {
         let p = p.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<Wrapped> {
@@ -148,17 +211,41 @@ pub async fn run(options: Options, pool: sqlx::PgPool) -> anyhow::Result<()> {
             )?)
         })
     };
+
     match action {
-        Action::CreateDataKey { project } => {
+        KmsOp::CreateDataKey { project } => {
+            let kms: Uuid = match existing_kms {
+                Some(id) => id,
+                None => sqlx::query_scalar(
+                    "insert into kms_key(provider,key_ref,purpose) values($1,$2,'data') returning id",
+                )
+                .bind(info.provider)
+                .bind(&info.key_ref)
+                .fetch_one(&pool)
+                .await?,
+            };
             let w = wrap(project).await??;
-            sqlx::query("insert into data_key(project_id,kms_key_id,kek_version,wrapped) values($1,$2,$3,$4)").bind(project).bind(kms).bind(w.kek_version() as i32).bind(w.as_bytes()).execute(&pool).await.context("a project has one active data key; use rotate")?;
+            sqlx::query("insert into data_key(project_id,kms_key_id,kek_version,wrapped) values($1,$2,$3,$4)")
+                .bind(project)
+                .bind(kms)
+                .bind(w.kek_version() as i32)
+                .bind(w.as_bytes())
+                .execute(&pool)
+                .await
+                .context("a project has one active data key; use rotate")?;
             println!(
                 "Data key created under {} version {}.",
                 info.provider,
                 w.kek_version()
             );
         }
-        Action::Rotate { project } => {
+        KmsOp::Rotate { project } => {
+            let kms = existing_kms.with_context(|| {
+                format!(
+                    "no active kms_key registered for provider={} key_ref={}; run `engine-admin kms create-data-key` first",
+                    info.provider, info.key_ref
+                )
+            })?;
             let w = wrap(Some(project)).await??;
             let mut tx = pool.begin().await?;
             sqlx::query("update data_key set state='decrypt_only', retired_at=now() where project_id=$1 and state='active'").bind(project).execute(&mut *tx).await?;
@@ -166,7 +253,13 @@ pub async fn run(options: Options, pool: sqlx::PgPool) -> anyhow::Result<()> {
             tx.commit().await?;
             println!("New data key active; the previous one is decrypt-only.");
         }
-        Action::Rewrap => {
+        KmsOp::Rewrap => {
+            let kms = existing_kms.with_context(|| {
+                format!(
+                    "no active kms_key registered for provider={} key_ref={}; run `engine-admin kms create-data-key` first",
+                    info.provider, info.key_ref
+                )
+            })?;
             let rows: Vec<(i32, Option<Uuid>, i32, Vec<u8>)> = sqlx::query_as("select id,project_id,kek_version,wrapped from data_key where kms_key_id=$1 order by id").bind(kms).fetch_all(&pool).await?;
             let mut done = 0;
             for (id, project, version, bytes) in rows {
@@ -191,7 +284,13 @@ pub async fn run(options: Options, pool: sqlx::PgPool) -> anyhow::Result<()> {
                 info.kek_version
             );
         }
-        Action::Backfill { project, batch } => {
+        KmsOp::Backfill { project, batch } => {
+            let _kms = existing_kms.with_context(|| {
+                format!(
+                    "no active kms_key registered for provider={} key_ref={}; run `engine-admin kms create-data-key` first",
+                    info.provider, info.key_ref
+                )
+            })?;
             use engine_core::at_rest::store;
             store::install(store::AtRest::new(installation, p.clone()));
             let mut db = pool.acquire().await?;
@@ -207,17 +306,56 @@ pub async fn run(options: Options, pool: sqlx::PgPool) -> anyhow::Result<()> {
             }
             println!("Sealed {total} stored object(s) of {project} at rest. Run again to confirm: it seals only rows still in plaintext.");
         }
-        Action::Erase { project, confirm } => {
-            if confirm != project {
-                bail!("--confirm must repeat the project id");
-            }
-            let n = sqlx::query("delete from data_key where project_id=$1")
-                .bind(project)
-                .execute(&pool)
-                .await?
-                .rows_affected();
-            println!("Crypto-erased: {n} data key(s) of {project} deleted. Values sealed under them cannot be read again.");
-        }
     }
     Ok(())
+}
+
+enum KmsOp {
+    CreateDataKey { project: Option<Uuid> },
+    Rewrap,
+    Rotate { project: Uuid },
+    Backfill { project: Uuid, batch: i64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        opts: Options,
+    }
+
+    #[test]
+    fn erase_parses_without_provider_or_key_ref() {
+        let project = Uuid::new_v4();
+        let parsed = TestCli::try_parse_from([
+            "kms",
+            "erase",
+            "--project",
+            &project.to_string(),
+            "--dry-run",
+        ])
+        .expect("erase should not require --provider or --key-ref");
+        match parsed.opts.action {
+            Action::Erase {
+                project: p,
+                confirm,
+                dry_run,
+            } => {
+                assert_eq!(p, project);
+                assert!(confirm.is_none());
+                assert!(dry_run);
+            }
+            _ => panic!("expected Erase"),
+        }
+    }
+
+    #[test]
+    fn create_data_key_requires_provider_and_key_ref() {
+        let err = TestCli::try_parse_from(["kms", "create-data-key"]);
+        assert!(err.is_err());
+    }
 }
