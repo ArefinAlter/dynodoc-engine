@@ -57,6 +57,13 @@ pub enum Action {
         /// The new origin, for example `<host>/dynodoc/v2/transparency`.
         #[arg(long)]
         origin: String,
+        /// Confirm that all pending outbox leaves were integrated and you want to append an
+        /// irreversible successor leaf.
+        #[arg(long)]
+        confirm_rotate: bool,
+        /// Inspect pending outbox leaf count without modifying the database.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Export the proof that a document's latest event of one anchored hour is
     /// committed by that hour's event-heads leaf (owner credential).
@@ -250,7 +257,12 @@ pub async fn run(action: Action) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Action::RotateLog { key, origin } => {
+        Action::RotateLog {
+            key,
+            origin,
+            confirm_rotate,
+            dry_run,
+        } => {
             let origin = Origin::new(&origin).map_err(|e| anyhow!("origin: {e}"))?;
             let signer = Signer::from_pkcs8(
                 origin.as_str(),
@@ -259,6 +271,27 @@ pub async fn run(action: Action) -> anyhow::Result<()> {
             )
             .map_err(|_| anyhow!("the log key must be an unencrypted Ed25519 PKCS#8 file"))?;
             let pool = crate::connect_migration().await?;
+            let pending: i64 = sqlx::query_scalar(
+                "select count(*) from transparency_outbox o where not exists(select 1 from transparency_leaf l where l.outbox_seq=o.seq)",
+            )
+            .fetch_one(&pool)
+            .await
+            .context("checking pending transparency outbox leaves")?;
+            if dry_run {
+                println!(
+                    "{}",
+                    json!({"dry_run": true, "origin": origin.as_str(), "verifier_key": signer.verifier_key().to_string(), "pending_outbox_leaves": pending})
+                );
+                return Ok(());
+            }
+            ensure!(
+                pending == 0,
+                "cannot rotate transparency log while {pending} outbox leaf/leaves remain pending; run `engine-admin transparency log-worker --once` with the old key first"
+            );
+            ensure!(
+                confirm_rotate,
+                "rotating the transparency log key appends an irreversible successor leaf; re-run with --confirm-rotate (or --dry-run to preview)"
+            );
             let step = engine_api::transparency::rotate_log(&pool, &signer, &origin).await?;
             println!(
                 "{}",

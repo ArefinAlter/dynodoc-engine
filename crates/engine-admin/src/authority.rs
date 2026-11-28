@@ -201,6 +201,8 @@ pub async fn revoke(
     reason: &str,
     effective_at: Option<&str>,
     epoch: Option<u32>,
+    confirm_revoke_epoch: Option<u32>,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
     if let Some(time) = effective_at {
         // An explicit offset keeps the marker independent of the server time zone.
@@ -216,6 +218,24 @@ pub async fn revoke(
             "--effective-at must be RFC 3339 with an explicit zone, for example 2026-10-14T09:30:00Z"
         );
     }
+    let state = server_authority::state(pool).await?;
+    let target_epoch = epoch.unwrap_or(state.epoch);
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": true,
+                "target_epoch": target_epoch,
+                "reason": reason,
+                "effective_at": effective_at,
+            }))?
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        confirm_revoke_epoch == Some(target_epoch),
+        "revoking receipt-authority epoch {target_epoch} is irreversible and stops receipt issuance immediately; re-run with --confirm-revoke-epoch {target_epoch} (or --dry-run to preview)"
+    );
     let marker = server_authority::revoke(pool, reason, effective_at, epoch).await?;
     println!(
         "{}",
