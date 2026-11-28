@@ -1,7 +1,7 @@
 # Dynodoc Engine
 
-[![CI](https://github.com/ArefinAlter/dynodoc-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/ArefinAlter/dynodoc-engine/actions/workflows/ci.yml)
-[![Platforms](https://github.com/ArefinAlter/dynodoc-engine/actions/workflows/platforms.yml/badge.svg)](https://github.com/ArefinAlter/dynodoc-engine/actions/workflows/platforms.yml)
+[![CI](https://github.com/Vernesystems/dynodoc-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Vernesystems/dynodoc-engine/actions/workflows/ci.yml)
+[![Platforms](https://github.com/Vernesystems/dynodoc-engine/actions/workflows/platforms.yml/badge.svg)](https://github.com/Vernesystems/dynodoc-engine/actions/workflows/platforms.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Semantic version control for documents edited in existing tools. Rust libraries,
