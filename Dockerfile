@@ -1,4 +1,4 @@
-# engine-api and engine-cli in one small image. Built natively for linux/amd64 and
+# engine-api and engine-admin in one small image. Built natively for linux/amd64 and
 # linux/arm64 by .github/workflows/containers.yml (the base images are multi-architecture).
 # Run it with DATABASE_URL set (roles and grants: docs/DATABASE-PRIVILEGES.md); with no
 # configuration it refuses to start and says why.
@@ -7,7 +7,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY migrations ./migrations
-RUN cargo build --locked --release -p engine-api -p engine-cli
+RUN cargo build --locked --release -p engine-api -p engine-admin
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -15,7 +15,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home dynodoc
 COPY --from=build /app/target/release/engine-api /usr/local/bin/engine-api
-COPY --from=build /app/target/release/engine-cli /usr/local/bin/engine-cli
+COPY --from=build /app/target/release/engine-admin /usr/local/bin/engine-admin
+# Transition symlink for existing operator scripts calling `engine-cli` inside the container.
+RUN ln -s /usr/local/bin/engine-admin /usr/local/bin/engine-cli
 COPY LICENSE NOTICE /usr/share/doc/dynodoc-engine/
 USER dynodoc
 EXPOSE 8080

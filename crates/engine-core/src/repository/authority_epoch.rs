@@ -4,7 +4,7 @@
 //! Receipts keep their own version-1 encoding; they name their epoch through the
 //! signing key, and a key belongs to exactly one epoch.
 use super::{
-    attestation::{hash, message, verify},
+    attestation::{hash, message, verify, SignedReceipt},
     hex, unhex, Error,
 };
 use crate::shared_checkpoint::Address;
@@ -443,6 +443,36 @@ impl Served {
             })?;
         }
         Ok(())
+    }
+}
+
+/// An offline bundle: the authority's served epoch chain plus the receipts after a
+/// pin. `receipt advance` and `receipt accept-break` verify everything locally;
+/// the file itself carries no trust.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainProof {
+    pub version: u8,
+    pub authority: Uuid,
+    pub active_key: String,
+    pub active_epoch: u32,
+    pub revoked: Vec<Revocation>,
+    pub rotations: Vec<SignedTransition>,
+    pub receipts: Vec<SignedReceipt>,
+}
+impl ChainProof {
+    pub fn served(&self) -> Result<Served, Error> {
+        if self.version != 1 {
+            return Err(Error::Invalid("unsupported authority proof version"));
+        }
+        let mut revoked = BTreeMap::new();
+        for marker in &self.revoked {
+            if revoked.insert(marker.epoch, marker.clone()).is_some() {
+                return Err(Error::Invalid("duplicate revocation marker"));
+            }
+        }
+        let chain = Chain::new(self.authority, self.rotations.clone())?;
+        Served::new(chain, self.active_key.clone(), self.active_epoch, revoked)
     }
 }
 

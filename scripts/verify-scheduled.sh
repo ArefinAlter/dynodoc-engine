@@ -12,7 +12,7 @@ if [ ! -x "$DYNODOC_VERIFY_ALERT" ]; then
   echo 'DYNODOC_VERIFY_ALERT is not executable' >&2
   exit 2
 fi
-engine_binary=${ENGINE_CLI:-engine-cli}
+engine_binary=${ENGINE_ADMIN:-${ENGINE_CLI:-engine-admin}}
 check_timeout=${DYNODOC_VERIFY_TIMEOUT:-30m}
 projection_status=0
 snapshot_status=0

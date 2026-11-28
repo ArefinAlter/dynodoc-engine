@@ -11,9 +11,7 @@ name: engine-platforms
 #   Windows x86-64    windows-latest     PostgreSQL from the runner image
 #   Windows aarch64   windows-11-arm     tier 2: non-blocking (continue-on-error)
 #
-# Each job also exercises the operating-system key store for real (native_keystore
-# test, ignored by default): a throwaway keychain on macOS, a private D-Bus session
-# with a fresh gnome-keyring on Linux, DPAPI on Windows.
+# Native OS keystore tests now run in Vernesystems/dynodoc-cli.
 #
 # The one skipped test: `sse_delivers_a_new_event_within_100ms` asserts that a server
 # sent event arrives within 100 ms. That is a latency check, not a behaviour check.
@@ -97,41 +95,8 @@ jobs:
           awk '/^test result:/ {p+=$4; f+=$6; i+=$8} END {print "Linux aarch64: " p " passed, " f " failed, " i " ignored"}' "$RUNNER_TEMP/test.log" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: OpenAPI consistency
         run: |
-          target/debug/engine-cli openapi --out "$RUNNER_TEMP/openapi.yaml"
+          target/debug/engine-admin openapi --out "$RUNNER_TEMP/openapi.yaml"
           diff -u openapi.yaml "$RUNNER_TEMP/openapi.yaml"
-      - name: Native key store (Secret Service through secret-tool)
-        timeout-minutes: 15
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gnome-keyring libsecret-tools dbus
-          # A private session bus and a fresh, unlocked keyring; nothing outside this
-          # job is touched.
-          dbus-run-session -- bash -ec '
-            eval "$(printf "%s" dynodoc-ci-keyring | gnome-keyring-daemon --unlock --daemonize --components=secrets)"
-            cargo test --locked -p engine-cli --test native_keystore -- --ignored --nocapture
-          '
-
-  linux-x64-key-store:
-    # ci.yml runs the whole suite on Linux x86-64 but cannot reach a Secret Service,
-    # so this small job runs the real key store test there as well.
-    name: Linux x86-64 key store
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install Rust toolchain (pinned via rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: key-store
-      - name: Native key store (Secret Service through secret-tool)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gnome-keyring libsecret-tools dbus
-          dbus-run-session -- bash -ec '
-            eval "$(printf "%s" dynodoc-ci-keyring | gnome-keyring-daemon --unlock --daemonize --components=secrets)"
-            cargo test --locked -p engine-cli --test native_keystore -- --ignored --nocapture
-          '
 
   macos:
     name: macOS ${{ matrix.arch }}
@@ -206,41 +171,8 @@ jobs:
           fi
       - name: OpenAPI consistency
         run: |
-          target/debug/engine-cli openapi --out "$RUNNER_TEMP/openapi.yaml"
+          target/debug/engine-admin openapi --out "$RUNNER_TEMP/openapi.yaml"
           diff -u openapi.yaml "$RUNNER_TEMP/openapi.yaml"
-      - name: Native key store (macOS Keychain, temporary keychain)
-        timeout-minutes: 15
-        run: |
-          # A throwaway keychain is the only one on the search list while the test runs.
-          # `security` never prompts for a keychain that is unlocked, and the test kills
-          # the CLI after 60 s, so a surprise prompt fails the step instead of hanging it.
-          KC="$RUNNER_TEMP/dynodoc-test.keychain-db"
-          PW="$(uuidgen)"
-          OLD_LIST="$(security list-keychains -d user | tr -d '"' | tr '\n' ' ')"
-          OLD_DEFAULT="$(security default-keychain -d user | tr -d '" ')"
-          echo "keychains before: $OLD_LIST (default $OLD_DEFAULT)"
-          security create-keychain -p "$PW" "$KC"
-          security set-keychain-settings -lut 3600 "$KC"
-          security unlock-keychain -p "$PW" "$KC"
-          security list-keychains -d user -s "$KC"
-          security default-keychain -d user -s "$KC"
-          echo "keychains during the test:"; security list-keychains -d user
-          restore() {
-            security default-keychain -d user -s "$OLD_DEFAULT" || true
-            # shellcheck disable=SC2086
-            security list-keychains -d user -s $OLD_LIST || true
-            security delete-keychain "$KC" || true
-            echo "keychains after:"; security list-keychains -d user
-          }
-          trap restore EXIT
-          cargo test --locked -p engine-cli --test native_keystore -- --ignored --nocapture
-      - name: Native key store left nothing in the login keychain
-        if: always()
-        run: |
-          if security find-generic-password -s dynodoc-key-v1 "$HOME/Library/Keychains/login.keychain-db" > /dev/null 2>&1; then
-            echo "a dynodoc-key-v1 item is in the login keychain"; exit 1
-          fi
-          echo "no dynodoc-key-v1 item in the login keychain"
 
   windows:
     name: Windows ${{ matrix.arch }}
@@ -343,11 +275,7 @@ jobs:
       - name: OpenAPI consistency
         if: ${{ !cancelled() }}
         run: |
-          target/debug/engine-cli.exe openapi --out "$RUNNER_TEMP/openapi.yaml"
+          target/debug/engine-admin.exe openapi --out "$RUNNER_TEMP/openapi.yaml"
           # The generated file must itself be LF only; the checkout may be CRLF.
           if grep -q $'\r' "$RUNNER_TEMP/openapi.yaml"; then echo "CR in the generated OpenAPI file"; exit 1; fi
           diff -u --strip-trailing-cr openapi.yaml "$RUNNER_TEMP/openapi.yaml"
-      - name: Native key store (DPAPI)
-        if: ${{ !cancelled() }}
-        timeout-minutes: 15
-        run: cargo test --locked -p engine-cli --test native_keystore -- --ignored --nocapture

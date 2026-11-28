@@ -60,8 +60,10 @@ release history lives in the [handoff](docs/ENGINE-EVOLUTION-HANDOFF.md).
 | `engine-agent` | Agent protocol: refs, hashes, compact text, outline/read/find/diff and the propose compiler |
 | `engine-mcp` | MCP server for the agent protocol; read-only by default, writes wait for a person |
 | `engine-api` | HTTP/SSE, auth and the existing document/workspace service adapter; `dynodoc-witness` transparency witness |
-| `engine-cli` | Verify/migrate/snapshot, local commits/branches, receipt journals, MCP and generated OpenAPI |
+| `engine-admin` | Server/database operator CLI (migrate, grant-runtime, auth, kms, verify, snapshot, openapi) |
 | `engine-wasm` | Pure engine (hashing, fold, operations, merge) for WebAssembly hosts |
+
+The user-facing command-line client and MCP server (`dynodoc` binary: `repo`, `sync`, `mcp`, `device`, `e2ee`, `escrow`, `receipt`) live in the separate [dynodoc-cli](https://github.com/Vernesystems/dynodoc-cli) repository.
 
 The API adapter still contains product roles, questionnaire validation, access
 hierarchies and administrative operations inherited from Dynodoc. Embedders can
@@ -87,29 +89,27 @@ task test:local    # Runs full workspace tests against the local Compose owner
 task db:upgrade    # After git pull: migrate + grant-runtime + check
 ```
 
-**Local-only CLI & pure tests (no Docker/PostgreSQL):**
+**Operator CLI & pure unit tests (no Docker/PostgreSQL for unit tests):**
 
 ```sh
-task install-cli   # Installs engine-cli into Cargo's bin directory (or use `task cli -- <args>`)
-task test:unit     # Runs pure-Rust and CLI unit tests
-engine-cli repo --help
+task test:unit     # Runs pure-Rust and operator parser unit tests
+task admin -- --help
 ```
 
-`engine-cli` commands (`repo`, `sync`, `historical-diff`, `mcp`) read `DYNODOC_REPO`,
-`DYNODOC_PROJECT`, `DYNODOC_REMOTE`, `DYNODOC_JOURNAL`, `DYNODOC_BRANCH`, and `DYNODOC_KEY`
-when flags are omitted. `engine-api` enforces strict credential separation: `.env` holds
+`engine-api` enforces strict credential separation: `.env` holds
 only the restricted `dynodoc_runtime` login, `.env.migrate` holds `MIGRATION_DATABASE_URL`,
 and `task test:local` uses an isolated test-owner URL. Never run tests against hosted data
-or pass `MIGRATION_DATABASE_URL` to `engine-api`.
+or pass `MIGRATION_DATABASE_URL` to `engine-api`. For local `dynodoc repo`, `sync`, and `mcp`,
+use [dynodoc-cli](https://github.com/Vernesystems/dynodoc-cli).
 
 ```sh
 task lint
 task docs
 task openapi
-# With DATABASE_URL exported (or via `task cli -- ...`):
-engine-cli verify DOCUMENT_UUID
-engine-cli replay DOCUMENT_UUID
-engine-cli snapshot DOCUMENT_UUID
+# With DATABASE_URL exported (or via `task admin -- ...`):
+engine-admin verify DOCUMENT_UUID
+engine-admin replay DOCUMENT_UUID
+engine-admin snapshot DOCUMENT_UUID
 ```
 
 See [local development and CLI usage](docs/LOCAL-DEVELOPMENT.md),
@@ -124,9 +124,10 @@ See [local development and CLI usage](docs/LOCAL-DEVELOPMENT.md),
 The engine, API and command line are built and tested on Linux, macOS and Windows,
 on x86-64 and on Arm (aarch64), by GitHub-hosted runners on every change
 ([platform workflow](.github/workflows/platforms.yml)). Windows on Arm is tier 2.
-Tagged `cli-v*` releases attach `engine-cli` and `engine-api` archives for all six
+Tagged `server-v*` releases attach `engine-admin` and `engine-api` archives for all six
 OS and processor pairs with a `SHA256SUMS` file; they are not code-signed, so
-macOS Gatekeeper and Windows SmartScreen will warn. The support matrix, what CI
+macOS Gatekeeper and Windows SmartScreen will warn. The user-facing `dynodoc` binary is
+released from [dynodoc-cli](https://github.com/Vernesystems/dynodoc-cli). The support matrix, what CI
 proves, what is excluded, platform differences and how to verify a download are in
 [PLATFORM-SUPPORT.md](docs/PLATFORM-SUPPORT.md).
 

@@ -46,15 +46,15 @@ tasks:
   migrate:
     desc: Apply migrations in a separate operator process
     dotenv: [".env.migrate"]
-    cmds: ["cargo run --locked -p engine-cli -- migrate"]
+    cmds: ["cargo run --locked -p engine-admin -- migrate"]
   db:grant-runtime:
     desc: Grant the explicit allowlist to an existing dynodoc_runtime login
     dotenv: [".env.migrate"]
-    cmds: ["cargo run --locked -p engine-cli -- grant-runtime dynodoc_runtime"]
+    cmds: ["cargo run --locked -p engine-admin -- grant-runtime dynodoc_runtime"]
   db:check:
     desc: Read-only schema/runtime privilege check
     dotenv: [".env"]
-    cmds: ["cargo run --locked -p engine-cli -- check-runtime"]
+    cmds: ["cargo run --locked -p engine-admin -- check-runtime"]
   doctor:
     desc: Check local prerequisites, env files, and runtime database privileges
     cmds:
@@ -76,11 +76,10 @@ tasks:
       DATABASE_URL: postgres://dynodoc:local-development-only@127.0.0.1:5548/dynodoc_engine
     cmds: ["cargo test --locked --workspace -- --test-threads=1"]
   test:unit:
-    desc: Run pure-Rust and non-DB CLI tests without needing PostgreSQL or Docker
+    desc: Run pure-Rust and operator parser unit tests without needing PostgreSQL or Docker
     cmds:
       - cargo test --locked -p engine-shared -p engine-agent -p engine-mcp -p dynodoc-engine-wasm
-      - cargo test --locked -p engine-cli --test key_files --test mcp_plugin --test mcp_stdio --test mcp_write_stdio --test platform_behaviour
-      - cargo test --locked -p engine-cli --bin engine-cli -- --skip export_token::tests --skip a_granted_key_signs_in --skip device_sessions_push_fetch --skip real_http_selected_push_fetch --skip refresh_rotation_retries_once --skip release_cli_options --skip release_create_ --skip release_list_ --skip release_permission_ --skip release_show_ --skip revocation_refuses_clients --skip sync_clients_follow_a_planned_rotation
+      - cargo test --locked -p engine-admin --bin engine-admin
   lint:
     cmds:
       - cargo fmt --all -- --check
@@ -94,10 +93,7 @@ tasks:
       - cargo run --release --locked -p engine-core --example richtext_bench
       - cargo run --release --locked -p engine-core --example similarity_bench
   openapi:
-    cmds: ["cargo run --locked -p engine-cli -- openapi --out openapi.yaml"]
-  install-cli:
-    desc: Install engine-cli into Cargo's bin directory for direct local use
-    cmds: ["cargo install --locked --path crates/engine-cli"]
-  cli:
-    desc: "Run engine-cli directly (usage: task cli -- <args>)"
-    cmds: ["cargo run --locked -p engine-cli -- {{.CLI_ARGS}}"]
+    cmds: ["cargo run --locked -p engine-admin -- openapi --out openapi.yaml"]
+  admin:
+    desc: "Run engine-admin directly (usage: task admin -- <args>)"
+    cmds: ["cargo run --locked -p engine-admin -- {{.CLI_ARGS}}"]

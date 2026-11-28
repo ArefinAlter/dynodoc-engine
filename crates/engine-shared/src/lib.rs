@@ -8,7 +8,9 @@
 //! Event-construction and fold logic live in `engine-core` (stage 14+); this crate
 //! is the shared data-model vocabulary the rest of the workspace builds on.
 
+pub mod auth_wire;
 pub mod enums;
+pub mod export_tokens;
 pub mod ids;
 pub mod payload;
 pub mod richtext;

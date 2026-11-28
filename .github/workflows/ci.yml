@@ -64,4 +64,4 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --workspace --no-deps
       - name: OpenAPI consistency
-        run: cargo run --locked -p engine-cli -- openapi --out /tmp/openapi.yaml && diff -u openapi.yaml /tmp/openapi.yaml
+        run: cargo run --locked -p engine-admin -- openapi --out /tmp/openapi.yaml && diff -u openapi.yaml /tmp/openapi.yaml
